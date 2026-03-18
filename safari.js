@@ -1,14 +1,160 @@
-// Safari automation layer via AppleScript/JXA
-// כל הפקודות רצות ברקע - בלי להקפיץ חלון Safari לקדמה
-// Persistent osascript process for fast execution (~5ms vs ~80ms per call)
+// Safari automation layer — dual engine:
+// 1. WebDriver (safaridriver) — fast (~30ms), reliable clicks, screenshots, JS eval
+// 2. AppleScript — tab management, existing tabs, operations WebDriver can't do
+// WebDriver is used for ALL page interactions. AppleScript only for tab listing/management.
 
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readFile, writeFile, unlink } from "node:fs/promises";
+import http from "node:http";
 
 const execFileAsync = promisify(execFile);
+
+// ========== WEBDRIVER SESSION MANAGEMENT ==========
+const WD_PORT = 4444;
+let _wdSessionId = null;
+let _wdDriverProc = null;
+
+// HTTP helper for WebDriver commands
+function wdRequest(method, path, body) {
+  return new Promise((resolve, reject) => {
+    const opts = {
+      hostname: "localhost",
+      port: WD_PORT,
+      path: `/session${_wdSessionId ? '/' + _wdSessionId : ''}${path}`,
+      method,
+      headers: { "Content-Type": "application/json" },
+      timeout: 30000,
+    };
+    const req = http.request(opts, (res) => {
+      let data = "";
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.value && parsed.value.error) {
+            reject(new Error(`WebDriver: ${parsed.value.message || parsed.value.error}`));
+          } else {
+            resolve(parsed.value);
+          }
+        } catch {
+          resolve(data);
+        }
+      });
+    });
+    req.on("error", reject);
+    req.on("timeout", () => { req.destroy(); reject(new Error("WebDriver timeout")); });
+    if (body) req.write(JSON.stringify(body));
+    req.end();
+  });
+}
+
+// Start safaridriver + create session (called lazily on first use)
+async function ensureWebDriver() {
+  if (_wdSessionId) {
+    // Verify session is alive
+    try {
+      await wdRequest("GET", "/url");
+      return;
+    } catch {
+      _wdSessionId = null; // Session died, recreate
+    }
+  }
+
+  // Start safaridriver if not running
+  try {
+    await new Promise((resolve, reject) => {
+      const req = http.request({ hostname: "localhost", port: WD_PORT, path: "/status", method: "GET", timeout: 1000 }, (res) => {
+        let d = ""; res.on("data", c => d += c); res.on("end", () => resolve(d));
+      });
+      req.on("error", reject);
+      req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
+      req.end();
+    });
+  } catch {
+    // safaridriver not running — start it
+    _wdDriverProc = spawn("safaridriver", ["-p", String(WD_PORT)], {
+      stdio: "ignore", detached: true,
+    });
+    _wdDriverProc.unref();
+    // Wait for it to be ready
+    for (let i = 0; i < 20; i++) {
+      try {
+        await new Promise((resolve, reject) => {
+          const req = http.request({ hostname: "localhost", port: WD_PORT, path: "/status", method: "GET", timeout: 500 }, (res) => {
+            let d = ""; res.on("data", c => d += c); res.on("end", () => resolve(d));
+          });
+          req.on("error", reject);
+          req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
+          req.end();
+        });
+        break;
+      } catch {
+        await new Promise(r => setTimeout(r, 300));
+      }
+    }
+  }
+
+  // Create session
+  const result = await new Promise((resolve, reject) => {
+    const body = JSON.stringify({ capabilities: { alwaysMatch: { browserName: "safari" } } });
+    const req = http.request({
+      hostname: "localhost", port: WD_PORT, path: "/session", method: "POST",
+      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
+      timeout: 15000,
+    }, (res) => {
+      let d = ""; res.on("data", c => d += c);
+      res.on("end", () => { try { resolve(JSON.parse(d)); } catch { reject(new Error(d)); } });
+    });
+    req.on("error", reject);
+    req.on("timeout", () => { req.destroy(); reject(new Error("Session timeout")); });
+    req.write(body);
+    req.end();
+  });
+
+  _wdSessionId = result.value?.sessionId;
+  if (!_wdSessionId) throw new Error("Failed to create WebDriver session");
+}
+
+// Execute JS via WebDriver (fast — ~30ms)
+async function wdEval(script, args = []) {
+  await ensureWebDriver();
+  const result = await wdRequest("POST", "/execute/sync", { script, args });
+  return result;
+}
+
+// Execute async JS via WebDriver
+async function wdEvalAsync(script, args = []) {
+  await ensureWebDriver();
+  return wdRequest("POST", "/execute/async", { script, args });
+}
+
+// Navigate via WebDriver
+async function wdNavigate(url) {
+  await ensureWebDriver();
+  await wdRequest("POST", "/url", { url });
+  return wdRequest("GET", "/url");
+}
+
+// Screenshot via WebDriver (returns base64)
+async function wdScreenshot() {
+  await ensureWebDriver();
+  return wdRequest("GET", "/screenshot");
+}
+
+// Get current URL via WebDriver
+async function wdGetUrl() {
+  await ensureWebDriver();
+  return wdRequest("GET", "/url");
+}
+
+// Get title via WebDriver
+async function wdGetTitle() {
+  await ensureWebDriver();
+  return wdRequest("GET", "/title");
+}
 
 // ========== ACTIVE TAB TRACKING ==========
 // Instead of visually switching tabs (which interrupts the user),
@@ -16,6 +162,7 @@ const execFileAsync = promisify(execFile);
 // when the user opens/closes tabs). Before each operation we resolve the URL
 // to the current index.
 let _activeTabIndex = null; // null = use front document (default)
+let _useWebDriver = false;  // true = use WebDriver for current tab (much faster)
 let _activeTabURL = null;   // URL-based tracking (stable even when tabs shift)
 let _lastResolveTime = 0;   // Cache: skip resolve if verified recently
 const RESOLVE_CACHE_MS = 5000; // Re-verify tab every 5 seconds max
@@ -197,13 +344,27 @@ async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
 // ========== NAVIGATION ==========
 
 export async function navigate(url) {
-  // No withoutStealingFocus needed — set URL + do JavaScript don't steal focus
-  // Safari 17+ auto-upgrades HTTP→HTTPS. If user gives http://, try https:// first.
-    // If user gives no protocol, default to https://
-    let targetUrl = url;
-    if (!/^https?:\/\//i.test(targetUrl)) {
-      targetUrl = "https://" + targetUrl;
+  let targetUrl = url;
+  if (!/^https?:\/\//i.test(targetUrl)) {
+    targetUrl = "https://" + targetUrl;
+  }
+
+  // WebDriver navigate — fast (~90ms), handles HTTPS, waits for load
+  if (_useWebDriver && _wdSessionId) {
+    try {
+      await wdRequest("POST", "/url", { url: targetUrl });
+      const currentUrl = await wdRequest("GET", "/url");
+      const title = await wdRequest("GET", "/title");
+      _activeTabURL = currentUrl || targetUrl;
+      // Inject click helpers
+      try { await wdEval(`${INJECT_MCP_HELPERS}`); } catch {}
+      return JSON.stringify({ title, url: currentUrl });
+    } catch {
+      // Fall through to AppleScript
     }
+  }
+
+  // AppleScript navigate
     const safeUrl = targetUrl.replace(/"/g, '\\"');
     // Resolve tab by URL first (in case indices shifted)
     if (_activeTabURL) await resolveActiveTab();
@@ -721,6 +882,16 @@ export async function typeText({ text, selector, ref }) {
 // ========== SCREENSHOT ==========
 
 export async function screenshot({ fullPage = false } = {}) {
+  // WebDriver screenshot — fast and reliable (~100ms)
+  if (_useWebDriver && _wdSessionId) {
+    try {
+      const base64 = await wdScreenshot();
+      if (base64 && base64.length > 100) return base64;
+    } catch {
+      // Fall through to AppleScript
+    }
+  }
+
   const tmpFile = join(tmpdir(), `safari-screenshot-${Date.now()}.png`);
   let savedTabIdx = null;
   try {
@@ -962,84 +1133,63 @@ export async function listTabs() {
 }
 
 export async function newTab(url = "") {
-  return withoutStealingFocus(async () => {
-    const safeUrl = url ? url.replace(/"/g, '\\"') : "";
-    try {
-      // Save user's current tab, create new tab, restore user's tab — all in ONE osascript call
-      // This minimizes the visual "flash" to nearly zero
-      if (url) {
-        await osascript(
-          `tell application "Safari"
-            tell front window
-              set userTab to current tab
-              make new tab with properties {URL:"${safeUrl}"}
-              set current tab to userTab
-            end tell
-          end tell`
-        );
-      } else {
-        await osascript(
-          `tell application "Safari"
-            tell front window
-              set userTab to current tab
-              make new tab
-              set current tab to userTab
-            end tell
-          end tell`
-        );
-      }
-    } catch {
-      // No window exists — create one
-      if (url) {
-        await osascript(`tell application "Safari" to make new document with properties {URL:"${safeUrl}"}`);
-      } else {
-        await osascript('tell application "Safari" to make new document');
-      }
+  // Use WebDriver to create a new tab — faster, more reliable, no visual interruption
+  try {
+    await ensureWebDriver();
+    if (url) {
+      await wdRequest("POST", "/url", { url });
     }
+    const currentUrl = await wdRequest("GET", "/url");
+    const title = await wdRequest("GET", "/title");
+    _useWebDriver = true;
+    _activeTabURL = currentUrl || url || null;
 
-    // Combined: get tab count + wait for load + get info in ONE osascript call
-    const combined = await osascript(
-      `tell application "Safari"
-        set tabCount to count of tabs of front window
-        set newTab to tab tabCount of front window
-        ${url ? `-- Wait for URL to load
-        repeat 40 times
-          try
-            set tabUrl to URL of newTab
-            if tabUrl is not "about:blank" and tabUrl is not "" and tabUrl is not missing value then
-              set rdy to do JavaScript "document.readyState" in newTab
-              if rdy is not "loading" then exit repeat
-            end if
-          end try
-          delay 0.25
-        end repeat` : 'delay 0.2'}
-        set info to do JavaScript "JSON.stringify({title:document.title,url:location.href})" in newTab
-        return (tabCount as text) & "|" & info
-      end tell`,
-      { timeout: 15000 }
-    );
-
-    // Parse combined result
-    const pipeIdx = combined.indexOf('|');
-    const newIndex = Number(combined.substring(0, pipeIdx));
-    const infoStr = combined.substring(pipeIdx + 1);
-    _activeTabIndex = newIndex;
-
+    // Find our tab index in Safari's tab list (for tracking)
     try {
-      const parsed = JSON.parse(infoStr);
-      if (parsed.url === 'about:blank' || parsed.url === '' || !parsed.url) {
-        _activeTabURL = url || null;
-      } else {
-        _activeTabURL = parsed.url;
+      const tabCount = await osascriptFast(
+        'tell application "Safari" to return count of tabs of front window'
+      );
+      _activeTabIndex = Number(tabCount); // WebDriver tab is usually the last one
+    } catch { _activeTabIndex = null; }
+
+    return JSON.stringify({ title: title || "", url: currentUrl || url || "", tabIndex: _activeTabIndex });
+  } catch (err) {
+    // WebDriver failed — fall back to AppleScript
+    _useWebDriver = false;
+    return withoutStealingFocus(async () => {
+      const safeUrl = url ? url.replace(/"/g, '\\"') : "";
+      try {
+        if (url) {
+          await osascript(`tell application "Safari"\ntell front window\nset userTab to current tab\nmake new tab with properties {URL:"${safeUrl}"}\nset current tab to userTab\nend tell\nend tell`);
+        } else {
+          await osascript(`tell application "Safari"\ntell front window\nset userTab to current tab\nmake new tab\nset current tab to userTab\nend tell\nend tell`);
+        }
+      } catch {
+        if (url) { await osascript(`tell application "Safari" to make new document with properties {URL:"${safeUrl}"}`); }
+        else { await osascript('tell application "Safari" to make new document'); }
       }
-    } catch {
+      const tabCount = await osascriptFast('tell application "Safari" to return count of tabs of front window');
+      _activeTabIndex = Number(tabCount);
       _activeTabURL = url || null;
-    }
-    return info;
-  });
+      await new Promise(r => setTimeout(r, 500));
+      const info = await runJS(`JSON.stringify({title:document.title,url:location.href,tabIndex:${_activeTabIndex}})`, { tabIndex: _activeTabIndex });
+      return info;
+    });
+  }
 }
 
 export async function closeTab() {
+  // WebDriver: delete session (closes the tab)
+  if (_useWebDriver && _wdSessionId) {
+    try {
+      await wdRequest("DELETE", "");
+      _wdSessionId = null;
+      _useWebDriver = false;
+      _activeTabIndex = null;
+      _activeTabURL = null;
+      return "Tab closed (WebDriver session ended)";
+    } catch {}
+  }
   if (_activeTabIndex) {
     await osascript(
       `tell application "Safari" to close tab ${_activeTabIndex} of front window`
@@ -1102,19 +1252,51 @@ export async function waitFor({ selector, text, timeout = 10000 }) {
 export async function evaluate({ script }) {
   let js = script.trim();
 
-  // Detect if script is async (uses await, fetch().then, async function, etc.)
+  // ===== WebDriver path (fast — ~30ms) =====
+  if (_useWebDriver && _wdSessionId) {
+    try {
+      // WebDriver execute/sync needs "return" at the top level
+      let wdScript = js;
+      // Detect async
+      const isAsync = /\bawait\b/.test(js) || /^async\b/.test(js);
+      if (isAsync) {
+        // WebDriver execute/async handles promises natively
+        const result = await wdEvalAsync(`var cb=arguments[arguments.length-1];(async function(){${js}})().then(function(r){cb(r)}).catch(function(e){cb('Error: '+e.message)})`);
+        return result !== null && result !== undefined ? String(result) : '(no return value)';
+      }
+      // Sync: wrap in function with return if needed
+      if (!wdScript.includes('return ') && !wdScript.includes('return;')) {
+        const lines = wdScript.split('\n');
+        for (let i = lines.length - 1; i >= 0; i--) {
+          const line = lines[i].trim();
+          if (!line || line.startsWith('//')) continue;
+          if (line.endsWith('}') || line.startsWith('var ') || line.startsWith('let ') || line.startsWith('const ')) break;
+          lines[i] = 'return ' + lines[i];
+          break;
+        }
+        wdScript = lines.join('\n');
+      }
+      const result = await wdEval(wdScript);
+      if (result !== null && result !== undefined) {
+        return typeof result === 'object' ? JSON.stringify(result) : String(result);
+      }
+      return '(no return value)';
+    } catch (err) {
+      // WebDriver failed — fall through to AppleScript
+    }
+  }
+
+  // ===== AppleScript path (slower — ~80ms) =====
   const isAsync = /\bawait\b/.test(js) || /\.then\s*\(/.test(js) || /^async\b/.test(js) || /\bfetch\s*\(/.test(js);
 
   if (isAsync) {
-    // Async script: wrap in async IIFE, store result in window.__mcp_async_result, then poll
     const id = Date.now();
     const wrappedAsync = `(async function(){try{window.__mcp_r${id}=JSON.stringify({v:await(async function(){${js}})()});}catch(e){window.__mcp_r${id}=JSON.stringify({e:e.message});}})()`;
     await runJS(wrappedAsync);
-    // Poll for result (up to 30 seconds)
     for (let i = 0; i < 60; i++) {
       const check = await runJS(`window.__mcp_r${id}||''`);
       if (check && check !== '') {
-        await runJS(`delete window.__mcp_r${id}`); // Cleanup
+        await runJS(`delete window.__mcp_r${id}`);
         try {
           const parsed = JSON.parse(check);
           if (parsed.e) return `Error: ${parsed.e}`;
@@ -1126,18 +1308,15 @@ export async function evaluate({ script }) {
     return '(async timeout — script took longer than 30 seconds)';
   }
 
-  // Sync script: wrap in IIFE if needed
   const isIIFE = /^\((?:async\s+)?function/.test(js) || /^\((?:async\s+)?\(/.test(js);
   const isSimpleExpression = !js.includes(';') && !js.includes('\n') && !js.startsWith('var ') && !js.startsWith('let ') && !js.startsWith('const ');
 
   if (!isIIFE && !isSimpleExpression) {
     if (!js.includes('return ') && !js.includes('return;')) {
-      // Find last non-empty, non-comment line and add return
       const lines = js.split('\n');
       for (let i = lines.length - 1; i >= 0; i--) {
         const line = lines[i].trim();
         if (!line || line.startsWith('//')) continue;
-        // Don't add return to control flow endings
         if (line.endsWith('}') || line.startsWith('var ') || line.startsWith('let ') || line.startsWith('const ')) break;
         lines[i] = 'return ' + lines[i];
         break;
