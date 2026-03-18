@@ -276,6 +276,9 @@ export async function navigate(url) {
       })()`
     );
 
+    // Pre-inject click helpers so subsequent clicks are fast (~100 bytes instead of 2KB)
+    runJS(`${INJECT_MCP_HELPERS}`).catch(() => {});
+
     // If HTTPS failed and original was HTTP, try original HTTP URL
     try {
       const parsed = JSON.parse(result);
@@ -365,61 +368,6 @@ export async function getPageSource({ maxLength = 200000 } = {}) {
 
 // ========== CLICK ==========
 
-// OS-level click: gets element screen coordinates, then uses AppleScript to perform
-// a REAL mouse click that macOS sends to Safari. Works on React, Airtable, any framework.
-// switchToTab: if true, temporarily switch Safari to our tab for the click (needed for background tabs)
-async function osClick(pageX, pageY, { switchToTab = true } = {}) {
-  // Calculate screen coordinates dynamically using JS window.screenX/screenY
-  // This accounts for Safari toolbar, tab bar, bookmarks bar — any configuration
-  const offset = await runJS(
-    "JSON.stringify({sx:window.screenX, sy:window.screenY, oh:window.outerHeight, ih:window.innerHeight})"
-  );
-  const { sx, sy, oh, ih } = JSON.parse(offset);
-  const toolbarHeight = oh - ih; // Dynamic: includes tab bar + address bar + bookmarks
-  const screenX = sx + Math.round(pageX);
-  const screenY = sy + toolbarHeight + Math.round(pageY);
-
-  // If working on a background tab, temporarily switch to it for the click
-  let savedTabIdx = null;
-  if (switchToTab && _activeTabIndex) {
-    try {
-      const currentIdx = await osascriptFast(
-        'tell application "Safari" to return index of current tab of front window'
-      );
-      if (Number(currentIdx) !== _activeTabIndex) {
-        savedTabIdx = Number(currentIdx);
-        await osascriptFast(
-          `tell application "Safari" to set current tab of front window to tab ${_activeTabIndex} of front window`
-        );
-        await new Promise(r => setTimeout(r, 150)); // Let Safari render the tab
-      }
-    } catch (_) {}
-  }
-
-  // Perform real OS click via cliclick (preferred — precise, reliable)
-  try {
-    await execFileAsync("cliclick", ["c:" + screenX + "," + screenY], { timeout: 3000 });
-  } catch (_) {
-    // Fallback: AppleScript System Events
-    await osascript(
-      `tell application "System Events" to click at {${screenX}, ${screenY}}`,
-      { timeout: 5000 }
-    );
-  }
-
-  // Restore the user's tab if we switched
-  if (savedTabIdx) {
-    await new Promise(r => setTimeout(r, 200)); // Let the click register
-    try {
-      await osascriptFast(
-        `tell application "Safari" to set current tab of front window to tab ${savedTabIdx} of front window`
-      );
-    } catch (_) {}
-  }
-
-  return true;
-}
-
 // Inject click helpers ONCE per page (cached on window.__mcp)
 // Includes: mcpClick (full event sequence), mcpReactClick (React Fiber), mcpFindText (fast TreeWalker)
 const INJECT_MCP_HELPERS = `if(!window.__mcp){window.__mcp=true;
@@ -476,47 +424,32 @@ const INJECT_MCP_HELPERS = `if(!window.__mcp){window.__mcp=true;
   };
 }`;
 
+// Ensure helpers are injected (fast no-op if already present)
+async function ensureHelpers() {
+  await runJS(`${INJECT_MCP_HELPERS}`).catch(() => {});
+}
+
 export async function click({ selector, text, x, y, ref }) {
   if (ref) selector = refSelector(ref);
 
   if (selector) {
     const sel = selector.replace(/'/g, "\\'");
+    // Tiny JS — helpers already injected by navigate/newTab. Fallback inject if not.
     return runJS(
-      `(function(){${INJECT_MCP_HELPERS}
-        var el=document.querySelector('${sel}');
-        if(!el)return 'Element not found: ${sel}';
-        // Try full event sequence first
-        mcpClick(el);
-        // If element is a link, also try navigation
-        if(el.tagName==='A'&&el.href&&!el.href.startsWith('javascript:'))try{var before=location.href;setTimeout(function(){if(location.href===before&&el.href)location.href=el.href},100)}catch(e){}
-        // React Fiber fallback (if event sequence didn't trigger handler)
-        mcpReactClick(el);
-        return 'Clicked: '+el.tagName+(el.textContent?(' "'+el.textContent.trim().substring(0,50)+'"'):'');
-      })()`
+      `(function(){if(!window.__mcp){${INJECT_MCP_HELPERS}}var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';mcpClick(el);mcpReactClick(el);return 'Clicked: '+el.tagName+(el.textContent?(' "'+el.textContent.trim().substring(0,50)+'"'):'');})()`
     );
   }
 
   if (text) {
     const safeText = text.replace(/'/g, "\\'");
     return runJS(
-      `(function(){${INJECT_MCP_HELPERS}
-        // TreeWalker search: exact first, then contains (10x faster than querySelectorAll)
-        var el=mcpFindText('${safeText}',true)||mcpFindText('${safeText}',false);
-        if(!el)return 'Element not found with text: ${safeText}';
-        mcpClick(el);mcpReactClick(el);
-        return 'Clicked: '+el.tagName+' "'+el.textContent.trim().substring(0,50)+'"';
-      })()`
+      `(function(){if(!window.__mcp){${INJECT_MCP_HELPERS}}var el=mcpFindText('${safeText}',true)||mcpFindText('${safeText}',false);if(!el)return 'Element not found with text: ${safeText}';mcpClick(el);mcpReactClick(el);return 'Clicked: '+el.tagName+' "'+el.textContent.trim().substring(0,50)+'"';})()`
     );
   }
 
   if (x !== undefined && y !== undefined) {
     return runJS(
-      `(function(){${INJECT_MCP_HELPERS}
-        var el=document.elementFromPoint(${Number(x)},${Number(y)});
-        if(!el)return 'No element at (${Number(x)},${Number(y)})';
-        mcpClick(el);mcpReactClick(el);
-        return 'Clicked: '+el.tagName+' at (${Number(x)},${Number(y)})';
-      })()`
+      `(function(){if(!window.__mcp){${INJECT_MCP_HELPERS}}var el=document.elementFromPoint(${Number(x)},${Number(y)});if(!el)return 'No element at (${Number(x)},${Number(y)})';mcpClick(el);mcpReactClick(el);return 'Clicked: '+el.tagName+' at (${Number(x)},${Number(y)})';})()`
     );
   }
   throw new Error("click requires selector, text, or x/y coordinates");
