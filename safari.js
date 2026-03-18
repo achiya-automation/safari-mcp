@@ -790,6 +790,10 @@ export async function scrollTo({ x = 0, y = 0 }) {
 // ========== TAB MANAGEMENT ==========
 
 export async function listTabs() {
+  // Reset active tab tracking — forces each session to open its own tab
+  // This prevents one Claude session from accidentally using another session's tab
+  _activeTabIndex = null;
+
   const result = await osascript(
     `tell application "Safari"
       set output to ""
