@@ -77,20 +77,10 @@ async function resolveActiveTab() {
   }
 }
 
-// ========== FAST OSASCRIPT VIA TEMP FILE REUSE ==========
-// osascript -i doesn't work with pipes. Instead, we use a shared temp file
-// and direct execFile — which is ~80ms but reliable.
-// For runJS specifically, we batch when possible.
-
-let _osaProc = null;
-let _osaReady = false;
-
-function getOsaProcess() {
-  // Persistent process doesn't work with osascript — return null to use fallback
-  return null;
-
-  return _osaProc;
-}
+// ========== FAST OSASCRIPT VIA TEMP FILE ==========
+// osascript -i persistent process doesn't work reliably with pipes.
+// Instead, we use execFile for every call (~80ms each).
+// Optimization: for runJS we write to temp file and execute (avoids arg escaping).
 
 // withoutStealingFocus: just run the function.
 // All Safari MCP operations use `tell application "Safari"` (not `activate`)
@@ -139,53 +129,9 @@ async function osascript(script, { timeout = 10000 } = {}) {
   }
 }
 
-// Fast osascript via persistent process — for simple tell commands
+// osascriptFast = osascript (same thing now, persistent process removed)
 async function osascriptFast(script, { timeout = 10000 } = {}) {
-  return new Promise((resolve, reject) => {
-    const proc = getOsaProcess();
-    if (!proc || proc.killed) {
-      // Fallback to regular osascript if persistent process is dead
-      return osascript(script, { timeout }).then(resolve, reject);
-    }
-
-    let output = "";
-    let timer = setTimeout(() => {
-      cleanup();
-      // Fallback on timeout
-      osascript(script, { timeout }).then(resolve, reject);
-    }, timeout);
-
-    function onData(chunk) {
-      output += chunk.toString();
-      // osascript -i returns result then a new prompt
-      if (output.includes("\r\n")) {
-        cleanup();
-        // Remove prompt artifacts
-        const result = output.split("\r\n")[0].trim();
-        resolve(result);
-      }
-    }
-
-    function onError(chunk) {
-      const err = chunk.toString().trim();
-      if (err && !err.startsWith(">>")) {
-        cleanup();
-        reject(new Error(`AppleScript error: ${err}`));
-      }
-    }
-
-    function cleanup() {
-      clearTimeout(timer);
-      proc.stdout.removeListener("data", onData);
-      proc.stderr.removeListener("data", onError);
-    }
-
-    proc.stdout.on("data", onData);
-    proc.stderr.on("data", onError);
-
-    // Send the script as a single line
-    proc.stdin.write(script.replace(/\n/g, "\r") + "\n");
-  });
+  return osascript(script, { timeout });
 }
 
 // Run JavaScript in Safari — fastest path, no focus stealing
@@ -399,10 +345,32 @@ const INJECT_MCP_HELPERS = `if(!window.__mcp){window.__mcp=true;
   };
   window.mcpReactClick=function(el){
     if(!el)return false;
-    var pk=Object.keys(el).find(function(k){return k.startsWith('__reactProps$')});
-    if(pk&&el[pk]&&el[pk].onClick){el[pk].onClick({type:'click',target:el,currentTarget:el,preventDefault:function(){},stopPropagation:function(){},nativeEvent:{},persist:function(){}});return true}
-    var fk=Object.keys(el).find(function(k){return k.startsWith('__reactFiber$')||k.startsWith('__reactInternalInstance$')});
-    if(fk){var f=el[fk];while(f){if(f.memoizedProps&&f.memoizedProps.onClick){f.memoizedProps.onClick({type:'click',target:el,currentTarget:el,preventDefault:function(){},stopPropagation:function(){},nativeEvent:{},persist:function(){}});return true}f=f.return}}
+    var synth={type:'click',target:el,currentTarget:el,preventDefault:function(){},stopPropagation:function(){},nativeEvent:new MouseEvent('click'),persist:function(){},bubbles:true,cancelable:true};
+    // Search React handlers on element AND all parents (delegation pattern)
+    var node=el;
+    for(var depth=0;depth<15&&node;depth++){
+      var pk=Object.keys(node).find(function(k){return k.startsWith('__reactProps$')});
+      if(pk&&node[pk]){
+        var props=node[pk];
+        // Try onClick, onMouseDown, onPointerDown (Airtable uses mousedown for dropdowns)
+        if(props.onClick){props.onClick(synth);return true}
+        if(props.onMouseDown){props.onMouseDown({...synth,type:'mousedown'});return true}
+        if(props.onPointerDown){props.onPointerDown({...synth,type:'pointerdown'});return true}
+      }
+      var fk=Object.keys(node).find(function(k){return k.startsWith('__reactFiber$')||k.startsWith('__reactInternalInstance$')});
+      if(fk){
+        var f=node[fk];
+        while(f){
+          if(f.memoizedProps){
+            if(f.memoizedProps.onClick){f.memoizedProps.onClick(synth);return true}
+            if(f.memoizedProps.onMouseDown){f.memoizedProps.onMouseDown({...synth,type:'mousedown'});return true}
+            if(f.memoizedProps.onPointerDown){f.memoizedProps.onPointerDown({...synth,type:'pointerdown'});return true}
+          }
+          f=f.return;
+        }
+      }
+      node=node.parentElement;
+    }
     return false;
   };
   // Fast text finder using TreeWalker (10x faster than querySelectorAll('*') on large DOMs)
@@ -1125,19 +1093,38 @@ export async function waitFor({ selector, text, timeout = 10000 }) {
 // ========== EVALUATE ==========
 
 export async function evaluate({ script }) {
-  // Wrap in IIFE if the script uses `return` outside a function
-  // or if it's a multi-statement script that might not return a value
   let js = script.trim();
 
-  // If already wrapped in IIFE or is a simple expression, use as-is
+  // Detect if script is async (uses await, fetch().then, async function, etc.)
+  const isAsync = /\bawait\b/.test(js) || /\.then\s*\(/.test(js) || /^async\b/.test(js) || /\bfetch\s*\(/.test(js);
+
+  if (isAsync) {
+    // Async script: wrap in async IIFE, store result in window.__mcp_async_result, then poll
+    const id = Date.now();
+    const wrappedAsync = `(async function(){try{window.__mcp_r${id}=JSON.stringify({v:await(async function(){${js}})()});}catch(e){window.__mcp_r${id}=JSON.stringify({e:e.message});}})()`;
+    await runJS(wrappedAsync);
+    // Poll for result (up to 30 seconds)
+    for (let i = 0; i < 60; i++) {
+      const check = await runJS(`window.__mcp_r${id}||''`);
+      if (check && check !== '') {
+        await runJS(`delete window.__mcp_r${id}`); // Cleanup
+        try {
+          const parsed = JSON.parse(check);
+          if (parsed.e) return `Error: ${parsed.e}`;
+          return parsed.v !== undefined ? String(parsed.v) : '(undefined)';
+        } catch { return check; }
+      }
+      await new Promise(r => setTimeout(r, 500));
+    }
+    return '(async timeout — script took longer than 30 seconds)';
+  }
+
+  // Sync script: wrap in IIFE if needed
   const isIIFE = /^\((?:async\s+)?function/.test(js) || /^\((?:async\s+)?\(/.test(js);
   const isSimpleExpression = !js.includes(';') && !js.includes('\n') && !js.startsWith('var ') && !js.startsWith('let ') && !js.startsWith('const ');
 
   if (!isIIFE && !isSimpleExpression) {
-    // Wrap in IIFE so `return` works and last expression is returned
-    // Also add implicit return of last expression if no explicit return
     if (!js.includes('return ') && !js.includes('return;')) {
-      // Add return to last line
       const lines = js.split('\n');
       const lastLine = lines[lines.length - 1].trim();
       if (lastLine && !lastLine.startsWith('//') && !lastLine.endsWith('}') && !lastLine.startsWith('var ') && !lastLine.startsWith('let ') && !lastLine.startsWith('const ')) {
@@ -1150,7 +1137,6 @@ export async function evaluate({ script }) {
   }
 
   const result = await runJS(js);
-  // Convert empty/null results to informative message
   if (result === null || result === undefined || result === '') {
     return '(no return value — script executed but returned nothing. Use explicit return or ensure last expression has a value)';
   }
