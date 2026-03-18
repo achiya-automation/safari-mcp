@@ -26,10 +26,20 @@ async function resolveActiveTab() {
   if (!_activeTabURL) return _activeTabIndex;
   try {
     const safeUrl = _activeTabURL.replace(/"/g, '\\"');
+    // If we have a known index, verify it first (O(1) instead of searching all tabs)
+    if (_activeTabIndex) {
+      const currentUrl = await osascriptFast(
+        `tell application "Safari" to return URL of tab ${_activeTabIndex} of front window`
+      ).catch(() => "");
+      if (currentUrl && currentUrl.startsWith(_activeTabURL)) {
+        return _activeTabIndex; // Same tab, same URL — no change needed
+      }
+    }
+    // Index shifted — search from the END (our tab is usually the newest)
     const idx = await osascriptFast(
       `tell application "Safari"
         set tabCount to count of tabs of front window
-        repeat with i from 1 to tabCount
+        repeat with i from tabCount to 1 by -1
           if URL of tab i of front window starts with "${safeUrl}" then return i
         end repeat
         return 0
