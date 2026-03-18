@@ -21,22 +21,41 @@ let _activeTabURL = null;   // URL-based tracking (stable even when tabs shift)
 export function getActiveTabIndex() { return _activeTabIndex; }
 export function setActiveTabIndex(idx) { _activeTabIndex = idx; }
 
-// Resolve our tracked URL to current tab index (indices shift when user opens/closes tabs)
+// Resolve our tracked URL to current tab index — single osascript call (fast!)
 async function resolveActiveTab() {
   if (!_activeTabURL) return _activeTabIndex;
   try {
-    const result = await osascriptFast(
-      `tell application "Safari" to return (count of tabs of front window) as text`
+    const safeUrl = _activeTabURL.replace(/"/g, '\\"');
+    const idx = await osascriptFast(
+      `tell application "Safari"
+        set tabCount to count of tabs of front window
+        repeat with i from 1 to tabCount
+          if URL of tab i of front window starts with "${safeUrl}" then return i
+        end repeat
+        return 0
+      end tell`
     );
-    const count = Number(result);
-    for (let i = 1; i <= count; i++) {
-      const url = await osascriptFast(
-        `tell application "Safari" to return URL of tab ${i} of front window`
-      );
-      if (url === _activeTabURL) {
-        _activeTabIndex = i;
-        return i;
-      }
+    const num = Number(idx);
+    if (num > 0) {
+      _activeTabIndex = num;
+      return num;
+    }
+    // Try partial match (URL may have changed due to redirects/navigation)
+    const domain = _activeTabURL.replace(/^https?:\/\//, '').split('/')[0];
+    const safeDomain = domain.replace(/"/g, '\\"');
+    const idx2 = await osascriptFast(
+      `tell application "Safari"
+        set tabCount to count of tabs of front window
+        repeat with i from tabCount to 1 by -1
+          if URL of tab i of front window contains "${safeDomain}" then return i
+        end repeat
+        return 0
+      end tell`
+    );
+    const num2 = Number(idx2);
+    if (num2 > 0) {
+      _activeTabIndex = num2;
+      return num2;
     }
     // Tab was closed — reset
     _activeTabIndex = null;
@@ -957,9 +976,13 @@ export async function scrollTo({ x = 0, y = 0 }) {
 // ========== TAB MANAGEMENT ==========
 
 export async function listTabs() {
-  // Reset active tab tracking — forces each session to open its own tab
-  // This prevents one Claude session from accidentally using another session's tab
-  _activeTabIndex = null;
+  // If we have a tracked URL, re-resolve the index (it may have shifted)
+  // If no URL tracked, reset index (new session should open its own tab)
+  if (_activeTabURL) {
+    await resolveActiveTab();
+  } else {
+    _activeTabIndex = null;
+  }
 
   const result = await osascript(
     `tell application "Safari"
