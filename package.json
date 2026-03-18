@@ -1,6 +1,6 @@
 {
   "name": "safari-mcp",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Safari browser automation for AI agents — native macOS, zero Chrome overhead. 80 tools via AppleScript + JavaScript.",
   "type": "module",
   "main": "index.js",

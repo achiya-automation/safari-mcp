@@ -96,13 +96,14 @@ server.tool(
 
 server.tool(
   "safari_click",
-  "Click element. Use ref (from snapshot), selector, text, or x/y",
+  "Click element. Use ref (from snapshot), selector, text, or x/y. Set force=true for React/Airtable apps that don't respond to JS clicks (uses OS-level mouse click).",
   {
     ref: z.string().optional().describe("Ref ID from safari_snapshot (e.g. '0_5')"),
     selector: z.string().optional().describe("CSS selector"),
     text: z.string().optional().describe("Visible text to find and click"),
     x: z.coerce.number().optional().describe("X coordinate"),
     y: z.coerce.number().optional().describe("Y coordinate"),
+    force: z.boolean().optional().describe("Force OS-level click (for React/Airtable/virtual DOM apps)"),
   },
   async (args) => {
     const result = await safari.click(args);
