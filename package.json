@@ -26,13 +26,13 @@
   ],
   "author": "Achiya Cohen <a.c0504197060@gmail.com>",
   "license": "MIT",
-  "homepage": "https://github.com/achiyacohen/safari-mcp",
+  "homepage": "https://github.com/achiya-automation/safari-mcp",
   "repository": {
     "type": "git",
-    "url": "https://github.com/achiyacohen/safari-mcp.git"
+    "url": "https://github.com/achiya-automation/safari-mcp.git"
   },
   "bugs": {
-    "url": "https://github.com/achiyacohen/safari-mcp/issues"
+    "url": "https://github.com/achiya-automation/safari-mcp/issues"
   },
   "engines": {
     "node": ">=18"

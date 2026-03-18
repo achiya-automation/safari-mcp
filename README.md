@@ -32,7 +32,7 @@ Use your real Safari browser with all your logins, cookies, and sessions. No hea
 ### Install
 
 ```bash
-git clone https://github.com/achiyacohen/safari-mcp.git
+git clone https://github.com/achiya-automation/safari-mcp.git
 cd safari-mcp
 npm install
 ```
