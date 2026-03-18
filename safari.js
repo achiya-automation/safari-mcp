@@ -1132,10 +1132,15 @@ export async function evaluate({ script }) {
 
   if (!isIIFE && !isSimpleExpression) {
     if (!js.includes('return ') && !js.includes('return;')) {
+      // Find last non-empty, non-comment line and add return
       const lines = js.split('\n');
-      const lastLine = lines[lines.length - 1].trim();
-      if (lastLine && !lastLine.startsWith('//') && !lastLine.endsWith('}') && !lastLine.startsWith('var ') && !lastLine.startsWith('let ') && !lastLine.startsWith('const ')) {
-        lines[lines.length - 1] = 'return ' + lastLine;
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i].trim();
+        if (!line || line.startsWith('//')) continue;
+        // Don't add return to control flow endings
+        if (line.endsWith('}') || line.startsWith('var ') || line.startsWith('let ') || line.startsWith('const ')) break;
+        lines[i] = 'return ' + lines[i];
+        break;
       }
       js = '(function(){' + lines.join('\n') + '})()';
     } else {
@@ -1145,7 +1150,7 @@ export async function evaluate({ script }) {
 
   const result = await runJS(js);
   if (result === null || result === undefined || result === '') {
-    return '(no return value — script executed but returned nothing. Use explicit return or ensure last expression has a value)';
+    return '(no return value)';
   }
   return result;
 }
@@ -2357,11 +2362,44 @@ export async function detectForms() {
 
 // ========== SCROLL TO ELEMENT ==========
 
-export async function scrollToElement({ selector, block = "center" }) {
-  const sel = selector.replace(/'/g, "\\'");
-  return runJS(
-    `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';el.scrollIntoView({behavior:'smooth',block:'${block}'});var r=el.getBoundingClientRect();return 'Scrolled to: '+el.tagName+' at y='+Math.round(r.y);})()`
-  );
+export async function scrollToElement({ selector, text, block = "center", timeout = 10000 }) {
+  if (selector) {
+    const sel = selector.replace(/'/g, "\\'");
+    return runJS(
+      `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';el.scrollIntoView({behavior:'smooth',block:'${block}'});var r=el.getBoundingClientRect();return 'Scrolled to: '+el.tagName+' at y='+Math.round(r.y);})()`
+    );
+  }
+  if (text) {
+    // Virtual DOM scroll: scroll down repeatedly until text appears (for Airtable, etc.)
+    const safeText = text.replace(/'/g, "\\'");
+    return runJS(
+      `(async function(){
+        var deadline = Date.now() + ${Number(timeout)};
+        var scrollable = document.querySelector('[class*="grid"],[class*="virtual"],[class*="scroll"],[role="grid"],[role="table"]') || document.scrollingElement || document.documentElement;
+        var lastY = -1;
+        while (Date.now() < deadline) {
+          // Check if text exists in DOM
+          var tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+          while(tw.nextNode()){
+            if(tw.currentNode.textContent.trim().includes('${safeText}')){
+              var el = tw.currentNode.parentElement;
+              el.scrollIntoView({behavior:'smooth',block:'${block}'});
+              return 'Found and scrolled to: "' + el.textContent.trim().substring(0,50) + '"';
+            }
+          }
+          // Scroll down
+          var curY = scrollable.scrollTop;
+          if (curY === lastY) return 'Text not found: ${safeText} (scrolled to bottom)';
+          lastY = curY;
+          scrollable.scrollBy(0, 500);
+          await new Promise(function(r){setTimeout(r,300)});
+        }
+        return 'Timeout: text not found within ${timeout}ms';
+      })()`,
+      { timeout: timeout + 5000 }
+    );
+  }
+  throw new Error("scrollToElement requires selector or text");
 }
 
 // ========== COMBO TOOLS (multi-step operations in a single call) ==========

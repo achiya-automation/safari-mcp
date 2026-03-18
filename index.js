@@ -991,10 +991,12 @@ server.tool(
 
 server.tool(
   "safari_scroll_to_element",
-  "Scroll smoothly to a specific element by CSS selector",
+  "Scroll to element by CSS selector OR text. For virtual DOM (Airtable) use text — scrolls down until text appears in DOM.",
   {
-    selector: z.string().describe("CSS selector of target element"),
+    selector: z.string().optional().describe("CSS selector of target element"),
+    text: z.string().optional().describe("Text to find — scrolls down until it appears (for virtual DOM/lazy loading)"),
     block: z.enum(["start", "center", "end", "nearest"]).optional().describe("Scroll alignment (default: center)"),
+    timeout: z.coerce.number().optional().describe("Max time to scroll in ms (default: 10000)"),
   },
   async (args) => {
     const result = await safari.scrollToElement(args);
