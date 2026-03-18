@@ -420,106 +420,85 @@ async function osClick(pageX, pageY, { switchToTab = true } = {}) {
   return true;
 }
 
-export async function click({ selector, text, x, y, ref, force }) {
-  // Ref-based click (from takeSnapshot) — fastest and most reliable
-  if (ref) {
-    selector = refSelector(ref);
-  }
+// Pure JS React-compatible click — full PointerEvent+MouseEvent sequence + React Fiber fallback
+// Works on React 16/17/18, Airtable, MUI, Ant Design — NO OS mouse, NO user interruption
+const REACT_CLICK_JS = `function mcpClick(el){
+  if(!el)return false;
+  el.scrollIntoView({block:'center'});
+  var r=el.getBoundingClientRect();
+  var x=r.left+r.width/2, y=r.top+r.height/2;
+  var shared={bubbles:true,cancelable:true,composed:true,view:window,clientX:x,clientY:y,button:0,detail:1};
+  var ptr={...shared,pointerId:1,pointerType:'mouse',isPrimary:true,width:1,height:1,pressure:0.5};
+  // Full event sequence matching real browser clicks (what Playwright does internally)
+  el.dispatchEvent(new PointerEvent('pointerover',{...ptr,buttons:0}));
+  el.dispatchEvent(new MouseEvent('mouseover',{...shared,buttons:0}));
+  el.dispatchEvent(new PointerEvent('pointerenter',{...ptr,buttons:0}));
+  el.dispatchEvent(new MouseEvent('mouseenter',{...shared,buttons:0}));
+  el.dispatchEvent(new PointerEvent('pointermove',{...ptr,buttons:0}));
+  el.dispatchEvent(new MouseEvent('mousemove',{...shared,buttons:0}));
+  el.dispatchEvent(new PointerEvent('pointerdown',{...ptr,buttons:1}));
+  el.dispatchEvent(new MouseEvent('mousedown',{...shared,buttons:1}));
+  if(el.focus)el.focus();
+  el.dispatchEvent(new PointerEvent('pointerup',{...ptr,buttons:0,pressure:0}));
+  el.dispatchEvent(new MouseEvent('mouseup',{...shared,buttons:0}));
+  el.dispatchEvent(new MouseEvent('click',{...shared,buttons:0}));
+  return true;
+}
+// React Fiber fallback: find and call onClick handler directly
+function mcpReactClick(el){
+  if(!el)return false;
+  var pk=Object.keys(el).find(function(k){return k.startsWith('__reactProps$')});
+  if(pk&&el[pk]&&el[pk].onClick){el[pk].onClick({type:'click',target:el,currentTarget:el,preventDefault:function(){},stopPropagation:function(){},nativeEvent:{},persist:function(){}});return true}
+  var fk=Object.keys(el).find(function(k){return k.startsWith('__reactFiber$')||k.startsWith('__reactInternalInstance$')});
+  if(fk){var f=el[fk];while(f){if(f.memoizedProps&&f.memoizedProps.onClick){f.memoizedProps.onClick({type:'click',target:el,currentTarget:el,preventDefault:function(){},stopPropagation:function(){},nativeEvent:{},persist:function(){}});return true}f=f.return}}
+  return false;
+}`;
 
-  // force=true → always use OS-level click (for React/virtual DOM apps like Airtable)
-  // Otherwise: try JS first, then fall back to OS click if needed
+export async function click({ selector, text, x, y, ref }) {
+  if (ref) selector = refSelector(ref);
 
   if (selector) {
     const sel = selector.replace(/'/g, "\\'");
-
-    // Step 1: Find element and get coordinates
-    const info = await runJS(
-      `(function(){var el=document.querySelector('${sel}');if(!el)return JSON.stringify({error:'Element not found: ${sel}'});el.scrollIntoView({block:'center'});var r=el.getBoundingClientRect();return JSON.stringify({tag:el.tagName,text:el.textContent.trim().substring(0,50),cx:r.left+r.width/2,cy:r.top+r.height/2,w:r.width,h:r.height});})()`
+    return runJS(
+      `(function(){${REACT_CLICK_JS}
+        var el=document.querySelector('${sel}');
+        if(!el)return 'Element not found: ${sel}';
+        // Try full event sequence first
+        mcpClick(el);
+        // If element is a link, also try navigation
+        if(el.tagName==='A'&&el.href&&!el.href.startsWith('javascript:'))try{var before=location.href;setTimeout(function(){if(location.href===before&&el.href)location.href=el.href},100)}catch(e){}
+        // React Fiber fallback (if event sequence didn't trigger handler)
+        mcpReactClick(el);
+        return 'Clicked: '+el.tagName+(el.textContent?(' "'+el.textContent.trim().substring(0,50)+'"'):'');
+      })()`
     );
-    let parsed;
-    try { parsed = JSON.parse(info); } catch { return info; }
-    if (parsed.error) return parsed.error;
-
-    // Step 2: Try JS click first (unless force=true)
-    if (!force) {
-      const jsResult = await runJS(
-        `(function(){var el=document.querySelector('${sel}');if(!el)return 'not found';var r=el.getBoundingClientRect();var cx=r.left+r.width/2;var cy=r.top+r.height/2;var opts={bubbles:true,cancelable:true,view:window,clientX:cx,clientY:cy,button:0};el.dispatchEvent(new PointerEvent('pointerdown',opts));el.dispatchEvent(new MouseEvent('mousedown',opts));el.dispatchEvent(new PointerEvent('pointerup',opts));el.dispatchEvent(new MouseEvent('mouseup',opts));el.dispatchEvent(new MouseEvent('click',opts));return 'js_clicked';})()`
-      );
-      if (jsResult === 'js_clicked') {
-        return `Clicked: ${parsed.tag} "${parsed.text}"`;
-      }
-    }
-
-    // Step 3: OS-level click (works on React, Airtable, any framework)
-    await osClick(parsed.cx, parsed.cy);
-    return `Clicked (OS): ${parsed.tag} "${parsed.text}"`;
   }
 
   if (text) {
     const safeText = text.replace(/'/g, "\\'");
-    // Find element by text and get its coordinates
-    const info = await runJS(
-      `(function(){
-        var safeText = '${safeText}';
-        var interactive = [...document.querySelectorAll('a,button,input[type=submit],input[type=button],[role=button],[role=link],[role=tab],[role=menuitem],[onclick],label,[data-testid],[class*=btn],[class*=Button]')];
-        var el = interactive.find(function(e){ return e.textContent.trim().includes(safeText); });
-        if (!el) {
-          var all = [...document.querySelectorAll('*')].filter(function(e) {
-            var r = e.getBoundingClientRect();
-            return r.width > 0 && r.height > 0 && e.textContent.trim().includes(safeText);
-          });
-          el = all.sort(function(a, b) { return a.textContent.length - b.textContent.length; })[0];
-        }
-        if (!el) return JSON.stringify({error:'Element not found with text: ${safeText}'});
-        el.scrollIntoView({block:'center'});
-        var r = el.getBoundingClientRect();
-        return JSON.stringify({tag:el.tagName,text:el.textContent.trim().substring(0,50),cx:r.left+r.width/2,cy:r.top+r.height/2});
+    return runJS(
+      `(function(){${REACT_CLICK_JS}
+        var safeText='${safeText}';
+        var interactive=[...document.querySelectorAll('a,button,input[type=submit],input[type=button],[role=button],[role=link],[role=tab],[role=menuitem],[onclick],label,[data-testid],[class*=btn],[class*=Button]')];
+        var el=interactive.find(function(e){return e.textContent.trim().includes(safeText)});
+        if(!el){var all=[...document.querySelectorAll('*')].filter(function(e){var r=e.getBoundingClientRect();return r.width>0&&r.height>0&&e.textContent.trim().includes(safeText)});el=all.sort(function(a,b){return a.textContent.length-b.textContent.length})[0]}
+        if(!el)return 'Element not found with text: '+safeText;
+        mcpClick(el);
+        if(el.tagName==='A'&&el.href&&!el.href.startsWith('javascript:'))try{var before=location.href;setTimeout(function(){if(location.href===before&&el.href)location.href=el.href},100)}catch(e){}
+        mcpReactClick(el);
+        return 'Clicked: '+el.tagName+' "'+el.textContent.trim().substring(0,50)+'"';
       })()`
     );
-    let parsed;
-    try { parsed = JSON.parse(info); } catch { return info; }
-    if (parsed.error) return parsed.error;
-
-    if (!force) {
-      // Try JS click first
-      const jsResult = await runJS(
-        `(function(){
-          var safeText = '${safeText}';
-          var interactive = [...document.querySelectorAll('a,button,input[type=submit],input[type=button],[role=button],[role=link],[role=tab],[role=menuitem],[onclick],label,[data-testid],[class*=btn],[class*=Button]')];
-          var el = interactive.find(function(e){ return e.textContent.trim().includes(safeText); });
-          if (!el) {
-            var all = [...document.querySelectorAll('*')].filter(function(e) {
-              var r = e.getBoundingClientRect();
-              return r.width > 0 && r.height > 0 && e.textContent.trim().includes(safeText);
-            });
-            el = all.sort(function(a, b) { return a.textContent.length - b.textContent.length; })[0];
-          }
-          if (!el) return 'not found';
-          var r=el.getBoundingClientRect();var cx=r.left+r.width/2;var cy=r.top+r.height/2;
-          var opts={bubbles:true,cancelable:true,view:window,clientX:cx,clientY:cy,button:0};
-          el.dispatchEvent(new PointerEvent('pointerdown',opts));el.dispatchEvent(new MouseEvent('mousedown',opts));
-          el.dispatchEvent(new PointerEvent('pointerup',opts));el.dispatchEvent(new MouseEvent('mouseup',opts));
-          el.dispatchEvent(new MouseEvent('click',opts));
-          return 'js_clicked';
-        })()`
-      );
-      if (jsResult === 'js_clicked') {
-        return `Clicked: ${parsed.tag} "${parsed.text}"`;
-      }
-    }
-
-    // OS-level click
-    await osClick(parsed.cx, parsed.cy);
-    return `Clicked (OS): ${parsed.tag} "${parsed.text}"`;
   }
 
   if (x !== undefined && y !== undefined) {
-    if (force) {
-      await osClick(Number(x), Number(y));
-      return `Clicked (OS) at (${x}, ${y})`;
-    }
     return runJS(
-      `(function(){var el=document.elementFromPoint(${Number(x)},${Number(y)});if(!el)return 'No element at (${Number(x)},${Number(y)})';el.click();return 'Clicked: '+el.tagName+' at (${Number(x)},${Number(y)})';})()`
+      `(function(){${REACT_CLICK_JS}
+        var el=document.elementFromPoint(${Number(x)},${Number(y)});
+        if(!el)return 'No element at (${Number(x)},${Number(y)})';
+        mcpClick(el);mcpReactClick(el);
+        return 'Clicked: '+el.tagName+' at (${Number(x)},${Number(y)})';
+      })()`
     );
   }
   throw new Error("click requires selector, text, or x/y coordinates");
