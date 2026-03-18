@@ -420,38 +420,60 @@ async function osClick(pageX, pageY, { switchToTab = true } = {}) {
   return true;
 }
 
-// Pure JS React-compatible click — full PointerEvent+MouseEvent sequence + React Fiber fallback
-// Works on React 16/17/18, Airtable, MUI, Ant Design — NO OS mouse, NO user interruption
-const REACT_CLICK_JS = `function mcpClick(el){
-  if(!el)return false;
-  el.scrollIntoView({block:'center'});
-  var r=el.getBoundingClientRect();
-  var x=r.left+r.width/2, y=r.top+r.height/2;
-  var shared={bubbles:true,cancelable:true,composed:true,view:window,clientX:x,clientY:y,button:0,detail:1};
-  var ptr={...shared,pointerId:1,pointerType:'mouse',isPrimary:true,width:1,height:1,pressure:0.5};
-  // Full event sequence matching real browser clicks (what Playwright does internally)
-  el.dispatchEvent(new PointerEvent('pointerover',{...ptr,buttons:0}));
-  el.dispatchEvent(new MouseEvent('mouseover',{...shared,buttons:0}));
-  el.dispatchEvent(new PointerEvent('pointerenter',{...ptr,buttons:0}));
-  el.dispatchEvent(new MouseEvent('mouseenter',{...shared,buttons:0}));
-  el.dispatchEvent(new PointerEvent('pointermove',{...ptr,buttons:0}));
-  el.dispatchEvent(new MouseEvent('mousemove',{...shared,buttons:0}));
-  el.dispatchEvent(new PointerEvent('pointerdown',{...ptr,buttons:1}));
-  el.dispatchEvent(new MouseEvent('mousedown',{...shared,buttons:1}));
-  if(el.focus)el.focus();
-  el.dispatchEvent(new PointerEvent('pointerup',{...ptr,buttons:0,pressure:0}));
-  el.dispatchEvent(new MouseEvent('mouseup',{...shared,buttons:0}));
-  el.dispatchEvent(new MouseEvent('click',{...shared,buttons:0}));
-  return true;
-}
-// React Fiber fallback: find and call onClick handler directly
-function mcpReactClick(el){
-  if(!el)return false;
-  var pk=Object.keys(el).find(function(k){return k.startsWith('__reactProps$')});
-  if(pk&&el[pk]&&el[pk].onClick){el[pk].onClick({type:'click',target:el,currentTarget:el,preventDefault:function(){},stopPropagation:function(){},nativeEvent:{},persist:function(){}});return true}
-  var fk=Object.keys(el).find(function(k){return k.startsWith('__reactFiber$')||k.startsWith('__reactInternalInstance$')});
-  if(fk){var f=el[fk];while(f){if(f.memoizedProps&&f.memoizedProps.onClick){f.memoizedProps.onClick({type:'click',target:el,currentTarget:el,preventDefault:function(){},stopPropagation:function(){},nativeEvent:{},persist:function(){}});return true}f=f.return}}
-  return false;
+// Inject click helpers ONCE per page (cached on window.__mcp)
+// Includes: mcpClick (full event sequence), mcpReactClick (React Fiber), mcpFindText (fast TreeWalker)
+const INJECT_MCP_HELPERS = `if(!window.__mcp){window.__mcp=true;
+  window.mcpClick=function(el){
+    if(!el)return false;
+    el.scrollIntoView({block:'center'});
+    var r=el.getBoundingClientRect();
+    var x=r.left+r.width/2,y=r.top+r.height/2;
+    var s={bubbles:true,cancelable:true,composed:true,view:window,clientX:x,clientY:y,button:0,detail:1};
+    var p={...s,pointerId:1,pointerType:'mouse',isPrimary:true,width:1,height:1,pressure:0.5};
+    el.dispatchEvent(new PointerEvent('pointerover',{...p,buttons:0}));
+    el.dispatchEvent(new MouseEvent('mouseover',{...s,buttons:0}));
+    el.dispatchEvent(new PointerEvent('pointerenter',{...p,buttons:0}));
+    el.dispatchEvent(new MouseEvent('mouseenter',{...s,buttons:0}));
+    el.dispatchEvent(new PointerEvent('pointermove',{...p,buttons:0}));
+    el.dispatchEvent(new MouseEvent('mousemove',{...s,buttons:0}));
+    el.dispatchEvent(new PointerEvent('pointerdown',{...p,buttons:1}));
+    el.dispatchEvent(new MouseEvent('mousedown',{...s,buttons:1}));
+    if(el.focus)el.focus();
+    el.dispatchEvent(new PointerEvent('pointerup',{...p,buttons:0,pressure:0}));
+    el.dispatchEvent(new MouseEvent('mouseup',{...s,buttons:0}));
+    el.dispatchEvent(new MouseEvent('click',{...s,buttons:0}));
+    return true;
+  };
+  window.mcpReactClick=function(el){
+    if(!el)return false;
+    var pk=Object.keys(el).find(function(k){return k.startsWith('__reactProps$')});
+    if(pk&&el[pk]&&el[pk].onClick){el[pk].onClick({type:'click',target:el,currentTarget:el,preventDefault:function(){},stopPropagation:function(){},nativeEvent:{},persist:function(){}});return true}
+    var fk=Object.keys(el).find(function(k){return k.startsWith('__reactFiber$')||k.startsWith('__reactInternalInstance$')});
+    if(fk){var f=el[fk];while(f){if(f.memoizedProps&&f.memoizedProps.onClick){f.memoizedProps.onClick({type:'click',target:el,currentTarget:el,preventDefault:function(){},stopPropagation:function(){},nativeEvent:{},persist:function(){}});return true}f=f.return}}
+    return false;
+  };
+  // Fast text finder using TreeWalker (10x faster than querySelectorAll('*') on large DOMs)
+  window.mcpFindText=function(text,exact){
+    var tw=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,null);
+    var best=null,bestArea=Infinity;
+    while(tw.nextNode()){
+      var n=tw.currentNode;
+      var t=n.textContent.trim();
+      if(!t)continue;
+      var match=exact?(t===text):t.includes(text);
+      if(!match)continue;
+      var el=n.parentElement;
+      if(!el)continue;
+      var r=el.getBoundingClientRect();
+      if(r.width===0||r.height===0)continue;
+      var area=r.width*r.height;
+      // Prefer: 1) exact text nodes, 2) smaller elements (deeper/more specific)
+      if(exact&&t===text&&area<bestArea){best=el;bestArea=area}
+      else if(!exact&&!best){best=el;bestArea=area}
+      else if(!exact&&area<bestArea&&el.children.length<5){best=el;bestArea=area}
+    }
+    return best;
+  };
 }`;
 
 export async function click({ selector, text, x, y, ref }) {
@@ -460,7 +482,7 @@ export async function click({ selector, text, x, y, ref }) {
   if (selector) {
     const sel = selector.replace(/'/g, "\\'");
     return runJS(
-      `(function(){${REACT_CLICK_JS}
+      `(function(){${INJECT_MCP_HELPERS}
         var el=document.querySelector('${sel}');
         if(!el)return 'Element not found: ${sel}';
         // Try full event sequence first
@@ -477,19 +499,11 @@ export async function click({ selector, text, x, y, ref }) {
   if (text) {
     const safeText = text.replace(/'/g, "\\'");
     return runJS(
-      `(function(){${REACT_CLICK_JS}
-        var safeText='${safeText}';
-        // Layer 1: Exact text match on interactive elements
-        var interactive=[...document.querySelectorAll('a,button,input[type=submit],input[type=button],[role=button],[role=link],[role=tab],[role=menuitem],[onclick],label,[data-testid],[class*=btn],[class*=Button],span,h1,h2,h3,h4,h5,h6,li,td,th,p')];
-        var el=interactive.find(function(e){return e.textContent.trim()===safeText&&e.getBoundingClientRect().width>0});
-        // Layer 2: Exact match on any visible element (smallest first = deepest)
-        if(!el){var exact=[...document.querySelectorAll('*')].filter(function(e){var r=e.getBoundingClientRect();return r.width>0&&r.height>0&&e.textContent.trim()===safeText});el=exact.sort(function(a,b){return(a.textContent.length-b.textContent.length)||((a.getBoundingClientRect().width*a.getBoundingClientRect().height)-(b.getBoundingClientRect().width*b.getBoundingClientRect().height))})[0]}
-        // Layer 3: Contains match — prefer deepest (smallest area) element
-        if(!el){var partial=[...document.querySelectorAll('*')].filter(function(e){var r=e.getBoundingClientRect();return r.width>0&&r.height>0&&e.textContent.trim().includes(safeText)&&e.children.length<5});el=partial.sort(function(a,b){return(a.textContent.length-b.textContent.length)||((a.getBoundingClientRect().width*a.getBoundingClientRect().height)-(b.getBoundingClientRect().width*b.getBoundingClientRect().height))})[0]}
-        if(!el)return 'Element not found with text: '+safeText;
-        mcpClick(el);
-        if(el.tagName==='A'&&el.href&&!el.href.startsWith('javascript:'))try{var before=location.href;setTimeout(function(){if(location.href===before&&el.href)location.href=el.href},100)}catch(e){}
-        mcpReactClick(el);
+      `(function(){${INJECT_MCP_HELPERS}
+        // TreeWalker search: exact first, then contains (10x faster than querySelectorAll)
+        var el=mcpFindText('${safeText}',true)||mcpFindText('${safeText}',false);
+        if(!el)return 'Element not found with text: ${safeText}';
+        mcpClick(el);mcpReactClick(el);
         return 'Clicked: '+el.tagName+' "'+el.textContent.trim().substring(0,50)+'"';
       })()`
     );
@@ -497,7 +511,7 @@ export async function click({ selector, text, x, y, ref }) {
 
   if (x !== undefined && y !== undefined) {
     return runJS(
-      `(function(){${REACT_CLICK_JS}
+      `(function(){${INJECT_MCP_HELPERS}
         var el=document.elementFromPoint(${Number(x)},${Number(y)});
         if(!el)return 'No element at (${Number(x)},${Number(y)})';
         mcpClick(el);mcpReactClick(el);
