@@ -62,7 +62,7 @@ server.tool(
   "Read page content (title, URL, text). Use selector to read specific element. Use maxLength to limit output.",
   {
     selector: z.string().optional().describe("CSS selector to read specific element"),
-    maxLength: z.number().optional().describe("Max chars to return (default: 50000)"),
+    maxLength: z.coerce.number().optional().describe("Max chars to return (default: 50000)"),
   },
   async ({ selector, maxLength }) => {
     const result = await safari.readPage({ selector, maxLength });
@@ -73,7 +73,7 @@ server.tool(
 server.tool(
   "safari_get_source",
   "Get HTML source of current page",
-  { maxLength: z.number().optional().describe("Max chars (default: 200000)") },
+  { maxLength: z.coerce.number().optional().describe("Max chars (default: 200000)") },
   async ({ maxLength }) => {
     const result = await safari.getPageSource({ maxLength });
     return { content: [{ type: "text", text: result }] };
@@ -101,8 +101,8 @@ server.tool(
     ref: z.string().optional().describe("Ref ID from safari_snapshot (e.g. '0_5')"),
     selector: z.string().optional().describe("CSS selector"),
     text: z.string().optional().describe("Visible text to find and click"),
-    x: z.number().optional().describe("X coordinate"),
-    y: z.number().optional().describe("Y coordinate"),
+    x: z.coerce.number().optional().describe("X coordinate"),
+    y: z.coerce.number().optional().describe("Y coordinate"),
   },
   async (args) => {
     const result = await safari.click(args);
@@ -115,8 +115,8 @@ server.tool(
   "Double-click an element by CSS selector or x/y coordinates (e.g. to select a word in text)",
   {
     selector: z.string().optional().describe("CSS selector"),
-    x: z.number().optional().describe("X coordinate"),
-    y: z.number().optional().describe("Y coordinate"),
+    x: z.coerce.number().optional().describe("X coordinate"),
+    y: z.coerce.number().optional().describe("Y coordinate"),
   },
   async (args) => {
     const result = await safari.doubleClick(args);
@@ -129,8 +129,8 @@ server.tool(
   "Right-click (context menu) an element by CSS selector or x/y coordinates",
   {
     selector: z.string().optional().describe("CSS selector"),
-    x: z.number().optional().describe("X coordinate"),
-    y: z.number().optional().describe("Y coordinate"),
+    x: z.coerce.number().optional().describe("X coordinate"),
+    y: z.coerce.number().optional().describe("Y coordinate"),
   },
   async (args) => {
     const result = await safari.rightClick(args);
@@ -256,7 +256,7 @@ server.tool(
   "Scroll the page up or down by a specified amount",
   {
     direction: z.enum(["up", "down"]).optional().describe("Scroll direction (default: down)"),
-    amount: z.number().optional().describe("Pixels to scroll (default: 500)"),
+    amount: z.coerce.number().optional().describe("Pixels to scroll (default: 500)"),
   },
   async (args) => {
     const result = await safari.scroll(args);
@@ -268,8 +268,8 @@ server.tool(
   "safari_scroll_to",
   "Scroll to a specific position on the page",
   {
-    x: z.number().optional().describe("X position (default: 0)"),
-    y: z.number().optional().describe("Y position (default: 0)"),
+    x: z.coerce.number().optional().describe("X position (default: 0)"),
+    y: z.coerce.number().optional().describe("Y position (default: 0)"),
   },
   async (args) => {
     const result = await safari.scrollTo(args);
@@ -312,7 +312,7 @@ server.tool(
 server.tool(
   "safari_switch_tab",
   "Switch to a specific tab by index (use safari_list_tabs to see indices)",
-  { index: z.number().describe("Tab index (starting from 1)") },
+  { index: z.coerce.number().describe("Tab index (starting from 1)") },
   async ({ index }) => {
     const result = await safari.switchTab(index);
     return { content: [{ type: "text", text: JSON.stringify(result) }] };
@@ -327,7 +327,7 @@ server.tool(
   {
     selector: z.string().optional().describe("CSS selector to wait for"),
     text: z.string().optional().describe("Text to wait for"),
-    timeout: z.number().optional().describe("Timeout in ms (default: 10000)"),
+    timeout: z.coerce.number().optional().describe("Timeout in ms (default: 10000)"),
   },
   async (args) => {
     const result = await safari.waitFor(args);
@@ -364,7 +364,7 @@ server.tool(
   "Find all elements matching a CSS selector (returns tag, text, href, value)",
   {
     selector: z.string().describe("CSS selector"),
-    limit: z.number().optional().describe("Max results (default: 20)"),
+    limit: z.coerce.number().optional().describe("Max results (default: 20)"),
   },
   async (args) => {
     const result = await safari.querySelectorAll(args);
@@ -380,8 +380,8 @@ server.tool(
   {
     ref: z.string().optional().describe("Ref ID from safari_snapshot"),
     selector: z.string().optional().describe("CSS selector"),
-    x: z.number().optional().describe("X coordinate"),
-    y: z.number().optional().describe("Y coordinate"),
+    x: z.coerce.number().optional().describe("X coordinate"),
+    y: z.coerce.number().optional().describe("Y coordinate"),
   },
   async (args) => {
     const result = await safari.hover(args);
@@ -410,8 +410,8 @@ server.tool(
   "safari_resize",
   "Resize the Safari window",
   {
-    width: z.number().describe("Window width"),
-    height: z.number().describe("Window height"),
+    width: z.coerce.number().describe("Window width"),
+    height: z.coerce.number().describe("Window height"),
   },
   async (args) => {
     const result = await safari.resizeWindow(args);
@@ -427,10 +427,10 @@ server.tool(
   {
     sourceSelector: z.string().optional().describe("CSS selector of element to drag"),
     targetSelector: z.string().optional().describe("CSS selector of drop target"),
-    sourceX: z.number().optional().describe("Source X coordinate"),
-    sourceY: z.number().optional().describe("Source Y coordinate"),
-    targetX: z.number().optional().describe("Target X coordinate"),
-    targetY: z.number().optional().describe("Target Y coordinate"),
+    sourceX: z.coerce.number().optional().describe("Source X coordinate"),
+    sourceY: z.coerce.number().optional().describe("Source Y coordinate"),
+    targetX: z.coerce.number().optional().describe("Target X coordinate"),
+    targetY: z.coerce.number().optional().describe("Target Y coordinate"),
   },
   async (args) => {
     const result = await safari.drag(args);
@@ -474,10 +474,10 @@ server.tool(
   "Emulate a mobile device by resizing window and setting user agent. Devices: iphone-14, iphone-14-pro-max, ipad, ipad-pro, pixel-7, galaxy-s24. Or use custom width/height.",
   {
     device: z.string().optional().describe("Device name: iphone-14, ipad, pixel-7, galaxy-s24, etc."),
-    width: z.number().optional().describe("Custom viewport width"),
-    height: z.number().optional().describe("Custom viewport height"),
+    width: z.coerce.number().optional().describe("Custom viewport width"),
+    height: z.coerce.number().optional().describe("Custom viewport height"),
     userAgent: z.string().optional().describe("Custom user agent string"),
-    scale: z.number().optional().describe("Initial scale (default: 1)"),
+    scale: z.coerce.number().optional().describe("Initial scale (default: 1)"),
   },
   async (args) => {
     const result = await safari.emulate(args);
@@ -522,7 +522,7 @@ server.tool(
 server.tool(
   "safari_network",
   "Get network requests made by the current page (via Performance API)",
-  { limit: z.number().optional().describe("Max requests to return (default: 50)") },
+  { limit: z.coerce.number().optional().describe("Max requests to return (default: 50)") },
   async ({ limit }) => {
     const result = await safari.getNetworkRequests({ limit });
     return { content: [{ type: "text", text: result }] };
@@ -597,7 +597,7 @@ server.tool(
   "Get the accessibility tree of the page (roles, ARIA labels, focusable elements, form states). Essential for a11y auditing.",
   {
     selector: z.string().optional().describe("CSS selector for subtree (default: full page)"),
-    maxDepth: z.number().optional().describe("Max tree depth (default: 5)"),
+    maxDepth: z.coerce.number().optional().describe("Max tree depth (default: 5)"),
   },
   async (args) => {
     const result = await safari.getAccessibilityTree(args);
@@ -750,7 +750,7 @@ server.tool(
   {
     urlPattern: z.string().describe("URL substring or regex pattern to match (e.g. '/api/users' or 'example\\.com')"),
     response: z.object({
-      status: z.number().optional().describe("HTTP status code (default: 200)"),
+      status: z.coerce.number().optional().describe("HTTP status code (default: 200)"),
       body: z.string().optional().describe("Response body string (JSON, HTML, text)"),
       contentType: z.string().optional().describe("Content-Type header (default: application/json)"),
     }).describe("Mock response to return"),
@@ -776,7 +776,7 @@ server.tool(
 server.tool(
   "safari_wait",
   "Wait for a specified number of milliseconds. Use between actions that need time to settle.",
-  { ms: z.number().describe("Milliseconds to wait") },
+  { ms: z.coerce.number().describe("Milliseconds to wait") },
   async ({ ms }) => {
     const result = await safari.waitForTime({ ms });
     return { content: [{ type: "text", text: result }] };
@@ -799,7 +799,7 @@ server.tool(
   "safari_network_details",
   "Get captured network requests with full details (must call safari_start_network_capture first)",
   {
-    limit: z.number().optional().describe("Max requests (default: 50)"),
+    limit: z.coerce.number().optional().describe("Max requests (default: 50)"),
     filter: z.string().optional().describe("Filter by URL substring"),
   },
   async (args) => {
@@ -837,8 +837,8 @@ server.tool(
   "Simulate slow network conditions. Profiles: slow-3g, fast-3g, 4g, offline. Or custom latency/speed. Call with no args to reset.",
   {
     profile: z.string().optional().describe("Preset: slow-3g, fast-3g, 4g, offline"),
-    latency: z.number().optional().describe("Custom latency in ms"),
-    downloadKbps: z.number().optional().describe("Custom download speed in Kbps"),
+    latency: z.coerce.number().optional().describe("Custom latency in ms"),
+    downloadKbps: z.coerce.number().optional().describe("Custom download speed in Kbps"),
   },
   async (args) => {
     const result = await safari.throttleNetwork(args);
@@ -865,7 +865,7 @@ server.tool(
   "Extract HTML tables as structured JSON (headers + rows). Perfect for scraping data tables.",
   {
     selector: z.string().optional().describe("CSS selector (default: 'table')"),
-    limit: z.number().optional().describe("Max tables (default: 10)"),
+    limit: z.coerce.number().optional().describe("Max tables (default: 10)"),
   },
   async (args) => {
     const result = await safari.extractTables(args);
@@ -886,7 +886,7 @@ server.tool(
 server.tool(
   "safari_extract_images",
   "Extract all images with src, alt, dimensions, loading strategy, viewport visibility",
-  { limit: z.number().optional().describe("Max images (default: 50)") },
+  { limit: z.coerce.number().optional().describe("Max images (default: 50)") },
   async (args) => {
     const result = await safari.extractImages(args);
     return { content: [{ type: "text", text: result }] };
@@ -897,7 +897,7 @@ server.tool(
   "safari_extract_links",
   "Extract all links with href, text, rel, target, external/nofollow detection",
   {
-    limit: z.number().optional().describe("Max links (default: 100)"),
+    limit: z.coerce.number().optional().describe("Max links (default: 100)"),
     filter: z.string().optional().describe("Filter by URL or text substring"),
   },
   async (args) => {
@@ -912,9 +912,9 @@ server.tool(
   "safari_override_geolocation",
   "Override the browser's geolocation API to return custom coordinates",
   {
-    latitude: z.number().describe("Latitude (-90 to 90)"),
-    longitude: z.number().describe("Longitude (-180 to 180)"),
-    accuracy: z.number().optional().describe("Accuracy in meters (default: 100)"),
+    latitude: z.coerce.number().describe("Latitude (-90 to 90)"),
+    longitude: z.coerce.number().describe("Longitude (-180 to 180)"),
+    accuracy: z.coerce.number().optional().describe("Accuracy in meters (default: 100)"),
   },
   async (args) => {
     const result = await safari.overrideGeolocation(args);
@@ -955,7 +955,7 @@ server.tool(
   {
     dbName: z.string().describe("Database name"),
     storeName: z.string().describe("Object store name"),
-    limit: z.number().optional().describe("Max records (default: 20)"),
+    limit: z.coerce.number().optional().describe("Max records (default: 20)"),
   },
   async (args) => {
     const result = await safari.getIndexedDB(args);
@@ -1021,7 +1021,7 @@ server.tool(
     selector: z.string().optional().describe("CSS selector to click"),
     text: z.string().optional().describe("Visible text to click"),
     waitFor: z.string().optional().describe("CSS selector to wait for after click"),
-    timeout: z.number().optional().describe("Wait timeout in ms (default: 10000)"),
+    timeout: z.coerce.number().optional().describe("Wait timeout in ms (default: 10000)"),
   },
   async (args) => {
     const result = await safari.clickAndWait(args);

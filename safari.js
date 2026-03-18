@@ -350,7 +350,7 @@ export async function click({ selector, text, x, y, ref }) {
   if (selector) {
     const sel = selector.replace(/'/g, "\\'");
     return runJS(
-      `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';el.scrollIntoView({block:'center'});el.click();return 'Clicked: '+el.tagName+(el.textContent?(' "'+el.textContent.trim().substring(0,50)+'"'):'');})()`
+      `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';el.scrollIntoView({block:'center'});var r=el.getBoundingClientRect();var cx=r.left+r.width/2;var cy=r.top+r.height/2;var opts={bubbles:true,cancelable:true,view:window,clientX:cx,clientY:cy,button:0};el.dispatchEvent(new PointerEvent('pointerdown',opts));el.dispatchEvent(new MouseEvent('mousedown',opts));el.dispatchEvent(new PointerEvent('pointerup',opts));el.dispatchEvent(new MouseEvent('mouseup',opts));el.dispatchEvent(new MouseEvent('click',opts));return 'Clicked: '+el.tagName+(el.textContent?(' "'+el.textContent.trim().substring(0,50)+'"'):'');})()`
     );
   }
   if (text) {
@@ -372,7 +372,11 @@ export async function click({ selector, text, x, y, ref }) {
         }
         if (!el) return 'Element not found with text: ${safeText}';
         el.scrollIntoView({block:'center'});
-        el.click();
+        var r=el.getBoundingClientRect();var cx=r.left+r.width/2;var cy=r.top+r.height/2;
+        var opts={bubbles:true,cancelable:true,view:window,clientX:cx,clientY:cy,button:0};
+        el.dispatchEvent(new PointerEvent('pointerdown',opts));el.dispatchEvent(new MouseEvent('mousedown',opts));
+        el.dispatchEvent(new PointerEvent('pointerup',opts));el.dispatchEvent(new MouseEvent('mouseup',opts));
+        el.dispatchEvent(new MouseEvent('click',opts));
         return 'Clicked: ' + el.tagName + ' "' + el.textContent.trim().substring(0, 50) + '"';
       })()`
     );
@@ -662,7 +666,7 @@ export async function screenshot({ fullPage = false } = {}) {
       } catch (_) {}
     }
 
-    // Try screencapture first (needs Screen Recording permission)
+    // Try screencapture — use osascript's do shell script to bypass VS Code permission issue
     const windowId = !skipScreencapture ? await osascript(
       'tell application "Safari" to return id of window 1'
     ).catch(() => null) : null;
@@ -673,18 +677,33 @@ export async function screenshot({ fullPage = false } = {}) {
           const bounds = await osascript(
             'tell application "Safari" to return bounds of front window'
           );
-          const height = await runJS("document.documentElement.scrollHeight");
-          const width = await runJS("document.documentElement.scrollWidth");
+          const dims = await runJS("JSON.stringify({h:document.documentElement.scrollHeight,w:document.documentElement.scrollWidth})");
+          const { h, w } = JSON.parse(dims);
           await osascript(
-            `tell application "Safari" to set bounds of front window to {0, 0, ${Number(width)}, ${Math.min(Number(height) + 100, 5000)}}`
+            `tell application "Safari" to set bounds of front window to {0, 0, ${Number(w)}, ${Math.min(Number(h) + 100, 5000)}}`
           );
           await new Promise((r) => setTimeout(r, 500));
-          await execFileAsync("screencapture", ["-l" + windowId, "-o", "-x", tmpFile]);
+          // Use do shell script to inherit osascript's Screen Recording permission
+          await osascript(
+            `do shell script "screencapture -l${windowId} -o -x '${tmpFile}'"`,
+            { timeout: 15000 }
+          );
           await osascript(
             `tell application "Safari" to set bounds of front window to {${bounds}}`
           );
         } else {
-          await execFileAsync("screencapture", ["-l" + windowId, "-o", "-x", tmpFile]);
+          // Try direct execFile first (works if VS Code has Screen Recording permission)
+          try {
+            await execFileAsync("screencapture", ["-l" + windowId, "-o", "-x", tmpFile]);
+            const testData = await readFile(tmpFile);
+            if (testData.length < 100) throw new Error("empty");
+          } catch (_) {
+            // Fallback: use do shell script (osascript may have permission)
+            await osascript(
+              `do shell script "screencapture -l${windowId} -o -x '${tmpFile}'"`,
+              { timeout: 15000 }
+            );
+          }
         }
         const data = await readFile(tmpFile);
         await unlink(tmpFile).catch(() => {});
@@ -898,7 +917,22 @@ export async function newTab(url = "") {
     const newIndex = Number(tabCount);
     _activeTabIndex = newIndex;
 
-    await new Promise((r) => setTimeout(r, 200));
+    // Wait for the new tab to start loading (especially if URL was provided)
+    if (url) {
+      // Poll until URL changes from about:blank/empty or readyState is complete
+      const waitResult = await runJS(
+        `(async function(){
+          for(var i=0;i<40;i++){
+            if(location.href !== 'about:blank' && location.href !== '' && document.readyState !== 'loading') break;
+            await new Promise(function(r){setTimeout(r,250)});
+          }
+          return 'ready';
+        })()`,
+        { tabIndex: newIndex, timeout: 15000 }
+      );
+    } else {
+      await new Promise((r) => setTimeout(r, 200));
+    }
     // Get info and track by URL (stable even when user opens/closes tabs)
     const info = await runJS(`JSON.stringify({title:document.title,url:location.href,tabIndex:${newIndex}})`, { tabIndex: newIndex });
     try {
@@ -970,7 +1004,36 @@ export async function waitFor({ selector, text, timeout = 10000 }) {
 // ========== EVALUATE ==========
 
 export async function evaluate({ script }) {
-  return runJS(script);
+  // Wrap in IIFE if the script uses `return` outside a function
+  // or if it's a multi-statement script that might not return a value
+  let js = script.trim();
+
+  // If already wrapped in IIFE or is a simple expression, use as-is
+  const isIIFE = /^\((?:async\s+)?function/.test(js) || /^\((?:async\s+)?\(/.test(js);
+  const isSimpleExpression = !js.includes(';') && !js.includes('\n') && !js.startsWith('var ') && !js.startsWith('let ') && !js.startsWith('const ');
+
+  if (!isIIFE && !isSimpleExpression) {
+    // Wrap in IIFE so `return` works and last expression is returned
+    // Also add implicit return of last expression if no explicit return
+    if (!js.includes('return ') && !js.includes('return;')) {
+      // Add return to last line
+      const lines = js.split('\n');
+      const lastLine = lines[lines.length - 1].trim();
+      if (lastLine && !lastLine.startsWith('//') && !lastLine.endsWith('}') && !lastLine.startsWith('var ') && !lastLine.startsWith('let ') && !lastLine.startsWith('const ')) {
+        lines[lines.length - 1] = 'return ' + lastLine;
+      }
+      js = '(function(){' + lines.join('\n') + '})()';
+    } else {
+      js = '(function(){' + js + '})()';
+    }
+  }
+
+  const result = await runJS(js);
+  // Convert empty/null results to informative message
+  if (result === null || result === undefined || result === '') {
+    return '(no return value — script executed but returned nothing. Use explicit return or ensure last expression has a value)';
+  }
+  return result;
 }
 
 // ========== ELEMENT INFO ==========
