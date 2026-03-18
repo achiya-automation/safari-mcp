@@ -786,9 +786,9 @@ export async function typeText({ text, selector, ref }) {
 
 export async function screenshot({ fullPage = false } = {}) {
   const tmpFile = join(tmpdir(), `safari-screenshot-${Date.now()}.png`);
+  let savedTabIdx = null;
   try {
     // If working on a background tab, temporarily switch to it for screenshot
-    let savedTabIdx = null;
     if (_activeTabIndex) {
       try {
         const currentIdx = await osascriptFast(
