@@ -210,24 +210,24 @@ export async function navigate(url) {
     const navTarget = _activeTabIndex
       ? `tab ${_activeTabIndex} of front window`
       : "front document";
-    await osascriptFast(
-      `tell application "Safari" to set URL of ${navTarget} to "${safeUrl}"`
-    );
-    // Single JS call: poll readyState inside JS, then return title+URL — 1 call instead of 40
-    const result = await runJS(
-      `(async function(){
-        for(var i=0;i<80;i++){
-          if(document.readyState==='complete')break;
-          await new Promise(function(r){setTimeout(r,i<10?200:500)});
-        }
-        // Check if page failed to load (Safari HTTPS-only block shows error page)
-        var failed = document.title.includes('cannot open') || document.title.includes('אין אפשרות') ||
-                     document.body?.innerText?.includes('not secure') || document.body?.innerText?.includes('אינו מאובטח');
-        return JSON.stringify({title:document.title,url:location.href,blocked:failed});
-      })()`
+    // Combined: set URL + poll readyState in ONE osascript call (saves 80ms vs 2 calls)
+    const result = await osascript(
+      `tell application "Safari"
+        set URL of ${navTarget} to "${safeUrl}"
+        repeat 80 times
+          try
+            set rdy to do JavaScript "document.readyState" in ${navTarget}
+            if rdy = "complete" then exit repeat
+          end try
+          delay 0.2
+        end repeat
+        set info to do JavaScript "JSON.stringify({title:document.title,url:location.href,blocked:document.title.includes('cannot open')||document.title.includes('אין אפשרות')})" in ${navTarget}
+        return info
+      end tell`,
+      { timeout: 30000 }
     );
 
-    // Pre-inject click helpers so subsequent clicks are fast (~100 bytes instead of 2KB)
+    // Inject click helpers in background (non-blocking, for subsequent clicks)
     runJS(`${INJECT_MCP_HELPERS}`).catch(() => {});
 
     // If HTTPS failed and original was HTTP, try original HTTP URL
@@ -997,34 +997,36 @@ export async function newTab(url = "") {
       }
     }
 
-    // Get the index of the newly created tab (always the last one)
-    const tabCount = await osascriptFast(
-      'tell application "Safari" to return count of tabs of front window'
+    // Combined: get tab count + wait for load + get info in ONE osascript call
+    const combined = await osascript(
+      `tell application "Safari"
+        set tabCount to count of tabs of front window
+        set newTab to tab tabCount of front window
+        ${url ? `-- Wait for URL to load
+        repeat 40 times
+          try
+            set tabUrl to URL of newTab
+            if tabUrl is not "about:blank" and tabUrl is not "" and tabUrl is not missing value then
+              set rdy to do JavaScript "document.readyState" in newTab
+              if rdy is not "loading" then exit repeat
+            end if
+          end try
+          delay 0.25
+        end repeat` : 'delay 0.2'}
+        set info to do JavaScript "JSON.stringify({title:document.title,url:location.href})" in newTab
+        return (tabCount as text) & "|" & info
+      end tell`,
+      { timeout: 15000 }
     );
-    const newIndex = Number(tabCount);
+
+    // Parse combined result
+    const pipeIdx = combined.indexOf('|');
+    const newIndex = Number(combined.substring(0, pipeIdx));
+    const infoStr = combined.substring(pipeIdx + 1);
     _activeTabIndex = newIndex;
 
-    // Wait for the new tab to start loading (especially if URL was provided)
-    if (url) {
-      // Poll until URL changes from about:blank/empty or readyState is complete
-      const waitResult = await runJS(
-        `(async function(){
-          for(var i=0;i<40;i++){
-            if(location.href !== 'about:blank' && location.href !== '' && document.readyState !== 'loading') break;
-            await new Promise(function(r){setTimeout(r,250)});
-          }
-          return 'ready';
-        })()`,
-        { tabIndex: newIndex, timeout: 15000 }
-      );
-    } else {
-      await new Promise((r) => setTimeout(r, 200));
-    }
-    // Track by URL — use TARGET url if tab hasn't loaded yet
-    const info = await runJS(`JSON.stringify({title:document.title,url:location.href,tabIndex:${newIndex}})`, { tabIndex: newIndex });
     try {
-      const parsed = JSON.parse(info);
-      // If tab is still about:blank, use the target URL for tracking
+      const parsed = JSON.parse(infoStr);
       if (parsed.url === 'about:blank' || parsed.url === '' || !parsed.url) {
         _activeTabURL = url || null;
       } else {
