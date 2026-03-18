@@ -445,27 +445,44 @@ async function ensureHelpers() {
   await runJS(`${INJECT_MCP_HELPERS}`).catch(() => {});
 }
 
+// Try tiny click first (~200B). If helpers missing, inject once and retry.
+async function clickWithRetry(js) {
+  try {
+    const result = await runJS(js);
+    if (result && (result.includes('mcpClick is not defined') || result.includes('mcpFindText is not defined'))) {
+      await ensureHelpers();
+      return runJS(js);
+    }
+    return result;
+  } catch (err) {
+    if (err.message && (err.message.includes('mcpClick') || err.message.includes('mcpFindText') || err.message.includes('not defined'))) {
+      await ensureHelpers();
+      return runJS(js);
+    }
+    throw err;
+  }
+}
+
 export async function click({ selector, text, x, y, ref }) {
   if (ref) selector = refSelector(ref);
 
   if (selector) {
     const sel = selector.replace(/'/g, "\\'");
-    // Tiny JS — helpers already injected by navigate/newTab. Fallback inject if not.
-    return runJS(
-      `(function(){if(!window.__mcp){${INJECT_MCP_HELPERS}}var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';mcpClick(el);mcpReactClick(el);return 'Clicked: '+el.tagName+(el.textContent?(' "'+el.textContent.trim().substring(0,50)+'"'):'');})()`
+    return clickWithRetry(
+      `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';mcpClick(el);mcpReactClick(el);return 'Clicked: '+el.tagName+(el.textContent?(' "'+el.textContent.trim().substring(0,50)+'"'):'');})()`
     );
   }
 
   if (text) {
     const safeText = text.replace(/'/g, "\\'");
-    return runJS(
-      `(function(){if(!window.__mcp){${INJECT_MCP_HELPERS}}var el=mcpFindText('${safeText}',true)||mcpFindText('${safeText}',false);if(!el)return 'Element not found with text: ${safeText}';mcpClick(el);mcpReactClick(el);return 'Clicked: '+el.tagName+' "'+el.textContent.trim().substring(0,50)+'"';})()`
+    return clickWithRetry(
+      `(function(){var el=mcpFindText('${safeText}',true)||mcpFindText('${safeText}',false);if(!el)return 'Element not found with text: ${safeText}';mcpClick(el);mcpReactClick(el);return 'Clicked: '+el.tagName+' "'+el.textContent.trim().substring(0,50)+'"';})()`
     );
   }
 
   if (x !== undefined && y !== undefined) {
-    return runJS(
-      `(function(){if(!window.__mcp){${INJECT_MCP_HELPERS}}var el=document.elementFromPoint(${Number(x)},${Number(y)});if(!el)return 'No element at (${Number(x)},${Number(y)})';mcpClick(el);mcpReactClick(el);return 'Clicked: '+el.tagName+' at (${Number(x)},${Number(y)})';})()`
+    return clickWithRetry(
+      `(function(){var el=document.elementFromPoint(${Number(x)},${Number(y)});if(!el)return 'No element at (${Number(x)},${Number(y)})';mcpClick(el);mcpReactClick(el);return 'Clicked: '+el.tagName+' at (${Number(x)},${Number(y)})';})()`
     );
   }
   throw new Error("click requires selector, text, or x/y coordinates");
