@@ -345,26 +345,31 @@ const INJECT_MCP_HELPERS = `if(!window.__mcp){window.__mcp=true;
   };
   window.mcpReactClick=function(el){
     if(!el)return false;
-    var synth={type:'click',target:el,currentTarget:el,preventDefault:function(){},stopPropagation:function(){},nativeEvent:new MouseEvent('click'),persist:function(){},bubbles:true,cancelable:true};
-    // Search React handlers on element AND all parents (delegation pattern)
+    // Build synthetic event with real coordinates from the TARGET element (not original el)
+    function makeSynth(targetNode, type){
+      var r=targetNode.getBoundingClientRect();
+      return{type:type||'click',target:targetNode,currentTarget:targetNode,
+        clientX:r.left+r.width/2,clientY:r.top+r.height/2,pageX:r.left+r.width/2+window.scrollX,pageY:r.top+r.height/2+window.scrollY,
+        preventDefault:function(){},stopPropagation:function(){},nativeEvent:new MouseEvent(type||'click'),persist:function(){},bubbles:true,cancelable:true};
+    }
+    // Search React handlers on element AND all parents
     var node=el;
     for(var depth=0;depth<15&&node;depth++){
       var pk=Object.keys(node).find(function(k){return k.startsWith('__reactProps$')});
       if(pk&&node[pk]){
         var props=node[pk];
-        // Try onClick, onMouseDown, onPointerDown (Airtable uses mousedown for dropdowns)
-        if(props.onClick){props.onClick(synth);return true}
-        if(props.onMouseDown){props.onMouseDown({...synth,type:'mousedown'});return true}
-        if(props.onPointerDown){props.onPointerDown({...synth,type:'pointerdown'});return true}
+        if(props.onClick){props.onClick(makeSynth(node,'click'));return true}
+        if(props.onMouseDown){props.onMouseDown(makeSynth(node,'mousedown'));return true}
+        if(props.onPointerDown){props.onPointerDown(makeSynth(node,'pointerdown'));return true}
       }
       var fk=Object.keys(node).find(function(k){return k.startsWith('__reactFiber$')||k.startsWith('__reactInternalInstance$')});
       if(fk){
         var f=node[fk];
         while(f){
           if(f.memoizedProps){
-            if(f.memoizedProps.onClick){f.memoizedProps.onClick(synth);return true}
-            if(f.memoizedProps.onMouseDown){f.memoizedProps.onMouseDown({...synth,type:'mousedown'});return true}
-            if(f.memoizedProps.onPointerDown){f.memoizedProps.onPointerDown({...synth,type:'pointerdown'});return true}
+            if(f.memoizedProps.onClick){f.memoizedProps.onClick(makeSynth(node,'click'));return true}
+            if(f.memoizedProps.onMouseDown){f.memoizedProps.onMouseDown(makeSynth(node,'mousedown'));return true}
+            if(f.memoizedProps.onPointerDown){f.memoizedProps.onPointerDown(makeSynth(node,'pointerdown'));return true}
           }
           f=f.return;
         }
