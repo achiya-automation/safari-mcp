@@ -12,12 +12,40 @@ const execFileAsync = promisify(execFile);
 
 // ========== ACTIVE TAB TRACKING ==========
 // Instead of visually switching tabs (which interrupts the user),
-// we track which tab index we're "working on" and pass it to runJS.
-// This way Safari stays on whatever tab the user is viewing.
+// we track which tab we're "working on" by URL (not index, because indices shift
+// when the user opens/closes tabs). Before each operation we resolve the URL
+// to the current index.
 let _activeTabIndex = null; // null = use front document (default)
+let _activeTabURL = null;   // URL-based tracking (stable even when tabs shift)
 
 export function getActiveTabIndex() { return _activeTabIndex; }
 export function setActiveTabIndex(idx) { _activeTabIndex = idx; }
+
+// Resolve our tracked URL to current tab index (indices shift when user opens/closes tabs)
+async function resolveActiveTab() {
+  if (!_activeTabURL) return _activeTabIndex;
+  try {
+    const result = await osascriptFast(
+      `tell application "Safari" to return (count of tabs of front window) as text`
+    );
+    const count = Number(result);
+    for (let i = 1; i <= count; i++) {
+      const url = await osascriptFast(
+        `tell application "Safari" to return URL of tab ${i} of front window`
+      );
+      if (url === _activeTabURL) {
+        _activeTabIndex = i;
+        return i;
+      }
+    }
+    // Tab was closed — reset
+    _activeTabIndex = null;
+    _activeTabURL = null;
+    return null;
+  } catch {
+    return _activeTabIndex;
+  }
+}
 
 // ========== PERSISTENT OSASCRIPT PROCESS ==========
 // Instead of spawning osascript for each command (~80ms overhead),
@@ -146,8 +174,13 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
     .replace(/\n/g, "\\n")
     .replace(/\r/g, "\\r")
     .replace(/\t/g, "\\t");
-  // Use explicit tabIndex > tracked activeTabIndex > front document
-  const idx = tabIndex || _activeTabIndex;
+  // Resolve tab: explicit tabIndex > URL-tracked tab > front document
+  // URL tracking ensures we find our tab even if user opened/closed tabs (shifting indices)
+  let idx = tabIndex;
+  if (!idx && _activeTabURL) {
+    idx = await resolveActiveTab();
+  }
+  if (!idx) idx = _activeTabIndex;
   const target = idx
     ? `tab ${idx} of front window`
     : "front document";
@@ -198,6 +231,8 @@ export async function navigate(url) {
       targetUrl = "https://" + targetUrl;
     }
     const safeUrl = targetUrl.replace(/"/g, '\\"');
+    // Resolve tab by URL first (in case indices shifted)
+    if (_activeTabURL) await resolveActiveTab();
     const navTarget = _activeTabIndex
       ? `tab ${_activeTabIndex} of front window`
       : "front document";
@@ -239,6 +274,12 @@ export async function navigate(url) {
         return retry;
       }
     } catch (_) {}
+
+    // Update URL tracking after navigation
+    try {
+      const parsed = JSON.parse(result);
+      if (parsed.url) _activeTabURL = parsed.url;
+    } catch {}
 
     return result;
 }
@@ -855,11 +896,16 @@ export async function newTab(url = "") {
       'tell application "Safari" to return count of tabs of front window'
     );
     const newIndex = Number(tabCount);
-    _activeTabIndex = newIndex; // Track this as our working tab
+    _activeTabIndex = newIndex;
 
     await new Promise((r) => setTimeout(r, 200));
-    // Get info from the new tab by index (without switching visually)
-    return runJS(`JSON.stringify({title:document.title,url:location.href,tabIndex:${newIndex}})`, { tabIndex: newIndex });
+    // Get info and track by URL (stable even when user opens/closes tabs)
+    const info = await runJS(`JSON.stringify({title:document.title,url:location.href,tabIndex:${newIndex}})`, { tabIndex: newIndex });
+    try {
+      const parsed = JSON.parse(info);
+      _activeTabURL = parsed.url || null;
+    } catch {}
+    return info;
   });
 }
 
@@ -869,6 +915,7 @@ export async function closeTab() {
       `tell application "Safari" to close tab ${_activeTabIndex} of front window`
     );
     _activeTabIndex = null;
+    _activeTabURL = null;
   } else {
     await osascript(
       `tell application "Safari" to close current tab of front window`
@@ -888,6 +935,11 @@ export async function switchTab(index) {
     `JSON.stringify({title:document.title,url:location.href})`,
     { tabIndex: idx }
   );
+  // Track by URL so we can find this tab even if indices shift
+  try {
+    const parsed = JSON.parse(result);
+    _activeTabURL = parsed.url || null;
+  } catch {}
   return result;
 }
 
