@@ -1,0 +1,46 @@
+{
+  "name": "safari-mcp",
+  "version": "2.0.0",
+  "description": "Safari browser automation for AI agents — native macOS, zero Chrome overhead. 80 tools via AppleScript + JavaScript.",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "safari-mcp": "index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "safari",
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "browser-automation",
+    "macos",
+    "apple",
+    "webkit",
+    "claude",
+    "cursor",
+    "ai-agent",
+    "applescript"
+  ],
+  "author": "Achiya Cohen <a.c0504197060@gmail.com>",
+  "license": "MIT",
+  "homepage": "https://github.com/achiyacohen/safari-mcp",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/achiyacohen/safari-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/achiyacohen/safari-mcp/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  }
+}
