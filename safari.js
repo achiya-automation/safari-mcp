@@ -479,9 +479,13 @@ export async function click({ selector, text, x, y, ref }) {
     return runJS(
       `(function(){${REACT_CLICK_JS}
         var safeText='${safeText}';
-        var interactive=[...document.querySelectorAll('a,button,input[type=submit],input[type=button],[role=button],[role=link],[role=tab],[role=menuitem],[onclick],label,[data-testid],[class*=btn],[class*=Button]')];
-        var el=interactive.find(function(e){return e.textContent.trim().includes(safeText)});
-        if(!el){var all=[...document.querySelectorAll('*')].filter(function(e){var r=e.getBoundingClientRect();return r.width>0&&r.height>0&&e.textContent.trim().includes(safeText)});el=all.sort(function(a,b){return a.textContent.length-b.textContent.length})[0]}
+        // Layer 1: Exact text match on interactive elements
+        var interactive=[...document.querySelectorAll('a,button,input[type=submit],input[type=button],[role=button],[role=link],[role=tab],[role=menuitem],[onclick],label,[data-testid],[class*=btn],[class*=Button],span,h1,h2,h3,h4,h5,h6,li,td,th,p')];
+        var el=interactive.find(function(e){return e.textContent.trim()===safeText&&e.getBoundingClientRect().width>0});
+        // Layer 2: Exact match on any visible element (smallest first = deepest)
+        if(!el){var exact=[...document.querySelectorAll('*')].filter(function(e){var r=e.getBoundingClientRect();return r.width>0&&r.height>0&&e.textContent.trim()===safeText});el=exact.sort(function(a,b){return(a.textContent.length-b.textContent.length)||((a.getBoundingClientRect().width*a.getBoundingClientRect().height)-(b.getBoundingClientRect().width*b.getBoundingClientRect().height))})[0]}
+        // Layer 3: Contains match — prefer deepest (smallest area) element
+        if(!el){var partial=[...document.querySelectorAll('*')].filter(function(e){var r=e.getBoundingClientRect();return r.width>0&&r.height>0&&e.textContent.trim().includes(safeText)&&e.children.length<5});el=partial.sort(function(a,b){return(a.textContent.length-b.textContent.length)||((a.getBoundingClientRect().width*a.getBoundingClientRect().height)-(b.getBoundingClientRect().width*b.getBoundingClientRect().height))})[0]}
         if(!el)return 'Element not found with text: '+safeText;
         mcpClick(el);
         if(el.tagName==='A'&&el.href&&!el.href.startsWith('javascript:'))try{var before=location.href;setTimeout(function(){if(location.href===before&&el.href)location.href=el.href},100)}catch(e){}
