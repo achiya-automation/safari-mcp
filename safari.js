@@ -47,23 +47,17 @@ async function resolveActiveTab() {
   }
 }
 
-// ========== PERSISTENT OSASCRIPT PROCESS ==========
-// Instead of spawning osascript for each command (~80ms overhead),
-// we keep one alive and send commands via stdin (~5ms per command)
+// ========== FAST OSASCRIPT VIA TEMP FILE REUSE ==========
+// osascript -i doesn't work with pipes. Instead, we use a shared temp file
+// and direct execFile — which is ~80ms but reliable.
+// For runJS specifically, we batch when possible.
 
 let _osaProc = null;
+let _osaReady = false;
 
 function getOsaProcess() {
-  if (_osaProc && !_osaProc.killed) return _osaProc;
-
-  _osaProc = spawn("osascript", ["-i"], {
-    stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, LANG: "en_US.UTF-8" },
-  });
-
-  _osaProc.on("exit", () => { _osaProc = null; });
-  _osaProc.on("error", () => { _osaProc = null; });
-  _osaReady = true;
+  // Persistent process doesn't work with osascript — return null to use fallback
+  return null;
 
   return _osaProc;
 }
