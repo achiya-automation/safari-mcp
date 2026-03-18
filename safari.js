@@ -17,6 +17,8 @@ const execFileAsync = promisify(execFile);
 // to the current index.
 let _activeTabIndex = null; // null = use front document (default)
 let _activeTabURL = null;   // URL-based tracking (stable even when tabs shift)
+let _lastResolveTime = 0;   // Cache: skip resolve if verified recently
+const RESOLVE_CACHE_MS = 5000; // Re-verify tab every 5 seconds max
 
 export function getActiveTabIndex() { return _activeTabIndex; }
 export function setActiveTabIndex(idx) { _activeTabIndex = idx; }
@@ -196,11 +198,14 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
     .replace(/\n/g, "\\n")
     .replace(/\r/g, "\\r")
     .replace(/\t/g, "\\t");
-  // Resolve tab: explicit tabIndex > URL-tracked tab > saved index > front document
+  // Resolve tab: explicit tabIndex > cached index > URL-tracked tab > front document
   let idx = tabIndex;
-  if (!idx && _activeTabURL && _activeTabURL !== 'about:blank' && _activeTabURL !== '') {
+  if (!idx && _activeTabIndex && (Date.now() - _lastResolveTime < RESOLVE_CACHE_MS)) {
+    // Recently verified — use cached index (skip osascript call)
+    idx = _activeTabIndex;
+  } else if (!idx && _activeTabURL && _activeTabURL !== 'about:blank' && _activeTabURL !== '') {
     const resolved = await resolveActiveTab();
-    if (resolved) idx = resolved;
+    if (resolved) { idx = resolved; _lastResolveTime = Date.now(); }
   }
   // ALWAYS fall back to _activeTabIndex — never clear it from resolve failures
   if (!idx) idx = _activeTabIndex;
@@ -401,7 +406,21 @@ const INJECT_MCP_HELPERS = `if(!window.__mcp){window.__mcp=true;
     return false;
   };
   // Fast text finder using TreeWalker (10x faster than querySelectorAll('*') on large DOMs)
+  // Also searches aria-label, placeholder, title, data-testid attributes
   window.mcpFindText=function(text,exact){
+    // Phase 1: Search attributes (aria-label, placeholder, title) — O(n) on interactive elements only
+    var attrSels='[aria-label],[placeholder],[title],[data-testid],[alt]';
+    var attrEls=document.querySelectorAll(attrSels);
+    for(var i=0;i<attrEls.length;i++){
+      var a=attrEls[i];
+      var r=a.getBoundingClientRect();
+      if(r.width===0||r.height===0)continue;
+      var vals=[a.getAttribute('aria-label'),a.getAttribute('placeholder'),a.getAttribute('title'),a.getAttribute('data-testid'),a.getAttribute('alt')].filter(Boolean);
+      for(var j=0;j<vals.length;j++){
+        if(exact?vals[j]===text:vals[j].includes(text))return a;
+      }
+    }
+    // Phase 2: TreeWalker on text nodes
     var tw=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,null);
     var best=null,bestArea=Infinity;
     while(tw.nextNode()){
@@ -412,13 +431,10 @@ const INJECT_MCP_HELPERS = `if(!window.__mcp){window.__mcp=true;
       if(!match)continue;
       var el=n.parentElement;
       if(!el)continue;
-      var r=el.getBoundingClientRect();
-      if(r.width===0||r.height===0)continue;
-      var area=r.width*r.height;
-      // Prefer: 1) exact text nodes, 2) smaller elements (deeper/more specific)
-      if(exact&&t===text&&area<bestArea){best=el;bestArea=area}
-      else if(!exact&&!best){best=el;bestArea=area}
-      else if(!exact&&area<bestArea&&el.children.length<5){best=el;bestArea=area}
+      var r2=el.getBoundingClientRect();
+      if(r2.width===0||r2.height===0)continue;
+      var area=r2.width*r2.height;
+      if(area<bestArea){best=el;bestArea=area}
     }
     return best;
   };
