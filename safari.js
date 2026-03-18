@@ -57,10 +57,9 @@ async function resolveActiveTab() {
       _activeTabIndex = num2;
       return num2;
     }
-    // Tab was closed — reset
-    _activeTabIndex = null;
+    // URL not found — tab may have navigated. Don't clear _activeTabIndex!
     _activeTabURL = null;
-    return null;
+    return _activeTabIndex; // Keep using saved index as best guess
   } catch {
     return _activeTabIndex;
   }
@@ -187,12 +186,13 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
     .replace(/\n/g, "\\n")
     .replace(/\r/g, "\\r")
     .replace(/\t/g, "\\t");
-  // Resolve tab: explicit tabIndex > URL-tracked tab > front document
-  // URL tracking ensures we find our tab even if user opened/closed tabs (shifting indices)
+  // Resolve tab: explicit tabIndex > URL-tracked tab > saved index > front document
   let idx = tabIndex;
-  if (!idx && _activeTabURL) {
-    idx = await resolveActiveTab();
+  if (!idx && _activeTabURL && _activeTabURL !== 'about:blank' && _activeTabURL !== '') {
+    const resolved = await resolveActiveTab();
+    if (resolved) idx = resolved;
   }
+  // ALWAYS fall back to _activeTabIndex — never clear it from resolve failures
   if (!idx) idx = _activeTabIndex;
   const target = idx
     ? `tab ${idx} of front window`
@@ -1063,12 +1063,19 @@ export async function newTab(url = "") {
     } else {
       await new Promise((r) => setTimeout(r, 200));
     }
-    // Get info and track by URL (stable even when user opens/closes tabs)
+    // Track by URL — use TARGET url if tab hasn't loaded yet
     const info = await runJS(`JSON.stringify({title:document.title,url:location.href,tabIndex:${newIndex}})`, { tabIndex: newIndex });
     try {
       const parsed = JSON.parse(info);
-      _activeTabURL = parsed.url || null;
-    } catch {}
+      // If tab is still about:blank, use the target URL for tracking
+      if (parsed.url === 'about:blank' || parsed.url === '' || !parsed.url) {
+        _activeTabURL = url || null;
+      } else {
+        _activeTabURL = parsed.url;
+      }
+    } catch {
+      _activeTabURL = url || null;
+    }
     return info;
   });
 }
