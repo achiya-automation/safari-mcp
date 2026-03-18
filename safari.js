@@ -787,20 +787,23 @@ export async function typeText({ text, selector, ref }) {
 export async function screenshot({ fullPage = false } = {}) {
   const tmpFile = join(tmpdir(), `safari-screenshot-${Date.now()}.png`);
   try {
-    // If we're working on a non-current tab, screencapture won't work
-    // (it captures the visually active tab). Use JS method directly.
-    const isBackgroundTab = _activeTabIndex != null;
-
-    // Check if our tab is the current one
-    let skipScreencapture = isBackgroundTab;
-    if (isBackgroundTab) {
+    // If working on a background tab, temporarily switch to it for screenshot
+    let savedTabIdx = null;
+    if (_activeTabIndex) {
       try {
         const currentIdx = await osascriptFast(
           `tell application "Safari" to return index of current tab of front window`
         );
-        if (Number(currentIdx) === _activeTabIndex) skipScreencapture = false;
+        if (Number(currentIdx) !== _activeTabIndex) {
+          savedTabIdx = Number(currentIdx);
+          await osascriptFast(
+            `tell application "Safari" to set current tab of front window to tab ${_activeTabIndex} of front window`
+          );
+          await new Promise(r => setTimeout(r, 200)); // Let Safari render the tab
+        }
       } catch (_) {}
     }
+    const skipScreencapture = false; // Always try screencapture now
 
     // Try screencapture — use osascript's do shell script to bypass VS Code permission issue
     const windowId = !skipScreencapture ? await osascript(
@@ -876,6 +879,14 @@ export async function screenshot({ fullPage = false } = {}) {
     throw new Error("Screenshot unavailable. Grant Screen Recording permission to VS Code/Terminal in System Settings → Privacy & Security → Screen Recording, then restart.");
   } finally {
     await unlink(tmpFile).catch(() => {});
+    // Restore user's tab if we switched
+    if (savedTabIdx) {
+      try {
+        await osascriptFast(
+          `tell application "Safari" to set current tab of front window to tab ${savedTabIdx} of front window`
+        );
+      } catch (_) {}
+    }
   }
 }
 
