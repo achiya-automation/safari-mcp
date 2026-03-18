@@ -344,29 +344,57 @@ export async function getPageSource({ maxLength = 200000 } = {}) {
 
 // OS-level click: gets element screen coordinates, then uses AppleScript to perform
 // a REAL mouse click that macOS sends to Safari. Works on React, Airtable, any framework.
-async function osClick(pageX, pageY) {
-  // Get Safari window position + toolbar offset to calculate screen coordinates
-  const winBounds = await osascriptFast(
-    'tell application "Safari" to return bounds of front window'
+// switchToTab: if true, temporarily switch Safari to our tab for the click (needed for background tabs)
+async function osClick(pageX, pageY, { switchToTab = true } = {}) {
+  // Calculate screen coordinates dynamically using JS window.screenX/screenY
+  // This accounts for Safari toolbar, tab bar, bookmarks bar — any configuration
+  const offset = await runJS(
+    "JSON.stringify({sx:window.screenX, sy:window.screenY, oh:window.outerHeight, ih:window.innerHeight})"
   );
-  const [winX, winY] = winBounds.split(",").map(s => Number(s.trim()));
-  // Safari toolbar height (address bar + tabs) — approximately 78px on macOS
-  const toolbarHeight = 78;
-  const screenX = winX + Math.round(pageX);
-  const screenY = winY + toolbarHeight + Math.round(pageY);
+  const { sx, sy, oh, ih } = JSON.parse(offset);
+  const toolbarHeight = oh - ih; // Dynamic: includes tab bar + address bar + bookmarks
+  const screenX = sx + Math.round(pageX);
+  const screenY = sy + toolbarHeight + Math.round(pageY);
 
-  // Perform real OS click via cliclick (if available) or AppleScript
+  // If working on a background tab, temporarily switch to it for the click
+  let savedTabIdx = null;
+  if (switchToTab && _activeTabIndex) {
+    try {
+      const currentIdx = await osascriptFast(
+        'tell application "Safari" to return index of current tab of front window'
+      );
+      if (Number(currentIdx) !== _activeTabIndex) {
+        savedTabIdx = Number(currentIdx);
+        await osascriptFast(
+          `tell application "Safari" to set current tab of front window to tab ${_activeTabIndex} of front window`
+        );
+        await new Promise(r => setTimeout(r, 150)); // Let Safari render the tab
+      }
+    } catch (_) {}
+  }
+
+  // Perform real OS click via cliclick (preferred — precise, reliable)
   try {
     await execFileAsync("cliclick", ["c:" + screenX + "," + screenY], { timeout: 3000 });
-    return true;
   } catch (_) {
-    // Fallback: AppleScript System Events click
+    // Fallback: AppleScript System Events
     await osascript(
       `tell application "System Events" to click at {${screenX}, ${screenY}}`,
       { timeout: 5000 }
     );
-    return true;
   }
+
+  // Restore the user's tab if we switched
+  if (savedTabIdx) {
+    await new Promise(r => setTimeout(r, 200)); // Let the click register
+    try {
+      await osascriptFast(
+        `tell application "Safari" to set current tab of front window to tab ${savedTabIdx} of front window`
+      );
+    } catch (_) {}
+  }
+
+  return true;
 }
 
 export async function click({ selector, text, x, y, ref, force }) {
