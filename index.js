@@ -1,11 +1,82 @@
 #!/usr/bin/env node
-// Safari MCP Server - שליטה מלאה ב-Safari דרך AppleScript
-// קל על המחשב, שומר לוגינים, רץ ברקע
+// Safari MCP Server — dual engine:
+// 1. Safari Web Extension (fast, ~5-20ms, keeps logins) — when extension is connected
+// 2. AppleScript fallback (~80ms, keeps logins) — when extension is not available
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import * as safari from "./safari.js";
+import { WebSocketServer } from "ws";
+import { randomUUID } from "node:crypto";
+
+// ========== WEBSOCKET SERVER FOR SAFARI EXTENSION ==========
+const WS_PORT = 9223;
+let _extensionWs = null;
+let _extensionConnected = false;
+
+const wss = new WebSocketServer({ port: WS_PORT });
+wss.on("connection", (ws) => {
+  _extensionWs = ws;
+  _extensionConnected = true;
+  console.error(`[Safari MCP] Extension connected on port ${WS_PORT}`);
+
+  ws.on("close", () => {
+    _extensionConnected = false;
+    _extensionWs = null;
+    console.error("[Safari MCP] Extension disconnected");
+  });
+
+  ws.on("message", (data) => {
+    // Responses are handled by sendToExtension's Promise
+    // Keepalive messages are ignored
+  });
+});
+
+// Send command to extension and wait for response
+function sendToExtension(type, payload = {}, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    if (!_extensionWs || !_extensionConnected) {
+      reject(new Error("Extension not connected"));
+      return;
+    }
+
+    const id = randomUUID();
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error(`Extension timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    function onMessage(data) {
+      let msg;
+      try { msg = JSON.parse(data.toString()); } catch { return; }
+      if (msg.type !== "response" || msg.id !== id) return;
+      cleanup();
+      if (msg.error) reject(new Error(msg.error));
+      else resolve(msg.result);
+    }
+
+    function cleanup() {
+      clearTimeout(timeout);
+      _extensionWs?.removeListener("message", onMessage);
+    }
+
+    _extensionWs.on("message", onMessage);
+    _extensionWs.send(JSON.stringify({ id, type, payload }));
+  });
+}
+
+// Try extension first, fall back to AppleScript
+async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) {
+  if (_extensionConnected) {
+    try {
+      return await sendToExtension(extensionType, extensionPayload);
+    } catch {
+      // Extension failed — fall back to AppleScript
+    }
+  }
+  return fallbackFn();
+}
 
 const server = new McpServer({
   name: "safari-mcp",

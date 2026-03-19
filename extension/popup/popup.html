@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html dir="ltr">
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { width: 250px; padding: 16px; font-family: -apple-system, system-ui, sans-serif; font-size: 13px; margin: 0; }
+    h3 { margin: 0 0 12px; font-size: 15px; }
+    .status { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; }
+    .connected { background: #4CAF50; }
+    .disconnected { background: #f44336; }
+    .info { color: #666; font-size: 11px; }
+  </style>
+</head>
+<body>
+  <h3>Safari MCP Bridge</h3>
+  <div class="status">
+    <div class="dot" id="statusDot"></div>
+    <span id="statusText">Checking...</span>
+  </div>
+  <div class="info" id="info"></div>
+  <script src="popup.js"></script>
+</body>
+</html>

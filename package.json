@@ -41,6 +41,7 @@
     "darwin"
   ],
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1"
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "ws": "^8.19.0"
   }
 }
