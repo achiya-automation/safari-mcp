@@ -1133,49 +1133,42 @@ export async function listTabs() {
 }
 
 export async function newTab(url = "") {
-  // Use WebDriver to create a new tab — faster, more reliable, no visual interruption
-  try {
-    await ensureWebDriver();
-    if (url) {
-      await wdRequest("POST", "/url", { url });
-    }
-    const currentUrl = await wdRequest("GET", "/url");
-    const title = await wdRequest("GET", "/title");
-    _useWebDriver = true;
-    _activeTabURL = currentUrl || url || null;
-
-    // Find our tab index in Safari's tab list (for tracking)
+  // AppleScript: opens tab IN the user's Safari (with all cookies/logins)
+  _useWebDriver = false;
+  return withoutStealingFocus(async () => {
+    const safeUrl = url ? url.replace(/"/g, '\\"') : "";
     try {
-      const tabCount = await osascriptFast(
-        'tell application "Safari" to return count of tabs of front window'
-      );
-      _activeTabIndex = Number(tabCount); // WebDriver tab is usually the last one
-    } catch { _activeTabIndex = null; }
-
-    return JSON.stringify({ title: title || "", url: currentUrl || url || "", tabIndex: _activeTabIndex });
-  } catch (err) {
-    // WebDriver failed — fall back to AppleScript
-    _useWebDriver = false;
-    return withoutStealingFocus(async () => {
-      const safeUrl = url ? url.replace(/"/g, '\\"') : "";
-      try {
-        if (url) {
-          await osascript(`tell application "Safari"\ntell front window\nset userTab to current tab\nmake new tab with properties {URL:"${safeUrl}"}\nset current tab to userTab\nend tell\nend tell`);
-        } else {
-          await osascript(`tell application "Safari"\ntell front window\nset userTab to current tab\nmake new tab\nset current tab to userTab\nend tell\nend tell`);
-        }
-      } catch {
-        if (url) { await osascript(`tell application "Safari" to make new document with properties {URL:"${safeUrl}"}`); }
-        else { await osascript('tell application "Safari" to make new document'); }
+      if (url) {
+        await osascript(`tell application "Safari"\ntell front window\nset userTab to current tab\nmake new tab with properties {URL:"${safeUrl}"}\nset current tab to userTab\nend tell\nend tell`);
+      } else {
+        await osascript(`tell application "Safari"\ntell front window\nset userTab to current tab\nmake new tab\nset current tab to userTab\nend tell\nend tell`);
       }
-      const tabCount = await osascriptFast('tell application "Safari" to return count of tabs of front window');
-      _activeTabIndex = Number(tabCount);
-      _activeTabURL = url || null;
-      await new Promise(r => setTimeout(r, 500));
-      const info = await runJS(`JSON.stringify({title:document.title,url:location.href,tabIndex:${_activeTabIndex}})`, { tabIndex: _activeTabIndex });
-      return info;
-    });
-  }
+    } catch {
+      if (url) { await osascript(`tell application "Safari" to make new document with properties {URL:"${safeUrl}"}`); }
+      else { await osascript('tell application "Safari" to make new document'); }
+    }
+    const tabCount = await osascriptFast('tell application "Safari" to return count of tabs of front window');
+    _activeTabIndex = Number(tabCount);
+    _activeTabURL = url || null;
+    _lastResolveTime = Date.now();
+    // Wait for page load if URL given
+    if (url) {
+      try {
+        await runJS(
+          `(async function(){for(var i=0;i<40;i++){if(location.href!=='about:blank'&&document.readyState==='complete')break;await new Promise(r=>setTimeout(r,250))}return 'ok'})()`,
+          { tabIndex: _activeTabIndex, timeout: 12000 }
+        );
+      } catch {}
+    } else {
+      await new Promise(r => setTimeout(r, 200));
+    }
+    const info = await runJS(`JSON.stringify({title:document.title,url:location.href,tabIndex:${_activeTabIndex}})`, { tabIndex: _activeTabIndex });
+    try {
+      const parsed = JSON.parse(info);
+      if (parsed.url && parsed.url !== 'about:blank') _activeTabURL = parsed.url;
+    } catch {}
+    return info;
+  });
 }
 
 export async function closeTab() {
