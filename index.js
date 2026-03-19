@@ -15,23 +15,35 @@ const WS_PORT = 9223;
 let _extensionWs = null;
 let _extensionConnected = false;
 
-const wss = new WebSocketServer({ port: WS_PORT });
-wss.on("connection", (ws) => {
-  _extensionWs = ws;
-  _extensionConnected = true;
-  console.error(`[Safari MCP] Extension connected on port ${WS_PORT}`);
+let wss;
+try {
+  wss = new WebSocketServer({ port: WS_PORT });
+  wss.on("connection", (ws) => {
+    _extensionWs = ws;
+    _extensionConnected = true;
+    console.error(`[Safari MCP] Extension connected on port ${WS_PORT}`);
 
-  ws.on("close", () => {
-    _extensionConnected = false;
-    _extensionWs = null;
-    console.error("[Safari MCP] Extension disconnected");
-  });
+    ws.on("close", () => {
+      _extensionConnected = false;
+      _extensionWs = null;
+      console.error("[Safari MCP] Extension disconnected");
+    });
 
-  ws.on("message", (data) => {
-    // Responses are handled by sendToExtension's Promise
-    // Keepalive messages are ignored
+    ws.on("message", (data) => {
+      // Responses are handled by sendToExtension's Promise
+      // Keepalive messages are ignored
+    });
   });
-});
+  wss.on("error", (err) => {
+    if (err.code === "EADDRINUSE") {
+      console.error(`[Safari MCP] Port ${WS_PORT} in use — extension WebSocket disabled (AppleScript still works)`);
+    } else {
+      console.error(`[Safari MCP] WebSocket error: ${err.message}`);
+    }
+  });
+} catch (err) {
+  console.error(`[Safari MCP] WebSocket failed: ${err.message} — continuing with AppleScript only`);
+}
 
 // Send command to extension and wait for response
 function sendToExtension(type, payload = {}, timeoutMs = 30000) {
