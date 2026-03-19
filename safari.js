@@ -603,20 +603,20 @@ export async function click({ selector, text, x, y, ref }) {
   if (selector) {
     const sel = selector.replace(/'/g, "\\'");
     return clickWithRetry(
-      `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';if(!mcpReactClick(el))mcpClick(el);return 'Clicked: '+el.tagName+(el.textContent?(' "'+el.textContent.trim().substring(0,50)+'"'):'');})()`
+      `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';if(!mcpReactClick(el))mcpClick(el);var a=el.closest?el.closest('a[href]'):null;if(a&&a.href&&!a.href.startsWith('javascript:'))location.href=a.href;return 'Clicked: '+el.tagName+(el.textContent?(' "'+el.textContent.trim().substring(0,50)+'"'):'');})()`
     );
   }
 
   if (text) {
     const safeText = text.replace(/'/g, "\\'");
     return clickWithRetry(
-      `(function(){var el=mcpFindText('${safeText}',true)||mcpFindText('${safeText}',false);if(!el)return 'Element not found with text: ${safeText}';if(!mcpReactClick(el))mcpClick(el);return 'Clicked: '+el.tagName+' "'+el.textContent.trim().substring(0,50)+'"';})()`
+      `(function(){var el=mcpFindText('${safeText}',true)||mcpFindText('${safeText}',false);if(!el)return 'Element not found with text: ${safeText}';if(!mcpReactClick(el))mcpClick(el);var a=el.closest?el.closest('a[href]'):null;if(a&&a.href&&!a.href.startsWith('javascript:'))location.href=a.href;return 'Clicked: '+el.tagName+' "'+el.textContent.trim().substring(0,50)+'"';})()`
     );
   }
 
   if (x !== undefined && y !== undefined) {
     return clickWithRetry(
-      `(function(){var el=document.elementFromPoint(${Number(x)},${Number(y)});if(!el)return 'No element at (${Number(x)},${Number(y)})';if(!mcpReactClick(el))mcpClick(el);return 'Clicked: '+el.tagName+' at (${Number(x)},${Number(y)})';})()`
+      `(function(){var el=document.elementFromPoint(${Number(x)},${Number(y)});if(!el)return 'No element at (${Number(x)},${Number(y)})';if(!mcpReactClick(el))mcpClick(el);var a=el.closest?el.closest('a[href]'):null;if(a&&a.href&&!a.href.startsWith('javascript:'))location.href=a.href;return 'Clicked: '+el.tagName+' at (${Number(x)},${Number(y)})';})()`
     );
   }
   throw new Error("click requires selector, text, or x/y coordinates");
