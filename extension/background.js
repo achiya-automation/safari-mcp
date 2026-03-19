@@ -126,10 +126,17 @@ async function handleCommand(type, payload) {
       }, [payload.selector || null, payload.maxLength || 50000]);
     }
 
-    // --- JavaScript Execution (via content script message) ---
+    // --- JavaScript Execution — direct eval in MAIN world (fast, no polling) ---
     case "evaluate": {
-      const tab = await getActiveTab();
-      return await sendToContentScript(tab.id, { action: "evaluate", script: payload.script });
+      return await execInTab(async (script) => {
+        try {
+          const result = await (0, eval)(script);
+          if (result === undefined || result === null) return null;
+          return typeof result === "object" ? JSON.stringify(result) : String(result);
+        } catch (e) {
+          return "Error: " + e.message;
+        }
+      }, [payload.script]);
     }
 
     // --- Screenshot ---
@@ -148,16 +155,17 @@ async function handleCommand(type, payload) {
         if (selector) {
           el = document.querySelector(selector);
         } else if (text) {
-          // Search attributes first
-          document.querySelectorAll("[aria-label],[placeholder],[title]").forEach(a => {
-            if (el) return;
+          // Search attributes first (aria-label, placeholder, title)
+          const attrEls = document.querySelectorAll("[aria-label],[placeholder],[title]");
+          for (let i = 0; i < attrEls.length; i++) {
+            const a = attrEls[i];
             const vals = [a.getAttribute("aria-label"), a.getAttribute("placeholder"), a.getAttribute("title")].filter(Boolean);
             if (vals.some(v => v === text || v.includes(text))) {
               const r = a.getBoundingClientRect();
-              if (r.width > 0 && r.height > 0) el = a;
+              if (r.width > 0 && r.height > 0) { el = a; break; }
             }
-          });
-          // TreeWalker
+          }
+          // TreeWalker text search
           if (!el) {
             const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
             let best = null, bestArea = Infinity;
@@ -196,21 +204,125 @@ async function handleCommand(type, payload) {
         el.dispatchEvent(new MouseEvent("mouseup", { ...s, buttons: 0 }));
         el.dispatchEvent(new MouseEvent("click", { ...s, buttons: 0 }));
 
-        // React Fiber fallback — traverse parents for onClick/onMouseDown
-        let node = el;
+        // React Fiber — traverse up to 15 parents for onClick/onMouseDown
+        // (works in MAIN world — has access to __reactProps$)
+        let node = el, reactFired = false;
         for (let depth = 0; depth < 15 && node; depth++) {
           const pk = Object.keys(node).find(k => k.startsWith("__reactProps$"));
           if (pk && node[pk]) {
             const props = node[pk];
             const synth = { type: "click", target: node, currentTarget: node, clientX: cx, clientY: cy, preventDefault() {}, stopPropagation() {}, nativeEvent: new MouseEvent("click"), persist() {}, bubbles: true };
-            if (props.onClick) { props.onClick(synth); break; }
-            if (props.onMouseDown) { props.onMouseDown({ ...synth, type: "mousedown" }); break; }
+            if (props.onClick) { props.onClick(synth); reactFired = true; break; }
+            if (props.onMouseDown) { props.onMouseDown({ ...synth, type: "mousedown" }); reactFired = true; break; }
           }
           node = node.parentElement;
         }
 
+        // A-tag fallback: if React Router didn't navigate, trigger href directly
+        if (!reactFired || !location.href.includes("__mcp_nav")) {
+          const aTag = el.closest ? el.closest("a[href]") : null;
+          if (aTag && aTag.href && !aTag.href.startsWith("javascript:") && aTag.href !== location.href) {
+            location.href = aTag.href;
+            return "Navigated to: " + aTag.href;
+          }
+        }
+
         return "Clicked: " + el.tagName + (el.textContent ? ' "' + el.textContent.trim().substring(0, 50) + '"' : "");
       }, [payload.selector, payload.text, payload.x, payload.y]);
+    }
+
+    // --- Click + Read (combo — saves 1 full MCP round-trip) ---
+    case "click_and_read": {
+      const tab = await getActiveTab();
+
+      // Click
+      await browser.scripting.executeScript({
+        target: { tabId: tab.id },
+        world: "MAIN",
+        func: (selector, text, x, y) => {
+          let el = null;
+          if (selector) {
+            el = document.querySelector(selector);
+          } else if (text) {
+            const attrEls = document.querySelectorAll("[aria-label],[placeholder],[title]");
+            for (let i = 0; i < attrEls.length; i++) {
+              const a = attrEls[i];
+              const vals = [a.getAttribute("aria-label"), a.getAttribute("placeholder"), a.getAttribute("title")].filter(Boolean);
+              if (vals.some(v => v === text || v.includes(text))) {
+                const r = a.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0) { el = a; break; }
+              }
+            }
+            if (!el) {
+              const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+              let best = null, bestArea = Infinity;
+              while (tw.nextNode()) {
+                const t = tw.currentNode.textContent.trim();
+                if (!t || !(t === text || t.includes(text))) continue;
+                const parent = tw.currentNode.parentElement;
+                if (!parent) continue;
+                const r = parent.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0 && r.width * r.height < bestArea) {
+                  best = parent; bestArea = r.width * r.height;
+                }
+              }
+              el = best;
+            }
+          } else if (x !== undefined && y !== undefined) {
+            el = document.elementFromPoint(x, y);
+          }
+          if (!el) return;
+          el.scrollIntoView({ block: "center" });
+          const r = el.getBoundingClientRect();
+          const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+          const s = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, button: 0, detail: 1 };
+          const po = { ...s, pointerId: 1, pointerType: "mouse", isPrimary: true, width: 1, height: 1, pressure: 0.5 };
+          el.dispatchEvent(new PointerEvent("pointerdown", { ...po, buttons: 1 }));
+          el.dispatchEvent(new MouseEvent("mousedown", { ...s, buttons: 1 }));
+          if (el.focus) el.focus();
+          el.dispatchEvent(new PointerEvent("pointerup", { ...po, buttons: 0, pressure: 0 }));
+          el.dispatchEvent(new MouseEvent("mouseup", { ...s, buttons: 0 }));
+          el.dispatchEvent(new MouseEvent("click", { ...s, buttons: 0 }));
+          // React Fiber
+          let node = el;
+          for (let d = 0; d < 15 && node; d++) {
+            const pk = Object.keys(node).find(k => k.startsWith("__reactProps$"));
+            if (pk && node[pk]) {
+              const props = node[pk];
+              const synth = { type: "click", target: node, currentTarget: node, clientX: cx, clientY: cy, preventDefault() {}, stopPropagation() {}, nativeEvent: new MouseEvent("click"), persist() {}, bubbles: true };
+              if (props.onClick) { props.onClick(synth); return; }
+              if (props.onMouseDown) { props.onMouseDown({ ...synth, type: "mousedown" }); return; }
+            }
+            node = node.parentElement;
+          }
+          // A-tag fallback
+          const a = el.closest ? el.closest("a[href]") : null;
+          if (a && a.href && !a.href.startsWith("javascript:") && a.href !== location.href) {
+            location.href = a.href;
+          }
+        },
+        args: [payload.selector, payload.text, payload.x, payload.y],
+      });
+
+      // Wait for update/navigation
+      const waitMs = payload.wait || 800;
+      await sleep(waitMs);
+
+      // Check if tab is still loading (navigation happened)
+      const currentTab = await browser.tabs.get(tab.id).catch(() => null);
+      if (currentTab?.status === "loading") {
+        await waitForTabLoad(tab.id, 10000);
+      }
+
+      // Read updated page
+      const maxLen = payload.maxLength || 50000;
+      const results = await browser.scripting.executeScript({
+        target: { tabId: tab.id },
+        world: "MAIN",
+        func: (ml) => JSON.stringify({ title: document.title, url: location.href, text: document.body.innerText.substring(0, ml) }),
+        args: [maxLen],
+      });
+      return results[0]?.result;
     }
 
     case "fill": {
@@ -337,34 +449,41 @@ async function handleCommand(type, payload) {
 
 // ========== HELPERS ==========
 
+// Cache active tab ID — avoid browser.tabs.query on every call
+let _cachedTabId = null;
+
+browser.tabs.onActivated.addListener(({ tabId }) => {
+  _cachedTabId = tabId;
+});
+
+browser.tabs.onRemoved.addListener((tabId) => {
+  if (_cachedTabId === tabId) _cachedTabId = null;
+});
+
 async function getActiveTab() {
+  if (_cachedTabId !== null) {
+    try {
+      const tab = await browser.tabs.get(_cachedTabId);
+      if (tab.active) return tab;
+    } catch {}
+    _cachedTabId = null;
+  }
   const tabs = await browser.tabs.query({ active: true, currentWindow: true });
   if (!tabs[0]) throw new Error("No active tab");
+  _cachedTabId = tabs[0].id;
   return tabs[0];
 }
 
-// Execute a function in the active tab via scripting API
+// Execute a function in the active tab — MAIN world for full page access (React Fiber, etc.)
 async function execInTab(func, args = []) {
   const tab = await getActiveTab();
   const results = await browser.scripting.executeScript({
     target: { tabId: tab.id },
+    world: "MAIN",
     func,
     args,
   });
   return results[0]?.result;
-}
-
-// Send message to content script and wait for response
-async function sendToContentScript(tabId, message) {
-  return new Promise((resolve, reject) => {
-    browser.tabs.sendMessage(tabId, message, (response) => {
-      if (browser.runtime.lastError) {
-        reject(new Error(browser.runtime.lastError.message));
-      } else {
-        resolve(response);
-      }
-    });
-  });
 }
 
 function waitForTabLoad(tabId, timeout = 30000) {

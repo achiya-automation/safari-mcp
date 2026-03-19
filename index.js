@@ -203,6 +203,31 @@ server.tool(
 );
 
 server.tool(
+  "safari_click_and_read",
+  "Click an element then return the updated page — saves 1 full round-trip vs separate click+read_page. Handles both React Router navigation and full page loads.",
+  {
+    text: z.string().optional().describe("Visible text of the element to click"),
+    selector: z.string().optional().describe("CSS selector"),
+    x: z.coerce.number().optional().describe("X coordinate"),
+    y: z.coerce.number().optional().describe("Y coordinate"),
+    wait: z.coerce.number().optional().describe("Ms to wait after click (default: 800)"),
+    maxLength: z.coerce.number().optional().describe("Max chars to return (default: 50000)"),
+  },
+  async (args) => {
+    const result = await extensionOrFallback(
+      "click_and_read",
+      { selector: args.selector, text: args.text, x: args.x, y: args.y, wait: args.wait, maxLength: args.maxLength },
+      async () => {
+        await safari.click(args);
+        await new Promise(r => setTimeout(r, args.wait || 800));
+        return safari.readPage({ maxLength: args.maxLength });
+      }
+    );
+    return { content: [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result) }] };
+  }
+);
+
+server.tool(
   "safari_double_click",
   "Double-click an element by CSS selector or x/y coordinates (e.g. to select a word in text)",
   {
