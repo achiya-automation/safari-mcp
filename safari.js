@@ -171,6 +171,7 @@ const RESOLVE_CACHE_MS = 5000; // Re-verify tab every 5 seconds max
 
 export function getActiveTabIndex() { return _activeTabIndex; }
 export function setActiveTabIndex(idx) { _activeTabIndex = idx; }
+export function getActiveTabURL() { return _activeTabURL; }
 
 // Resolve our tracked URL to current tab index — single osascript call (fast!)
 async function resolveActiveTab() {

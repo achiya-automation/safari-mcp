@@ -79,10 +79,13 @@ function sendToExtension(type, payload = {}, timeoutMs = 30000) {
 }
 
 // Try extension first, fall back to AppleScript
+// Automatically injects tabUrl so the extension targets the MCP's tab, not the user's active tab
 async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) {
   if (_extensionConnected) {
     try {
-      return await sendToExtension(extensionType, extensionPayload);
+      const tabUrl = safari.getActiveTabURL();
+      const payload = tabUrl ? { ...extensionPayload, tabUrl } : extensionPayload;
+      return await sendToExtension(extensionType, payload);
     } catch {
       // Extension failed — fall back to AppleScript
     }

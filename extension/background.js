@@ -70,49 +70,47 @@ function keepAlive() {
 // ========== COMMAND HANDLERS ==========
 
 async function handleCommand(type, payload) {
+  // Find the MCP's specific tab (by URL if provided), never touch user's active tab blindly
+  const targetTab = await getTargetTab(payload.tabUrl);
+  const tabId = targetTab.id;
+
   switch (type) {
     // --- Navigation ---
     case "navigate": {
-      const tab = await getActiveTab();
-      await browser.tabs.update(tab.id, { url: payload.url });
-      await waitForTabLoad(tab.id, payload.timeout || 30000);
-      const updated = await browser.tabs.get(tab.id);
+      await browser.tabs.update(tabId, { url: payload.url });
+      await waitForTabLoad(tabId, payload.timeout || 30000);
+      const updated = await browser.tabs.get(tabId);
       return { title: updated.title, url: updated.url };
     }
 
     case "go_back": {
-      const tab = await getActiveTab();
-      await browser.tabs.goBack(tab.id);
+      await browser.tabs.goBack(tabId);
       await sleep(500);
-      const updated = await browser.tabs.get(tab.id);
+      const updated = await browser.tabs.get(tabId);
       return { title: updated.title, url: updated.url };
     }
 
     case "go_forward": {
-      const tab = await getActiveTab();
-      await browser.tabs.goForward(tab.id);
+      await browser.tabs.goForward(tabId);
       await sleep(500);
-      const updated = await browser.tabs.get(tab.id);
+      const updated = await browser.tabs.get(tabId);
       return { title: updated.title, url: updated.url };
     }
 
     case "reload": {
-      const tab = await getActiveTab();
-      await browser.tabs.reload(tab.id, { bypassCache: payload.hard || false });
-      await waitForTabLoad(tab.id);
-      const updated = await browser.tabs.get(tab.id);
+      await browser.tabs.reload(tabId, { bypassCache: payload.hard || false });
+      await waitForTabLoad(tabId);
+      const updated = await browser.tabs.get(tabId);
       return { title: updated.title, url: updated.url };
     }
 
     // --- Page Info ---
     case "get_url": {
-      const tab = await getActiveTab();
-      return tab.url;
+      return targetTab.url;
     }
 
     case "get_title": {
-      const tab = await getActiveTab();
-      return tab.title;
+      return targetTab.title;
     }
 
     case "read_page": {
@@ -123,7 +121,7 @@ async function handleCommand(type, payload) {
           return el.value !== undefined && el.value !== "" ? el.value.substring(0, maxLen) : (el.innerText || el.textContent || "").substring(0, maxLen);
         }
         return JSON.stringify({ title: document.title, url: location.href, text: document.body.innerText.substring(0, maxLen) });
-      }, [payload.selector || null, payload.maxLength || 50000]);
+      }, [payload.selector || null, payload.maxLength || 50000], tabId);
     }
 
     // --- JavaScript Execution — direct eval in MAIN world (fast, no polling) ---
@@ -136,7 +134,7 @@ async function handleCommand(type, payload) {
         } catch (e) {
           return "Error: " + e.message;
         }
-      }, [payload.script]);
+      }, [payload.script], tabId);
     }
 
     // --- Screenshot ---
@@ -218,26 +216,22 @@ async function handleCommand(type, payload) {
           node = node.parentElement;
         }
 
-        // A-tag fallback: if React Router didn't navigate, trigger href directly
-        if (!reactFired || !location.href.includes("__mcp_nav")) {
-          const aTag = el.closest ? el.closest("a[href]") : null;
-          if (aTag && aTag.href && !aTag.href.startsWith("javascript:") && aTag.href !== location.href) {
-            location.href = aTag.href;
-            return "Navigated to: " + aTag.href;
-          }
+        // A-tag fallback: always navigate via href for link elements
+        const aTag = el.closest ? el.closest("a[href]") : null;
+        if (aTag && aTag.href && !aTag.href.startsWith("javascript:") && aTag.href !== location.href) {
+          location.href = aTag.href;
+          return "Navigated to: " + aTag.href;
         }
 
         return "Clicked: " + el.tagName + (el.textContent ? ' "' + el.textContent.trim().substring(0, 50) + '"' : "");
-      }, [payload.selector, payload.text, payload.x, payload.y]);
+      }, [payload.selector, payload.text, payload.x, payload.y], tabId);
     }
 
     // --- Click + Read (combo — saves 1 full MCP round-trip) ---
     case "click_and_read": {
-      const tab = await getActiveTab();
-
       // Click
       await browser.scripting.executeScript({
-        target: { tabId: tab.id },
+        target: { tabId },
         world: "MAIN",
         func: (selector, text, x, y) => {
           let el = null;
@@ -309,15 +303,15 @@ async function handleCommand(type, payload) {
       await sleep(waitMs);
 
       // Check if tab is still loading (navigation happened)
-      const currentTab = await browser.tabs.get(tab.id).catch(() => null);
+      const currentTab = await browser.tabs.get(tabId).catch(() => null);
       if (currentTab?.status === "loading") {
-        await waitForTabLoad(tab.id, 10000);
+        await waitForTabLoad(tabId, 10000);
       }
 
       // Read updated page
       const maxLen = payload.maxLength || 50000;
       const results = await browser.scripting.executeScript({
-        target: { tabId: tab.id },
+        target: { tabId },
         world: "MAIN",
         func: (ml) => JSON.stringify({ title: document.title, url: location.href, text: document.body.innerText.substring(0, ml) }),
         args: [maxLen],
@@ -344,7 +338,7 @@ async function handleCommand(type, payload) {
           el.value = value;
         }
         return "Filled: " + selector;
-      }, [payload.selector, payload.value]);
+      }, [payload.selector, payload.value], tabId);
     }
 
     case "type_text": {
@@ -352,7 +346,7 @@ async function handleCommand(type, payload) {
         if (selector) { const el = document.querySelector(selector); if (el) el.focus(); }
         document.execCommand("insertText", false, text);
         return "Typed " + text.length + " chars";
-      }, [payload.text, payload.selector]);
+      }, [payload.text, payload.selector], tabId);
     }
 
     case "press_key": {
@@ -369,7 +363,7 @@ async function handleCommand(type, payload) {
         el.dispatchEvent(new KeyboardEvent("keypress", opts));
         el.dispatchEvent(new KeyboardEvent("keyup", opts));
         return "Pressed: " + key;
-      }, [payload.key, payload.modifiers]);
+      }, [payload.key, payload.modifiers], tabId);
     }
 
     // --- Tab Management ---
@@ -379,9 +373,9 @@ async function handleCommand(type, payload) {
     }
 
     case "new_tab": {
-      const tab = await browser.tabs.create({ url: payload.url || "about:blank", active: false });
-      if (payload.url) await waitForTabLoad(tab.id);
-      const updated = await browser.tabs.get(tab.id);
+      const newTab = await browser.tabs.create({ url: payload.url || "about:blank", active: false });
+      if (payload.url) await waitForTabLoad(newTab.id);
+      const updated = await browser.tabs.get(newTab.id);
       return { title: updated.title, url: updated.url, tabIndex: updated.index + 1 };
     }
 
@@ -391,8 +385,7 @@ async function handleCommand(type, payload) {
         const target = tabs[payload.index - 1];
         if (target) await browser.tabs.remove(target.id);
       } else {
-        const tab = await getActiveTab();
-        await browser.tabs.remove(tab.id);
+        await browser.tabs.remove(tabId);
       }
       return "Tab closed";
     }
@@ -410,7 +403,7 @@ async function handleCommand(type, payload) {
       return await execInTab((dir, amount) => {
         window.scrollBy(0, dir === "up" ? -amount : amount);
         return "Scrolled " + dir + " " + amount + "px";
-      }, [payload.direction || "down", payload.amount || 500]);
+      }, [payload.direction || "down", payload.amount || 500], tabId);
     }
 
     // --- Wait ---
@@ -423,7 +416,7 @@ async function handleCommand(type, payload) {
           await new Promise(r => setTimeout(r, 200));
         }
         return "TIMEOUT";
-      }, [payload.selector, payload.text, payload.timeout || 10000]);
+      }, [payload.selector, payload.text, payload.timeout || 10000], tabId);
     }
 
     // --- Hover ---
@@ -439,7 +432,7 @@ async function handleCommand(type, payload) {
         el.dispatchEvent(new PointerEvent("pointerenter", opts));
         el.dispatchEvent(new MouseEvent("mouseenter", opts));
         return "Hovered: " + el.tagName;
-      }, [payload.selector]);
+      }, [payload.selector], tabId);
     }
 
     default:
@@ -460,6 +453,21 @@ browser.tabs.onRemoved.addListener((tabId) => {
   if (_cachedTabId === tabId) _cachedTabId = null;
 });
 
+// Find tab by URL (MCP's working tab) — never use user's active tab blindly
+async function getTargetTab(tabUrl) {
+  if (tabUrl) {
+    // Find the MCP's specific tab by URL (partial match from start)
+    const all = await browser.tabs.query({ currentWindow: true });
+    const match = all.find(t => t.url && (t.url.startsWith(tabUrl) || tabUrl.startsWith(t.url.split('?')[0])));
+    if (match) {
+      _cachedTabId = match.id;
+      return match;
+    }
+  }
+  // No specific URL — use active tab (default)
+  return getActiveTab();
+}
+
 async function getActiveTab() {
   if (_cachedTabId !== null) {
     try {
@@ -474,11 +482,11 @@ async function getActiveTab() {
   return tabs[0];
 }
 
-// Execute a function in the active tab — MAIN world for full page access (React Fiber, etc.)
-async function execInTab(func, args = []) {
-  const tab = await getActiveTab();
+// Execute a function in the MCP's tab — MAIN world for full page access (React Fiber, etc.)
+async function execInTab(func, args = [], tabId = null) {
+  const id = tabId || (await getActiveTab()).id;
   const results = await browser.scripting.executeScript({
-    target: { tabId: tab.id },
+    target: { tabId: id },
     world: "MAIN",
     func,
     args,
