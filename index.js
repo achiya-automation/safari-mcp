@@ -103,8 +103,11 @@ server.tool(
   "Navigate to a URL in Safari. Waits for page to fully load.",
   { url: z.string().describe("URL to navigate to") },
   async ({ url }) => {
-    const result = await safari.navigate(url);
-    return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    const result = await extensionOrFallback(
+      "navigate", { url },
+      () => safari.navigate(url)
+    );
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
 
@@ -148,8 +151,11 @@ server.tool(
     maxLength: z.coerce.number().optional().describe("Max chars to return (default: 50000)"),
   },
   async ({ selector, maxLength }) => {
-    const result = await safari.readPage({ selector, maxLength });
-    return { content: [{ type: "text", text: result }] };
+    const result = await extensionOrFallback(
+      "read_page", { selector, maxLength },
+      () => safari.readPage({ selector, maxLength })
+    );
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
 
@@ -188,8 +194,11 @@ server.tool(
     y: z.coerce.number().optional().describe("Y coordinate"),
   },
   async (args) => {
-    const result = await safari.click(args);
-    return { content: [{ type: "text", text: result }] };
+    const result = await extensionOrFallback(
+      "click", { selector: args.selector, text: args.text, x: args.x, y: args.y },
+      () => safari.click(args)
+    );
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
 
@@ -313,7 +322,10 @@ server.tool(
     fullPage: z.boolean().optional().describe("Capture full page (not just viewport)"),
   },
   async ({ fullPage }) => {
-    const base64 = await safari.screenshot({ fullPage });
+    const base64 = await extensionOrFallback(
+      "screenshot", { fullPage },
+      () => safari.screenshot({ fullPage })
+    );
     return {
       content: [{ type: "image", data: base64, mimeType: "image/png" }],
     };
@@ -367,8 +379,11 @@ server.tool(
   "List all open tabs in Safari with their titles and URLs",
   {},
   async () => {
-    const result = await safari.listTabs();
-    return { content: [{ type: "text", text: result }] };
+    const result = await extensionOrFallback(
+      "list_tabs", {},
+      () => safari.listTabs()
+    );
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result, null, 2) }] };
   }
 );
 
@@ -377,8 +392,11 @@ server.tool(
   "Open a new tab, optionally with a URL",
   { url: z.string().optional().describe("URL to open (empty for blank tab)") },
   async ({ url }) => {
-    const result = await safari.newTab(url);
-    return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    const result = await extensionOrFallback(
+      "new_tab", { url },
+      () => safari.newTab(url)
+    );
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
 
@@ -425,8 +443,11 @@ server.tool(
   "Execute arbitrary JavaScript in the current page and return the result",
   { script: z.string().describe("JavaScript code to execute") },
   async (args) => {
-    const result = await safari.evaluate(args);
-    return { content: [{ type: "text", text: result || "(no return value)" }] };
+    const result = await extensionOrFallback(
+      "evaluate", { script: args.script },
+      () => safari.evaluate(args)
+    );
+    return { content: [{ type: "text", text: (typeof result === 'string' ? result : JSON.stringify(result)) || "(no return value)" }] };
   }
 );
 

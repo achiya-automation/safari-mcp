@@ -1,7 +1,8 @@
-// Safari automation layer — dual engine:
-// 1. WebDriver (safaridriver) — fast (~30ms), reliable clicks, screenshots, JS eval
-// 2. AppleScript — tab management, existing tabs, operations WebDriver can't do
-// WebDriver is used for ALL page interactions. AppleScript only for tab listing/management.
+// Safari automation layer — triple engine:
+// 1. Extension (WebSocket) — fastest (~5ms), native browser API, keeps logins
+// 2. WebDriver (safaridriver) — fast (~30ms), clean session (no logins)
+// 3. AppleScript — slow (~80ms), keeps logins, fallback
+// Extension is preferred. AppleScript is fallback when extension is not connected.
 
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
@@ -9,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readFile, writeFile, unlink } from "node:fs/promises";
 import http from "node:http";
+// Extension bridge is handled by index.js (WebSocket server on port 9223)
 
 const execFileAsync = promisify(execFile);
 
