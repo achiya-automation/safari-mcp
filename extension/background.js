@@ -1,70 +1,126 @@
 // Safari MCP Bridge — Background Service Worker
-// Connects to MCP server via WebSocket, executes browser commands
+// Connects to MCP server via WebSocket (Chrome) or HTTP polling (Safari)
+// Safari blocks WebSocket from service workers to localhost — HTTP polling works around this
 
-const WS_URL = "ws://localhost:9223";
+const WS_URL = "ws://127.0.0.1:9223";
+const HTTP_URL = "http://127.0.0.1:9224";
 let ws = null;
 let isConnected = false;
+let transport = "none"; // "websocket" | "http" | "none"
 
-// ========== WEBSOCKET CONNECTION ==========
+// ========== TRANSPORT SELECTION ==========
 
-function connect() {
+async function connect() {
+  // Try WebSocket first (works in Chrome, may work in future Safari)
   try {
     ws = new WebSocket(WS_URL);
-  } catch (e) {
-    setTimeout(connect, 3000);
+    await new Promise((resolve, reject) => {
+      ws.onopen = resolve;
+      ws.onerror = reject;
+      setTimeout(reject, 2000);
+    });
+    transport = "websocket";
+    isConnected = true;
+    setupWebSocket();
+    updateBadge("WS");
     return;
+  } catch {
+    ws = null;
   }
 
-  ws.onopen = () => {
-    isConnected = true;
-    browser.action.setBadgeText({ text: "ON" });
-    browser.action.setBadgeBackgroundColor({ color: "#4CAF50" });
-    keepAlive();
-  };
-
-  ws.onclose = () => {
-    isConnected = false;
-    ws = null;
-    browser.action.setBadgeText({ text: "" });
-    setTimeout(connect, 3000);
-  };
-
-  ws.onerror = () => {
-    ws?.close();
-  };
-
-  ws.onmessage = async (event) => {
-    let msg;
-    try {
-      msg = JSON.parse(event.data);
-    } catch {
+  // Fall back to HTTP polling (Safari)
+  try {
+    const res = await fetch(`${HTTP_URL}/connect`, { method: "POST" });
+    if (res.ok) {
+      transport = "http";
+      isConnected = true;
+      updateBadge("ON");
+      pollForCommands();
       return;
     }
+  } catch {}
 
-    try {
-      const result = await handleCommand(msg.type, msg.payload || {});
-      ws.send(JSON.stringify({
-        type: "response",
-        id: msg.id,
-        result,
-        error: null,
-      }));
-    } catch (err) {
-      ws.send(JSON.stringify({
-        type: "response",
-        id: msg.id,
-        result: null,
-        error: err.message || String(err),
-      }));
-    }
-  };
+  // Neither worked — retry in 3s
+  updateBadge("");
+  setTimeout(connect, 3000);
 }
 
-// Keep service worker alive (Safari kills after 30s idle)
+function updateBadge(text) {
+  browser.action.setBadgeText({ text });
+  if (text) browser.action.setBadgeBackgroundColor({ color: "#4CAF50" });
+}
+
+// ========== WEBSOCKET TRANSPORT ==========
+
+function setupWebSocket() {
+  ws.onclose = () => {
+    isConnected = false;
+    transport = "none";
+    ws = null;
+    updateBadge("");
+    setTimeout(connect, 3000);
+  };
+  ws.onerror = () => ws?.close();
+  ws.onmessage = async (event) => {
+    let msg;
+    try { msg = JSON.parse(event.data); } catch { return; }
+    await executeAndReply(msg);
+  };
+  keepAlive();
+}
+
 function keepAlive() {
-  if (!isConnected) return;
+  if (transport !== "websocket") return;
   ws?.send(JSON.stringify({ type: "keepalive" }));
   setTimeout(keepAlive, 5000);
+}
+
+// ========== HTTP POLLING TRANSPORT ==========
+
+async function pollForCommands() {
+  while (transport === "http") {
+    try {
+      const res = await fetch(`${HTTP_URL}/poll`);
+      if (res.status === 200) {
+        const msg = await res.json();
+        await executeAndReply(msg);
+      }
+      // 204 = no command, just loop
+    } catch {
+      // Server gone — reconnect
+      isConnected = false;
+      transport = "none";
+      updateBadge("");
+      setTimeout(connect, 3000);
+      return;
+    }
+  }
+}
+
+// ========== SHARED: Execute command and send response ==========
+
+async function executeAndReply(msg) {
+  if (!msg || !msg.id || !msg.type) return;
+
+  let response;
+  try {
+    const result = await handleCommand(msg.type, msg.payload || {});
+    response = { type: "response", id: msg.id, result, error: null };
+  } catch (err) {
+    response = { type: "response", id: msg.id, result: null, error: err.message || String(err) };
+  }
+
+  if (transport === "websocket" && ws) {
+    ws.send(JSON.stringify(response));
+  } else if (transport === "http") {
+    try {
+      await fetch(`${HTTP_URL}/result`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(response),
+      });
+    } catch {}
+  }
 }
 
 // ========== COMMAND HANDLERS ==========
@@ -516,5 +572,17 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
+// ========== KEEP-ALIVE VIA ALARMS ==========
+// Safari kills service workers after ~30s of inactivity.
+// browser.alarms wakes the worker periodically.
+try {
+  browser.alarms.create("keepalive", { periodInMinutes: 1 });
+  browser.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === "keepalive" && (!isConnected || transport === "none")) {
+      connect();
+    }
+  });
+} catch {}
+
 // ========== STARTUP ==========
-connect();
+setTimeout(connect, 100);

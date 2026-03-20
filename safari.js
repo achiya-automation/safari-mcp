@@ -1,162 +1,55 @@
-// Safari automation layer — triple engine:
+// Safari automation layer — dual engine:
 // 1. Extension (WebSocket) — fastest (~5ms), native browser API, keeps logins
-// 2. WebDriver (safaridriver) — fast (~30ms), clean session (no logins)
-// 3. AppleScript — slow (~80ms), keeps logins, fallback
+// 2. AppleScript + Swift daemon (~5ms) — keeps logins, always available
 // Extension is preferred. AppleScript is fallback when extension is not connected.
 
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { readFile, writeFile, unlink } from "node:fs/promises";
-import http from "node:http";
+import { fileURLToPath } from "node:url";
 // Extension bridge is handled by index.js (WebSocket server on port 9223)
 
 const execFileAsync = promisify(execFile);
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// ========== WEBDRIVER SESSION MANAGEMENT ==========
-const WD_PORT = 4444;
-let _wdSessionId = null;
-let _wdDriverProc = null;
+// ========== SWIFT HELPER DAEMON ==========
+// Persistent process — no subprocess spawn overhead (~5ms vs ~90ms)
+let _helperProc = null;
+const _helperQueue = []; // callbacks waiting for responses
 
-// HTTP helper for WebDriver commands
-function wdRequest(method, path, body) {
-  return new Promise((resolve, reject) => {
-    const opts = {
-      hostname: "localhost",
-      port: WD_PORT,
-      path: `/session${_wdSessionId ? '/' + _wdSessionId : ''}${path}`,
-      method,
-      headers: { "Content-Type": "application/json" },
-      timeout: 30000,
-    };
-    const req = http.request(opts, (res) => {
-      let data = "";
-      res.on("data", (chunk) => (data += chunk));
-      res.on("end", () => {
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed.value && parsed.value.error) {
-            reject(new Error(`WebDriver: ${parsed.value.message || parsed.value.error}`));
-          } else {
-            resolve(parsed.value);
-          }
-        } catch {
-          resolve(data);
-        }
-      });
-    });
-    req.on("error", reject);
-    req.on("timeout", () => { req.destroy(); reject(new Error("WebDriver timeout")); });
-    if (body) req.write(JSON.stringify(body));
-    req.end();
-  });
+// Reject all pending callbacks when helper crashes
+function _drainHelperQueue(reason) {
+  while (_helperQueue.length > 0) {
+    const cb = _helperQueue.shift();
+    if (cb) cb(JSON.stringify({ error: reason }));
+  }
 }
 
-// Start safaridriver + create session (called lazily on first use)
-async function ensureWebDriver() {
-  if (_wdSessionId) {
-    // Verify session is alive
-    try {
-      await wdRequest("GET", "/url");
-      return;
-    } catch {
-      _wdSessionId = null; // Session died, recreate
-    }
-  }
-
-  // Start safaridriver if not running
+function startHelper() {
+  const helperPath = join(__dirname, "safari-helper");
   try {
-    await new Promise((resolve, reject) => {
-      const req = http.request({ hostname: "localhost", port: WD_PORT, path: "/status", method: "GET", timeout: 1000 }, (res) => {
-        let d = ""; res.on("data", c => d += c); res.on("end", () => resolve(d));
-      });
-      req.on("error", reject);
-      req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
-      req.end();
-    });
-  } catch {
-    // safaridriver not running — start it
-    _wdDriverProc = spawn("safaridriver", ["-p", String(WD_PORT)], {
-      stdio: "ignore", detached: true,
-    });
-    _wdDriverProc.unref();
-    // Wait for it to be ready
-    for (let i = 0; i < 20; i++) {
-      try {
-        await new Promise((resolve, reject) => {
-          const req = http.request({ hostname: "localhost", port: WD_PORT, path: "/status", method: "GET", timeout: 500 }, (res) => {
-            let d = ""; res.on("data", c => d += c); res.on("end", () => resolve(d));
-          });
-          req.on("error", reject);
-          req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
-          req.end();
-        });
-        break;
-      } catch {
-        await new Promise(r => setTimeout(r, 300));
+    _helperProc = spawn(helperPath, [], { stdio: ["pipe", "pipe", "ignore"] });
+    let _buf = "";
+    _helperProc.stdout.on("data", (chunk) => {
+      _buf += chunk.toString();
+      const lines = _buf.split("\n");
+      _buf = lines.pop(); // Keep incomplete line
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const cb = _helperQueue.shift();
+        if (cb) cb(line);
       }
-    }
-  }
-
-  // Create session
-  const result = await new Promise((resolve, reject) => {
-    const body = JSON.stringify({ capabilities: { alwaysMatch: { browserName: "safari" } } });
-    const req = http.request({
-      hostname: "localhost", port: WD_PORT, path: "/session", method: "POST",
-      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
-      timeout: 15000,
-    }, (res) => {
-      let d = ""; res.on("data", c => d += c);
-      res.on("end", () => { try { resolve(JSON.parse(d)); } catch { reject(new Error(d)); } });
     });
-    req.on("error", reject);
-    req.on("timeout", () => { req.destroy(); reject(new Error("Session timeout")); });
-    req.write(body);
-    req.end();
-  });
-
-  _wdSessionId = result.value?.sessionId;
-  if (!_wdSessionId) throw new Error("Failed to create WebDriver session");
+    _helperProc.on("error", () => { _drainHelperQueue("helper process error"); _helperProc = null; });
+    _helperProc.on("exit", () => { _drainHelperQueue("helper process exited"); _helperProc = null; });
+  } catch {
+    _helperProc = null;
+  }
 }
 
-// Execute JS via WebDriver (fast — ~30ms)
-async function wdEval(script, args = []) {
-  await ensureWebDriver();
-  const result = await wdRequest("POST", "/execute/sync", { script, args });
-  return result;
-}
-
-// Execute async JS via WebDriver
-async function wdEvalAsync(script, args = []) {
-  await ensureWebDriver();
-  return wdRequest("POST", "/execute/async", { script, args });
-}
-
-// Navigate via WebDriver
-async function wdNavigate(url) {
-  await ensureWebDriver();
-  await wdRequest("POST", "/url", { url });
-  return wdRequest("GET", "/url");
-}
-
-// Screenshot via WebDriver (returns base64)
-async function wdScreenshot() {
-  await ensureWebDriver();
-  return wdRequest("GET", "/screenshot");
-}
-
-// Get current URL via WebDriver
-async function wdGetUrl() {
-  await ensureWebDriver();
-  return wdRequest("GET", "/url");
-}
-
-// Get title via WebDriver
-async function wdGetTitle() {
-  await ensureWebDriver();
-  return wdRequest("GET", "/title");
-}
+startHelper();
 
 // ========== ACTIVE TAB TRACKING ==========
 // Instead of visually switching tabs (which interrupts the user),
@@ -164,14 +57,49 @@ async function wdGetTitle() {
 // when the user opens/closes tabs). Before each operation we resolve the URL
 // to the current index.
 let _activeTabIndex = null; // null = use front document (default)
-let _useWebDriver = false;  // true = use WebDriver for current tab (much faster)
 let _activeTabURL = null;   // URL-based tracking (stable even when tabs shift)
 let _lastResolveTime = 0;   // Cache: skip resolve if verified recently
 const RESOLVE_CACHE_MS = 5000; // Re-verify tab every 5 seconds max
 
+// ========== PROFILE TARGETING ==========
+// Set SAFARI_PROFILE env var to target a specific Safari profile window.
+// Safari shows profile windows as: "ProfileName — Tab Title"
+const SAFARI_PROFILE = process.env.SAFARI_PROFILE || null;
+let _targetWindowRef = 'front window'; // Updated by refreshTargetWindow()
+let _targetWindowCacheTime = 0;
+const TARGET_WINDOW_CACHE_MS = 5000;
+
+async function refreshTargetWindow(force = false) {
+  if (!SAFARI_PROFILE) return;
+  const now = Date.now();
+  if (!force && _targetWindowRef !== 'front window' && (now - _targetWindowCacheTime) < TARGET_WINDOW_CACHE_MS) return;
+  const safeProfile = SAFARI_PROFILE.replace(/"/g, '\\"');
+  const result = await osascriptFast(
+    `tell application "Safari"\n  repeat with w in every window\n    if name of w starts with "${safeProfile} \u2014" then return id of w\n  end repeat\n  return 0\nend tell`
+  ).catch(() => '0');
+  const id = Number(result);
+  if (id > 0) {
+    _targetWindowRef = `window id ${id}`;
+    _targetWindowCacheTime = now;
+  }
+}
+
+// Initialize profile window at startup (ES module top-level await)
+if (SAFARI_PROFILE) {
+  await new Promise(r => setTimeout(r, 50)); // Let helper process initialize
+  await refreshTargetWindow(true);
+}
+
+// Detect stale window ID errors and invalidate cache
+function isStaleWindowError(err) {
+  const msg = (err && (err.message || err.stderr || String(err))) || '';
+  return /window id \d+/.test(msg) && /(-1728|-10006)/.test(msg);
+}
+
 export function getActiveTabIndex() { return _activeTabIndex; }
 export function setActiveTabIndex(idx) { _activeTabIndex = idx; }
 export function getActiveTabURL() { return _activeTabURL; }
+export function setActiveTabURL(url) { _activeTabURL = url; _lastResolveTime = Date.now(); }
 
 // Resolve our tracked URL to current tab index — single osascript call (fast!)
 async function resolveActiveTab() {
@@ -181,7 +109,7 @@ async function resolveActiveTab() {
     // If we have a known index, verify it first (O(1) instead of searching all tabs)
     if (_activeTabIndex) {
       const currentUrl = await osascriptFast(
-        `tell application "Safari" to return URL of tab ${_activeTabIndex} of front window`
+        `tell application "Safari" to return URL of tab ${_activeTabIndex} of ${_targetWindowRef}`
       ).catch(() => "");
       if (currentUrl && currentUrl.startsWith(_activeTabURL)) {
         return _activeTabIndex; // Same tab, same URL — no change needed
@@ -190,9 +118,9 @@ async function resolveActiveTab() {
     // Index shifted — search from the END (our tab is usually the newest)
     const idx = await osascriptFast(
       `tell application "Safari"
-        set tabCount to count of tabs of front window
+        set tabCount to count of tabs of ${_targetWindowRef}
         repeat with i from tabCount to 1 by -1
-          if URL of tab i of front window starts with "${safeUrl}" then return i
+          if URL of tab i of ${_targetWindowRef} starts with "${safeUrl}" then return i
         end repeat
         return 0
       end tell`
@@ -207,9 +135,9 @@ async function resolveActiveTab() {
     const safeDomain = domain.replace(/"/g, '\\"');
     const idx2 = await osascriptFast(
       `tell application "Safari"
-        set tabCount to count of tabs of front window
+        set tabCount to count of tabs of ${_targetWindowRef}
         repeat with i from tabCount to 1 by -1
-          if URL of tab i of front window contains "${safeDomain}" then return i
+          if URL of tab i of ${_targetWindowRef} contains "${safeDomain}" then return i
         end repeat
         return 0
       end tell`
@@ -232,40 +160,6 @@ async function resolveActiveTab() {
 // Instead, we use execFile for every call (~80ms each).
 // Optimization: for runJS we write to temp file and execute (avoids arg escaping).
 
-// withoutStealingFocus: just run the function.
-// All Safari MCP operations use `tell application "Safari"` (not `activate`)
-// and `do JavaScript` — neither steals focus. No restore needed.
-async function withoutStealingFocus(fn) {
-  // Save the frontmost app BEFORE touching Safari
-  let prevApp = null;
-  try {
-    prevApp = await osascriptFast(
-      'tell application "System Events" to return name of first application process whose frontmost is true'
-    );
-  } catch (_) {}
-
-  const result = await fn();
-
-  // If Safari stole focus, give it back to the previous app
-  if (prevApp && prevApp !== "Safari") {
-    try {
-      await osascriptFast(
-        `tell application "${prevApp}" to activate`
-      );
-    } catch (_) {}
-  }
-
-  return result;
-}
-
-// Helper: get title + URL in a single call (instead of 2)
-async function getTitleAndURL() {
-  const result = await runJS(
-    "JSON.stringify({title:document.title,url:location.href})"
-  );
-  try { return JSON.parse(result); } catch { return { title: result, url: "" }; }
-}
-
 // Run AppleScript — uses execFile (safe, isolated, for complex scripts)
 async function osascript(script, { timeout = 10000 } = {}) {
   try {
@@ -275,25 +169,86 @@ async function osascript(script, { timeout = 10000 } = {}) {
     });
     return stdout.trim();
   } catch (err) {
+    // Retry once if the window ID became stale (window reopened/changed)
+    if (isStaleWindowError(err) && SAFARI_PROFILE) {
+      const oldRef = _targetWindowRef;
+      await refreshTargetWindow(true);
+      if (_targetWindowRef !== oldRef) {
+        const retryScript = script.replace(new RegExp(oldRef.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), _targetWindowRef);
+        const { stdout } = await execFileAsync("osascript", ["-e", retryScript], { timeout, maxBuffer: 10 * 1024 * 1024 });
+        return stdout.trim();
+      }
+    }
     throw new Error(`AppleScript error: ${err.stderr || err.message}`);
   }
 }
 
-// osascriptFast = osascript (same thing now, persistent process removed)
+// osascriptFast: uses persistent Swift daemon (~5ms) — 18x faster than subprocess (~90ms)
 async function osascriptFast(script, { timeout = 10000 } = {}) {
+  if (!_helperProc) startHelper();
+  if (_helperProc) {
+    try {
+      return await _osascriptFastHelper(script, timeout);
+    } catch (err) {
+      // Retry once if the window ID became stale
+      if (isStaleWindowError(err) && SAFARI_PROFILE) {
+        const oldRef = _targetWindowRef;
+        await refreshTargetWindow(true);
+        if (_targetWindowRef !== oldRef) {
+          const retryScript = script.replace(new RegExp(oldRef.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), _targetWindowRef);
+          return await _osascriptFastHelper(retryScript, timeout);
+        }
+      }
+      throw err;
+    }
+  }
   return osascript(script, { timeout });
+}
+
+function _osascriptFastHelper(script, timeout) {
+  return new Promise((resolve, reject) => {
+    let resolved = false;
+    const timer = setTimeout(() => {
+      if (resolved) return;
+      resolved = true;
+      const idx = _helperQueue.indexOf(cb);
+      if (idx >= 0) _helperQueue.splice(idx, 1);
+      _helperProc?.kill();
+      _helperProc = null;
+      setTimeout(startHelper, 100);
+      reject(new Error("safari-helper timeout"));
+    }, timeout);
+
+    function cb(line) {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed.error) reject(new Error(parsed.error));
+        else resolve(parsed.result ?? "");
+      } catch {
+        resolve(line);
+      }
+    }
+
+    _helperQueue.push(cb);
+    _helperProc.stdin.write(JSON.stringify({ script }) + "\n");
+  });
 }
 
 // Run JavaScript in Safari — fastest path, no focus stealing
 // Uses osascriptFast (persistent process, ~5ms) for short scripts,
 // falls back to osascript (~80ms) for long scripts that exceed stdin limits
 async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
+  await refreshTargetWindow();
   const escaped = js
+    .replace(/^\s*\/\/[^\n]*$/gm, '')  // Strip // comment-only lines before flattening
     .replace(/\\/g, "\\\\")
     .replace(/"/g, '\\"')
-    .replace(/\n/g, "\\n")
-    .replace(/\r/g, "\\r")
-    .replace(/\t/g, "\\t");
+    .replace(/\n/g, " ")
+    .replace(/\r/g, "")
+    .replace(/\t/g, " ");
   // Resolve tab: explicit tabIndex > cached index > URL-tracked tab > front document
   let idx = tabIndex;
   if (!idx && _activeTabIndex && (Date.now() - _lastResolveTime < RESOLVE_CACHE_MS)) {
@@ -306,7 +261,7 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
   // ALWAYS fall back to _activeTabIndex — never clear it from resolve failures
   if (!idx) idx = _activeTabIndex;
   const target = idx
-    ? `tab ${idx} of front window`
+    ? `tab ${idx} of ${_targetWindowRef}`
     : "front document";
   const script = `tell application "Safari" to do JavaScript "${escaped}" in ${target}`;
   // Use fast path for scripts under 50KB (persistent process handles these well)
@@ -319,17 +274,19 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
 // Run large JavaScript via temp file — bypasses osascript arg length limit (~260KB)
 // Used for operations that embed file data (upload, paste image)
 async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
+  await refreshTargetWindow();
   const idx = tabIndex || _activeTabIndex;
   const target = idx
-    ? `tab ${idx} of front window`
+    ? `tab ${idx} of ${_targetWindowRef}`
     : "front document";
   // Write AppleScript to temp file — the JS is embedded inside the AppleScript
   const escaped = js
+    .replace(/^\s*\/\/[^\n]*$/gm, '')  // Strip // comment-only lines before flattening
     .replace(/\\/g, "\\\\")
     .replace(/"/g, '\\"')
-    .replace(/\n/g, "\\n")
-    .replace(/\r/g, "\\r")
-    .replace(/\t/g, "\\t");
+    .replace(/\n/g, " ")
+    .replace(/\r/g, "")
+    .replace(/\t/g, " ");
   const appleScript = `tell application "Safari" to do JavaScript "${escaped}" in ${target}`;
   const tmpFile = join(tmpdir(), `safari-mcp-${Date.now()}.scpt`);
   await writeFile(tmpFile, appleScript, "utf8");
@@ -347,32 +304,17 @@ async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
 // ========== NAVIGATION ==========
 
 export async function navigate(url) {
+  await refreshTargetWindow();
   let targetUrl = url;
   if (!/^https?:\/\//i.test(targetUrl)) {
     targetUrl = "https://" + targetUrl;
   }
 
-  // WebDriver navigate — fast (~90ms), handles HTTPS, waits for load
-  if (_useWebDriver && _wdSessionId) {
-    try {
-      await wdRequest("POST", "/url", { url: targetUrl });
-      const currentUrl = await wdRequest("GET", "/url");
-      const title = await wdRequest("GET", "/title");
-      _activeTabURL = currentUrl || targetUrl;
-      // Inject click helpers
-      try { await wdEval(`${INJECT_MCP_HELPERS}`); } catch {}
-      return JSON.stringify({ title, url: currentUrl });
-    } catch {
-      // Fall through to AppleScript
-    }
-  }
-
-  // AppleScript navigate
-    const safeUrl = targetUrl.replace(/"/g, '\\"');
+  const safeUrl = targetUrl.replace(/"/g, '\\"');
     // Resolve tab by URL first (in case indices shifted)
     if (_activeTabURL) await resolveActiveTab();
     const navTarget = _activeTabIndex
-      ? `tab ${_activeTabIndex} of front window`
+      ? `tab ${_activeTabIndex} of ${_targetWindowRef}`
       : "front document";
     // Combined: set URL + poll readyState in ONE osascript call (saves 80ms vs 2 calls)
     const result = await osascript(
@@ -390,6 +332,10 @@ export async function navigate(url) {
       end tell`,
       { timeout: 30000 }
     );
+
+    // Update URL tracking after successful navigate
+    _activeTabURL = targetUrl;
+    _lastResolveTime = Date.now();
 
     // Inject click helpers in background (non-blocking, for subsequent clicks)
     runJS(`${INJECT_MCP_HELPERS}`).catch(() => {});
@@ -426,39 +372,32 @@ export async function navigate(url) {
 }
 
 export async function goBack() {
-  // Single call: go back + wait + return title+URL
+  // Single call: navigate back + wait for load + return info
   return runJS(
-    `(async function(){history.back();await new Promise(function(r){setTimeout(r,500)});return JSON.stringify({title:document.title,url:location.href});})()`
+    `(async function(){history.back();for(var i=0;i<30;i++){await new Promise(function(r){setTimeout(r,200)});if(document.readyState==='complete')break;}return JSON.stringify({title:document.title,url:location.href});})()`,
+    { timeout: 10000 }
   );
 }
 
 export async function goForward() {
   return runJS(
-    `(async function(){history.forward();await new Promise(function(r){setTimeout(r,500)});return JSON.stringify({title:document.title,url:location.href});})()`
+    `(async function(){history.forward();for(var i=0;i<30;i++){await new Promise(function(r){setTimeout(r,200)});if(document.readyState==='complete')break;}return JSON.stringify({title:document.title,url:location.href});})()`,
+    { timeout: 10000 }
   );
 }
 
 export async function reload(hardReload = false) {
-  const reload = hardReload ? "location.reload(true)" : "location.reload()";
-  await runJS(reload);
-  // Must wait separately since page reloads and JS context is lost
-  await new Promise((r) => setTimeout(r, 800));
-  return runJS("JSON.stringify({title:document.title,url:location.href})");
+  // Reload destroys JS context — must wait separately then re-query
+  await runJS(hardReload ? "location.reload(true)" : "location.reload()");
+  await new Promise((r) => setTimeout(r, 500));
+  // Poll readyState in a single call
+  return runJS(
+    `(async function(){for(var i=0;i<30;i++){if(document.readyState==='complete')break;await new Promise(function(r){setTimeout(r,200)});}return JSON.stringify({title:document.title,url:location.href});})()`,
+    { timeout: 10000 }
+  );
 }
 
 // ========== PAGE INFO ==========
-
-export async function getTitle() {
-  return osascript(
-    'tell application "Safari" to return name of front document'
-  );
-}
-
-export async function getURL() {
-  return osascript(
-    'tell application "Safari" to return URL of front document'
-  );
-}
 
 export async function readPage({ selector, maxLength = 50000 } = {}) {
   if (selector) {
@@ -485,39 +424,151 @@ export async function getPageSource({ maxLength = 200000 } = {}) {
 
 // Inject click helpers ONCE per page (cached on window.__mcp)
 // Includes: mcpClick (full event sequence), mcpReactClick (React Fiber), mcpFindText (fast TreeWalker)
-const INJECT_MCP_HELPERS = `if(!window.__mcp){window.__mcp=true;
-  window.mcpClick=function(el){
-    if(!el)return false;
-    el.scrollIntoView({block:'center'});
+const INJECT_MCP_HELPERS = `if(window.__mcpVersion!==4){window.__mcpVersion=4;
+  window.__mcpRefs=window.__mcpRefs||{};
+  window.mcpCollectRoots=function(){
+    var roots=[document];
+    var all=document.querySelectorAll('*');
+    for(var i=0;i<all.length;i++){
+      if(all[i].shadowRoot)roots.push(all[i].shadowRoot);
+    }
+    return roots;
+  };
+  window.mcpQuerySelectorDeep=function(selector){
+    try{
+      var direct=document.querySelector(selector);
+      if(direct)return direct;
+    }catch(e){return null}
+    var roots=window.mcpCollectRoots();
+    for(var i=1;i<roots.length;i++){
+      try{
+        var found=roots[i].querySelector(selector);
+        if(found)return found;
+      }catch(e){}
+    }
+    return null;
+  };
+  window.mcpElementFromPoint=function(x,y){
+    var el=document.elementFromPoint(x,y);
+    while(el&&el.shadowRoot){
+      try{
+        if(typeof el.shadowRoot.elementFromPoint!=='function')break;
+        var inner=el.shadowRoot.elementFromPoint(x,y);
+        if(!inner||inner===el)break;
+        el=inner;
+      }catch(e){break}
+    }
+    return el;
+  };
+  window.mcpIsVisible=function(el){
+    if(!el||el.nodeType!==1||!el.isConnected)return false;
+    var cs=window.getComputedStyle(el);
+    if(!cs||cs.display==='none'||cs.visibility==='hidden'||cs.visibility==='collapse'||cs.pointerEvents==='none')return false;
     var r=el.getBoundingClientRect();
+    return r.width>0&&r.height>0;
+  };
+  window.mcpIsActionable=function(el){
+    if(!window.mcpIsVisible(el))return false;
+    if(el.disabled||el.getAttribute('aria-disabled')==='true')return false;
+    if(el.matches&&el.matches('input[type="hidden"]'))return false;
+    return true;
+  };
+  window.mcpPickActionable=function(el){
+    var node=el&&el.nodeType===1?el:(el&&el.parentElement)||null;
+    while(node){
+      if(window.mcpIsActionable(node)&&node.matches&&node.matches('a[href],button,input:not([type="hidden"]),textarea,select,summary,label,option,[role],[onclick],[tabindex],[contenteditable=""],[contenteditable="true"]'))return node;
+      node=node.parentElement;
+    }
+    return el&&el.nodeType===1?el:null;
+  };
+  window.mcpFindByAttr=function(attr,value,selector){
+    if(!value)return null;
+    var roots=window.mcpCollectRoots();
+    var sel=selector||('['+attr+']');
+    for(var i=0;i<roots.length;i++){
+      var els=roots[i].querySelectorAll(sel);
+      for(var j=0;j<els.length;j++){
+        var current=attr==='href'?els[j].href:els[j].getAttribute(attr);
+        if(current===value&&window.mcpIsVisible(els[j]))return els[j];
+      }
+    }
+    return null;
+  };
+  window.mcpNormalizeText=function(value){
+    return String(value||'').replace(/\\s+/g,' ').trim();
+  };
+  window.mcpResolveTarget=function(el){
+    var base=window.mcpPickActionable(el)||el;
+    if(!base)return null;
+    try{base.scrollIntoView({block:'center',inline:'center'});}catch(e){}
+    var r=base.getBoundingClientRect();
+    var dx=Math.min(12,Math.max(4,r.width/4));
+    var dy=Math.min(12,Math.max(4,r.height/4));
+    var pts=[
+      [r.left+r.width/2,r.top+r.height/2],
+      [r.left+dx,r.top+r.height/2],
+      [r.right-dx,r.top+r.height/2],
+      [r.left+r.width/2,r.top+dy],
+      [r.left+r.width/2,r.bottom-dy]
+    ];
+    for(var i=0;i<pts.length;i++){
+      var x=pts[i][0],y=pts[i][1];
+      if(x<0||y<0||x>window.innerWidth||y>window.innerHeight)continue;
+      var hit=window.mcpElementFromPoint(x,y);
+      if(!hit)continue;
+      if(base===hit||base.contains(hit)||hit.contains(base))return window.mcpPickActionable(hit)||hit;
+    }
+    return base;
+  };
+  window.mcpClick=function(el){
+    var target=window.mcpResolveTarget(el);
+    if(!window.mcpIsActionable(target))return false;
+    var r=target.getBoundingClientRect();
     var x=r.left+r.width/2,y=r.top+r.height/2;
+    var beforeUrl=location.href;
+    var anchor=target.closest?target.closest('a[href]'):null;
+    var href=anchor&&anchor.href&&!anchor.href.startsWith('javascript:')?anchor.href:'';
     var s={bubbles:true,cancelable:true,composed:true,view:window,clientX:x,clientY:y,button:0,detail:1};
     var p={...s,pointerId:1,pointerType:'mouse',isPrimary:true,width:1,height:1,pressure:0.5};
-    el.dispatchEvent(new PointerEvent('pointerover',{...p,buttons:0}));
-    el.dispatchEvent(new MouseEvent('mouseover',{...s,buttons:0}));
-    el.dispatchEvent(new PointerEvent('pointerenter',{...p,buttons:0}));
-    el.dispatchEvent(new MouseEvent('mouseenter',{...s,buttons:0}));
-    el.dispatchEvent(new PointerEvent('pointermove',{...p,buttons:0}));
-    el.dispatchEvent(new MouseEvent('mousemove',{...s,buttons:0}));
-    el.dispatchEvent(new PointerEvent('pointerdown',{...p,buttons:1}));
-    el.dispatchEvent(new MouseEvent('mousedown',{...s,buttons:1}));
-    if(el.focus)el.focus();
-    el.dispatchEvent(new PointerEvent('pointerup',{...p,buttons:0,pressure:0}));
-    el.dispatchEvent(new MouseEvent('mouseup',{...s,buttons:0}));
-    el.dispatchEvent(new MouseEvent('click',{...s,buttons:0}));
+    target.dispatchEvent(new PointerEvent('pointerover',{...p,buttons:0}));
+    target.dispatchEvent(new MouseEvent('mouseover',{...s,buttons:0}));
+    target.dispatchEvent(new PointerEvent('pointerenter',{...p,buttons:0}));
+    target.dispatchEvent(new MouseEvent('mouseenter',{...s,buttons:0}));
+    target.dispatchEvent(new PointerEvent('pointermove',{...p,buttons:0}));
+    target.dispatchEvent(new MouseEvent('mousemove',{...s,buttons:0}));
+    target.dispatchEvent(new PointerEvent('pointerdown',{...p,buttons:1}));
+    target.dispatchEvent(new MouseEvent('mousedown',{...s,buttons:1}));
+    if(target.focus){try{target.focus({preventScroll:true});}catch(e){try{target.focus();}catch(_){}}}
+    target.dispatchEvent(new PointerEvent('pointerup',{...p,buttons:0,pressure:0}));
+    target.dispatchEvent(new MouseEvent('mouseup',{...s,buttons:0}));
+    try{
+      if(typeof target.click==='function'){
+        target.click();
+        if(href&&href!==beforeUrl){
+          location.href=href;
+        }
+      }
+    }catch(e){}
+    target.dispatchEvent(new MouseEvent('click',{...s,buttons:0}));
+    if(href&&href!==beforeUrl){
+      location.href=href;
+    }
+    var form=target.closest?target.closest('form'):null;
+    if(form&&(target.type==='submit'||(target.tagName==='BUTTON'&&target.type!=='button'&&target.type!=='reset'))){
+      try{form.submit();}catch(e){}
+    }
     return true;
   };
   window.mcpReactClick=function(el){
-    if(!el)return false;
-    // Build synthetic event with real coordinates from the TARGET element (not original el)
+    var startNode=window.mcpResolveTarget(el)||el;
+    if(!startNode)return false;
     function makeSynth(targetNode, type){
       var r=targetNode.getBoundingClientRect();
       return{type:type||'click',target:targetNode,currentTarget:targetNode,
         clientX:r.left+r.width/2,clientY:r.top+r.height/2,pageX:r.left+r.width/2+window.scrollX,pageY:r.top+r.height/2+window.scrollY,
         preventDefault:function(){},stopPropagation:function(){},nativeEvent:new MouseEvent(type||'click'),persist:function(){},bubbles:true,cancelable:true};
     }
-    // Search React handlers on element AND all parents
-    var node=el;
+    var node=startNode;
     for(var depth=0;depth<15&&node;depth++){
       var pk=Object.keys(node).find(function(k){return k.startsWith('__reactProps$')});
       if(pk&&node[pk]){
@@ -542,44 +593,102 @@ const INJECT_MCP_HELPERS = `if(!window.__mcp){window.__mcp=true;
     }
     return false;
   };
-  // Fast text finder using TreeWalker (10x faster than querySelectorAll('*') on large DOMs)
-  // Also searches aria-label, placeholder, title, data-testid attributes
-  window.mcpFindText=function(text,exact){
-    // Phase 1: Search attributes (aria-label, placeholder, title) — O(n) on interactive elements only
-    var attrSels='[aria-label],[placeholder],[title],[data-testid],[alt]';
-    var attrEls=document.querySelectorAll(attrSels);
-    for(var i=0;i<attrEls.length;i++){
-      var a=attrEls[i];
-      var r=a.getBoundingClientRect();
-      if(r.width===0||r.height===0)continue;
-      var vals=[a.getAttribute('aria-label'),a.getAttribute('placeholder'),a.getAttribute('title'),a.getAttribute('data-testid'),a.getAttribute('alt')].filter(Boolean);
-      for(var j=0;j<vals.length;j++){
-        if(exact?vals[j]===text:vals[j].includes(text))return a;
-      }
+  window.mcpClickWithReact=function(el){
+    var target=window.mcpResolveTarget(el)||el;
+    var reactFired=false;
+    try{reactFired=window.mcpReactClick(target);}catch(e){}
+    var anchor=target&&target.closest?target.closest('a[href]'):null;
+    if(!reactFired||anchor)window.mcpClick(target);
+    return target;
+  };
+  window.mcpFindRef=function(ref){
+    var el=window.mcpQuerySelectorDeep('[data-mcp-ref="'+ref+'"]');
+    if(el)return el;
+    if(!window.__mcpRefs||!window.__mcpRefs[ref])return null;
+    var m=window.__mcpRefs[ref];
+    if(m.id){el=window.mcpFindByAttr('id',m.id);if(el)return el}
+    if(m.testid){el=window.mcpFindByAttr('data-testid',m.testid);if(el)return el}
+    if(m.nameAttr){el=window.mcpFindByAttr('name',m.nameAttr);if(el)return el}
+    if(m.href){el=window.mcpFindByAttr('href',m.href,'a[href]');if(el)return el}
+    if(m.al){el=window.mcpFindByAttr('aria-label',m.al);if(el)return el}
+    if(m.ph){el=window.mcpFindByAttr('placeholder',m.ph);if(el)return el}
+    if(m.text){
+      el=window.mcpFindText(m.text,true)||window.mcpFindText(m.text,false);
+      if(el)return el;
     }
-    // Phase 2: TreeWalker on text nodes
-    var tw=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,null);
-    var best=null,bestArea=Infinity;
-    while(tw.nextNode()){
-      var n=tw.currentNode;
-      var t=n.textContent.trim();
-      if(!t)continue;
-      var match=exact?(t===text):t.includes(text);
-      if(!match)continue;
-      var el=n.parentElement;
-      if(!el)continue;
-      var r2=el.getBoundingClientRect();
-      if(r2.width===0||r2.height===0)continue;
-      var area=r2.width*r2.height;
-      if(area<bestArea){best=el;bestArea=area}
+    if(m.cx!==undefined&&m.cy!==undefined){
+      try{
+        window.scrollTo(window.scrollX,Math.max(0,m.cy-window.innerHeight/2));
+      }catch(e){}
+      el=window.mcpElementFromPoint(m.cx-window.scrollX,m.cy-window.scrollY);
+      if(el)return window.mcpPickActionable(el)||el;
+    }
+    return null;
+  };
+  window.mcpFindText=function(text,exact){
+    var needle=window.mcpNormalizeText(text);
+    var best=null,bestScore=Infinity;
+    function consider(node){
+      var target=window.mcpPickActionable(node)||node;
+      if(!window.mcpIsVisible(target))return;
+      var r=target.getBoundingClientRect();
+      var area=r.width*r.height;
+      var interactive=target.matches&&target.matches('a[href],button,input:not([type="hidden"]),textarea,select,summary,label,[role=button],[role=link],[role=tab],[onclick],[tabindex]');
+      var score=area+(interactive?0:1000000);
+      if(score<bestScore){best=target;bestScore=score}
+    }
+    var roots=window.mcpCollectRoots();
+    for(var i=0;i<roots.length;i++){
+      var attrEls=roots[i].querySelectorAll('[aria-label],[placeholder],[title],[data-testid],[alt]');
+      for(var j=0;j<attrEls.length;j++){
+        var a=attrEls[j];
+        var vals=[a.getAttribute('aria-label'),a.getAttribute('placeholder'),a.getAttribute('title'),a.getAttribute('data-testid'),a.getAttribute('alt')];
+        for(var k=0;k<vals.length;k++){
+          var val=vals[k];
+          if(!val)continue;
+          var normalized=window.mcpNormalizeText(val);
+          if(exact?normalized===needle:normalized.includes(needle)){consider(a);break}
+        }
+      }
+      var tw=document.createTreeWalker(roots[i],NodeFilter.SHOW_TEXT,null);
+      while(tw.nextNode()){
+        var n=tw.currentNode;
+        var t=window.mcpNormalizeText(n.textContent);
+        if(!t)continue;
+        if(exact?(t!==needle):!t.includes(needle))continue;
+        if(n.parentElement)consider(n.parentElement);
+      }
     }
     return best;
   };
 }`;
 
-// Ensure helpers are injected (fast no-op if already present)
+// Ensure helpers are injected — verify critical functions exist, reset version if partial
+// Cache: skip ensureHelpers check if we already injected on this URL recently
+let _helpersInjectedForUrl = null;
+let _helpersInjectedAt = 0;
+const HELPERS_CACHE_MS = 10000; // Re-verify every 10s max
+
 async function ensureHelpers() {
-  await runJS(`${INJECT_MCP_HELPERS}`).catch(() => {});
+  // Skip check if we recently verified helpers on the same URL
+  const now = Date.now();
+  if (_helpersInjectedForUrl === _activeTabURL && (now - _helpersInjectedAt) < HELPERS_CACHE_MS) return;
+
+  // Check if helpers are actually present (not just version flag)
+  const check = await runJS("(typeof mcpClickWithReact==='function'&&typeof mcpFindText==='function')?'ok':'missing'").catch(() => 'missing');
+  if (check === 'ok') {
+    _helpersInjectedForUrl = _activeTabURL;
+    _helpersInjectedAt = now;
+    return;
+  }
+  // Reset version to force re-injection
+  await runJS("window.__mcpVersion=0").catch(() => {});
+  const result = await runJSLarge(`${INJECT_MCP_HELPERS}`).catch(err => 'INJECT_ERR:' + err.message);
+  if (typeof result === 'string' && result.startsWith('INJECT_ERR:')) {
+    throw new Error('ensureHelpers failed: ' + result);
+  }
+  _helpersInjectedForUrl = _activeTabURL;
+  _helpersInjectedAt = now;
 }
 
 // Try tiny click first (~200B). If helpers missing, inject once and retry.
@@ -601,25 +710,30 @@ async function clickWithRetry(js) {
 }
 
 export async function click({ selector, text, x, y, ref }) {
-  if (ref) selector = refSelector(ref);
+  await ensureHelpers();
+  if (ref) {
+    return clickWithRetry(
+      `(function(){var el=mcpFindRef('${ref}');if(!el)return 'Element not found: ref=${ref}';var target=mcpClickWithReact(el);return 'Clicked: '+target.tagName+((target.innerText||target.textContent)?(' "'+(target.innerText||target.textContent).trim().substring(0,50)+'"'):'');})()`
+    );
+  }
 
   if (selector) {
     const sel = selector.replace(/'/g, "\\'");
     return clickWithRetry(
-      `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';if(!mcpReactClick(el))mcpClick(el);var a=el.closest?el.closest('a[href]'):null;if(a&&a.href&&!a.href.startsWith('javascript:'))location.href=a.href;return 'Clicked: '+el.tagName+(el.textContent?(' "'+el.textContent.trim().substring(0,50)+'"'):'');})()`
+      `(function(){var el=mcpQuerySelectorDeep('${sel}');if(!el)return 'Element not found: ${sel}';var target=mcpClickWithReact(el);return 'Clicked: '+target.tagName+((target.innerText||target.textContent)?(' "'+(target.innerText||target.textContent).trim().substring(0,50)+'"'):'');})()`
     );
   }
 
   if (text) {
     const safeText = text.replace(/'/g, "\\'");
     return clickWithRetry(
-      `(function(){var el=mcpFindText('${safeText}',true)||mcpFindText('${safeText}',false);if(!el)return 'Element not found with text: ${safeText}';if(!mcpReactClick(el))mcpClick(el);var a=el.closest?el.closest('a[href]'):null;if(a&&a.href&&!a.href.startsWith('javascript:'))location.href=a.href;return 'Clicked: '+el.tagName+' "'+el.textContent.trim().substring(0,50)+'"';})()`
+      `(function(){var el=mcpFindText('${safeText}',true)||mcpFindText('${safeText}',false);if(!el)return 'Element not found with text: ${safeText}';var target=mcpClickWithReact(el);return 'Clicked: '+target.tagName+' "'+((target.innerText||target.textContent)||'').trim().substring(0,50)+'"';})()`
     );
   }
 
   if (x !== undefined && y !== undefined) {
     return clickWithRetry(
-      `(function(){var el=document.elementFromPoint(${Number(x)},${Number(y)});if(!el)return 'No element at (${Number(x)},${Number(y)})';if(!mcpReactClick(el))mcpClick(el);var a=el.closest?el.closest('a[href]'):null;if(a&&a.href&&!a.href.startsWith('javascript:'))location.href=a.href;return 'Clicked: '+el.tagName+' at (${Number(x)},${Number(y)})';})()`
+      `(function(){var el=mcpElementFromPoint(${Number(x)},${Number(y)});if(!el)return 'No element at (${Number(x)},${Number(y)})';var target=mcpClickWithReact(el);return 'Clicked: '+target.tagName+' at (${Number(x)},${Number(y)})';})()`
     );
   }
   throw new Error("click requires selector, text, or x/y coordinates");
@@ -664,28 +778,7 @@ export async function fill({ selector, value, ref }) {
   // Proper escaping order: backslashes first, then quotes
   const val = value.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, "");
   return runJS(
-    `(function(){
-      var el = document.querySelector('${sel}');
-      if (!el) return 'Element not found: ${sel}';
-      el.focus();
-      // For contenteditable elements (Rich text editors like Medium, ProseMirror)
-      if (el.isContentEditable || el.getAttribute('contenteditable') === 'true') {
-        el.textContent = '';
-        document.execCommand('insertText', false, '${val}');
-        return 'Filled contenteditable with "' + el.textContent.substring(0, 50) + '"';
-      }
-      // For regular inputs/textareas (React-compatible via native setter)
-      var nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value') ||
-                         Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value');
-      if (nativeSetter && nativeSetter.set) {
-        nativeSetter.set.call(el, '${val}');
-      } else {
-        el.value = '${val}';
-      }
-      el.dispatchEvent(new Event('input', {bubbles: true}));
-      el.dispatchEvent(new Event('change', {bubbles: true}));
-      return 'Filled: ' + el.tagName + '[' + (el.type || '') + '] with "' + el.value.substring(0, 50) + '"';
-    })()`
+    `(function(){try{var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';el.focus();if(el.isContentEditable||el.getAttribute('contenteditable')==='true'){el.textContent='';document.execCommand('insertText',false,'${val}');return 'Filled contenteditable';}var proto=el.tagName==='TEXTAREA'?window.HTMLTextAreaElement.prototype:window.HTMLInputElement.prototype;var s=Object.getOwnPropertyDescriptor(proto,'value');if(s&&s.set){s.set.call(el,'${val}');}else{el.value='${val}';}el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));return 'Filled: '+el.value.substring(0,50);}catch(e){return 'ERR: '+e.message;}})()`
   );
 }
 
@@ -850,33 +943,7 @@ export async function typeText({ text, selector, ref }) {
   // No System Events = no keyboard conflict with user
   const safeText = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n");
   const result = await runJS(
-    `(function(){
-      var el = document.activeElement;
-      if (!el) return 'No focused element';
-
-      // Method 1: execCommand insertText (works in contenteditable, inputs, textareas)
-      var ok = document.execCommand('insertText', false, '${safeText}');
-      if (ok) return 'Typed ' + ${text.length} + ' chars via insertText';
-
-      // Method 2: InputEvent (for modern editors like ProseMirror, Draft.js, Slate)
-      try {
-        el.dispatchEvent(new InputEvent('beforeinput', {inputType:'insertText', data:'${safeText}', bubbles:true, cancelable:true}));
-        el.dispatchEvent(new InputEvent('input', {inputType:'insertText', data:'${safeText}', bubbles:true}));
-        return 'Typed ' + ${text.length} + ' chars via InputEvent';
-      } catch(e) {}
-
-      // Method 3: Direct value set (for plain inputs/textareas)
-      if ('value' in el) {
-        var start = el.selectionStart || 0;
-        el.value = el.value.substring(0, start) + '${safeText}' + el.value.substring(el.selectionEnd || start);
-        el.selectionStart = el.selectionEnd = start + ${text.length};
-        el.dispatchEvent(new Event('input', {bubbles:true}));
-        el.dispatchEvent(new Event('change', {bubbles:true}));
-        return 'Typed ' + ${text.length} + ' chars via value set';
-      }
-
-      return 'Could not type — no compatible input method';
-    })()`
+    `(function(){var el=document.activeElement;if(!el)return 'No focused element';var ok=document.execCommand('insertText',false,'${safeText}');if(ok)return 'Typed '+${text.length}+' chars';try{el.dispatchEvent(new InputEvent('beforeinput',{inputType:'insertText',data:'${safeText}',bubbles:true,cancelable:true}));el.dispatchEvent(new InputEvent('input',{inputType:'insertText',data:'${safeText}',bubbles:true}));return 'Typed '+${text.length}+' chars via InputEvent';}catch(e){}if('value' in el){var start=el.selectionStart||0;el.value=el.value.substring(0,start)+'${safeText}'+el.value.substring(el.selectionEnd||start);el.selectionStart=el.selectionEnd=start+${text.length};el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));return 'Typed '+${text.length}+' chars via value set';}return 'Could not type';})()`
   );
 
   return result;
@@ -885,16 +952,6 @@ export async function typeText({ text, selector, ref }) {
 // ========== SCREENSHOT ==========
 
 export async function screenshot({ fullPage = false } = {}) {
-  // WebDriver screenshot — fast and reliable (~100ms)
-  if (_useWebDriver && _wdSessionId) {
-    try {
-      const base64 = await wdScreenshot();
-      if (base64 && base64.length > 100) return base64;
-    } catch {
-      // Fall through to AppleScript
-    }
-  }
-
   const tmpFile = join(tmpdir(), `safari-screenshot-${Date.now()}.png`);
   let savedTabIdx = null;
   try {
@@ -902,12 +959,12 @@ export async function screenshot({ fullPage = false } = {}) {
     if (_activeTabIndex) {
       try {
         const currentIdx = await osascriptFast(
-          `tell application "Safari" to return index of current tab of front window`
+          `tell application "Safari" to return index of current tab of ${_targetWindowRef}`
         );
         if (Number(currentIdx) !== _activeTabIndex) {
           savedTabIdx = Number(currentIdx);
           await osascriptFast(
-            `tell application "Safari" to set current tab of front window to tab ${_activeTabIndex} of front window`
+            `tell application "Safari" to set current tab of ${_targetWindowRef} to tab ${_activeTabIndex} of ${_targetWindowRef}`
           );
           await new Promise(r => setTimeout(r, 200)); // Let Safari render the tab
         }
@@ -917,19 +974,19 @@ export async function screenshot({ fullPage = false } = {}) {
 
     // Try screencapture — use osascript's do shell script to bypass VS Code permission issue
     const windowId = !skipScreencapture ? await osascript(
-      'tell application "Safari" to return id of window 1'
+      `tell application "Safari" to return id of ${_targetWindowRef}`
     ).catch(() => null) : null;
 
     if (windowId) {
       try {
         if (fullPage) {
           const bounds = await osascript(
-            'tell application "Safari" to return bounds of front window'
+            `tell application "Safari" to return bounds of ${_targetWindowRef}`
           );
           const dims = await runJS("JSON.stringify({h:document.documentElement.scrollHeight,w:document.documentElement.scrollWidth})");
           const { h, w } = JSON.parse(dims);
           await osascript(
-            `tell application "Safari" to set bounds of front window to {0, 0, ${Number(w)}, ${Math.min(Number(h) + 100, 5000)}}`
+            `tell application "Safari" to set bounds of ${_targetWindowRef} to {0, 0, ${Number(w)}, ${Math.min(Number(h) + 100, 5000)}}`
           );
           await new Promise((r) => setTimeout(r, 500));
           // Use do shell script to inherit osascript's Screen Recording permission
@@ -938,7 +995,7 @@ export async function screenshot({ fullPage = false } = {}) {
             { timeout: 15000 }
           );
           await osascript(
-            `tell application "Safari" to set bounds of front window to {${bounds}}`
+            `tell application "Safari" to set bounds of ${_targetWindowRef} to {${bounds}}`
           );
         } else {
           // Try direct execFile first (works if VS Code has Screen Recording permission)
@@ -993,7 +1050,7 @@ export async function screenshot({ fullPage = false } = {}) {
     if (savedTabIdx) {
       try {
         await osascriptFast(
-          `tell application "Safari" to set current tab of front window to tab ${savedTabIdx} of front window`
+          `tell application "Safari" to set current tab of ${_targetWindowRef} to tab ${savedTabIdx} of ${_targetWindowRef}`
         );
       } catch (_) {}
     }
@@ -1057,7 +1114,7 @@ export async function screenshotElement({ selector }) {
     // Fallback: use screencapture + crop
     const tmpFile = join(tmpdir(), `safari-el-${Date.now()}.png`);
     try {
-      const windowId = await osascript('tell application "Safari" to return id of window 1').catch(() => null);
+      const windowId = await osascript(`tell application "Safari" to return id of ${_targetWindowRef}`).catch(() => null);
       if (!windowId) throw new Error("Cannot get Safari window ID");
 
       // Get element bounds relative to screen
@@ -1107,6 +1164,7 @@ export async function scrollTo({ x = 0, y = 0 }) {
 // ========== TAB MANAGEMENT ==========
 
 export async function listTabs() {
+  await refreshTargetWindow();
   // If we have a tracked URL, re-resolve the index (it may have shifted)
   // If no URL tracked, reset index (new session should open its own tab)
   if (_activeTabURL) {
@@ -1119,7 +1177,7 @@ export async function listTabs() {
     `tell application "Safari"
       set output to ""
       set tabIndex to 1
-      repeat with t in every tab of front window
+      repeat with t in every tab of ${_targetWindowRef}
         if tabIndex > 1 then set output to output & linefeed
         set output to output & (tabIndex as text) & (ASCII character 9) & name of t & (ASCII character 9) & URL of t
         set tabIndex to tabIndex + 1
@@ -1136,21 +1194,19 @@ export async function listTabs() {
 }
 
 export async function newTab(url = "") {
-  // AppleScript: opens tab IN the user's Safari (with all cookies/logins)
-  // No withoutStealingFocus — the AppleScript already saves/restores current tab
-  _useWebDriver = false;
+  await refreshTargetWindow();
   const safeUrl = url ? url.replace(/"/g, '\\"') : "";
   try {
     if (url) {
-      await osascript(`tell application "Safari"\ntell front window\nset userTab to current tab\nmake new tab with properties {URL:"${safeUrl}"}\nset current tab to userTab\nend tell\nend tell`);
+      await osascript(`tell application "Safari"\ntell ${_targetWindowRef}\nset userTab to current tab\nmake new tab with properties {URL:"${safeUrl}"}\nset current tab to userTab\nend tell\nend tell`);
     } else {
-      await osascript(`tell application "Safari"\ntell front window\nset userTab to current tab\nmake new tab\nset current tab to userTab\nend tell\nend tell`);
+      await osascript(`tell application "Safari"\ntell ${_targetWindowRef}\nset userTab to current tab\nmake new tab\nset current tab to userTab\nend tell\nend tell`);
     }
   } catch {
     if (url) { await osascript(`tell application "Safari" to make new document with properties {URL:"${safeUrl}"}`); }
     else { await osascript('tell application "Safari" to make new document'); }
   }
-  const tabCount = await osascriptFast('tell application "Safari" to return count of tabs of front window');
+  const tabCount = await osascriptFast(`tell application "Safari" to return count of tabs of ${_targetWindowRef}`);
   _activeTabIndex = Number(tabCount);
   _activeTabURL = url || null;
   _lastResolveTime = Date.now();
@@ -1174,26 +1230,15 @@ export async function newTab(url = "") {
 }
 
 export async function closeTab() {
-  // WebDriver: delete session (closes the tab)
-  if (_useWebDriver && _wdSessionId) {
-    try {
-      await wdRequest("DELETE", "");
-      _wdSessionId = null;
-      _useWebDriver = false;
-      _activeTabIndex = null;
-      _activeTabURL = null;
-      return "Tab closed (WebDriver session ended)";
-    } catch {}
-  }
   if (_activeTabIndex) {
     await osascript(
-      `tell application "Safari" to close tab ${_activeTabIndex} of front window`
+      `tell application "Safari" to close tab ${_activeTabIndex} of ${_targetWindowRef}`
     );
     _activeTabIndex = null;
     _activeTabURL = null;
   } else {
     await osascript(
-      `tell application "Safari" to close current tab of front window`
+      `tell application "Safari" to close current tab of ${_targetWindowRef}`
     );
   }
   return "Tab closed";
@@ -1230,7 +1275,7 @@ export async function waitFor({ selector, text, timeout = 10000 }) {
       while (Date.now() < deadline) {
         ${safeSelector ? `if (document.querySelector('${safeSelector}')) return 'Found: ${safeSelector}';` : ""}
         ${safeText ? `if (document.body && document.body.innerText.includes('${safeText}')) return 'Found text: ${safeText}';` : ""}
-        await new Promise(function(r){setTimeout(r, 200)});
+        await new Promise(function(r){setTimeout(r, 50)});
       }
       return 'TIMEOUT';
     })()`,
@@ -1247,60 +1292,26 @@ export async function waitFor({ selector, text, timeout = 10000 }) {
 export async function evaluate({ script }) {
   let js = script.trim();
 
-  // ===== WebDriver path (fast — ~30ms) =====
-  if (_useWebDriver && _wdSessionId) {
-    try {
-      // WebDriver execute/sync needs "return" at the top level
-      let wdScript = js;
-      // Detect async
-      const isAsync = /\bawait\b/.test(js) || /^async\b/.test(js);
-      if (isAsync) {
-        // WebDriver execute/async handles promises natively
-        const result = await wdEvalAsync(`var cb=arguments[arguments.length-1];(async function(){${js}})().then(function(r){cb(r)}).catch(function(e){cb('Error: '+e.message)})`);
-        return result !== null && result !== undefined ? String(result) : '(no return value)';
-      }
-      // Sync: wrap in function with return if needed
-      if (!wdScript.includes('return ') && !wdScript.includes('return;')) {
-        const lines = wdScript.split('\n');
-        for (let i = lines.length - 1; i >= 0; i--) {
-          const line = lines[i].trim();
-          if (!line || line.startsWith('//')) continue;
-          if (line.endsWith('}') || line.startsWith('var ') || line.startsWith('let ') || line.startsWith('const ')) break;
-          lines[i] = 'return ' + lines[i];
-          break;
-        }
-        wdScript = lines.join('\n');
-      }
-      const result = await wdEval(wdScript);
-      if (result !== null && result !== undefined) {
-        return typeof result === 'object' ? JSON.stringify(result) : String(result);
-      }
-      return '(no return value)';
-    } catch (err) {
-      // WebDriver failed — fall through to AppleScript
-    }
-  }
-
-  // ===== AppleScript path (slower — ~80ms) =====
   const isAsync = /\bawait\b/.test(js) || /\.then\s*\(/.test(js) || /^async\b/.test(js) || /\bfetch\s*\(/.test(js);
 
   if (isAsync) {
-    const id = Date.now();
-    const wrappedAsync = `(async function(){try{window.__mcp_r${id}=JSON.stringify({v:await(async function(){${js}})()});}catch(e){window.__mcp_r${id}=JSON.stringify({e:e.message});}})()`;
-    await runJS(wrappedAsync);
-    for (let i = 0; i < 60; i++) {
-      const check = await runJS(`window.__mcp_r${id}||''`);
-      if (check && check !== '') {
-        await runJS(`delete window.__mcp_r${id}`);
-        try {
-          const parsed = JSON.parse(check);
-          if (parsed.e) return `Error: ${parsed.e}`;
-          return parsed.v !== undefined ? String(parsed.v) : '(undefined)';
-        } catch { return check; }
-      }
-      await new Promise(r => setTimeout(r, 500));
-    }
-    return '(async timeout — script took longer than 30 seconds)';
+    // Single combined call: execute async + return result in ONE runJS (no polling!)
+    const result = await runJS(
+      `(async function(){
+        try{
+          var v = await(async function(){${js}})();
+          return JSON.stringify({v: v !== undefined && v !== null ? (typeof v === 'object' ? JSON.stringify(v) : String(v)) : null});
+        }catch(e){
+          return JSON.stringify({e: e.message});
+        }
+      })()`,
+      { timeout: 35000 }
+    );
+    try {
+      const parsed = JSON.parse(result);
+      if (parsed.e) return `Error: ${parsed.e}`;
+      return parsed.v !== undefined && parsed.v !== null ? String(parsed.v) : '(undefined)';
+    } catch { return result || '(undefined)'; }
   }
 
   const isIIFE = /^\((?:async\s+)?function/.test(js) || /^\((?:async\s+)?\(/.test(js);
@@ -1388,7 +1399,7 @@ export async function handleDialog({ action = "accept", text }) {
 
 export async function resizeWindow({ width, height }) {
   await osascript(
-    `tell application "Safari" to set bounds of front window to {0, 0, ${Number(width)}, ${Number(height)}}`
+    `tell application "Safari" to set bounds of ${_targetWindowRef} to {0, 0, ${Number(width)}, ${Number(height)}}`
   );
   return `Resized to ${width}x${height}`;
 }
@@ -1462,9 +1473,12 @@ export async function uploadFile({ selector, filePath }) {
   await osascript(
     `tell application "System Events"
       tell process "Safari"
-        if exists sheet 1 of window 1 then
-          click button "ביטול" of sheet 1 of window 1
-        end if
+        repeat with w in every window
+          if exists sheet 1 of w then
+            click button "ביטול" of sheet 1 of w
+            exit repeat
+          end if
+        end repeat
       end tell
     end tell`
   ).catch(() => {}); // Ignore if no dialog open
@@ -1590,7 +1604,7 @@ export async function emulate({ device, width, height, userAgent, scale = 1 }) {
 
   // Resize Safari window to match device
   await osascript(
-    `tell application "Safari" to set bounds of front window to {0, 0, ${w}, ${h + 100}}`
+    `tell application "Safari" to set bounds of ${_targetWindowRef} to {0, 0, ${w}, ${h + 100}}`
   );
 
   // Override viewport meta and user agent if specified
@@ -1626,7 +1640,7 @@ export async function resetEmulation() {
   );
   // Maximize window
   await osascript(
-    `tell application "Safari" to set bounds of front window to {0, 0, 1440, 900}`
+    `tell application "Safari" to set bounds of ${_targetWindowRef} to {0, 0, 1440, 900}`
   );
   await runJS(
     `(async function(){location.reload();await new Promise(function(r){setTimeout(r,300)});for(var i=0;i<30;i++){if(document.readyState==='complete')break;await new Promise(function(r){setTimeout(r,200)});}return 'done';})()`
@@ -1654,7 +1668,7 @@ export async function clearConsoleCapture() {
 // ========== PDF SAVE ==========
 
 export async function savePDF({ path: pdfPath }) {
-  const safePath = pdfPath.replace(/"/g, '\\"');
+  const safePath = pdfPath.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "").replace(/\r/g, "");
   // Use window.print() API + AppleScript to save as PDF
   // Strategy: use osascript to print to PDF directly via CUPS (no UI at all)
   try {
@@ -1766,25 +1780,44 @@ export async function takeSnapshot({ selector } = {}) {
         return false;
       }
 
+      function isStyleVisible(el) {
+        var style = window.getComputedStyle(el);
+        if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+        if (el.getAttribute('aria-hidden') === 'true') return false;
+        return true;
+      }
+
       function isVisible(el) {
-        if (!el.offsetParent && el.tagName !== 'BODY' && el.tagName !== 'HTML') return false;
+        if (!isStyleVisible(el)) return false;
         var r = el.getBoundingClientRect();
         return r.width > 0 && r.height > 0;
       }
 
       function walk(el, depth) {
-        if (depth > 8) return;
-        if (!isVisible(el)) return;
+        if (depth > 20 || id > 800) return;
+        if (!isStyleVisible(el)) return;
 
         var role = getRole(el);
         var interactive = isInteractive(el);
         var isHeading = /^H[1-6]$/.test(el.tagName);
         var isText = !role && el.children.length === 0 && el.textContent.trim().length > 0 && el.textContent.trim().length < 200;
+        var visible = isVisible(el);
 
         // Include: interactive elements, headings, images, text nodes with content
-        if (role || interactive || isHeading || isText) {
+        if (visible && (role || interactive || isHeading || isText)) {
           var ref = gen + '_' + (id++);
           el.setAttribute('data-mcp-ref', ref);
+          var rect=el.getBoundingClientRect();
+          var meta={tag:el.tagName};var nm=getName(el);if(nm)meta.text=nm.substring(0,80);
+          if(el.id)meta.id=el.id;
+          if(el.getAttribute('name'))meta.nameAttr=el.getAttribute('name');
+          var _ti=el.getAttribute('data-testid');if(_ti)meta.testid=_ti;
+          if(el.href)meta.href=el.href;
+          var _al=el.getAttribute('aria-label');if(_al)meta.al=_al;
+          if(el.placeholder)meta.ph=el.placeholder;
+          meta.cx=Math.round(window.scrollX+rect.left+rect.width/2);
+          meta.cy=Math.round(window.scrollY+rect.top+rect.height/2);
+          window.__mcpRefs[ref]=meta;
           var indent = '  '.repeat(depth);
           var line = indent + 'ref=' + ref + ' ';
 
@@ -1827,8 +1860,14 @@ export async function takeSnapshot({ selector } = {}) {
         for (var i = 0; i < el.children.length; i++) {
           walk(el.children[i], depth + (role ? 1 : 0));
         }
+        if (el.shadowRoot) {
+          for (var j = 0; j < el.shadowRoot.children.length; j++) {
+            walk(el.shadowRoot.children[j], depth + (role ? 1 : 0));
+          }
+        }
       }
 
+      window.__mcpRefs = {};
       var root = ${root};
       if (!root) return 'Element not found';
       walk(root, 0);
@@ -2021,16 +2060,17 @@ export async function exportStorageState() {
 // Import storage state from JSON
 export async function importStorageState({ state }) {
   const parsed = typeof state === "string" ? JSON.parse(state) : state;
+  const esc = (s) => String(s).replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/"/g, '\\"').replace(/\n/g, "\\n").replace(/\r/g, "");
   const cmds = [];
-  if (parsed.cookies) cmds.push(`document.cookie='${parsed.cookies.replace(/'/g, "\\'")}'`);
+  if (parsed.cookies) cmds.push(`document.cookie='${esc(parsed.cookies)}'`);
   if (parsed.localStorage) {
     for (const [k, v] of Object.entries(parsed.localStorage)) {
-      cmds.push(`localStorage.setItem('${k.replace(/'/g, "\\'")}','${String(v).replace(/'/g, "\\'")}')`);
+      cmds.push(`localStorage.setItem('${esc(k)}','${esc(v)}')`);
     }
   }
   if (parsed.sessionStorage) {
     for (const [k, v] of Object.entries(parsed.sessionStorage)) {
-      cmds.push(`sessionStorage.setItem('${k.replace(/'/g, "\\'")}','${String(v).replace(/'/g, "\\'")}')`);
+      cmds.push(`sessionStorage.setItem('${esc(k)}','${esc(v)}')`);
     }
   }
   return runJS(cmds.join(";") + "; 'Imported ' + " + cmds.length + " + ' items'");
@@ -2057,15 +2097,26 @@ export async function clipboardWrite({ text, restore = true }) {
     } catch {}
   }
 
-  const safeText = text.replace(/"/g, '\\"');
-  await execFileAsync("bash", ["-c", `echo -n "${safeText}" | pbcopy`]);
+  // Use spawn + stdin pipe — safe from shell injection (no shell involved)
+  await new Promise((resolve, reject) => {
+    const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
+    proc.stdin.write(text);
+    proc.stdin.end();
+    proc.on("close", resolve);
+    proc.on("error", reject);
+  });
 
   // Schedule clipboard restore after 5 seconds (gives time to paste)
   if (restore && oldClipboard !== null) {
     setTimeout(async () => {
       try {
-        const safeOld = oldClipboard.replace(/"/g, '\\"');
-        await execFileAsync("bash", ["-c", `echo -n "${safeOld}" | pbcopy`]);
+        await new Promise((resolve, reject) => {
+          const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
+          proc.stdin.write(oldClipboard);
+          proc.stdin.end();
+          proc.on("close", resolve);
+          proc.on("error", reject);
+        });
       } catch {}
     }, 5000);
   }
@@ -2583,7 +2634,7 @@ export async function navigateAndRead(url, { maxLength = 50000 } = {}) {
   let targetUrl = url;
   if (!/^https?:\/\//i.test(targetUrl)) targetUrl = "https://" + targetUrl;
   const safeUrl = targetUrl.replace(/"/g, '\\"');
-  const navTarget = _activeTabIndex ? `tab ${_activeTabIndex} of front window` : "front document";
+  const navTarget = _activeTabIndex ? `tab ${_activeTabIndex} of ${_targetWindowRef}` : "front document";
   await osascriptFast(`tell application "Safari" to set URL of ${navTarget} to "${safeUrl}"`);
   // Single JS call: poll readyState + return page data — 1 call instead of 30+
   return runJS(
@@ -2689,3 +2740,13 @@ export async function analyzePage() {
     })()`
   );
 }
+
+// ========== GRACEFUL SHUTDOWN ==========
+function cleanup() {
+  if (_helperProc) { try { _helperProc.kill(); } catch {} _helperProc = null; }
+  _drainHelperQueue("shutting down");
+}
+
+process.on("exit", cleanup);
+process.on("SIGINT", () => { cleanup(); process.exit(0); });
+process.on("SIGTERM", () => { cleanup(); process.exit(0); });

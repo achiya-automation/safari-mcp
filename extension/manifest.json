@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Safari MCP Bridge",
   "description": "Connects AI agents to Safari — fast JS execution, screenshots, clicks with your real cookies/logins",
-  "version": "1.0",
+  "version": "1.2",
 
   "icons": {
     "48": "images/icon-48.png",
@@ -28,10 +28,15 @@
     }
   },
 
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; connect-src 'self' ws://localhost:9223 ws://127.0.0.1:9223 http://localhost:9224 http://127.0.0.1:9224"
+  },
+
   "permissions": [
     "activeTab",
     "scripting",
-    "tabs"
+    "tabs",
+    "alarms"
   ],
 
   "host_permissions": [

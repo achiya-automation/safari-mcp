@@ -1,85 +1,205 @@
 #!/usr/bin/env node
 // Safari MCP Server — dual engine:
 // 1. Safari Web Extension (fast, ~5-20ms, keeps logins) — when extension is connected
-// 2. AppleScript fallback (~80ms, keeps logins) — when extension is not available
+// 2. AppleScript + Swift daemon (~5ms, keeps logins) — always available
+//
+// Extension transport: WebSocket (Chrome) OR HTTP polling (Safari — WebSocket blocked by Apple)
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import * as safari from "./safari.js";
 import { WebSocketServer } from "ws";
+import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 
-// ========== WEBSOCKET SERVER FOR SAFARI EXTENSION ==========
+// ========== EXTENSION BRIDGE (WebSocket + HTTP polling) ==========
 const WS_PORT = 9223;
+const HTTP_PORT = 9224;
 let _extensionWs = null;
 let _extensionConnected = false;
 
+// Pending requests: command sent to extension, waiting for result
+const _pendingRequests = new Map();
+
+// Command queue: commands waiting to be picked up by HTTP-polling extension
+const _commandQueue = [];
+
+// ========== WEBSOCKET SERVER (for Chrome extensions / direct WebSocket) ==========
 let wss;
 try {
-  wss = new WebSocketServer({ port: WS_PORT });
+  wss = new WebSocketServer({ host: "127.0.0.1", port: WS_PORT });
   wss.on("connection", (ws) => {
     _extensionWs = ws;
     _extensionConnected = true;
-    console.error(`[Safari MCP] Extension connected on port ${WS_PORT}`);
-
+    console.error(`[Safari MCP] Extension connected via WebSocket`);
+    _setupExtensionListener(ws);
     ws.on("close", () => {
       _extensionConnected = false;
       _extensionWs = null;
-      console.error("[Safari MCP] Extension disconnected");
-    });
-
-    ws.on("message", (data) => {
-      // Responses are handled by sendToExtension's Promise
-      // Keepalive messages are ignored
+      console.error("[Safari MCP] Extension disconnected (WebSocket)");
     });
   });
   wss.on("error", (err) => {
     if (err.code === "EADDRINUSE") {
-      console.error(`[Safari MCP] Port ${WS_PORT} in use — extension WebSocket disabled (AppleScript still works)`);
-    } else {
-      console.error(`[Safari MCP] WebSocket error: ${err.message}`);
+      console.error(`[Safari MCP] WebSocket port ${WS_PORT} in use — WebSocket disabled`);
     }
   });
-} catch (err) {
-  console.error(`[Safari MCP] WebSocket failed: ${err.message} — continuing with AppleScript only`);
+} catch {}
+
+function _setupExtensionListener(ws) {
+  ws.on("message", (data) => {
+    let msg;
+    try { msg = JSON.parse(data.toString()); } catch { return; }
+    _handleExtensionResponse(msg);
+  });
 }
 
-// Send command to extension and wait for response
-function sendToExtension(type, payload = {}, timeoutMs = 30000) {
-  return new Promise((resolve, reject) => {
-    if (!_extensionWs || !_extensionConnected) {
-      reject(new Error("Extension not connected"));
+// ========== HTTP POLLING SERVER (for Safari extensions — WebSocket blocked) ==========
+try {
+  const httpServer = createServer((req, res) => {
+    // CORS headers for extension
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
       return;
     }
 
+    // GET /poll — extension asks for next command (long-poll, up to 5s)
+    if (req.method === "GET" && req.url === "/poll") {
+      if (_commandQueue.length > 0) {
+        const cmd = _commandQueue.shift();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(cmd));
+      } else {
+        // Long-poll: wait up to 5 seconds for a command
+        const timer = setTimeout(() => {
+          res.writeHead(204);
+          res.end();
+        }, 5000);
+
+        const checkInterval = setInterval(() => {
+          if (_commandQueue.length > 0) {
+            clearTimeout(timer);
+            clearInterval(checkInterval);
+            const cmd = _commandQueue.shift();
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(cmd));
+          }
+        }, 20); // Check every 20ms
+
+        // Cleanup on client disconnect
+        req.on("close", () => {
+          clearTimeout(timer);
+          clearInterval(checkInterval);
+        });
+      }
+      return;
+    }
+
+    // POST /result — extension sends command result
+    if (req.method === "POST" && req.url === "/result") {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", () => {
+        try {
+          const msg = JSON.parse(body);
+          _handleExtensionResponse(msg);
+        } catch {}
+        res.writeHead(200);
+        res.end("ok");
+      });
+      return;
+    }
+
+    // POST /connect — extension announces it's alive
+    if (req.method === "POST" && req.url === "/connect") {
+      if (!_extensionConnected) {
+        _extensionConnected = true;
+        console.error("[Safari MCP] Extension connected via HTTP polling");
+      }
+      _extensionLastPollTime = Date.now();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "connected" }));
+      return;
+    }
+
+    res.writeHead(404);
+    res.end("Not found");
+  });
+
+  httpServer.listen(HTTP_PORT, "127.0.0.1", () => {
+    // Silent start
+  });
+  httpServer.on("error", (err) => {
+    if (err.code === "EADDRINUSE") {
+      console.error(`[Safari MCP] HTTP port ${HTTP_PORT} in use — HTTP polling disabled`);
+    }
+  });
+} catch {}
+
+let _extensionLastPollTime = 0;
+// Detect stale HTTP connection (no poll in 10s = disconnected)
+setInterval(() => {
+  if (_extensionConnected && !_extensionWs && _extensionLastPollTime > 0) {
+    if (Date.now() - _extensionLastPollTime > 10000) {
+      _extensionConnected = false;
+      console.error("[Safari MCP] Extension disconnected (HTTP poll timeout)");
+    }
+  }
+}, 5000);
+
+// ========== SHARED EXTENSION LOGIC ==========
+
+function _handleExtensionResponse(msg) {
+  if (msg.type === "keepalive") return;
+  if (msg.type === "connected") {
+    if (!_extensionConnected) {
+      _extensionConnected = true;
+      console.error("[Safari MCP] Extension connected");
+    }
+    return;
+  }
+  if (msg.type !== "response" || !msg.id) return;
+  const pending = _pendingRequests.get(msg.id);
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  _pendingRequests.delete(msg.id);
+  if (msg.error) pending.reject(new Error(msg.error));
+  else pending.resolve(msg.result);
+}
+
+// Send command to extension (via WebSocket or HTTP command queue)
+function sendToExtension(type, payload = {}, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    if (!_extensionConnected) {
+      reject(new Error("Extension not connected"));
+      return;
+    }
     const id = randomUUID();
-    const timeout = setTimeout(() => {
-      cleanup();
+    const timer = setTimeout(() => {
+      _pendingRequests.delete(id);
       reject(new Error(`Extension timeout after ${timeoutMs}ms`));
     }, timeoutMs);
+    _pendingRequests.set(id, { resolve, reject, timer });
 
-    function onMessage(data) {
-      let msg;
-      try { msg = JSON.parse(data.toString()); } catch { return; }
-      if (msg.type !== "response" || msg.id !== id) return;
-      cleanup();
-      if (msg.error) reject(new Error(msg.error));
-      else resolve(msg.result);
+    const command = { id, type, payload };
+
+    // If WebSocket is connected, use it (faster)
+    if (_extensionWs) {
+      _extensionWs.send(JSON.stringify(command));
+    } else {
+      // Otherwise, queue for HTTP polling
+      _commandQueue.push(command);
     }
-
-    function cleanup() {
-      clearTimeout(timeout);
-      _extensionWs?.removeListener("message", onMessage);
-    }
-
-    _extensionWs.on("message", onMessage);
-    _extensionWs.send(JSON.stringify({ id, type, payload }));
   });
 }
 
 // Try extension first, fall back to AppleScript
-// Automatically injects tabUrl so the extension targets the MCP's tab, not the user's active tab
 async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) {
   if (_extensionConnected) {
     try {
@@ -119,7 +239,7 @@ server.tool(
   "Go back in browser history",
   {},
   async () => {
-    const result = await safari.goBack();
+    const result = await extensionOrFallback("go_back", {}, () => safari.goBack());
     return { content: [{ type: "text", text: JSON.stringify(result) }] };
   }
 );
@@ -129,7 +249,7 @@ server.tool(
   "Go forward in browser history",
   {},
   async () => {
-    const result = await safari.goForward();
+    const result = await extensionOrFallback("go_forward", {}, () => safari.goForward());
     return { content: [{ type: "text", text: JSON.stringify(result) }] };
   }
 );
@@ -139,7 +259,7 @@ server.tool(
   "Reload the current page",
   { hard: z.boolean().optional().describe("Hard reload (bypass cache)") },
   async ({ hard }) => {
-    const result = await safari.reload(hard);
+    const result = await extensionOrFallback("reload", { hard }, () => safari.reload(hard));
     return { content: [{ type: "text", text: JSON.stringify(result) }] };
   }
 );
@@ -179,8 +299,31 @@ server.tool(
   "Get page accessibility tree with ref IDs for every interactive element. Use refs with click/fill/type instead of CSS selectors. PREFERRED workflow: snapshot → see refs → click({ref:'0_5'})",
   { selector: z.string().optional().describe("CSS selector for subtree (default: full page)") },
   async (args) => {
-    const result = await safari.takeSnapshot(args);
-    return { content: [{ type: "text", text: result }] };
+    const result = await extensionOrFallback(
+      "snapshot", { selector: args.selector },
+      () => safari.takeSnapshot(args)
+    );
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+  }
+);
+
+server.tool(
+  "safari_navigate_and_read",
+  "Navigate to a URL and return the page content in one step — saves 1 full round-trip vs navigate+read_page. Use instead of safari_navigate + safari_read_page.",
+  {
+    url: z.string().describe("URL to navigate to"),
+    maxLength: z.coerce.number().optional().describe("Max chars to return (default: 50000)"),
+    timeout: z.coerce.number().optional().describe("Load timeout in ms (default: 30000)"),
+  },
+  async ({ url, maxLength, timeout }) => {
+    const result = await extensionOrFallback(
+      "navigate_and_read", { url, maxLength, timeout },
+      async () => {
+        await safari.navigate(url);
+        return safari.readPage({ maxLength });
+      }
+    );
+    return { content: [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result) }] };
   }
 );
 
@@ -198,7 +341,7 @@ server.tool(
   },
   async (args) => {
     const result = await extensionOrFallback(
-      "click", { selector: args.selector, text: args.text, x: args.x, y: args.y },
+      "click", { ref: args.ref, selector: args.selector, text: args.text, x: args.x, y: args.y },
       () => safari.click(args)
     );
     return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
@@ -239,8 +382,11 @@ server.tool(
     y: z.coerce.number().optional().describe("Y coordinate"),
   },
   async (args) => {
-    const result = await safari.doubleClick(args);
-    return { content: [{ type: "text", text: result }] };
+    const result = await extensionOrFallback(
+      "double_click", { selector: args.selector, x: args.x, y: args.y },
+      () => safari.doubleClick(args)
+    );
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
 
@@ -253,8 +399,11 @@ server.tool(
     y: z.coerce.number().optional().describe("Y coordinate"),
   },
   async (args) => {
-    const result = await safari.rightClick(args);
-    return { content: [{ type: "text", text: result }] };
+    const result = await extensionOrFallback(
+      "right_click", { selector: args.selector, x: args.x, y: args.y },
+      () => safari.rightClick(args)
+    );
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
 
@@ -270,7 +419,7 @@ server.tool(
   },
   async (args) => {
     const result = await safari.fill(args);
-    return { content: [{ type: "text", text: result }] };
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
 
@@ -279,8 +428,11 @@ server.tool(
   "Clear an input field",
   { selector: z.string().describe("CSS selector of the input") },
   async (args) => {
-    const result = await safari.clearField(args);
-    return { content: [{ type: "text", text: result }] };
+    const result = await extensionOrFallback(
+      "clear_field", { selector: args.selector },
+      () => safari.clearField(args)
+    );
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
 
@@ -292,8 +444,11 @@ server.tool(
     value: z.string().describe("Option value to select"),
   },
   async (args) => {
-    const result = await safari.selectOption(args);
-    return { content: [{ type: "text", text: result }] };
+    const result = await extensionOrFallback(
+      "select_option", { selector: args.selector, value: args.value },
+      () => safari.selectOption(args)
+    );
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
 
@@ -307,8 +462,11 @@ server.tool(
     })).describe("Array of {selector, value} pairs"),
   },
   async (args) => {
-    const result = await safari.fillForm(args);
-    return { content: [{ type: "text", text: result }] };
+    const result = await extensionOrFallback(
+      "fill_form", { fields: args.fields },
+      () => safari.fillForm(args)
+    );
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
 
@@ -322,8 +480,11 @@ server.tool(
     modifiers: z.array(z.string()).optional().describe("Modifier keys: cmd, shift, alt, ctrl"),
   },
   async (args) => {
-    const result = await safari.pressKey(args);
-    return { content: [{ type: "text", text: result }] };
+    const result = await extensionOrFallback(
+      "press_key", { key: args.key, modifiers: args.modifiers },
+      () => safari.pressKey(args)
+    );
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
 
@@ -336,8 +497,11 @@ server.tool(
     selector: z.string().optional().describe("CSS selector to focus"),
   },
   async (args) => {
-    const result = await safari.typeText(args);
-    return { content: [{ type: "text", text: result }] };
+    const result = await extensionOrFallback(
+      "type_text", { text: args.text, selector: args.ref ? `[data-mcp-ref="${args.ref}"]` : args.selector },
+      () => safari.typeText(args)
+    );
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
 
@@ -382,8 +546,11 @@ server.tool(
     amount: z.coerce.number().optional().describe("Pixels to scroll (default: 500)"),
   },
   async (args) => {
-    const result = await safari.scroll(args);
-    return { content: [{ type: "text", text: result }] };
+    const result = await extensionOrFallback(
+      "scroll", { direction: args.direction, amount: args.amount },
+      () => safari.scroll(args)
+    );
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
 
@@ -395,8 +562,11 @@ server.tool(
     y: z.coerce.number().optional().describe("Y position (default: 0)"),
   },
   async (args) => {
-    const result = await safari.scrollTo(args);
-    return { content: [{ type: "text", text: result }] };
+    const result = await extensionOrFallback(
+      "scroll_to", { x: args.x, y: args.y },
+      () => safari.scrollTo(args)
+    );
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
 
@@ -424,6 +594,13 @@ server.tool(
       "new_tab", { url },
       () => safari.newTab(url)
     );
+    // Sync safari.js tracking when extension handled new_tab
+    if (result?.tabIndex) {
+      safari.setActiveTabIndex(result.tabIndex);
+    }
+    if (result?.url) {
+      safari.setActiveTabURL(result.url);
+    }
     return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
@@ -433,8 +610,8 @@ server.tool(
   "Close the current tab",
   {},
   async () => {
-    const result = await safari.closeTab();
-    return { content: [{ type: "text", text: result }] };
+    const result = await extensionOrFallback("close_tab", {}, () => safari.closeTab());
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
 
@@ -443,7 +620,10 @@ server.tool(
   "Switch to a specific tab by index (use safari_list_tabs to see indices)",
   { index: z.coerce.number().describe("Tab index (starting from 1)") },
   async ({ index }) => {
-    const result = await safari.switchTab(index);
+    const result = await extensionOrFallback(
+      "switch_tab", { index },
+      () => safari.switchTab(index)
+    );
     return { content: [{ type: "text", text: JSON.stringify(result) }] };
   }
 );
@@ -459,8 +639,11 @@ server.tool(
     timeout: z.coerce.number().optional().describe("Timeout in ms (default: 10000)"),
   },
   async (args) => {
-    const result = await safari.waitFor(args);
-    return { content: [{ type: "text", text: result }] };
+    const result = await extensionOrFallback(
+      "wait_for", { selector: args.selector, text: args.text, timeout: args.timeout },
+      () => safari.waitFor(args)
+    );
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
 
@@ -516,8 +699,12 @@ server.tool(
     y: z.coerce.number().optional().describe("Y coordinate"),
   },
   async (args) => {
-    const result = await safari.hover(args);
-    return { content: [{ type: "text", text: result }] };
+    const sel = args.ref ? `[data-mcp-ref="${args.ref}"]` : args.selector;
+    const result = await extensionOrFallback(
+      "hover", { selector: sel },
+      () => safari.hover(args)
+    );
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
 
@@ -1137,16 +1324,6 @@ server.tool(
 );
 
 // ========== COMBO TOOLS (fast multi-step operations) ==========
-
-server.tool(
-  "safari_navigate_and_read",
-  "Navigate to URL AND read the page content in one fast operation. Returns title, URL, and text. Use this instead of navigate + read_page separately.",
-  { url: z.string().describe("URL to navigate to") },
-  async ({ url }) => {
-    const result = await safari.navigateAndRead(url);
-    return { content: [{ type: "text", text: result }] };
-  }
-);
 
 server.tool(
   "safari_click_and_wait",
