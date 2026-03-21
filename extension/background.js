@@ -1,38 +1,42 @@
 // Safari MCP Bridge — Background Service Worker
-// Connects to MCP server via WebSocket (Chrome) or HTTP polling (Safari)
-// Safari blocks WebSocket from service workers to localhost — HTTP polling works around this
+// Uses HTTP long-polling to communicate with MCP server
+// Safari terminates idle service workers after ~30s, so we keep an active fetch() going
 
-const WS_URL = "ws://127.0.0.1:9223";
 const HTTP_URL = "http://127.0.0.1:9224";
-let ws = null;
 let isConnected = false;
-let transport = "none"; // "websocket" | "http" | "none"
+let pollAbort = null;
 
-// ========== TRANSPORT SELECTION ==========
+// ========== GLOBAL ERROR HANDLER ==========
+// Prevent unhandled errors from crashing the service worker
+self.addEventListener("unhandledrejection", (e) => {
+  e.preventDefault();
+  console.warn("Safari MCP Bridge: unhandled rejection:", e.reason);
+});
+
+// ========== BADGE ==========
+
+function updateBadge(text) {
+  try {
+    browser.action.setBadgeText({ text });
+    if (text) browser.action.setBadgeBackgroundColor({ color: text === "ON" ? "#4CAF50" : "#FF9800" });
+  } catch {}
+}
+
+// ========== HTTP LONG-POLLING TRANSPORT ==========
 
 async function connect() {
-  // Try WebSocket first (works in Chrome, may work in future Safari)
-  try {
-    ws = new WebSocket(WS_URL);
-    await new Promise((resolve, reject) => {
-      ws.onopen = resolve;
-      ws.onerror = reject;
-      setTimeout(reject, 2000);
-    });
-    transport = "websocket";
-    isConnected = true;
-    setupWebSocket();
-    updateBadge("WS");
-    return;
-  } catch {
-    ws = null;
+  // Cancel any existing poll
+  if (pollAbort) {
+    try { pollAbort.abort(); } catch {}
+    pollAbort = null;
   }
 
-  // Fall back to HTTP polling (Safari)
   try {
-    const res = await fetch(`${HTTP_URL}/connect`, { method: "POST" });
+    const res = await fetch(`${HTTP_URL}/connect`, {
+      method: "POST",
+      signal: AbortSignal.timeout(5000),
+    });
     if (res.ok) {
-      transport = "http";
       isConnected = true;
       updateBadge("ON");
       pollForCommands();
@@ -40,58 +44,42 @@ async function connect() {
     }
   } catch {}
 
-  // Neither worked — retry in 3s
+  // Server not available — use alarm to retry (keeps worker from dying)
+  isConnected = false;
   updateBadge("");
-  setTimeout(connect, 3000);
+  scheduleReconnect();
 }
 
-function updateBadge(text) {
-  browser.action.setBadgeText({ text });
-  if (text) browser.action.setBadgeBackgroundColor({ color: "#4CAF50" });
-}
-
-// ========== WEBSOCKET TRANSPORT ==========
-
-function setupWebSocket() {
-  ws.onclose = () => {
-    isConnected = false;
-    transport = "none";
-    ws = null;
-    updateBadge("");
+function scheduleReconnect() {
+  // Use alarms instead of setTimeout — alarms wake up a terminated service worker
+  try {
+    browser.alarms.create("reconnect", { delayInMinutes: 0.05 }); // ~3 seconds (minimum Safari allows)
+  } catch {
+    // Fallback: setTimeout (won't survive worker termination, but better than nothing)
     setTimeout(connect, 3000);
-  };
-  ws.onerror = () => ws?.close();
-  ws.onmessage = async (event) => {
-    let msg;
-    try { msg = JSON.parse(event.data); } catch { return; }
-    await executeAndReply(msg);
-  };
-  keepAlive();
+  }
 }
-
-function keepAlive() {
-  if (transport !== "websocket") return;
-  ws?.send(JSON.stringify({ type: "keepalive" }));
-  setTimeout(keepAlive, 5000);
-}
-
-// ========== HTTP POLLING TRANSPORT ==========
 
 async function pollForCommands() {
-  while (transport === "http") {
+  while (isConnected) {
     try {
-      const res = await fetch(`${HTTP_URL}/poll`);
+      pollAbort = new AbortController();
+      // Long-poll: server holds connection open until a command arrives or timeout
+      // This active fetch keeps the service worker alive in Safari
+      const res = await fetch(`${HTTP_URL}/poll`, {
+        signal: pollAbort.signal,
+      });
       if (res.status === 200) {
         const msg = await res.json();
         await executeAndReply(msg);
       }
-      // 204 = no command, just loop
-    } catch {
+      // 204 = no command, loop immediately to keep connection active
+    } catch (err) {
+      if (err.name === "AbortError") return; // Intentional abort
       // Server gone — reconnect
       isConnected = false;
-      transport = "none";
       updateBadge("");
-      setTimeout(connect, 3000);
+      scheduleReconnect();
       return;
     }
   }
@@ -110,23 +98,19 @@ async function executeAndReply(msg) {
     response = { type: "response", id: msg.id, result: null, error: err.message || String(err) };
   }
 
-  if (transport === "websocket" && ws) {
-    ws.send(JSON.stringify(response));
-  } else if (transport === "http") {
-    try {
-      await fetch(`${HTTP_URL}/result`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(response),
-      });
-    } catch {}
-  }
+  try {
+    await fetch(`${HTTP_URL}/result`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(response),
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch {}
 }
 
 // ========== COMMAND HANDLERS ==========
 
 async function handleCommand(type, payload) {
-  // Find the MCP's specific tab (by URL if provided), never touch user's active tab blindly
   const targetTab = await getTargetTab(payload.tabUrl);
   const tabId = targetTab.id;
 
@@ -209,7 +193,6 @@ async function handleCommand(type, payload) {
         if (selector) {
           el = document.querySelector(selector);
         } else if (text) {
-          // Search attributes first (aria-label, placeholder, title)
           const attrEls = document.querySelectorAll("[aria-label],[placeholder],[title]");
           for (let i = 0; i < attrEls.length; i++) {
             const a = attrEls[i];
@@ -219,7 +202,6 @@ async function handleCommand(type, payload) {
               if (r.width > 0 && r.height > 0) { el = a; break; }
             }
           }
-          // TreeWalker text search
           if (!el) {
             const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
             let best = null, bestArea = Infinity;
@@ -259,7 +241,6 @@ async function handleCommand(type, payload) {
         el.dispatchEvent(new MouseEvent("click", { ...s, buttons: 0 }));
 
         // React Fiber — traverse up to 15 parents for onClick/onMouseDown
-        // (works in MAIN world — has access to __reactProps$)
         let node = el, reactFired = false;
         for (let depth = 0; depth < 15 && node; depth++) {
           const pk = Object.keys(node).find(k => k.startsWith("__reactProps$"));
@@ -272,7 +253,7 @@ async function handleCommand(type, payload) {
           node = node.parentElement;
         }
 
-        // A-tag fallback: always navigate via href for link elements
+        // A-tag fallback
         const aTag = el.closest ? el.closest("a[href]") : null;
         if (aTag && aTag.href && !aTag.href.startsWith("javascript:") && aTag.href !== location.href) {
           location.href = aTag.href;
@@ -285,7 +266,6 @@ async function handleCommand(type, payload) {
 
     // --- Click + Read (combo — saves 1 full MCP round-trip) ---
     case "click_and_read": {
-      // Click
       await browser.scripting.executeScript({
         target: { tabId },
         world: "MAIN",
@@ -333,7 +313,6 @@ async function handleCommand(type, payload) {
           el.dispatchEvent(new PointerEvent("pointerup", { ...po, buttons: 0, pressure: 0 }));
           el.dispatchEvent(new MouseEvent("mouseup", { ...s, buttons: 0 }));
           el.dispatchEvent(new MouseEvent("click", { ...s, buttons: 0 }));
-          // React Fiber
           let node = el;
           for (let d = 0; d < 15 && node; d++) {
             const pk = Object.keys(node).find(k => k.startsWith("__reactProps$"));
@@ -345,7 +324,6 @@ async function handleCommand(type, payload) {
             }
             node = node.parentElement;
           }
-          // A-tag fallback
           const a = el.closest ? el.closest("a[href]") : null;
           if (a && a.href && !a.href.startsWith("javascript:") && a.href !== location.href) {
             location.href = a.href;
@@ -354,17 +332,14 @@ async function handleCommand(type, payload) {
         args: [payload.selector, payload.text, payload.x, payload.y],
       });
 
-      // Wait for update/navigation
       const waitMs = payload.wait || 800;
       await sleep(waitMs);
 
-      // Check if tab is still loading (navigation happened)
       const currentTab = await browser.tabs.get(tabId).catch(() => null);
       if (currentTab?.status === "loading") {
         await waitForTabLoad(tabId, 10000);
       }
 
-      // Read updated page
       const maxLen = payload.maxLength || 50000;
       const results = await browser.scripting.executeScript({
         target: { tabId },
@@ -498,7 +473,6 @@ async function handleCommand(type, payload) {
 
 // ========== HELPERS ==========
 
-// Cache active tab ID — avoid browser.tabs.query on every call
 let _cachedTabId = null;
 
 browser.tabs.onActivated.addListener(({ tabId }) => {
@@ -509,18 +483,15 @@ browser.tabs.onRemoved.addListener((tabId) => {
   if (_cachedTabId === tabId) _cachedTabId = null;
 });
 
-// Find tab by URL (MCP's working tab) — never use user's active tab blindly
 async function getTargetTab(tabUrl) {
   if (tabUrl) {
-    // Find the MCP's specific tab by URL (partial match from start)
     const all = await browser.tabs.query({ currentWindow: true });
-    const match = all.find(t => t.url && (t.url.startsWith(tabUrl) || tabUrl.startsWith(t.url.split('?')[0])));
+    const match = all.find(t => t.url && (t.url.startsWith(tabUrl) || tabUrl.startsWith(t.url.split("?")[0])));
     if (match) {
       _cachedTabId = match.id;
       return match;
     }
   }
-  // No specific URL — use active tab (default)
   return getActiveTab();
 }
 
@@ -538,7 +509,6 @@ async function getActiveTab() {
   return tabs[0];
 }
 
-// Execute a function in the MCP's tab — MAIN world for full page access (React Fiber, etc.)
 async function execInTab(func, args = [], tabId = null) {
   const id = tabId || (await getActiveTab()).id;
   const results = await browser.scripting.executeScript({
@@ -574,15 +544,18 @@ function sleep(ms) {
 
 // ========== KEEP-ALIVE VIA ALARMS ==========
 // Safari kills service workers after ~30s of inactivity.
-// browser.alarms wakes the worker periodically.
-try {
-  browser.alarms.create("keepalive", { periodInMinutes: 1 });
-  browser.alarms.onAlarm.addListener((alarm) => {
-    if (alarm.name === "keepalive" && (!isConnected || transport === "none")) {
+// browser.alarms re-wakes the worker and reconnects if needed.
+// The active fetch() in pollForCommands() keeps the worker alive while connected.
+browser.alarms.create("keepalive", { periodInMinutes: 0.5 });
+browser.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === "keepalive" || alarm.name === "reconnect") {
+    if (!isConnected) {
       connect();
     }
-  });
-} catch {}
+  }
+});
 
 // ========== STARTUP ==========
-setTimeout(connect, 100);
+console.log("Safari MCP Bridge: service worker started");
+updateBadge("...");
+connect();
