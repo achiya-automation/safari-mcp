@@ -53,7 +53,7 @@ async function connect() {
 function scheduleReconnect() {
   // Use alarms instead of setTimeout — alarms wake up a terminated service worker
   try {
-    browser.alarms.create("reconnect", { delayInMinutes: 0.05 }); // ~3 seconds (minimum Safari allows)
+    browser.alarms.create("reconnect", { delayInMinutes: 1 }); // Safari minimum is 1 minute
   } catch {
     // Fallback: setTimeout (won't survive worker termination, but better than nothing)
     setTimeout(connect, 3000);
@@ -546,7 +546,7 @@ function sleep(ms) {
 // Safari kills service workers after ~30s of inactivity.
 // browser.alarms re-wakes the worker and reconnects if needed.
 // The active fetch() in pollForCommands() keeps the worker alive while connected.
-browser.alarms.create("keepalive", { periodInMinutes: 0.5 });
+browser.alarms.create("keepalive", { periodInMinutes: 1 });
 browser.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "keepalive" || alarm.name === "reconnect") {
     if (!isConnected) {
