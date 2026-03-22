@@ -96,60 +96,64 @@ function isStaleWindowError(err) {
   return /window id \d+/.test(msg) && /(-1728|-10006)/.test(msg);
 }
 
+// Quick JS execution — exposed for smart-wait checks in index.js
+export async function runJSQuick(js) { return runJS(js); }
+
 export function getActiveTabIndex() { return _activeTabIndex; }
 export function setActiveTabIndex(idx) { _activeTabIndex = idx; }
 export function getActiveTabURL() { return _activeTabURL; }
 export function setActiveTabURL(url) { _activeTabURL = url; _lastResolveTime = Date.now(); }
 
-// Resolve our tracked URL to current tab index — single osascript call (fast!)
+// Resolve our tracked URL to current tab index — single combined osascript call
 async function resolveActiveTab() {
   if (!_activeTabURL) return _activeTabIndex;
   try {
     const safeUrl = _activeTabURL.replace(/"/g, '\\"');
-    // If we have a known index, verify it first (O(1) instead of searching all tabs)
-    if (_activeTabIndex) {
-      const currentUrl = await osascriptFast(
-        `tell application "Safari" to return URL of tab ${_activeTabIndex} of ${_targetWindowRef}`
-      ).catch(() => "");
-      if (currentUrl && currentUrl.startsWith(_activeTabURL)) {
-        return _activeTabIndex; // Same tab, same URL — no change needed
-      }
-    }
-    // Index shifted — search from the END (our tab is usually the newest)
-    const idx = await osascriptFast(
+    const domain = _activeTabURL.replace(/^https?:\/\//, '').split('/')[0].replace(/"/g, '\\"');
+    // Single AppleScript call: verify current index, then search by URL, then by domain
+    // Also returns tabCount so we can clamp stale indices
+    const result = await osascriptFast(
       `tell application "Safari"
-        set tabCount to count of tabs of ${_targetWindowRef}
+        set w to ${_targetWindowRef}
+        set tabCount to count of tabs of w
+        ${_activeTabIndex ? `try
+          if tabCount >= ${_activeTabIndex} then
+            if URL of tab ${_activeTabIndex} of w starts with "${safeUrl}" then return ${_activeTabIndex}
+          end if
+        end try` : ''}
         repeat with i from tabCount to 1 by -1
-          if URL of tab i of ${_targetWindowRef} starts with "${safeUrl}" then return i
+          if URL of tab i of w starts with "${safeUrl}" then return i
         end repeat
-        return 0
+        repeat with i from tabCount to 1 by -1
+          if URL of tab i of w contains "${domain}" then return -(i)
+        end repeat
+        return "0:" & tabCount
       end tell`
     );
-    const num = Number(idx);
+    // Parse result — can be "N" (found) or "0:tabCount" (not found)
+    const resultStr = String(result);
+    if (resultStr.includes(':')) {
+      // Not found — clamp stale index to tabCount
+      const tabCount = Number(resultStr.split(':')[1]) || 1;
+      _activeTabURL = null;
+      if (_activeTabIndex && _activeTabIndex > tabCount) {
+        console.error(`[Safari MCP] Tab ghost fix: index ${_activeTabIndex} > tabCount ${tabCount}, clamping to ${tabCount}`);
+        _activeTabIndex = tabCount;
+      }
+      return _activeTabIndex;
+    }
+    const num = Number(result);
     if (num > 0) {
       _activeTabIndex = num;
       return num;
     }
-    // Try partial match (URL may have changed due to redirects/navigation)
-    const domain = _activeTabURL.replace(/^https?:\/\//, '').split('/')[0];
-    const safeDomain = domain.replace(/"/g, '\\"');
-    const idx2 = await osascriptFast(
-      `tell application "Safari"
-        set tabCount to count of tabs of ${_targetWindowRef}
-        repeat with i from tabCount to 1 by -1
-          if URL of tab i of ${_targetWindowRef} contains "${safeDomain}" then return i
-        end repeat
-        return 0
-      end tell`
-    );
-    const num2 = Number(idx2);
-    if (num2 > 0) {
-      _activeTabIndex = num2;
-      return num2;
+    if (num < 0) {
+      // Domain match (negative = partial match)
+      _activeTabIndex = -num;
+      return -num;
     }
-    // URL not found — tab may have navigated. Don't clear _activeTabIndex!
     _activeTabURL = null;
-    return _activeTabIndex; // Keep using saved index as best guess
+    return _activeTabIndex;
   } catch {
     return _activeTabIndex;
   }
@@ -233,6 +237,12 @@ function _osascriptFastHelper(script, timeout) {
     }
 
     _helperQueue.push(cb);
+    if (!_helperProc || !_helperProc.stdin) {
+      // Helper died between the check and write — reject immediately
+      _helperQueue.pop(); // Remove the callback we just pushed
+      reject(new Error("safari-helper not available"));
+      return;
+    }
     _helperProc.stdin.write(JSON.stringify({ script }) + "\n");
   });
 }
@@ -264,18 +274,48 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
     ? `tab ${idx} of ${_targetWindowRef}`
     : "front document";
   const script = `tell application "Safari" to do JavaScript "${escaped}" in ${target}`;
-  // Use fast path for scripts under 50KB (persistent process handles these well)
-  if (script.length < 50000) {
-    return osascriptFast(script, { timeout });
+  try {
+    if (script.length < 50000) {
+      return await osascriptFast(script, { timeout });
+    }
+    return await osascript(script, { timeout });
+  } catch (err) {
+    // Tab ghost recovery: "Can't get tab X" → re-resolve and retry once
+    const msg = err.message || '';
+    if (idx && (msg.includes("Can't get tab") || msg.includes("-1728"))) {
+      console.error(`[Safari MCP] Tab ghost detected (tab ${idx}), re-resolving...`);
+      _lastResolveTime = 0; // Force re-resolve
+      _activeTabIndex = null;
+      if (_activeTabURL) {
+        const newIdx = await resolveActiveTab();
+        if (newIdx && newIdx !== idx) {
+          const newTarget = `tab ${newIdx} of ${_targetWindowRef}`;
+          const retryScript = `tell application "Safari" to do JavaScript "${escaped}" in ${newTarget}`;
+          if (retryScript.length < 50000) return osascriptFast(retryScript, { timeout });
+          return osascript(retryScript, { timeout });
+        }
+      }
+      // If still can't resolve, try current tab of the window
+      const fallbackScript = `tell application "Safari" to do JavaScript "${escaped}" in current tab of ${_targetWindowRef}`;
+      console.error(`[Safari MCP] Falling back to current tab`);
+      if (fallbackScript.length < 50000) return osascriptFast(fallbackScript, { timeout });
+      return osascript(fallbackScript, { timeout });
+    }
+    throw err;
   }
-  return osascript(script, { timeout });
 }
 
 // Run large JavaScript via temp file — bypasses osascript arg length limit (~260KB)
 // Used for operations that embed file data (upload, paste image)
 async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
   await refreshTargetWindow();
-  const idx = tabIndex || _activeTabIndex;
+  // Resolve tab the same way runJS does — verify cached index via URL
+  let idx = tabIndex;
+  if (!idx && _activeTabURL && _activeTabURL !== 'about:blank' && _activeTabURL !== '') {
+    const resolved = await resolveActiveTab();
+    if (resolved) { idx = resolved; _lastResolveTime = Date.now(); }
+  }
+  if (!idx) idx = _activeTabIndex;
   const target = idx
     ? `tab ${idx} of ${_targetWindowRef}`
     : "front document";
@@ -316,38 +356,40 @@ export async function navigate(url) {
     const navTarget = _activeTabIndex
       ? `tab ${_activeTabIndex} of ${_targetWindowRef}`
       : "front document";
-    // Combined: set URL + poll readyState in ONE osascript call (saves 80ms vs 2 calls)
-    const result = await osascript(
-      `tell application "Safari"
-        set URL of ${navTarget} to "${safeUrl}"
-        repeat 80 times
-          try
-            set rdy to do JavaScript "document.readyState" in ${navTarget}
-            if rdy = "complete" then exit repeat
-          end try
-          delay 0.2
-        end repeat
-        set info to do JavaScript "JSON.stringify({title:document.title,url:location.href,blocked:document.title.includes('cannot open')||document.title.includes('אין אפשרות')})" in ${navTarget}
-        return info
-      end tell`,
+    // Step 0: Suppress onbeforeunload dialogs (prevents blocking navigation)
+    await runJS("window.onbeforeunload=null", { timeout: 2000 }).catch(() => {});
+
+    // Step 1: Set URL via fast daemon (~5ms) — don't block daemon with polling
+    await osascriptFast(
+      `tell application "Safari" to set URL of ${navTarget} to "${safeUrl}"`,
+      { timeout: 10000 }
+    );
+
+    // Step 2: Poll readyState via JS (runs in Safari, doesn't block daemon)
+    const result = await runJS(
+      `(async function(){
+        for(var i=0;i<80;i++){
+          if(document.readyState==='complete')break;
+          await new Promise(function(r){setTimeout(r,200)});
+        }
+        return JSON.stringify({title:document.title,url:location.href,blocked:document.title.includes('cannot open')||document.title.includes('אין אפשרות')});
+      })()`,
       { timeout: 30000 }
     );
 
-    // Update URL tracking after successful navigate
-    _activeTabURL = targetUrl;
-    _lastResolveTime = Date.now();
-
     // Inject click helpers in background (non-blocking, for subsequent clicks)
-    runJS(`${INJECT_MCP_HELPERS}`).catch(() => {});
+    _injectHelpersfast().catch(() => {});
 
     // If HTTPS failed and original was HTTP, try original HTTP URL
     try {
       const parsed = JSON.parse(result);
       if (parsed.blocked && url.startsWith("http://")) {
-        // Try the original HTTP URL — Safari may still block it, but at least we tried
         const httpUrl = url.replace(/"/g, '\\"');
+        const navTarget = _activeTabIndex
+          ? `tab ${_activeTabIndex} of ${_targetWindowRef}`
+          : `current tab of ${_targetWindowRef}`;
         await osascriptFast(
-          `tell application "Safari" to set URL of front document to "${httpUrl}"`
+          `tell application "Safari" to set URL of ${navTarget} to "${httpUrl}"`
         );
         const retry = await runJS(
           `(async function(){
@@ -358,30 +400,39 @@ export async function navigate(url) {
             return JSON.stringify({title:document.title,url:location.href});
           })()`
         );
+        // Update URL tracking with actual URL after HTTP retry
+        try {
+          const retryParsed = JSON.parse(retry);
+          if (retryParsed.url) _activeTabURL = retryParsed.url;
+        } catch {}
+        _lastResolveTime = Date.now();
         return retry;
       }
     } catch (_) {}
 
-    // Update URL tracking after navigation
+    // Update URL tracking after navigation (non-blocked path)
     try {
       const parsed = JSON.parse(result);
-      if (parsed.url) _activeTabURL = parsed.url;
-    } catch {}
+      _activeTabURL = parsed.url || targetUrl;
+    } catch {
+      _activeTabURL = targetUrl;
+    }
+    _lastResolveTime = Date.now();
 
     return result;
 }
 
 export async function goBack() {
-  // Single call: navigate back + wait for load + return info
+  // Navigate back + smart wait: check immediately, then poll only if loading
   return runJS(
-    `(async function(){history.back();for(var i=0;i<30;i++){await new Promise(function(r){setTimeout(r,200)});if(document.readyState==='complete')break;}return JSON.stringify({title:document.title,url:location.href});})()`,
+    `(async function(){history.back();await new Promise(function(r){setTimeout(r,50)});if(document.readyState!=='complete'){for(var i=0;i<30;i++){await new Promise(function(r){setTimeout(r,150)});if(document.readyState==='complete')break;}}return JSON.stringify({title:document.title,url:location.href});})()`,
     { timeout: 10000 }
   );
 }
 
 export async function goForward() {
   return runJS(
-    `(async function(){history.forward();for(var i=0;i<30;i++){await new Promise(function(r){setTimeout(r,200)});if(document.readyState==='complete')break;}return JSON.stringify({title:document.title,url:location.href});})()`,
+    `(async function(){history.forward();await new Promise(function(r){setTimeout(r,50)});if(document.readyState!=='complete'){for(var i=0;i<30;i++){await new Promise(function(r){setTimeout(r,150)});if(document.readyState==='complete')break;}}return JSON.stringify({title:document.title,url:location.href});})()`,
     { timeout: 10000 }
   );
 }
@@ -389,7 +440,7 @@ export async function goForward() {
 export async function reload(hardReload = false) {
   // Reload destroys JS context — must wait separately then re-query
   await runJS(hardReload ? "location.reload(true)" : "location.reload()");
-  await new Promise((r) => setTimeout(r, 500));
+  await new Promise((r) => setTimeout(r, 100)); // Brief wait for reload to start (was 500ms)
   // Poll readyState in a single call
   return runJS(
     `(async function(){for(var i=0;i<30;i++){if(document.readyState==='complete')break;await new Promise(function(r){setTimeout(r,200)});}return JSON.stringify({title:document.title,url:location.href});})()`,
@@ -424,14 +475,31 @@ export async function getPageSource({ maxLength = 200000 } = {}) {
 
 // Inject click helpers ONCE per page (cached on window.__mcp)
 // Includes: mcpClick (full event sequence), mcpReactClick (React Fiber), mcpFindText (fast TreeWalker)
-const INJECT_MCP_HELPERS = `if(window.__mcpVersion!==4){window.__mcpVersion=4;
+const INJECT_MCP_HELPERS = `if(window.__mcpVersion!==5){window.__mcpVersion=5;
   window.__mcpRefs=window.__mcpRefs||{};
+  window.__mcpCachedRoots=null;
+  window.__mcpRootsDirty=true;
+  if(!window.__mcpRootsObserver){
+    window.__mcpRootsObserver=new MutationObserver(function(){window.__mcpRootsDirty=true;});
+    window.__mcpRootsObserver.observe(document.documentElement,{childList:true,subtree:true});
+  }
   window.mcpCollectRoots=function(){
-    var roots=[document];
-    var all=document.querySelectorAll('*');
-    for(var i=0;i<all.length;i++){
-      if(all[i].shadowRoot)roots.push(all[i].shadowRoot);
+    if(!window.__mcpRootsDirty&&window.__mcpCachedRoots)return window.__mcpCachedRoots;
+    var roots=[];
+    function collect(root){
+      roots.push(root);
+      var all=root.querySelectorAll('*');
+      for(var i=0;i<all.length;i++){
+        if(all[i].shadowRoot)collect(all[i].shadowRoot);
+      }
     }
+    collect(document);
+    var iframes=document.querySelectorAll('iframe');
+    for(var i=0;i<iframes.length;i++){
+      try{var doc=iframes[i].contentDocument;if(doc)collect(doc);}catch(e){}
+    }
+    window.__mcpCachedRoots=roots;
+    window.__mcpRootsDirty=false;
     return roots;
   };
   window.mcpQuerySelectorDeep=function(selector){
@@ -444,6 +512,13 @@ const INJECT_MCP_HELPERS = `if(window.__mcpVersion!==4){window.__mcpVersion=4;
       try{
         var found=roots[i].querySelector(selector);
         if(found)return found;
+      }catch(e){}
+    }
+    var iframes=document.querySelectorAll('iframe');
+    for(var i=0;i<iframes.length;i++){
+      try{
+        var doc=iframes[i].contentDocument;
+        if(doc){var found=doc.querySelector(selector);if(found)return found;}
       }catch(e){}
     }
     return null;
@@ -463,7 +538,7 @@ const INJECT_MCP_HELPERS = `if(window.__mcpVersion!==4){window.__mcpVersion=4;
   window.mcpIsVisible=function(el){
     if(!el||el.nodeType!==1||!el.isConnected)return false;
     var cs=window.getComputedStyle(el);
-    if(!cs||cs.display==='none'||cs.visibility==='hidden'||cs.visibility==='collapse'||cs.pointerEvents==='none')return false;
+    if(!cs||cs.display==='none'||cs.visibility==='hidden'||cs.visibility==='collapse'||cs.pointerEvents==='none'||cs.opacity==='0')return false;
     var r=el.getBoundingClientRect();
     return r.width>0&&r.height>0;
   };
@@ -659,9 +734,40 @@ const INJECT_MCP_HELPERS = `if(window.__mcpVersion!==4){window.__mcpVersion=4;
         if(n.parentElement)consider(n.parentElement);
       }
     }
+    if(!best){
+      var allEls=document.querySelectorAll('*');
+      for(var i=0;i<allEls.length;i++){
+        var el=allEls[i];
+        var it=window.mcpNormalizeText(el.innerText);
+        if(!it)continue;
+        if(exact?(it!==needle):!it.includes(needle))continue;
+        consider(el);
+      }
+    }
     return best;
   };
 }`;
+
+// Precomputed escaped helper string — avoids re-escaping ~4KB on every injection call
+const _HELPERS_ESCAPED = INJECT_MCP_HELPERS
+  .replace(/^\s*\/\/[^\n]*$/gm, '')
+  .replace(/\\/g, "\\\\")
+  .replace(/"/g, '\\"')
+  .replace(/\n/g, " ")
+  .replace(/\r/g, "")
+  .replace(/\t/g, " ");
+
+// Fast helper injection — uses precomputed escaped string + daemon directly
+// Skips runJS overhead (escaping, tab resolution) since we already have the escaped string
+async function _injectHelpersfast() {
+  await refreshTargetWindow();
+  let idx = _activeTabIndex;
+  const target = idx
+    ? `tab ${idx} of ${_targetWindowRef}`
+    : "front document";
+  const script = `tell application "Safari" to do JavaScript "${_HELPERS_ESCAPED}" in ${target}`;
+  return osascriptFast(script, { timeout: 15000 });
+}
 
 // Ensure helpers are injected — verify critical functions exist, reset version if partial
 // Cache: skip ensureHelpers check if we already injected on this URL recently
@@ -672,7 +778,7 @@ const HELPERS_CACHE_MS = 10000; // Re-verify every 10s max
 async function ensureHelpers() {
   // Skip check if we recently verified helpers on the same URL
   const now = Date.now();
-  if (_helpersInjectedForUrl === _activeTabURL && (now - _helpersInjectedAt) < HELPERS_CACHE_MS) return;
+  if (_activeTabURL && _helpersInjectedForUrl === _activeTabURL && (now - _helpersInjectedAt) < HELPERS_CACHE_MS) return;
 
   // Check if helpers are actually present (not just version flag)
   const check = await runJS("(typeof mcpClickWithReact==='function'&&typeof mcpFindText==='function')?'ok':'missing'").catch(() => 'missing');
@@ -683,7 +789,8 @@ async function ensureHelpers() {
   }
   // Reset version to force re-injection
   await runJS("window.__mcpVersion=0").catch(() => {});
-  const result = await runJSLarge(`${INJECT_MCP_HELPERS}`).catch(err => 'INJECT_ERR:' + err.message);
+  // Use precomputed escaped string + osascriptFast directly (~5ms vs ~80ms subprocess)
+  const result = await _injectHelpersfast().catch(err => 'INJECT_ERR:' + err.message);
   if (typeof result === 'string' && result.startsWith('INJECT_ERR:')) {
     throw new Error('ensureHelpers failed: ' + result);
   }
@@ -936,16 +1043,140 @@ export async function typeText({ text, selector, ref }) {
   if (selector) {
     const sel = selector.replace(/'/g, "\\'");
     await runJS(`document.querySelector('${sel}')?.focus()`);
-    await new Promise((r) => setTimeout(r, 200));
+    // Quick poll for focus to settle (was 200ms fixed sleep)
+    await new Promise((r) => setTimeout(r, 30));
   }
 
-  // Use JavaScript insertText — works in inputs, textareas, and contenteditable
-  // No System Events = no keyboard conflict with user
+  // Use execCommand("insertText") — the ONLY approach that works for BOTH:
+  // 1. Regular inputs/textareas (execCommand works natively)
+  // 2. ContentEditable (ProseMirror/Draft.js/Slate) — execCommand causes real DOM mutation
+  //    → MutationObserver fires → framework detects change → state updates
+  // InputEvent dispatch does NOT work because it doesn't cause real DOM mutations.
   const safeText = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n");
   const result = await runJS(
-    `(function(){var el=document.activeElement;if(!el)return 'No focused element';var ok=document.execCommand('insertText',false,'${safeText}');if(ok)return 'Typed '+${text.length}+' chars';try{el.dispatchEvent(new InputEvent('beforeinput',{inputType:'insertText',data:'${safeText}',bubbles:true,cancelable:true}));el.dispatchEvent(new InputEvent('input',{inputType:'insertText',data:'${safeText}',bubbles:true}));return 'Typed '+${text.length}+' chars via InputEvent';}catch(e){}if('value' in el){var start=el.selectionStart||0;el.value=el.value.substring(0,start)+'${safeText}'+el.value.substring(el.selectionEnd||start);el.selectionStart=el.selectionEnd=start+${text.length};el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));return 'Typed '+${text.length}+' chars via value set';}return 'Could not type';})()`
+    `(function(){var el=document.activeElement;if(!el)return 'No focused element';` +
+    `var ok=document.execCommand('insertText',false,'${safeText}');if(ok)return 'Typed '+${text.length}+' chars';` +
+    // Fallback for inputs where execCommand failed
+    `if('value' in el){var start=el.selectionStart||0;el.value=el.value.substring(0,start)+'${safeText}'+el.value.substring(el.selectionEnd||start);el.selectionStart=el.selectionEnd=start+${text.length};el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));return 'Typed '+${text.length}+' chars via value set';}return 'Could not type';})()`
   );
 
+  return result;
+}
+
+// ========== EDITOR SUPPORT (Monaco, CodeMirror) ==========
+
+// Replace all content in a code editor (Monaco, CodeMirror, or ace)
+// Used when typeText/fill can't handle the editor
+export async function replaceEditorContent({ text }) {
+  // Escape for embedding in JS string
+  const safeText = text
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'")
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '');
+
+  const result = await runJS(
+    `(function(){
+      // Monaco editor (Airtable, VS Code web, GitHub)
+      // Try both global 'monaco' and window.monaco — some sites expose one but not the other
+      var m = (typeof monaco !== 'undefined') ? monaco : window.monaco;
+      if (m && m.editor) {
+        // Try getModels first (works on Airtable and most Monaco embeds)
+        try {
+          var models = m.editor.getModels();
+          if (models && models.length > 0) {
+            models[models.length - 1].setValue('${safeText}');
+            return 'Monaco(model): replaced ' + '${safeText}'.split('\\n').length + ' lines';
+          }
+        } catch(e) {}
+        // Try getEditors (standard Monaco API)
+        try {
+          var eds = m.editor.getEditors();
+          if (eds && eds.length > 0) {
+            eds[eds.length - 1].setValue('${safeText}');
+            return 'Monaco(editor): replaced ' + '${safeText}'.split('\\n').length + ' lines';
+          }
+        } catch(e) {}
+      }
+
+      // CodeMirror 6 (uses EditorView stored on DOM element)
+      var cmEls = document.querySelectorAll('.cm-editor');
+      for (var i = cmEls.length - 1; i >= 0; i--) {
+        var view = cmEls[i].cmView;
+        if (view && view.view) {
+          var v = view.view;
+          v.dispatch({changes: {from: 0, to: v.state.doc.length, insert: '${safeText}'}});
+          return 'CodeMirror6: replaced ' + '${safeText}'.split('\\n').length + ' lines';
+        }
+      }
+
+      // CodeMirror 5
+      var CM5 = (typeof CodeMirror !== 'undefined') ? CodeMirror : window.CodeMirror;
+      if (CM5) {
+        var cm5 = document.querySelector('.CodeMirror');
+        if (cm5 && cm5.CodeMirror) {
+          cm5.CodeMirror.setValue('${safeText}');
+          return 'CodeMirror5: replaced ' + '${safeText}'.split('\\n').length + ' lines';
+        }
+      }
+
+      // Ace editor
+      var aceRef = (typeof ace !== 'undefined') ? ace : window.ace;
+      if (aceRef) {
+        var aceEls = document.querySelectorAll('.ace_editor');
+        if (aceEls.length > 0) {
+          var aceEd = aceRef.edit(aceEls[aceEls.length - 1]);
+          aceEd.setValue('${safeText}', -1);
+          return 'Ace: replaced ' + '${safeText}'.split('\\n').length + ' lines';
+        }
+      }
+
+      // ProseMirror (LinkedIn, Medium, Notion, HackerNoon)
+      var pmEl = document.querySelector('.ProseMirror');
+      if (pmEl) {
+        // Strategy 1: Native API via view.dispatch (most reliable)
+        try {
+          var view = pmEl.pmViewDesc && pmEl.pmViewDesc.view;
+          if (view && view.state && view.dispatch) {
+            var state = view.state;
+            var tr = state.tr.replaceWith(0, state.doc.content.size,
+              state.schema.text ? state.schema.text('${safeText}') : state.schema.node('paragraph', null, state.schema.text('${safeText}')));
+            view.dispatch(tr);
+            view.focus();
+            return 'ProseMirror(API): replaced';
+          }
+        } catch(e) {}
+        // Strategy 2: execCommand fallback
+        try {
+          pmEl.focus();
+          document.execCommand('selectAll');
+          document.execCommand('insertText', false, '${safeText}');
+          return 'ProseMirror(execCommand): replaced';
+        } catch(e) {}
+      }
+
+      // Fallback: try execCommand on active contentEditable element
+      var el = document.activeElement;
+      if (el && el.isContentEditable) {
+        el.textContent = '';
+        document.execCommand('selectAll');
+        document.execCommand('insertText', false, '${safeText}');
+        return 'ContentEditable: replaced';
+      }
+
+      // Last resort: any contenteditable on the page
+      var ce = document.querySelector('[contenteditable="true"]');
+      if (ce) {
+        ce.focus();
+        ce.innerHTML = '${safeText}';
+        ce.dispatchEvent(new Event('input', {bubbles: true}));
+        return 'ContentEditable(found): replaced';
+      }
+
+      return 'No code editor found';
+    })()`
+    , { timeout: 15000 }
+  );
   return result;
 }
 
@@ -1011,6 +1242,24 @@ export async function screenshot({ fullPage = false } = {}) {
             );
           }
         }
+        // Compress: convert PNG to JPEG (50% quality) + resize to max 1200px width
+        // Cuts ~600KB PNG → ~60KB JPEG — critical for staying under 20MB context limit
+        const jpgFile = tmpFile.replace('.png', '.jpg');
+        try {
+          await execFileAsync("sips", [
+            "-s", "format", "jpeg",
+            "-s", "formatOptions", "50",
+            "--resampleWidth", "1200",
+            tmpFile, "--out", jpgFile
+          ], { timeout: 5000 });
+          const jpgData = await readFile(jpgFile);
+          await unlink(tmpFile).catch(() => {});
+          await unlink(jpgFile).catch(() => {});
+          if (jpgData.length > 100) return jpgData.toString("base64");
+        } catch (_) {
+          // sips failed — fall back to original PNG
+          await unlink(jpgFile).catch(() => {});
+        }
         const data = await readFile(tmpFile);
         await unlink(tmpFile).catch(() => {});
         if (data.length > 100) return data.toString("base64");
@@ -1042,8 +1291,8 @@ export async function screenshot({ fullPage = false } = {}) {
       return dataUrl;
     }
 
-    // Final fallback: return page text description
-    throw new Error("Screenshot unavailable. Grant Screen Recording permission to VS Code/Terminal in System Settings → Privacy & Security → Screen Recording, then restart.");
+    // Final fallback: throw with clear message for the retry logic in index.js
+    throw new Error("screencapture failed — Screen Recording permission may have been lost. Grant permission in System Settings → Privacy & Security → Screen Recording, then restart Safari.");
   } finally {
     await unlink(tmpFile).catch(() => {});
     // Restore user's tab if we switched
@@ -1475,7 +1724,15 @@ export async function uploadFile({ selector, filePath }) {
       tell process "Safari"
         repeat with w in every window
           if exists sheet 1 of w then
-            click button "ביטול" of sheet 1 of w
+            try
+              click button "ביטול" of sheet 1 of w
+            on error
+              try
+                click button "Cancel" of sheet 1 of w
+              on error
+                key code 53
+              end try
+            end try
             exit repeat
           end if
         end repeat
@@ -1508,7 +1765,22 @@ export async function uploadFile({ selector, filePath }) {
   // Send to Safari via runJSLarge (handles files >260KB via temp file)
   const result = await runJSLarge(
     `(function(){
-      var el = document.querySelector('${sel}');
+      // Deep query: main document → shadow DOM → iframes
+      function deepQuery(sel) {
+        var el = document.querySelector(sel);
+        if (el) return el;
+        var all = document.querySelectorAll('*');
+        for (var i = 0; i < all.length; i++) {
+          var sr = all[i].shadowRoot;
+          if (sr) { el = sr.querySelector(sel); if (el) return el; }
+        }
+        var iframes = document.querySelectorAll('iframe');
+        for (var i = 0; i < iframes.length; i++) {
+          try { var doc = iframes[i].contentDocument; if (doc) { el = doc.querySelector(sel); if (el) return el; } } catch(_) {}
+        }
+        return null;
+      }
+      var el = deepQuery('${sel}');
       if (!el) return 'Element not found: ${sel}';
 
       // Decode base64 to binary
@@ -1520,12 +1792,30 @@ export async function uploadFile({ selector, filePath }) {
       var file = new File([bytes], '${safeName}', { type: '${mime}' });
       var dt = new DataTransfer();
       dt.items.add(file);
-      el.files = dt.files;
 
-      // Trigger events for frameworks
+      // Strategy 1: Direct files assignment (works on most inputs)
+      try { el.files = dt.files; } catch(_) {}
+
+      if (el.files && el.files.length > 0) {
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        return 'Uploaded: ${safeName} (' + Math.round(bytes.length / 1024) + ' KB, verified ' + el.files.length + ' file(s))';
+      }
+
+      // Strategy 2: Drop event on the input or its container (works when files property is read-only)
+      var dropTarget = el.closest('[class*="upload"], [class*="drop"], [class*="file"]') || el.parentElement || el;
+      var dropEvent = new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt });
+      dropTarget.dispatchEvent(new DragEvent('dragenter', { bubbles: true, dataTransfer: dt }));
+      dropTarget.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: dt }));
+      dropTarget.dispatchEvent(dropEvent);
       el.dispatchEvent(new Event('change', { bubbles: true }));
       el.dispatchEvent(new Event('input', { bubbles: true }));
-      return 'Uploaded: ${safeName} (' + Math.round(bytes.length / 1024) + ' KB)';
+
+      // Re-check after drop
+      if (el.files && el.files.length > 0) {
+        return 'Uploaded via drop: ${safeName} (' + Math.round(bytes.length / 1024) + ' KB, verified ' + el.files.length + ' file(s))';
+      }
+      return 'Upload FAILED: ${safeName} (' + Math.round(bytes.length / 1024) + ' KB) — el.files is read-only and drop event did not take. Try: (1) click the upload button to open file dialog, then use safari_evaluate to handle it, or (2) use a different selector targeting the actual <input type=file> element, not its wrapper.';
     })()`,
     { timeout: 30000 }
   );

@@ -37,6 +37,7 @@ try {
     ws.on("close", () => {
       _extensionConnected = false;
       _extensionWs = null;
+      _drainOnDisconnect("WebSocket close");
       console.error("[Safari MCP] Extension disconnected (WebSocket)");
     });
   });
@@ -71,6 +72,11 @@ try {
 
     // GET /poll — extension asks for next command (long-poll, up to 5s)
     if (req.method === "GET" && req.url === "/poll") {
+      _extensionLastPollTime = Date.now(); // Keep connection alive — critical for stale detection
+      if (!_extensionConnected) {
+        _extensionConnected = true;
+        console.error("[Safari MCP] Extension reconnected via poll");
+      }
       if (_commandQueue.length > 0) {
         const cmd = _commandQueue.shift();
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -90,7 +96,7 @@ try {
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify(cmd));
           }
-        }, 20); // Check every 20ms
+        }, 5); // Check every 5ms (reduced from 20ms — cuts avg command delivery delay from 10ms to 2.5ms)
 
         // Cleanup on client disconnect
         req.on("close", () => {
@@ -124,7 +130,33 @@ try {
       }
       _extensionLastPollTime = Date.now();
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "connected" }));
+      res.end(JSON.stringify({ status: "connected", profile: process.env.SAFARI_PROFILE || null }));
+      return;
+    }
+
+    // GET /proxy-check — secondary instances check if extension is connected
+    if (req.method === "GET" && req.url === "/proxy-check") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ extensionConnected: _extensionConnected }));
+      return;
+    }
+
+    // POST /proxy-command — secondary instances send commands through primary
+    if (req.method === "POST" && req.url === "/proxy-command") {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", async () => {
+        try {
+          const { type, payload } = JSON.parse(body);
+          const timeout = _commandTimeouts[type] || 30000;
+          const result = await sendToExtension(type, payload, timeout);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ result }));
+        } catch (err) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: err.message }));
+        }
+      });
       return;
     }
 
@@ -133,27 +165,93 @@ try {
   });
 
   httpServer.listen(HTTP_PORT, "127.0.0.1", () => {
-    // Silent start
+    _isExtensionHost = true;
+    console.error(`[Safari MCP] HTTP server listening on port ${HTTP_PORT} (extension host)`);
   });
   httpServer.on("error", (err) => {
     if (err.code === "EADDRINUSE") {
-      console.error(`[Safari MCP] HTTP port ${HTTP_PORT} in use — HTTP polling disabled`);
+      console.error(`[Safari MCP] HTTP port ${HTTP_PORT} in use — will proxy commands to primary instance`);
+      _isExtensionHost = false;
+      // Check if primary instance has extension connected
+      _checkPrimaryExtension();
     }
   });
 } catch {}
 
+// ========== PROXY MODE ==========
+// When another MCP instance already owns the port, we proxy commands through it
+let _isExtensionHost = false;
+let _primaryHasExtension = false;
+
+// Delayed check: if after 2 seconds we're not the host, try proxy mode
+setTimeout(() => {
+  if (!_isExtensionHost && !_primaryHasExtension) {
+    console.error("[Safari MCP] Not extension host after startup — checking for primary instance");
+    _checkPrimaryExtension();
+  }
+}, 2000);
+
+async function _checkPrimaryExtension() {
+  try {
+    const res = await fetch(`http://127.0.0.1:${HTTP_PORT}/proxy-check`, {
+      method: "GET",
+      signal: AbortSignal.timeout(2000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      _primaryHasExtension = data.extensionConnected;
+      if (_primaryHasExtension) {
+        _extensionConnected = true; // Enable extension path in extensionOrFallback
+        console.error(`[Safari MCP] Primary instance has extension — proxy mode enabled`);
+      }
+    }
+  } catch {
+    _primaryHasExtension = false;
+  }
+  // Re-check every 10s
+  setTimeout(_checkPrimaryExtension, 10000);
+}
+
+// Send command to primary instance's extension via proxy
+async function _proxyToExtension(type, payload, timeoutMs = 30000) {
+  const res = await fetch(`http://127.0.0.1:${HTTP_PORT}/proxy-command`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ type, payload }),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) throw new Error(`Proxy error: ${res.status}`);
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data.result;
+}
+
 let _extensionLastPollTime = 0;
 // Detect stale HTTP connection (no poll in 10s = disconnected)
+// Only applies to primary instance (extension host) — not proxy mode
 setInterval(() => {
-  if (_extensionConnected && !_extensionWs && _extensionLastPollTime > 0) {
+  if (_isExtensionHost && _extensionConnected && !_extensionWs && _extensionLastPollTime > 0) {
     if (Date.now() - _extensionLastPollTime > 10000) {
       _extensionConnected = false;
+      _drainOnDisconnect("HTTP poll timeout");
       console.error("[Safari MCP] Extension disconnected (HTTP poll timeout)");
     }
   }
 }, 5000);
 
 // ========== SHARED EXTENSION LOGIC ==========
+
+// Drain pending requests and command queue on disconnect — allows fast fallback to AppleScript
+function _drainOnDisconnect(reason) {
+  // Reject all in-flight requests immediately (instead of waiting for timeout)
+  for (const [id, pending] of _pendingRequests) {
+    clearTimeout(pending.timer);
+    pending.reject(new Error(`Extension disconnected: ${reason}`));
+  }
+  _pendingRequests.clear();
+  // Clear queued commands that will never be picked up
+  _commandQueue.length = 0;
+}
 
 function _handleExtensionResponse(msg) {
   if (msg.type === "keepalive") return;
@@ -173,8 +271,13 @@ function _handleExtensionResponse(msg) {
   else pending.resolve(msg.result);
 }
 
-// Send command to extension (via WebSocket or HTTP command queue)
+// Send command to extension (via WebSocket, HTTP command queue, or proxy to primary)
 function sendToExtension(type, payload = {}, timeoutMs = 30000) {
+  // If we're a secondary instance, proxy through primary
+  if (!_isExtensionHost && _primaryHasExtension) {
+    return _proxyToExtension(type, payload, timeoutMs);
+  }
+
   return new Promise((resolve, reject) => {
     if (!_extensionConnected) {
       reject(new Error("Extension not connected"));
@@ -199,18 +302,56 @@ function sendToExtension(type, payload = {}, timeoutMs = 30000) {
   });
 }
 
+// Per-command timeouts — fast commands get short timeouts, nav/screenshot get longer ones
+const _commandTimeouts = {
+  click: 10000, fill: 5000, read_page: 10000, get_source: 10000, evaluate: 15000,
+  type_text: 5000, press_key: 5000, scroll: 3000, scroll_to: 3000, scroll_to_element: 3000,
+  hover: 5000, list_tabs: 5000, new_tab: 15000, close_tab: 5000, switch_tab: 5000,
+  wait_for: 30000, navigate: 30000, navigate_and_read: 30000, go_back: 10000, go_forward: 10000,
+  reload: 15000, screenshot: 15000, snapshot: 15000, click_and_read: 15000,
+  double_click: 10000, right_click: 10000, clear_field: 5000, select_option: 5000, fill_form: 10000,
+  get_url: 3000, get_title: 3000,
+};
+
+// Commands where null result means failure (should fall back to AppleScript)
+const _nullMeansFailure = new Set([
+  "click", "double_click", "right_click", "fill",
+  "press_key", "hover", "clear_field", "select_option", "fill_form",
+  // NOTE: "type_text" intentionally NOT here — execCommand always returns a string,
+  // and double execution would duplicate text in contenteditable editors.
+  "read_page", "get_source", "snapshot", "get_element", "query_all",
+  "scroll", "scroll_to",
+  // NOTE: "evaluate" intentionally NOT here — null is a valid return value.
+  // CSP fallback is handled separately via isCspError check.
+]);
+
 // Try extension first, fall back to AppleScript
 async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) {
   if (_extensionConnected) {
     try {
+      const t0 = Date.now();
       const tabUrl = safari.getActiveTabURL();
       const payload = tabUrl ? { ...extensionPayload, tabUrl } : extensionPayload;
-      return await sendToExtension(extensionType, payload);
-    } catch {
-      // Extension failed — fall back to AppleScript
+      const timeout = _commandTimeouts[extensionType] || 30000;
+      const result = await sendToExtension(extensionType, payload, timeout);
+      // If extension returned null or "Element not found" for action commands,
+      // fall back to AppleScript (which has better element discovery with helpers)
+      const isCspError = extensionType === 'evaluate' && typeof result === 'string' && (result.includes('unsafe-eval') || result.includes('trusted-types') || result.includes('Content Security Policy'));
+      const isFailed = result === null || (typeof result === 'string' && result.startsWith('Element not found')) || isCspError;
+      if (isFailed && _nullMeansFailure.has(extensionType)) {
+        console.error(`[Safari MCP] ${extensionType} extension failed: ${result} (${Date.now() - t0}ms) — falling back to AppleScript`);
+      } else {
+        console.error(`[Safari MCP] ${extensionType} via extension (${Date.now() - t0}ms)`);
+        return result;
+      }
+    } catch (err) {
+      console.error(`[Safari MCP] ${extensionType} extension failed: ${err.message} — falling back to AppleScript`);
     }
   }
-  return fallbackFn();
+  const t0 = Date.now();
+  const result = await fallbackFn();
+  console.error(`[Safari MCP] ${extensionType} via AppleScript (${Date.now() - t0}ms)`);
+  return result;
 }
 
 const server = new McpServer({
@@ -287,7 +428,10 @@ server.tool(
   "Get HTML source of current page",
   { maxLength: z.coerce.number().optional().describe("Max chars (default: 200000)") },
   async ({ maxLength }) => {
-    const result = await safari.getPageSource({ maxLength });
+    const result = await extensionOrFallback(
+      "get_source", { maxLength },
+      () => safari.getPageSource({ maxLength })
+    );
     return { content: [{ type: "text", text: result }] };
   }
 );
@@ -356,7 +500,7 @@ server.tool(
     selector: z.string().optional().describe("CSS selector"),
     x: z.coerce.number().optional().describe("X coordinate"),
     y: z.coerce.number().optional().describe("Y coordinate"),
-    wait: z.coerce.number().optional().describe("Ms to wait after click (default: 800)"),
+    wait: z.coerce.number().optional().describe("Ms to wait after click (default: auto-detect navigation)"),
     maxLength: z.coerce.number().optional().describe("Max chars to return (default: 50000)"),
   },
   async (args) => {
@@ -365,7 +509,19 @@ server.tool(
       { selector: args.selector, text: args.text, x: args.x, y: args.y, wait: args.wait, maxLength: args.maxLength },
       async () => {
         await safari.click(args);
-        await new Promise(r => setTimeout(r, args.wait || 800));
+        if (args.wait) {
+          await new Promise(r => setTimeout(r, args.wait));
+        } else {
+          // Smart wait: brief pause then check if page is loading
+          await new Promise(r => setTimeout(r, 50));
+          const state = await safari.runJSQuick("document.readyState");
+          if (state === "loading") {
+            // Page is navigating — wait for it to complete
+            await safari.runJSQuick("(async function(){for(var i=0;i<50;i++){if(document.readyState==='complete')return 'done';await new Promise(r=>setTimeout(r,200));}return 'timeout';})()");
+          } else {
+            await new Promise(r => setTimeout(r, 100)); // SPA settle time
+          }
+        }
         return safari.readPage({ maxLength: args.maxLength });
       }
     );
@@ -418,7 +574,11 @@ server.tool(
     value: z.string().describe("Value to fill"),
   },
   async (args) => {
-    const result = await safari.fill(args);
+    const selector = args.ref ? `[data-mcp-ref="${args.ref}"]` : args.selector;
+    const result = await extensionOrFallback(
+      "fill", { selector, value: args.value },
+      () => safari.fill(args)
+    );
     return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
@@ -505,21 +665,49 @@ server.tool(
   }
 );
 
+// ========== CODE EDITOR ==========
+
+server.tool(
+  "safari_replace_editor",
+  "Replace ALL content in a code editor (Monaco, CodeMirror, Ace). Use this instead of type_text/fill for code editors like Airtable automations, GitHub gists, CodePen, etc. Selects all existing code and replaces it.",
+  {
+    text: z.string().describe("The complete code/text to put in the editor"),
+  },
+  async ({ text }) => {
+    const result = await extensionOrFallback(
+      "replace_editor", { text },
+      () => safari.replaceEditorContent({ text })
+    );
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+  }
+);
+
 // ========== SCREENSHOT ==========
 
 server.tool(
   "safari_screenshot",
-  "Take a screenshot of the current Safari window. Returns base64 PNG image.",
+  "Take a screenshot of the current Safari window. Returns base64 JPEG image.",
   {
     fullPage: z.boolean().optional().describe("Capture full page (not just viewport)"),
   },
   async ({ fullPage }) => {
-    const base64 = await extensionOrFallback(
-      "screenshot", { fullPage },
-      () => safari.screenshot({ fullPage })
-    );
+    let base64;
+    try {
+      base64 = await extensionOrFallback(
+        "screenshot", { fullPage },
+        () => safari.screenshot({ fullPage })
+      );
+    } catch (err) {
+      // If AppleScript screenshot failed (permission lost), retry via extension only
+      if (_extensionConnected && err.message && (err.message.includes("permission") || err.message.includes("screencapture") || err.message.includes("empty"))) {
+        console.error("[Safari MCP] Screenshot AppleScript failed, retrying via extension only");
+        base64 = await sendToExtension("screenshot", { fullPage }, 15000);
+      } else {
+        throw err;
+      }
+    }
     return {
-      content: [{ type: "image", data: base64, mimeType: "image/png" }],
+      content: [{ type: "image", data: base64, mimeType: "image/jpeg" }],
     };
   }
 );
@@ -531,7 +719,7 @@ server.tool(
   async ({ selector }) => {
     const base64 = await safari.screenshotElement({ selector });
     return {
-      content: [{ type: "image", data: base64, mimeType: "image/png" }],
+      content: [{ type: "image", data: base64, mimeType: "image/jpeg" }],
     };
   }
 );
@@ -624,6 +812,11 @@ server.tool(
       "switch_tab", { index },
       () => safari.switchTab(index)
     );
+    // Sync safari.js state so AppleScript fallback targets the correct tab
+    safari.setActiveTabIndex(index);
+    if (result && typeof result === 'object' && result.url) {
+      safari.setActiveTabURL(result.url);
+    }
     return { content: [{ type: "text", text: JSON.stringify(result) }] };
   }
 );
@@ -644,6 +837,39 @@ server.tool(
       () => safari.waitFor(args)
     );
     return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+  }
+);
+
+server.tool(
+  "safari_wait_for_new_tab",
+  "Wait for a new tab to appear (e.g. after OAuth login click opens popup). Automatically switches to the new tab.",
+  {
+    timeout: z.coerce.number().optional().describe("Timeout in ms (default: 10000)"),
+    urlContains: z.string().optional().describe("Only match new tabs whose URL contains this string"),
+  },
+  async ({ timeout, urlContains }) => {
+    const timeoutMs = timeout || 10000;
+    // Get current tab list
+    const beforeRaw = await extensionOrFallback("list_tabs", {}, () => safari.listTabs());
+    const beforeTabs = typeof beforeRaw === 'string' ? JSON.parse(beforeRaw) : beforeRaw;
+    const beforeUrls = new Set(beforeTabs.map(t => t.url));
+
+    // Poll for new tab
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 500));
+      const nowRaw = await extensionOrFallback("list_tabs", {}, () => safari.listTabs());
+      const nowTabs = typeof nowRaw === 'string' ? JSON.parse(nowRaw) : nowRaw;
+      for (const tab of nowTabs) {
+        if (!beforeUrls.has(tab.url) && tab.url !== 'about:blank') {
+          if (urlContains && !tab.url.includes(urlContains)) continue;
+          // Switch to new tab
+          await extensionOrFallback("switch_tab", { index: tab.index }, () => safari.switchTab(tab.index));
+          return { content: [{ type: "text", text: `Found new tab: ${tab.title} (${tab.url})` }] };
+        }
+      }
+    }
+    return { content: [{ type: "text", text: "TIMEOUT: no new tab appeared" }] };
   }
 );
 
@@ -669,8 +895,11 @@ server.tool(
   "Get detailed info about an element (tag, text, rect, attributes, visibility)",
   { selector: z.string().describe("CSS selector") },
   async (args) => {
-    const result = await safari.getElementInfo(args);
-    return { content: [{ type: "text", text: result }] };
+    const result = await extensionOrFallback(
+      "get_element", { selector: args.selector },
+      () => safari.getElementInfo(args)
+    );
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
 
@@ -682,8 +911,11 @@ server.tool(
     limit: z.coerce.number().optional().describe("Max results (default: 20)"),
   },
   async (args) => {
-    const result = await safari.querySelectorAll(args);
-    return { content: [{ type: "text", text: result }] };
+    const result = await extensionOrFallback(
+      "query_all", { selector: args.selector, limit: args.limit },
+      () => safari.querySelectorAll(args)
+    );
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
 

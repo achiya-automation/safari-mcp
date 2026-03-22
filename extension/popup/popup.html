@@ -9,7 +9,18 @@
     .dot { width: 10px; height: 10px; border-radius: 50%; }
     .connected { background: #4CAF50; }
     .disconnected { background: #f44336; }
-    .info { color: #666; font-size: 11px; }
+    .paused { background: #FF9800; }
+    .checking { background: #FF9800; animation: pulse 1.2s ease-in-out infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+    .info { color: #666; font-size: 11px; margin-bottom: 12px; }
+    .toggle-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-top: 1px solid #e0e0e0; }
+    .toggle-label { font-size: 13px; font-weight: 500; }
+    .toggle { position: relative; width: 42px; height: 24px; cursor: pointer; }
+    .toggle input { opacity: 0; width: 0; height: 0; }
+    .slider { position: absolute; inset: 0; background: #ccc; border-radius: 24px; transition: 0.2s; }
+    .slider::before { content: ""; position: absolute; width: 18px; height: 18px; left: 3px; bottom: 3px; background: white; border-radius: 50%; transition: 0.2s; }
+    .toggle input:checked + .slider { background: #4CAF50; }
+    .toggle input:checked + .slider::before { transform: translateX(18px); }
   </style>
 </head>
 <body>
@@ -19,6 +30,49 @@
     <span id="statusText">Checking...</span>
   </div>
   <div class="info" id="info"></div>
-  <script src="popup.js"></script>
+  <div class="toggle-row">
+    <span class="toggle-label">Active</span>
+    <label class="toggle">
+      <input type="checkbox" id="enableToggle" checked>
+      <span class="slider"></span>
+    </label>
+  </div>
+  <script>
+    // Inline script — cannot be cached separately by Safari
+    function setStatus(c, t, i) {
+      document.getElementById("statusDot").className = "dot " + c;
+      document.getElementById("statusText").textContent = t;
+      document.getElementById("info").textContent = i;
+    }
+    async function getVal(k, d) {
+      try { const r = await browser.storage.local.get(k); return r[k] !== undefined ? r[k] : d; }
+      catch { return d; }
+    }
+    async function check() {
+      const on = await getVal("mcpEnabled", true);
+      document.getElementById("enableToggle").checked = on;
+      if (!on) { setStatus("paused", "Paused", "Toggle to resume"); return; }
+      // Ask background script for real-time status first
+      try {
+        const resp = await browser.runtime.sendMessage({ action: "getStatus" });
+        if (resp) {
+          if (resp.connected) { setStatus("connected", "Connected", "Port 9224"); return; }
+          if (!resp.enabled) { setStatus("paused", "Paused", "Toggle to resume"); return; }
+        }
+      } catch {}
+      // Fallback: read from storage
+      const s = await getVal("mcpStatus", null);
+      if (s === "connected") setStatus("connected", "Connected", "Port 9224");
+      else if (s === "paused") setStatus("paused", "Paused", "Toggle to resume");
+      else if (s === "checking") setStatus("checking", "Connecting...", "Trying port 9224...");
+      else setStatus("disconnected", "Not connected", "Start the MCP server to connect");
+    }
+    document.getElementById("enableToggle").addEventListener("change", async (e) => {
+      await browser.storage.local.set({ mcpEnabled: e.target.checked });
+      try { browser.runtime.sendMessage({ action: "setEnabled", enabled: e.target.checked }); } catch {}
+      setTimeout(check, 500);
+    });
+    check();
+  </script>
 </body>
 </html>
