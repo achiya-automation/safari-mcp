@@ -336,7 +336,7 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
       const result = await sendToExtension(extensionType, payload, timeout);
       // If extension returned null or "Element not found" for action commands,
       // fall back to AppleScript (which has better element discovery with helpers)
-      const isCspError = typeof result === 'string' && (result.includes('unsafe-eval') || result.includes('trusted-types') || result.includes('Content Security Policy'));
+      const isCspError = typeof result === 'string' && (result.includes('unsafe-eval') || result.includes('trusted-types') || result.includes('Trusted Type') || result.includes('Content Security Policy'));
       const isPermissionDenied = typeof result === 'string' && result.includes('__SCREENSHOT_PERMISSION_DENIED__');
       const isFailed = result === null || (typeof result === 'string' && result.startsWith('Element not found'));
       // Permission denied or CSP errors ALWAYS fall back to AppleScript

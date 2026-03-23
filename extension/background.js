@@ -263,7 +263,7 @@ async function handleCommand(type, payload) {
           if (result === undefined || result === null) return null;
           return typeof result === "object" ? JSON.stringify(result) : String(result);
         } catch (e) {
-          if (e.message.includes("unsafe-eval") || e.message.includes("trusted-types")) {
+          if (e.message.includes("unsafe-eval") || e.message.includes("trusted-types") || e.message.includes("Trusted Type")) {
             return "__CSP_BLOCKED__";
           }
           return "Error: " + e.message;
@@ -912,7 +912,7 @@ async function handleCommand(type, payload) {
       if (payload.url) await waitForTabLoad(newTab.id);
       const updated = await browser.tabs.get(newTab.id);
       // Learn profile window from newly created tab
-      if (!_profileWindowId) _profileWindowId = updated.windowId;
+      if (!_profileWindowId) { _profileWindowId = updated.windowId; browser.storage.local.set({ mcpProfileWindowId: _profileWindowId }).catch(() => {}); }
       // CRITICAL: Set new tab as the target for subsequent commands
       _cachedTabId = updated.id;
       _cachedTabUrl = updated.url;
@@ -1509,19 +1509,32 @@ browser.tabs.onRemoved.addListener((tabId) => {
 async function _discoverProfileWindow() {
   if (!_targetProfile) return;
   try {
-    const allWindows = await browser.windows.getAll();
-
-    // Single window — use it (most common case)
-    if (allWindows.length === 1) {
-      _profileWindowId = allWindows[0].id;
-      console.log("Safari MCP: profile window (single):", _profileWindowId);
-      return;
+    // Try to restore from storage first (survives service worker restart)
+    if (!_profileWindowId) {
+      try {
+        const stored = await browser.storage.local.get("mcpProfileWindowId");
+        if (stored.mcpProfileWindowId) {
+          // Verify the window still exists
+          const win = await browser.windows.get(stored.mcpProfileWindowId).catch(() => null);
+          if (win) {
+            _profileWindowId = stored.mcpProfileWindowId;
+            console.log("Safari MCP: profile window restored from storage:", _profileWindowId);
+            return;
+          }
+        }
+      } catch (_) {}
     }
 
-    // Multiple windows — prefer the focused one, fall back to first
-    const focused = allWindows.find(w => w.focused);
-    _profileWindowId = focused ? focused.id : allWindows[0].id;
-    console.log("Safari MCP: profile window (multi, focused=" + !!focused + "):", _profileWindowId);
+    const allWindows = await browser.windows.getAll();
+    if (allWindows.length === 1) {
+      _profileWindowId = allWindows[0].id;
+    } else {
+      const focused = allWindows.find(w => w.focused);
+      _profileWindowId = focused ? focused.id : allWindows[0].id;
+    }
+    // Persist for service worker restarts
+    browser.storage.local.set({ mcpProfileWindowId: _profileWindowId }).catch(() => {});
+    console.log("Safari MCP: profile window:", _profileWindowId);
   } catch (err) {
     console.warn("Safari MCP: _discoverProfileWindow error:", err.message);
   }
@@ -1556,6 +1569,7 @@ async function getTargetTab(tabUrl) {
           console.log("Safari MCP: profile window changed:", _profileWindowId, "→", match.windowId);
         }
         _profileWindowId = match.windowId;
+        browser.storage.local.set({ mcpProfileWindowId: _profileWindowId }).catch(() => {});
         console.log("Safari MCP: profile windowId =", _profileWindowId);
       }
       return match;

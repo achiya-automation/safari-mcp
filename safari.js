@@ -238,7 +238,10 @@ async function osascriptFast(script, { timeout = 10000 } = {}) {
         await refreshTargetWindow(true);
         if (_targetWindowRef !== oldRef) {
           const retryScript = script.replace(new RegExp(oldRef.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), _targetWindowRef);
-          return await _osascriptFastHelper(retryScript, timeout);
+          // Guard: helper may have died during the stale-window retry
+          if (!_helperProc) startHelper();
+          if (_helperProc) return await _osascriptFastHelper(retryScript, timeout);
+          return await osascript(retryScript, { timeout });
         }
       }
       throw err;
