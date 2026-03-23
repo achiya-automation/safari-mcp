@@ -513,78 +513,86 @@ async function handleCommand(type, payload) {
         if (!el) return "Element not found: " + selector;
         el.focus();
         if (el.isContentEditable) {
+          let ceResult = null;
           // === ProseMirror: use native view.dispatch API ===
           const pmEl = el.closest(".ProseMirror") || document.querySelector(".ProseMirror");
-          if (pmEl) {
+          if (!ceResult && pmEl) {
             try {
               const view = pmEl.pmViewDesc && pmEl.pmViewDesc.view;
               if (view && view.state && view.dispatch) {
                 const { state } = view;
-                // Replace entire document content
                 const tr = state.tr.replaceWith(0, state.doc.content.size,
                   state.schema.text ? state.schema.text(value) : state.schema.node("paragraph", null, state.schema.text(value)));
                 view.dispatch(tr);
                 view.focus();
-                return "Filled contenteditable (ProseMirror API)";
+                ceResult = "Filled contenteditable (ProseMirror API)";
               }
             } catch (e) { /* fall through */ }
           }
 
           // === Draft.js: use React fiber to access EditorState ===
-          const draftEl = el.closest("[data-editor]") || document.querySelector("[data-editor]");
-          if (draftEl) {
-            try {
-              const fiberKey = Object.keys(draftEl).find(function(k) {
-                return k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$");
-              });
-              if (fiberKey) {
-                let fiber = draftEl[fiberKey];
-                for (let i = 0; i < 30 && fiber; i++) {
-                  const props = fiber.memoizedProps || (fiber.stateNode && fiber.stateNode.props);
-                  if (props && props.editorState && props.onChange) {
-                    const Draft = window.Draft || window.DraftJS;
-                    if (Draft && Draft.Modifier && Draft.EditorState && Draft.SelectionState) {
-                      const es = props.editorState;
-                      const content = es.getCurrentContent();
-                      const allSel = es.getSelection().merge({
-                        anchorKey: content.getFirstBlock().getKey(), anchorOffset: 0,
-                        focusKey: content.getLastBlock().getKey(), focusOffset: content.getLastBlock().getLength(),
-                      });
-                      const newContent = Draft.Modifier.replaceText(content, allSel, value);
-                      props.onChange(Draft.EditorState.push(es, newContent, "insert-characters"));
-                      return "Filled contenteditable (Draft.js API)";
+          if (!ceResult) {
+            const draftEl = el.closest("[data-editor]") || document.querySelector("[data-editor]");
+            if (draftEl) {
+              try {
+                const fiberKey = Object.keys(draftEl).find(function(k) {
+                  return k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$");
+                });
+                if (fiberKey) {
+                  let fiber = draftEl[fiberKey];
+                  for (let i = 0; i < 30 && fiber; i++) {
+                    const props = fiber.memoizedProps || (fiber.stateNode && fiber.stateNode.props);
+                    if (props && props.editorState && props.onChange) {
+                      const Draft = window.Draft || window.DraftJS;
+                      if (Draft && Draft.Modifier && Draft.EditorState && Draft.SelectionState) {
+                        const es = props.editorState;
+                        const content = es.getCurrentContent();
+                        const allSel = es.getSelection().merge({
+                          anchorKey: content.getFirstBlock().getKey(), anchorOffset: 0,
+                          focusKey: content.getLastBlock().getKey(), focusOffset: content.getLastBlock().getLength(),
+                        });
+                        const newContent = Draft.Modifier.replaceText(content, allSel, value);
+                        props.onChange(Draft.EditorState.push(es, newContent, "insert-characters"));
+                        ceResult = "Filled contenteditable (Draft.js API)";
+                      }
+                      break;
                     }
-                    break;
+                    fiber = fiber.return;
                   }
-                  fiber = fiber.return;
                 }
-              }
-            } catch (e) { /* fall through */ }
+              } catch (e) { /* fall through */ }
+            }
           }
 
           // === Strategy 3: Clipboard paste (universal — works for Closure/Medium/Tiptap/unknown) ===
-          // All rich text editors handle paste events to insert content with proper structure.
-          // This is safer than selectAll+insertText which destroys structural elements.
-          try {
-            document.execCommand("selectAll", false, null);
-            const dt = new DataTransfer();
-            dt.setData("text/plain", value);
-            // Wrap in paragraphs for HTML-aware editors
-            const htmlValue = value.split("\n").filter(function(l) { return l.trim(); })
-              .map(function(l) { return "<p>" + l + "</p>"; }).join("");
-            dt.setData("text/html", htmlValue);
-            const pe = new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: dt });
-            const handled = !el.dispatchEvent(pe); // true if editor called preventDefault
-            if (handled) return "Filled contenteditable (clipboard paste)";
-          } catch (e) { /* clipboard paste not supported, fall through */ }
+          if (!ceResult) {
+            try {
+              document.execCommand("selectAll", false, null);
+              const dt = new DataTransfer();
+              dt.setData("text/plain", value);
+              const htmlValue = value.split("\n").filter(function(l) { return l.trim(); })
+                .map(function(l) { return "<p>" + l + "</p>"; }).join("");
+              dt.setData("text/html", htmlValue);
+              const pe = new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: dt });
+              const handled = !el.dispatchEvent(pe);
+              if (handled) ceResult = "Filled contenteditable (clipboard paste)";
+            } catch (e) { /* fall through */ }
+          }
 
-          // === Strategy 4: selectAll + delete + insertText (safer than selectAll + insertText) ===
-          // delete lets the editor handle removal and rebuild empty state structure.
-          // Then insertText adds to the clean empty editor.
-          document.execCommand("selectAll", false, null);
-          document.execCommand("delete", false, null);
-          document.execCommand("insertText", false, value);
-          return "Filled contenteditable";
+          // === Strategy 4: selectAll + delete + insertText (safest fallback) ===
+          if (!ceResult) {
+            document.execCommand("selectAll", false, null);
+            document.execCommand("delete", false, null);
+            document.execCommand("insertText", false, value);
+            ceResult = "Filled contenteditable";
+          }
+
+          // Dispatch blur/focusout to trigger form validation (React/Formik/etc.)
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new Event("blur", { bubbles: true }));
+          el.dispatchEvent(new Event("focusout", { bubbles: true }));
+          el.focus(); // Re-focus for continued interaction
+          return ceResult;
         }
         // For React-controlled inputs: use native setter + full event sequence
         // React (Formik, React Hook Form, etc.) needs: focus → input → change → blur
@@ -991,8 +999,12 @@ async function handleCommand(type, payload) {
       return await execInTab((selector, value) => {
         const el = (window.__mcpDeepQuery || document.querySelector.bind(document))(selector);
         if (!el) return "Element not found";
-        el.value = value;
+        // Use native setter for React controlled selects
+        const desc = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value");
+        if (desc && desc.set) { desc.set.call(el, value); } else { el.value = value; }
+        el.dispatchEvent(new Event("input", { bubbles: true }));
         el.dispatchEvent(new Event("change", { bubbles: true }));
+        el.dispatchEvent(new Event("blur", { bubbles: true }));
         return "Selected: " + el.value;
       }, [payload.selector, payload.value], tabId);
     }
@@ -1033,12 +1045,36 @@ async function handleCommand(type, payload) {
 
     // --- Scroll To Element ---
     case "scroll_to_element": {
-      return await execInTab((selector) => {
+      if (payload.text) {
+        // Text-based scroll: scroll down until text appears in DOM (for virtual DOM/lazy loading)
+        return await execInTab(async (text, block, timeout) => {
+          const deadline = Date.now() + (timeout || 10000);
+          const scrollable = document.querySelector('[class*="grid"],[class*="virtual"],[class*="scroll"],[role="grid"],[role="table"]') || document.scrollingElement || document.documentElement;
+          let lastY = -1;
+          while (Date.now() < deadline) {
+            const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+            while (tw.nextNode()) {
+              if (tw.currentNode.textContent.trim().includes(text)) {
+                const el = tw.currentNode.parentElement;
+                el.scrollIntoView({ behavior: "smooth", block: block || "center" });
+                return 'Found and scrolled to: "' + el.textContent.trim().substring(0, 50) + '"';
+              }
+            }
+            const curY = scrollable.scrollTop;
+            if (curY === lastY) return "Text not found: " + text + " (scrolled to bottom)";
+            lastY = curY;
+            scrollable.scrollBy(0, 500);
+            await new Promise(function(r) { setTimeout(r, 300); });
+          }
+          return "Timeout: text not found within " + timeout + "ms";
+        }, [payload.text, payload.block, payload.timeout], tabId);
+      }
+      return await execInTab((selector, block) => {
         const el = (window.__mcpDeepQuery || document.querySelector.bind(document))(selector);
         if (!el) return "Element not found: " + selector;
-        el.scrollIntoView({ block: "center", behavior: "smooth" });
+        el.scrollIntoView({ block: block || "center", behavior: "smooth" });
         return "Scrolled to: " + el.tagName;
-      }, [payload.selector], tabId);
+      }, [payload.selector, payload.block], tabId);
     }
 
     // --- Replace Editor Content (Monaco, CodeMirror, Ace) ---

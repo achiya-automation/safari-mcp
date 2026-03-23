@@ -886,7 +886,7 @@ export async function fill({ selector, value, ref }) {
   // Proper escaping order: backslashes first, then quotes
   const val = value.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, "");
   return runJS(
-    `(function(){try{var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';el.focus();if(el.isContentEditable||el.getAttribute('contenteditable')==='true'){el.textContent='';document.execCommand('insertText',false,'${val}');return 'Filled contenteditable';}var proto=el.tagName==='TEXTAREA'?window.HTMLTextAreaElement.prototype:window.HTMLInputElement.prototype;var s=Object.getOwnPropertyDescriptor(proto,'value');if(s&&s.set){s.set.call(el,'${val}');}else{el.value='${val}';}el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));return 'Filled: '+el.value.substring(0,50);}catch(e){return 'ERR: '+e.message;}})()`
+    `(function(){try{var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';el.focus();if(el.isContentEditable||el.getAttribute('contenteditable')==='true'){el.textContent='';document.execCommand('insertText',false,'${val}');el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('blur',{bubbles:true}));el.dispatchEvent(new Event('focusout',{bubbles:true}));el.focus();return 'Filled contenteditable';}var proto=el.tagName==='TEXTAREA'?window.HTMLTextAreaElement.prototype:window.HTMLInputElement.prototype;var s=Object.getOwnPropertyDescriptor(proto,'value');if(s&&s.set){s.set.call(el,'${val}');}else{el.value='${val}';}el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));el.dispatchEvent(new Event('blur',{bubbles:true}));el.dispatchEvent(new Event('focusout',{bubbles:true}));el.focus();return 'Filled: '+el.value.substring(0,50);}catch(e){return 'ERR: '+e.message;}})()`
   );
 }
 
@@ -901,7 +901,7 @@ export async function selectOption({ selector, value }) {
   const sel = selector.replace(/'/g, "\\'");
   const val = value.replace(/'/g, "\\'");
   return runJS(
-    `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found';el.value='${val}';el.dispatchEvent(new Event('change',{bubbles:true}));return 'Selected: '+el.value;})()`
+    `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found';var d=Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value');if(d&&d.set){d.set.call(el,'${val}');}else{el.value='${val}';}el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));el.dispatchEvent(new Event('blur',{bubbles:true}));return 'Selected: '+el.value;})()`
   );
 }
 
@@ -1775,7 +1775,7 @@ export async function uploadFile({ selector, filePath }) {
 
   // Send to Safari via runJSLarge (handles files >260KB via temp file)
   const result = await runJSLarge(
-    `(function(){
+    `(async function(){
       // Deep query: main document → shadow DOM → iframes
       function deepQuery(sel) {
         var el = document.querySelector(sel);
@@ -1822,11 +1822,15 @@ export async function uploadFile({ selector, filePath }) {
       el.dispatchEvent(new Event('change', { bubbles: true }));
       el.dispatchEvent(new Event('input', { bubbles: true }));
 
+      // Wait briefly for framework to process drop events before checking
+      await new Promise(function(r) { setTimeout(r, 200); });
+
       // Re-check after drop
       if (el.files && el.files.length > 0) {
         return 'Uploaded via drop: ${safeName} (' + Math.round(bytes.length / 1024) + ' KB, verified ' + el.files.length + ' file(s))';
       }
-      return 'Upload FAILED: ${safeName} (' + Math.round(bytes.length / 1024) + ' KB) — el.files is read-only and drop event did not take. Try: (1) click the upload button to open file dialog, then use safari_evaluate to handle it, or (2) use a different selector targeting the actual <input type=file> element, not its wrapper.';
+      // Drop may have succeeded even if el.files is empty (custom upload handlers)
+      return 'Upload attempted: ${safeName} (' + Math.round(bytes.length / 1024) + ' KB) — drop event dispatched but el.files still empty. The upload may have succeeded if the site uses a custom handler. Verify with safari_snapshot.';
     })()`,
     { timeout: 30000 }
   );
