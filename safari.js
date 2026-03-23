@@ -1499,12 +1499,17 @@ export async function closeTab() {
 }
 
 export async function switchTab(index) {
-  // NO visual tab switch — just update internal tracking.
-  // All subsequent runJS calls will target this tab by index.
-  // The user's visible tab stays unchanged.
   const idx = Number(index);
   _activeTabIndex = idx;
-  // Get title+URL from the target tab without switching visually
+  // Visually switch the tab in Safari so screenshot/screencapture work correctly
+  try {
+    await osascriptFast(
+      `tell application "Safari" to set current tab of ${_targetWindowRef} to tab ${idx} of ${_targetWindowRef}`
+    );
+  } catch (e) {
+    console.error(`[Safari MCP] switchTab visual switch failed: ${e.message}`);
+  }
+  // Get title+URL from the target tab
   const result = await runJS(
     `JSON.stringify({title:document.title,url:location.href})`,
     { tabIndex: idx }
