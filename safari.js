@@ -1155,22 +1155,27 @@ export async function replaceEditorContent({ text }) {
         } catch(e) {}
       }
 
-      // Fallback: try execCommand on active contentEditable element
+      // Fallback: contentEditable — try clipboard paste first, then delete+insert
       var el = document.activeElement;
+      if (!el || !el.isContentEditable) {
+        el = document.querySelector('[contenteditable="true"]');
+        if (el) el.focus();
+      }
       if (el && el.isContentEditable) {
-        el.textContent = '';
+        // Try clipboard paste (safe for Closure/Medium/unknown editors)
+        try {
+          document.execCommand('selectAll');
+          var dt = new DataTransfer();
+          dt.setData('text/plain', '${safeText}');
+          var pe = new ClipboardEvent('paste', {bubbles:true,cancelable:true,clipboardData:dt});
+          var handled = !el.dispatchEvent(pe);
+          if (handled) return 'ContentEditable(paste): replaced';
+        } catch(e) {}
+        // Fallback: delete then insert (don't combine selectAll+insertText)
         document.execCommand('selectAll');
+        document.execCommand('delete');
         document.execCommand('insertText', false, '${safeText}');
         return 'ContentEditable: replaced';
-      }
-
-      // Last resort: any contenteditable on the page
-      var ce = document.querySelector('[contenteditable="true"]');
-      if (ce) {
-        ce.focus();
-        ce.innerHTML = '${safeText}';
-        ce.dispatchEvent(new Event('input', {bubbles: true}));
-        return 'ContentEditable(found): replaced';
       }
 
       return 'No code editor found';

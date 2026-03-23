@@ -409,7 +409,7 @@ server.tool(
 
 server.tool(
   "safari_read_page",
-  "Read page content (title, URL, text). Use selector to read specific element. Use maxLength to limit output.",
+  "Read page text content (title, URL, body text). Use for reading article text or page content. For interacting with elements, prefer safari_snapshot (gives ref IDs). Use selector to read specific element. Use maxLength to limit output.",
   {
     selector: z.string().optional().describe("CSS selector to read specific element"),
     maxLength: z.coerce.number().optional().describe("Max chars to return (default: 50000)"),
@@ -440,7 +440,7 @@ server.tool(
 
 server.tool(
   "safari_snapshot",
-  "Get page accessibility tree with ref IDs for every interactive element. Use refs with click/fill/type instead of CSS selectors. PREFERRED workflow: snapshot → see refs → click({ref:'0_5'})",
+  "PREFERRED way to see page state. Returns accessibility tree with ref IDs for every interactive element. Use refs with click/fill/type instead of CSS selectors. Workflow: snapshot → see refs → click({ref:'0_5'}). PREFER THIS over safari_screenshot (cheaper, structured text vs heavy image) and over safari_read_page (includes interactive refs). Use safari_screenshot only when you need to see visual layout/styling.",
   { selector: z.string().optional().describe("CSS selector for subtree (default: full page)") },
   async (args) => {
     const result = await extensionOrFallback(
@@ -567,7 +567,7 @@ server.tool(
 
 server.tool(
   "safari_fill",
-  "Fill input field. Use ref (from snapshot) or CSS selector",
+  "Fill/replace value in an input, textarea, select, OR contenteditable (rich text). Handles React controlled inputs, ProseMirror, Draft.js, and Google Closure editors automatically. Use for SETTING a value (replaces existing). For code editors (Monaco/CodeMirror/Ace), use safari_replace_editor instead. For character-by-character typing in search boxes, use safari_type_text.",
   {
     ref: z.string().optional().describe("Ref ID from safari_snapshot"),
     selector: z.string().optional().describe("CSS selector"),
@@ -650,7 +650,7 @@ server.tool(
 
 server.tool(
   "safari_type_text",
-  "Type text character by character. Use ref or selector to focus first.",
+  "Type text character-by-character with realistic key events. Best for: search boxes (triggers autocomplete), chat inputs, and fields that react to each keystroke. For rich text editors (Medium, HackerNoon, LinkedIn), use safari_fill instead — it uses framework-native APIs. For code editors (Monaco/CodeMirror), use safari_replace_editor.",
   {
     text: z.string().describe("Text to type"),
     ref: z.string().optional().describe("Ref ID from safari_snapshot"),
@@ -669,7 +669,7 @@ server.tool(
 
 server.tool(
   "safari_replace_editor",
-  "Replace ALL content in a code editor (Monaco, CodeMirror, Ace). Use this instead of type_text/fill for code editors like Airtable automations, GitHub gists, CodePen, etc. Selects all existing code and replaces it.",
+  "Replace ALL content in a code editor (Monaco, CodeMirror, Ace, ProseMirror). Use ONLY for code editors — Airtable automations, GitHub gists, CodePen, n8n code nodes, etc. NOT for rich text editors like Medium/LinkedIn (use safari_fill for those). Detects ProseMirror/Draft.js/CodeMirror/Monaco/Ace and uses their native API.",
   {
     text: z.string().describe("The complete code/text to put in the editor"),
   },
@@ -686,7 +686,7 @@ server.tool(
 
 server.tool(
   "safari_screenshot",
-  "Take a screenshot of the current Safari window. Returns base64 JPEG image.",
+  "Take a visual screenshot (base64 JPEG). EXPENSIVE — use safari_snapshot instead for most tasks. Only use screenshot when you need to verify visual layout, styling, images, or colors that snapshot can't show.",
   {
     fullPage: z.boolean().optional().describe("Capture full page (not just viewport)"),
   },
@@ -877,7 +877,7 @@ server.tool(
 
 server.tool(
   "safari_evaluate",
-  "Execute arbitrary JavaScript in the current page and return the result",
+  "Execute JavaScript in the current page. WARNING: Some sites (e.g. Google Search Console) block this with Content Security Policy (Trusted Types). If blocked, use safari_snapshot + safari_click/fill with refs instead. For reading data, prefer safari_read_page or safari_snapshot.",
   { script: z.string().describe("JavaScript code to execute") },
   async (args) => {
     const result = await extensionOrFallback(
@@ -993,7 +993,7 @@ server.tool(
 
 server.tool(
   "safari_upload_file",
-  "Upload a file to a <input type='file'> element via JavaScript DataTransfer — NO file dialog, NO UI interaction. IMPORTANT: Do NOT click the file input before calling this tool — just provide the selector and file path. If a file dialog is already open, this tool will close it first.",
+  "Upload a file to a <input type='file'> element via JavaScript DataTransfer — NO file dialog, NO UI interaction. IMPORTANT: Do NOT click the file input before calling this tool — just provide the selector and file path. If a file dialog is already open, this tool will close it first. NOTE: 'verified 0 files' may appear even on success if the site uses a custom upload handler — check visually with safari_snapshot.",
   {
     selector: z.string().describe("CSS selector of the file input"),
     filePath: z.string().describe("Absolute path to the file to upload"),
@@ -1008,7 +1008,7 @@ server.tool(
 
 server.tool(
   "safari_paste_image",
-  "Paste an image from a local file into the focused element. Copies to clipboard then Cmd+V. Works on Medium, dev.to, HackerNoon, etc.",
+  "Paste an image from a local file into the focused element. Copies to clipboard then Cmd+V. Works on Medium, dev.to, HackerNoon, TOI, etc. WARNING: This STEALS FOCUS — Safari comes to foreground briefly. Also briefly overwrites system clipboard (auto-restored).",
   {
     filePath: z.string().describe("Absolute path to the image file (PNG, JPG, WebP)"),
   },
@@ -1072,7 +1072,7 @@ server.tool(
 
 server.tool(
   "safari_network",
-  "Get network requests made by the current page (via Performance API)",
+  "Quick network overview via Performance API (no setup needed). Shows URLs and timing for resources loaded by the page. For detailed request/response info (headers, status codes, POST bodies), use safari_start_network_capture + safari_network_details instead.",
   { limit: z.coerce.number().optional().describe("Max requests to return (default: 50)") },
   async ({ limit }) => {
     const result = await safari.getNetworkRequests({ limit });
@@ -1133,7 +1133,7 @@ server.tool(
 
 server.tool(
   "safari_save_pdf",
-  "Save the current page as a PDF file. Uses Safari's native Export as PDF.",
+  "Save the current page as a PDF file. Uses Safari's native Export as PDF. WARNING: This STEALS FOCUS — Safari comes to foreground briefly for the Export menu.",
   { path: z.string().describe("Absolute file path to save the PDF (e.g. /Users/am/Downloads/page.pdf)") },
   async (args) => {
     const result = await safari.savePDF(args);
@@ -1326,7 +1326,7 @@ server.tool(
 
 server.tool(
   "safari_wait",
-  "Wait for a specified number of milliseconds. Use between actions that need time to settle.",
+  "Wait for a fixed time in milliseconds. Use only when you need a brief pause between actions. PREFER safari_wait_for (waits for element/text to appear) — it's smarter and doesn't waste time.",
   { ms: z.coerce.number().describe("Milliseconds to wait") },
   async ({ ms }) => {
     const result = await safari.waitForTime({ ms });
@@ -1338,7 +1338,7 @@ server.tool(
 
 server.tool(
   "safari_start_network_capture",
-  "Start capturing detailed network requests (fetch + XHR) with headers, status, timing. Call once per page.",
+  "Start capturing detailed network requests (fetch + XHR) with headers, status, timing. Call once per page. Intercepts fetch/XHR — captures requests AFTER this call only. For quick overview of already-loaded resources, use safari_network instead.",
   {},
   async () => {
     const result = await safari.startNetworkCapture();

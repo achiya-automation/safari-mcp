@@ -556,8 +556,27 @@ async function handleCommand(type, payload) {
             } catch (e) { /* fall through */ }
           }
 
-          // === Fallback: execCommand (works for simple contenteditable) ===
+          // === Strategy 3: Clipboard paste (universal — works for Closure/Medium/Tiptap/unknown) ===
+          // All rich text editors handle paste events to insert content with proper structure.
+          // This is safer than selectAll+insertText which destroys structural elements.
+          try {
+            document.execCommand("selectAll", false, null);
+            const dt = new DataTransfer();
+            dt.setData("text/plain", value);
+            // Wrap in paragraphs for HTML-aware editors
+            const htmlValue = value.split("\n").filter(function(l) { return l.trim(); })
+              .map(function(l) { return "<p>" + l + "</p>"; }).join("");
+            dt.setData("text/html", htmlValue);
+            const pe = new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: dt });
+            const handled = !el.dispatchEvent(pe); // true if editor called preventDefault
+            if (handled) return "Filled contenteditable (clipboard paste)";
+          } catch (e) { /* clipboard paste not supported, fall through */ }
+
+          // === Strategy 4: selectAll + delete + insertText (safer than selectAll + insertText) ===
+          // delete lets the editor handle removal and rebuild empty state structure.
+          // Then insertText adds to the clean empty editor.
           document.execCommand("selectAll", false, null);
+          document.execCommand("delete", false, null);
           document.execCommand("insertText", false, value);
           return "Filled contenteditable";
         }
