@@ -881,13 +881,26 @@ async function handleCommand(type, payload) {
         if (isClosure) {
           for (var ci = 0; ci < text.length; ci++) {
             var ch = text[ci];
+            // Re-acquire activeElement on every iteration — Closure editors move cursor
+            // to new paragraph elements after Enter, which changes activeElement.
+            var target = document.activeElement || ae;
+            // Handle newlines: Enter key creates a new paragraph in Closure editor
+            if (ch === "\n") {
+              target.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", keyCode: 13, code: "Enter", bubbles: true, cancelable: true }));
+              target.dispatchEvent(new KeyboardEvent("keypress", { key: "Enter", keyCode: 13, charCode: 13, code: "Enter", bubbles: true, cancelable: true }));
+              target.dispatchEvent(new InputEvent("beforeinput", { inputType: "insertParagraph", bubbles: true, cancelable: true }));
+              document.execCommand("insertParagraph", false, null);
+              target.dispatchEvent(new InputEvent("input", { inputType: "insertParagraph", bubbles: true }));
+              target.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", keyCode: 13, code: "Enter", bubbles: true }));
+              continue;
+            }
             var kc = ch.charCodeAt(0);
-            ae.dispatchEvent(new KeyboardEvent("keydown", { key: ch, keyCode: kc, bubbles: true, cancelable: true }));
-            ae.dispatchEvent(new KeyboardEvent("keypress", { key: ch, keyCode: kc, charCode: kc, bubbles: true, cancelable: true }));
-            ae.dispatchEvent(new InputEvent("beforeinput", { data: ch, inputType: "insertText", bubbles: true, cancelable: true }));
+            target.dispatchEvent(new KeyboardEvent("keydown", { key: ch, keyCode: kc, bubbles: true, cancelable: true }));
+            target.dispatchEvent(new KeyboardEvent("keypress", { key: ch, keyCode: kc, charCode: kc, bubbles: true, cancelable: true }));
+            target.dispatchEvent(new InputEvent("beforeinput", { data: ch, inputType: "insertText", bubbles: true, cancelable: true }));
             document.execCommand("insertText", false, ch);
-            ae.dispatchEvent(new InputEvent("input", { data: ch, inputType: "insertText", bubbles: true }));
-            ae.dispatchEvent(new KeyboardEvent("keyup", { key: ch, keyCode: kc, bubbles: true }));
+            target.dispatchEvent(new InputEvent("input", { data: ch, inputType: "insertText", bubbles: true }));
+            target.dispatchEvent(new KeyboardEvent("keyup", { key: ch, keyCode: kc, bubbles: true }));
           }
           return "Typed " + text.length + " chars (Closure char-by-char)";
         }
