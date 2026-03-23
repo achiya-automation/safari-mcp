@@ -348,9 +348,19 @@ async function handleCommand(type, payload) {
           // Focus the window (brings profile to front) — critical for multi-profile setups
           await browser.windows.update(captureWindowId, { focused: true });
         } catch (_) {}
-        // Make this tab active in its window
+        // Make this tab active and VERIFY it became active
         await browser.tabs.update(tabId, { active: true });
-        await new Promise(r => setTimeout(r, 200)); // Wait for visual switch + render
+        // Wait for visual switch + render — 200ms wasn't always enough
+        await new Promise(r => setTimeout(r, 350));
+        // Verify the correct tab is now active in this window
+        try {
+          const activeTabs = await browser.tabs.query({ active: true, windowId: captureWindowId });
+          if (activeTabs[0] && activeTabs[0].id !== tabId) {
+            // Wrong tab is active — retry once
+            await browser.tabs.update(tabId, { active: true });
+            await new Promise(r => setTimeout(r, 300));
+          }
+        } catch (_) {}
       }
       // Use JPEG with quality 50 to reduce size (~600KB PNG → ~60KB JPEG)
       try {
@@ -376,12 +386,21 @@ async function handleCommand(type, payload) {
         function querySelectorDeep(sel) {
           let el = document.querySelector(sel);
           if (el) return el;
-          // Shadow DOM
-          const allEls = document.querySelectorAll("*");
-          for (let i = 0; i < allEls.length; i++) {
-            const sr = allEls[i].shadowRoot;
-            if (sr) { el = sr.querySelector(sel); if (el) return el; }
+          // Shadow DOM (supports closed roots via monkey-patched getter)
+          const getSR = window.__mcpGetShadowRoot || function(e) { return e.shadowRoot; };
+          function searchShadows(root) {
+            const allEls = root.querySelectorAll("*");
+            for (let i = 0; i < allEls.length; i++) {
+              const sr = getSR(allEls[i]);
+              if (sr) {
+                el = sr.querySelector(sel); if (el) return el;
+                el = searchShadows(sr); if (el) return el;
+              }
+            }
+            return null;
           }
+          el = searchShadows(document);
+          if (el) return el;
           // Same-origin iframes
           const iframes = document.querySelectorAll("iframe");
           for (let i = 0; i < iframes.length; i++) {
@@ -1152,8 +1171,18 @@ async function handleCommand(type, payload) {
           }
 
           let children = "";
-          for (const child of el.childNodes) {
-            children += walk(child, depth + 1);
+          // Enter shadow root INLINE (not as afterthought) — critical for Reddit/custom elements
+          const getSR = window.__mcpGetShadowRoot || function(e) { return e.shadowRoot; };
+          const sr = getSR(el);
+          if (sr) {
+            // Shadow root replaces light DOM children in rendering
+            for (const child of sr.childNodes) {
+              children += walk(child, depth + 1);
+            }
+          } else {
+            for (const child of el.childNodes) {
+              children += walk(child, depth + 1);
+            }
           }
 
           // Skip wrapper-only non-interactive elements
@@ -1169,12 +1198,17 @@ async function handleCommand(type, payload) {
         const root = rootSelector ? document.querySelector(rootSelector) : document.body;
         if (!root) return "Root element not found";
         let tree = walk(root, 0);
-        // Walk shadow roots
+        // Walk shadow roots that weren't caught inline (fallback for roots created AFTER monkey-patch)
+        const getSR2 = window.__mcpGetShadowRoot || function(e) { return e.shadowRoot; };
         function walkShadows(node, depth) {
           if (id >= MAX_ELEMENTS) return;
           const all = node.querySelectorAll("*");
           for (const el of all) {
-            if (el.shadowRoot) tree += walk(el.shadowRoot, depth);
+            const sr = getSR2(el);
+            if (sr) {
+              tree += walk(sr, depth);
+              walkShadows(sr, depth + 1); // Recurse into nested shadow roots
+            }
           }
         }
         walkShadows(root, 1);
@@ -1744,14 +1778,16 @@ function _deepQueryScript() {
   window.__mcpDeepQuery = function(selector) {
     let el = document.querySelector(selector);
     if (el) return el;
-    // Recursive shadow DOM
+    // Recursive shadow DOM (supports closed roots via monkey-patched getter)
+    var getSR = window.__mcpGetShadowRoot || function(e) { return e.shadowRoot; };
     function searchShadow(root) {
-      const all = root.querySelectorAll("*");
-      for (let i = 0; i < all.length; i++) {
-        if (all[i].shadowRoot) {
-          el = all[i].shadowRoot.querySelector(selector);
+      var all = root.querySelectorAll("*");
+      for (var i = 0; i < all.length; i++) {
+        var sr = getSR(all[i]);
+        if (sr) {
+          el = sr.querySelector(selector);
           if (el) return el;
-          el = searchShadow(all[i].shadowRoot);
+          el = searchShadow(sr);
           if (el) return el;
         }
       }
