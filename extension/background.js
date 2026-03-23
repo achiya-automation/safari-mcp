@@ -229,49 +229,60 @@ async function handleCommand(type, payload) {
     // Strategy 1: indirect eval (fast, works when CSP allows unsafe-eval)
     // Strategy 2: script element injection (bypasses CSP in MAIN world context)
     case "evaluate": {
-      return await execInTab(async (script) => {
+      // Strategy 1: Direct eval via execInTab (fast, works when CSP allows unsafe-eval)
+      const evalResult = await execInTab(async (script) => {
         try {
-          // Try indirect eval first (fastest)
           const result = await (0, eval)(script);
           if (result === undefined || result === null) return null;
           return typeof result === "object" ? JSON.stringify(result) : String(result);
         } catch (e) {
-          if (!e.message.includes("unsafe-eval") && !e.message.includes("trusted-types")) {
-            return "Error: " + e.message;
+          if (e.message.includes("unsafe-eval") || e.message.includes("trusted-types")) {
+            return "__CSP_BLOCKED__";
           }
-          // CSP blocks eval — use script element injection (runs in page's MAIN world)
-          return await new Promise((resolve) => {
-            const id = "__mcp_eval_" + Date.now();
-            window[id] = { done: false };
-            const s = document.createElement("script");
-            const code = "try{var __r=(function(){" + script + "})();if(__r&&typeof __r.then==='function'){__r.then(function(v){window['" + id + "']={done:true,v:v};}).catch(function(e){window['" + id + "']={done:true,e:e.message};});}else{window['" + id + "']={done:true,v:__r};}}catch(e){window['" + id + "']={done:true,e:e.message};}";
-            // Handle Trusted Types CSP
-            if (window.trustedTypes && window.trustedTypes.createPolicy) {
-              try {
-                const policy = window.trustedTypes.createPolicy("mcpEval", { createScript: (s) => s });
-                s.textContent = policy.createScript(code);
-              } catch (_) { s.textContent = code; }
-            } else {
-              s.textContent = code;
-            }
-            document.documentElement.appendChild(s);
-            s.remove();
-            let attempts = 0;
-            const poll = () => {
-              const r = window[id];
-              if (r && r.done) {
-                delete window[id];
-                if (r.e) resolve("Error: " + r.e);
-                else resolve(r.v === undefined || r.v === null ? null : typeof r.v === "object" ? JSON.stringify(r.v) : String(r.v));
-                return;
-              }
-              if (++attempts > 100) { delete window[id]; resolve("Error: timeout"); return; }
-              setTimeout(poll, 50);
-            };
-            poll();
-          });
+          return "Error: " + e.message;
         }
       }, [payload.script], tabId);
+
+      if (evalResult !== "__CSP_BLOCKED__") return evalResult;
+
+      // Strategy 2: Script element injection (works when inline scripts are allowed)
+      const injectResult = await execInTab(async (script) => {
+        return await new Promise((resolve) => {
+          const id = "__mcp_eval_" + Date.now();
+          window[id] = { done: false };
+          const s = document.createElement("script");
+          const code = "try{var __r=(function(){" + script + "})();if(__r&&typeof __r.then==='function'){__r.then(function(v){window['" + id + "']={done:true,v:v};}).catch(function(e){window['" + id + "']={done:true,e:e.message};});}else{window['" + id + "']={done:true,v:__r};}}catch(e){window['" + id + "']={done:true,e:e.message};}";
+          if (window.trustedTypes && window.trustedTypes.createPolicy) {
+            try {
+              const policy = window.trustedTypes.createPolicy("mcpEval", { createScript: (s) => s });
+              s.textContent = policy.createScript(code);
+            } catch (_) { s.textContent = code; }
+          } else {
+            s.textContent = code;
+          }
+          document.documentElement.appendChild(s);
+          s.remove();
+          let attempts = 0;
+          const poll = () => {
+            const r = window[id];
+            if (r && r.done) {
+              delete window[id];
+              if (r.e) resolve("Error: " + r.e);
+              else resolve(r.v === undefined || r.v === null ? null : typeof r.v === "object" ? JSON.stringify(r.v) : String(r.v));
+              return;
+            }
+            if (++attempts > 100) { delete window[id]; resolve("Error: timeout"); return; }
+            setTimeout(poll, 50);
+          };
+          poll();
+        });
+      }, [payload.script], tabId);
+
+      // If script injection also returned a CSP error, signal to fall back to AppleScript
+      if (injectResult && typeof injectResult === "string" && (injectResult.includes("unsafe-eval") || injectResult.includes("trusted-types") || injectResult.includes("Content Security Policy"))) {
+        return "Error: CSP blocked both eval and script injection. Falling back to AppleScript.";
+      }
+      return injectResult;
     }
 
     // --- Screenshot ---
@@ -601,7 +612,32 @@ async function handleCommand(type, payload) {
             }
           }
 
-          // === Strategy 3: Clipboard paste (universal — works for Closure/Medium/Tiptap/unknown) ===
+          // === Strategy 2.5: Google Closure / Medium detection ===
+          // Medium uses Closure Library — detected by closure_uid_* properties on DOM elements.
+          // selectAll destroys Closure's internal structure. Safe approach: insertText only (no selectAll).
+          if (!ceResult) {
+            const isClosure = el.closest && (
+              Object.keys(el).some(k => k.startsWith("closure_uid_")) ||
+              Object.keys(el.parentElement || {}).some(k => k.startsWith("closure_uid_")) ||
+              document.querySelector('[data-testid="editorParagraph"]') || // Medium body
+              (location.hostname.includes("medium.com"))
+            );
+            if (isClosure) {
+              // Move cursor to end, then type — don't selectAll which breaks structure
+              const sel = window.getSelection();
+              if (sel.rangeCount) {
+                const range = document.createRange();
+                range.selectNodeContents(el);
+                range.collapse(false); // collapse to end
+                sel.removeAllRanges();
+                sel.addRange(range);
+              }
+              document.execCommand("insertText", false, value);
+              ceResult = "Filled contenteditable (Closure/Medium safe mode)";
+            }
+          }
+
+          // === Strategy 3: Clipboard paste (universal — works for Tiptap/unknown) ===
           if (!ceResult) {
             try {
               document.execCommand("selectAll", false, null);
