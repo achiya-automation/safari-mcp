@@ -42,8 +42,8 @@ function startHelper() {
         if (cb) cb(line);
       }
     });
-    _helperProc.on("error", () => { _drainHelperQueue("helper process error"); _helperProc = null; });
-    _helperProc.on("exit", () => { _drainHelperQueue("helper process exited"); _helperProc = null; });
+    _helperProc.on("error", () => { _drainHelperQueue("helper process error"); _helperProc = null; _scheduleRestart(); });
+    _helperProc.on("exit", (code) => { _drainHelperQueue("helper process exited (code " + code + ")"); _helperProc = null; _scheduleRestart(); });
   } catch {
     _helperProc = null;
   }
@@ -51,9 +51,32 @@ function startHelper() {
 
 startHelper();
 
+// ========== AUTO-RESTART: recover from helper crashes ==========
+let _restartCount = 0;
+let _restartTimer = null;
+let _shuttingDown = false;
+
+function _scheduleRestart() {
+  if (_shuttingDown || _restartTimer) return;
+  _restartCount++;
+  // Exponential backoff: 500ms, 1s, 2s, 4s, max 10s
+  const delay = Math.min(500 * Math.pow(2, _restartCount - 1), 10000);
+  console.error(`safari-helper crashed (restart #${_restartCount}, retrying in ${delay}ms)`);
+  _restartTimer = setTimeout(() => {
+    _restartTimer = null;
+    if (!_shuttingDown && !_helperProc) {
+      startHelper();
+      // Reset restart count after 60s of stability
+      setTimeout(() => { if (_helperProc) _restartCount = 0; }, 60000);
+    }
+  }, delay);
+}
+
 // ========== CLEANUP: kill helper when parent process exits ==========
 // Without this, safari-helper processes accumulate as zombies when MCP restarts
 function cleanupHelper() {
+  _shuttingDown = true;
+  if (_restartTimer) { clearTimeout(_restartTimer); _restartTimer = null; }
   if (_helperProc) {
     try { _helperProc.kill("SIGTERM"); } catch (_) {}
     _helperProc = null;
@@ -1844,8 +1867,10 @@ export async function uploadFile({ selector, filePath }) {
       if (el.files && el.files.length > 0) {
         return 'Uploaded via drop: ${safeName} (' + Math.round(bytes.length / 1024) + ' KB, verified ' + el.files.length + ' file(s))';
       }
-      // Drop may have succeeded even if el.files is empty (custom upload handlers)
-      return 'Upload attempted: ${safeName} (' + Math.round(bytes.length / 1024) + ' KB) — drop event dispatched but el.files still empty. The upload may have succeeded if the site uses a custom handler. Verify with safari_snapshot.';
+      // Check if any new images/files appeared on the page after the drop
+      var newImgs = document.querySelectorAll('img[src*="blob:"], img[src*="data:"], [style*="background-image"]');
+      var hint = newImgs.length > 0 ? ' (detected ' + newImgs.length + ' blob/data images on page — upload likely succeeded)' : '';
+      return 'Upload attempted: ${safeName} (' + Math.round(bytes.length / 1024) + ' KB) — drop event dispatched. el.files is empty (normal for custom upload handlers).' + hint + ' Verify with safari_snapshot.';
     })()`,
     { timeout: 30000 }
   );

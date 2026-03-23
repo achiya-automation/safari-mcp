@@ -365,7 +365,14 @@ async function handleCommand(type, payload) {
           if (el) return el;
           // Fallback to stored ref metadata
           const refs = window.__mcpRefs;
-          if (!refs || !refs[refId]) return null;
+          if (!refs || !refs[refId]) {
+            // Stale ref detection: check if refs exist but this ID is from a different generation
+            const age = window.__mcpRefsTime ? Math.round((Date.now() - window.__mcpRefsTime) / 1000) : -1;
+            if (refs && age > 30) {
+              return "__STALE_REF__:Ref '" + refId + "' not found. Snapshot is " + age + "s old — take a fresh snapshot.";
+            }
+            return null;
+          }
           const m = refs[refId];
           if (m.id) { el = document.getElementById(m.id); if (el) return el; }
           if (m.nameAttr) { el = document.querySelector('[name="' + m.nameAttr + '"]'); if (el) return el; }
@@ -383,6 +390,8 @@ async function handleCommand(type, payload) {
         let el = null;
         if (ref) {
           el = findByRef(ref);
+          // Stale ref detection: findByRef returns a string starting with __STALE_REF__
+          if (typeof el === "string" && el.startsWith("__STALE_REF__")) return el.substring(14);
         } else if (selector) {
           el = querySelectorDeep(selector);
         } else if (text) {
@@ -819,7 +828,16 @@ async function handleCommand(type, payload) {
         }
 
         // === Strategy 3: execCommand (works for simple contenteditable + some frameworks) ===
+        // For contenteditable: snapshot current text, insert, then check for duplication.
+        // Some editors (Reddit) process insertText AND their own MutationObserver both add text.
+        var ae = document.activeElement;
+        var beforeLen = ae && ae.isContentEditable ? ae.textContent.length : -1;
         document.execCommand("insertText", false, text);
+        // Deduplication check: if text was added twice (editor + execCommand), undo one copy
+        if (beforeLen >= 0 && ae.textContent.length > beforeLen + text.length * 1.5) {
+          document.execCommand("undo", false, null);
+          return "Typed " + text.length + " chars (deduplicated — editor handled insertion)";
+        }
         return "Typed " + text.length + " chars";
       }, [payload.text, payload.selector], tabId);
     }
@@ -1072,8 +1090,9 @@ async function handleCommand(type, payload) {
             if (doc && doc.body) tree += walk(doc.body, 1);
           } catch (_) {}
         }
-        // Store refs globally for ref-based click/fill
+        // Store refs globally for ref-based click/fill, with generation timestamp
         window.__mcpRefs = refs;
+        window.__mcpRefsTime = Date.now();
         return tree;
       }, [payload.selector || null], tabId);
     }
@@ -1109,9 +1128,23 @@ async function handleCommand(type, payload) {
       return await execInTab((selector) => {
         const el = (window.__mcpDeepQuery || document.querySelector.bind(document))(selector);
         if (!el) return "Element not found";
-        el.value = "";
+        if (el.isContentEditable) {
+          // Contenteditable: use selectAll+delete to let editor handle clearing properly
+          el.focus();
+          document.execCommand("selectAll", false, null);
+          document.execCommand("delete", false, null);
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          return "Cleared (contenteditable)";
+        }
+        // Standard input/textarea: use native setter for React compatibility
+        const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const desc = Object.getOwnPropertyDescriptor(proto, "value");
+        if (desc && desc.set) { desc.set.call(el, ""); } else { el.value = ""; }
+        const tracker = el._valueTracker;
+        if (tracker) tracker.setValue("x"); // Force React to see change
         el.dispatchEvent(new Event("input", { bubbles: true }));
         el.dispatchEvent(new Event("change", { bubbles: true }));
+        el.dispatchEvent(new Event("blur", { bubbles: true }));
         return "Cleared";
       }, [payload.selector], tabId);
     }
