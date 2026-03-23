@@ -867,11 +867,29 @@ async function handleCommand(type, payload) {
           } catch (e) { /* fall through */ }
         }
 
+        // === Strategy 2.5: Closure/Medium — char-by-char with full keyboard events ===
+        var ae = document.activeElement || document.body;
+        var isClosure = ae.isContentEditable && (
+          Object.keys(ae).some(function(k) { return k.startsWith("closure_uid_"); }) ||
+          Object.keys(ae.parentElement || {}).some(function(k) { return k.startsWith("closure_uid_"); }) ||
+          location.hostname.includes("medium.com")
+        );
+        if (isClosure) {
+          for (var ci = 0; ci < text.length; ci++) {
+            var ch = text[ci];
+            var kc = ch.charCodeAt(0);
+            ae.dispatchEvent(new KeyboardEvent("keydown", { key: ch, keyCode: kc, bubbles: true, cancelable: true }));
+            ae.dispatchEvent(new KeyboardEvent("keypress", { key: ch, keyCode: kc, charCode: kc, bubbles: true, cancelable: true }));
+            ae.dispatchEvent(new InputEvent("beforeinput", { data: ch, inputType: "insertText", bubbles: true, cancelable: true }));
+            document.execCommand("insertText", false, ch);
+            ae.dispatchEvent(new InputEvent("input", { data: ch, inputType: "insertText", bubbles: true }));
+            ae.dispatchEvent(new KeyboardEvent("keyup", { key: ch, keyCode: kc, bubbles: true }));
+          }
+          return "Typed " + text.length + " chars (Closure char-by-char)";
+        }
+
         // === Strategy 3: execCommand (works for simple contenteditable + some frameworks) ===
-        // For contenteditable: snapshot current text, insert, then check for duplication.
-        // Some editors (Reddit) process insertText AND their own MutationObserver both add text.
-        var ae = document.activeElement;
-        var beforeLen = ae && ae.isContentEditable ? ae.textContent.length : -1;
+        var beforeLen = ae.isContentEditable ? ae.textContent.length : -1;
         document.execCommand("insertText", false, text);
         // Deduplication check: if text was added twice (editor + execCommand), undo one copy
         if (beforeLen >= 0 && ae.textContent.length > beforeLen + text.length * 1.5) {
@@ -885,7 +903,16 @@ async function handleCommand(type, payload) {
     case "press_key": {
       return await execInTab((key, modifiers) => {
         const el = document.activeElement || document.body;
-        const opts = { key, code: "Key" + key.toUpperCase(), bubbles: true, cancelable: true };
+        // Proper key→code mapping (KeyA for letters, special codes for others)
+        const codeMap = {
+          Enter: "Enter", Tab: "Tab", Escape: "Escape", Backspace: "Backspace",
+          Delete: "Delete", ArrowUp: "ArrowUp", ArrowDown: "ArrowDown",
+          ArrowLeft: "ArrowLeft", ArrowRight: "ArrowRight", Home: "Home", End: "End",
+          PageUp: "PageUp", PageDown: "PageDown", " ": "Space", space: "Space",
+          Space: "Space"
+        };
+        const code = codeMap[key] || (key.length === 1 ? "Key" + key.toUpperCase() : key);
+        const opts = { key: key === "space" || key === "Space" ? " " : key, code, bubbles: true, cancelable: true };
         if (modifiers) {
           if (modifiers.includes("cmd") || modifiers.includes("meta")) opts.metaKey = true;
           if (modifiers.includes("ctrl")) opts.ctrlKey = true;
@@ -1140,12 +1167,22 @@ async function handleCommand(type, payload) {
     // --- Double Click ---
     case "double_click": {
       return await execInTab((selector, x, y) => {
+        const dq = window.__mcpDeepQuery || document.querySelector.bind(document);
         let el = null;
-        if (selector) el = document.querySelector(selector);
+        if (selector) el = dq(selector);
         else if (x !== undefined && y !== undefined) el = document.elementFromPoint(x, y);
         if (!el) return "Element not found";
         el.scrollIntoView({ block: "center" });
-        el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true }));
+        const r = el.getBoundingClientRect();
+        const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+        const opts = { bubbles: true, cancelable: true, clientX: cx, clientY: cy };
+        el.dispatchEvent(new MouseEvent("mousedown", opts));
+        el.dispatchEvent(new MouseEvent("mouseup", opts));
+        el.dispatchEvent(new MouseEvent("click", opts));
+        el.dispatchEvent(new MouseEvent("mousedown", { ...opts, detail: 2 }));
+        el.dispatchEvent(new MouseEvent("mouseup", { ...opts, detail: 2 }));
+        el.dispatchEvent(new MouseEvent("click", { ...opts, detail: 2 }));
+        el.dispatchEvent(new MouseEvent("dblclick", { ...opts, detail: 2 }));
         return "Double-clicked: " + el.tagName;
       }, [payload.selector, payload.x, payload.y], tabId);
     }
@@ -1153,12 +1190,15 @@ async function handleCommand(type, payload) {
     // --- Right Click ---
     case "right_click": {
       return await execInTab((selector, x, y) => {
+        const dq = window.__mcpDeepQuery || document.querySelector.bind(document);
         let el = null;
-        if (selector) el = document.querySelector(selector);
+        if (selector) el = dq(selector);
         else if (x !== undefined && y !== undefined) el = document.elementFromPoint(x, y);
         if (!el) return "Element not found";
         el.scrollIntoView({ block: "center" });
-        el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, button: 2 }));
+        const r = el.getBoundingClientRect();
+        const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+        el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, button: 2, clientX: cx, clientY: cy }));
         return "Right-clicked: " + el.tagName;
       }, [payload.selector, payload.x, payload.y], tabId);
     }
@@ -1261,17 +1301,50 @@ async function handleCommand(type, payload) {
           const el = dq(f.selector);
           if (!el) { results.push("Not found: " + f.selector); return; }
           el.focus();
-          if (el.isContentEditable) {
-            el.textContent = "";
-            document.execCommand("insertText", false, f.value);
-          } else {
-            const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-            const desc = Object.getOwnPropertyDescriptor(proto, "value");
-            if (desc?.set) desc.set.call(el, f.value);
-            else el.value = f.value;
+
+          // Checkbox/radio: click to toggle, with _valueTracker reset
+          if (el.tagName === "INPUT" && (el.type === "checkbox" || el.type === "radio")) {
+            const want = f.value === "true" || f.value === "1" || f.value === "on";
+            if (el.checked !== want) {
+              const tracker = el._valueTracker;
+              if (tracker) tracker.setValue(el.checked ? "true" : "");
+              el.click();
+            }
+            results.push((el.checked ? "Checked" : "Unchecked") + ": " + (f.selector));
+            return;
+          }
+
+          // SELECT element
+          if (el.tagName === "SELECT") {
+            const tracker = el._valueTracker;
+            if (tracker) tracker.setValue("");
+            const desc = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value");
+            if (desc && desc.set) desc.set.call(el, f.value); else el.value = f.value;
             el.dispatchEvent(new Event("input", { bubbles: true }));
             el.dispatchEvent(new Event("change", { bubbles: true }));
+            results.push("Selected: " + el.value);
+            return;
           }
+
+          // Contenteditable
+          if (el.isContentEditable) {
+            document.execCommand("selectAll", false, null);
+            document.execCommand("delete", false, null);
+            document.execCommand("insertText", false, f.value);
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            results.push("Filled CE: " + f.value.substring(0, 30));
+            return;
+          }
+
+          // Standard input/textarea with React _valueTracker reset
+          const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+          const desc = Object.getOwnPropertyDescriptor(proto, "value");
+          if (desc && desc.set) desc.set.call(el, f.value); else el.value = f.value;
+          const tracker = el._valueTracker;
+          if (tracker) tracker.setValue("");
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          el.dispatchEvent(new Event("blur", { bubbles: true }));
           results.push("Filled: " + el.tagName + ' "' + f.value.substring(0, 30) + '"');
         });
         return results.join("\n");

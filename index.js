@@ -1562,7 +1562,11 @@ server.tool(
     timeout: z.coerce.number().optional().describe("Max time to scroll in ms (default: 10000)"),
   },
   async (args) => {
-    const result = await safari.scrollToElement(args);
+    const result = await extensionOrFallback(
+      "scroll_to_element",
+      { selector: args.selector, text: args.text, block: args.block },
+      () => safari.scrollToElement(args)
+    );
     return { content: [{ type: "text", text: result }] };
   }
 );
