@@ -337,9 +337,12 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
       // If extension returned null or "Element not found" for action commands,
       // fall back to AppleScript (which has better element discovery with helpers)
       const isCspError = typeof result === 'string' && (result.includes('unsafe-eval') || result.includes('trusted-types') || result.includes('Content Security Policy'));
+      const isPermissionDenied = typeof result === 'string' && result.includes('__SCREENSHOT_PERMISSION_DENIED__');
       const isFailed = result === null || (typeof result === 'string' && result.startsWith('Element not found'));
-      // CSP errors ALWAYS fall back to AppleScript (regardless of _nullMeansFailure)
-      if (isCspError) {
+      // Permission denied or CSP errors ALWAYS fall back to AppleScript
+      if (isPermissionDenied) {
+        console.error(`[Safari MCP] ${extensionType} permission denied (${Date.now() - t0}ms) — falling back to AppleScript`);
+      } else if (isCspError) {
         console.error(`[Safari MCP] ${extensionType} CSP blocked: ${result?.substring(0, 100)} (${Date.now() - t0}ms) — falling back to AppleScript`);
       } else if (isFailed && _nullMeansFailure.has(extensionType)) {
         console.error(`[Safari MCP] ${extensionType} extension failed: ${result} (${Date.now() - t0}ms) — falling back to AppleScript`);
