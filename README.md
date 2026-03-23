@@ -1,10 +1,38 @@
+<div align="center">
+
 # 🦁 Safari MCP
 
-**Native Safari automation for AI agents — zero Chrome overhead.**
+**The only MCP server for Safari — native browser automation for AI agents.**
 
-Use your real Safari browser with all your logins, cookies, and sessions. No headless browsers, no Chrome, no Puppeteer. Just pure AppleScript + JavaScript running natively on macOS.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![GitHub release](https://img.shields.io/github/v/release/achiya-automation/safari-mcp)](https://github.com/achiya-automation/safari-mcp/releases)
+[![Node.js](https://img.shields.io/badge/Node.js-18%2B-green)](https://nodejs.org/)
+[![macOS](https://img.shields.io/badge/macOS-only-blue)](https://www.apple.com/macos/)
+[![MCP](https://img.shields.io/badge/MCP-compatible-purple)](https://modelcontextprotocol.io)
+[![achiya-automation/safari-mcp MCP server](https://glama.ai/mcp/servers/achiya-automation/safari-mcp/badges/score.svg)](https://glama.ai/mcp/servers/achiya-automation/safari-mcp)
 
-> **Why?** Chrome DevTools MCP heats up your Mac. Playwright launches a separate browser without your logins. Safari MCP uses your actual Safari — lightweight, native WebKit, and you stay logged in everywhere.
+**80 tools** · **Zero dependencies** · **~5ms per command** · **60% less CPU than Chrome**
+
+[Quick Start](#quick-start) · [All 80 Tools](#tools-80) · [Why Safari MCP?](#safari-mcp-vs-alternatives) · [Architecture](#architecture)
+
+</div>
+
+---
+
+> **TL;DR:** Use your real Safari with all your logins, cookies, and sessions. No headless browsers, no Chrome, no Puppeteer. Just pure AppleScript + JavaScript running natively on macOS — 60% less CPU/heat on Apple Silicon.
+
+<details>
+<summary><b>🤔 Why not just use Playwright or Chrome DevTools MCP?</b></summary>
+
+| Problem | Safari MCP Solution |
+|---------|-------------------|
+| Chrome DevTools MCP heats up your Mac | Native WebKit — ~60% less CPU |
+| Playwright launches a new browser without your logins | Uses your **real Safari** with all sessions |
+| Puppeteer requires Chrome + debug port | Zero dependencies — just AppleScript |
+| Headless browsers can't access your authenticated sessions | Gmail, GitHub, Slack — already logged in |
+| Browser automation steals window focus | Safari stays in background, never interrupts |
+
+</details>
 
 ---
 
@@ -343,6 +371,20 @@ Safari MCP needs these one-time permissions:
 
 ---
 
+## Works With
+
+Safari MCP works with any MCP-compatible client:
+
+| Client | Status |
+|--------|--------|
+| [Claude Code](https://claude.ai/claude-code) | ✅ Tested daily |
+| [Claude Desktop](https://claude.ai/download) | ✅ Tested |
+| [Cursor](https://cursor.sh) | ✅ Tested |
+| [Windsurf](https://codeium.com/windsurf) | ✅ Compatible |
+| [VS Code + Continue](https://continue.dev) | ✅ Compatible |
+
+---
+
 ## Contributing
 
 PRs welcome! The codebase is two files:
@@ -351,6 +393,14 @@ PRs welcome! The codebase is two files:
 
 ---
 
+## Star History
+
+If Safari MCP saved you from Chrome overhead, consider giving it a ⭐
+
+[![Star History Chart](https://api.star-history.com/svg?repos=achiya-automation/safari-mcp&type=Date)](https://star-history.com/#achiya-automation/safari-mcp&Date)
+
+---
+
 ## License
 
-MIT
+MIT — use it however you want.
