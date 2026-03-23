@@ -500,7 +500,7 @@ async function handleCommand(type, payload) {
           el = document.elementFromPoint(x, y);
         }
 
-        if (!el) return "Element not found";
+        if (!el) return "Element not found" + (ref ? " ref=" + ref : "") + (selector ? " selector=" + selector : "") + (text ? ' text="' + text + '"' : "") + (x !== undefined ? " x=" + x + " y=" + y : "");
 
         // --- Visibility check ---
         const cs = window.getComputedStyle(el);
@@ -989,7 +989,7 @@ async function handleCommand(type, payload) {
           if (text && document.body?.innerText.includes(text)) return "Found text: " + text;
           await new Promise(r => setTimeout(r, 200));
         }
-        return "TIMEOUT";
+        return "TIMEOUT after " + timeout + "ms waiting for " + (selector ? "selector: " + selector : "text: " + text);
       }, [payload.selector, payload.text, payload.timeout || 10000], tabId);
     }
 
@@ -997,14 +997,18 @@ async function handleCommand(type, payload) {
     case "hover": {
       return await execInTab((selector) => {
         const el = (window.__mcpDeepQuery || document.querySelector.bind(document))(selector);
-        if (!el) return "Element not found";
+        if (!el) return "Element not found: " + selector;
         el.scrollIntoView({ block: "center" });
         const r = el.getBoundingClientRect();
-        const opts = { bubbles: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
-        el.dispatchEvent(new PointerEvent("pointerover", opts));
-        el.dispatchEvent(new MouseEvent("mouseover", opts));
-        el.dispatchEvent(new PointerEvent("pointerenter", opts));
-        el.dispatchEvent(new MouseEvent("mouseenter", opts));
+        const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+        const s = { bubbles: true, cancelable: true, composed: true, view: window, clientX: cx, clientY: cy };
+        const p = { ...s, pointerId: 1, pointerType: "mouse", isPrimary: true, width: 1, height: 1, pressure: 0 };
+        el.dispatchEvent(new PointerEvent("pointerover", p));
+        el.dispatchEvent(new MouseEvent("mouseover", s));
+        el.dispatchEvent(new PointerEvent("pointerenter", { ...p, bubbles: false }));
+        el.dispatchEvent(new MouseEvent("mouseenter", { ...s, bubbles: false }));
+        el.dispatchEvent(new PointerEvent("pointermove", p));
+        el.dispatchEvent(new MouseEvent("mousemove", s));
         return "Hovered: " + el.tagName;
       }, [payload.selector], tabId);
     }
@@ -1032,6 +1036,10 @@ async function handleCommand(type, payload) {
     // --- Snapshot (accessibility tree with ref IDs) ---
     case "snapshot": {
       return await execInTab((rootSelector) => {
+        // Clean ALL stale data-mcp-ref attributes from previous snapshots.
+        // Without this, old refs remain on DOM and findByRef/CSS selector can target WRONG elements.
+        document.querySelectorAll("[data-mcp-ref]").forEach(function(el) { el.removeAttribute("data-mcp-ref"); });
+
         let id = 0;
         const MAX_ELEMENTS = 800;
         const MAX_DEPTH = 20;
@@ -1160,6 +1168,10 @@ async function handleCommand(type, payload) {
         // Store refs globally for ref-based click/fill, with generation timestamp
         window.__mcpRefs = refs;
         window.__mcpRefsTime = Date.now();
+        // Warn if truncated
+        if (id >= MAX_ELEMENTS) {
+          tree += "\n[WARNING: Snapshot truncated at " + MAX_ELEMENTS + " elements. Use selector parameter to focus on a specific section.]";
+        }
         return tree;
       }, [payload.selector || null], tabId);
     }
@@ -1171,7 +1183,7 @@ async function handleCommand(type, payload) {
         let el = null;
         if (selector) el = dq(selector);
         else if (x !== undefined && y !== undefined) el = document.elementFromPoint(x, y);
-        if (!el) return "Element not found";
+        if (!el) return "Element not found: " + (selector || "x=" + x + ",y=" + y);
         el.scrollIntoView({ block: "center" });
         const r = el.getBoundingClientRect();
         const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
@@ -1194,7 +1206,7 @@ async function handleCommand(type, payload) {
         let el = null;
         if (selector) el = dq(selector);
         else if (x !== undefined && y !== undefined) el = document.elementFromPoint(x, y);
-        if (!el) return "Element not found";
+        if (!el) return "Element not found: " + (selector || "x=" + x + ",y=" + y);
         el.scrollIntoView({ block: "center" });
         const r = el.getBoundingClientRect();
         const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
@@ -1207,7 +1219,7 @@ async function handleCommand(type, payload) {
     case "clear_field": {
       return await execInTab((selector) => {
         const el = (window.__mcpDeepQuery || document.querySelector.bind(document))(selector);
-        if (!el) return "Element not found";
+        if (!el) return "Element not found: " + selector;
         if (el.isContentEditable) {
           // Contenteditable: use selectAll+delete to let editor handle clearing properly
           el.focus();
@@ -1233,7 +1245,7 @@ async function handleCommand(type, payload) {
     case "select_option": {
       return await execInTab((selector, value) => {
         const el = (window.__mcpDeepQuery || document.querySelector.bind(document))(selector);
-        if (!el) return "Element not found";
+        if (!el) return "Element not found: " + selector + " (for value: " + value + ")";
         el.focus();
 
         // Reset React's _valueTracker so React sees the change as "new"
