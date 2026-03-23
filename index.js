@@ -607,10 +607,16 @@ server.tool(
     value: z.string().describe("Option value to select"),
   },
   async (args) => {
-    const result = await extensionOrFallback(
+    let result = await extensionOrFallback(
       "select_option", { selector: args.selector, value: args.value },
       () => safari.selectOption(args)
     );
+    // If extension returned "Selected: " with empty/default value, fuzzy match may have failed.
+    // Retry via AppleScript path which has the latest fuzzy match code.
+    if (typeof result === 'string' && result.match(/^Selected:\s*$/) ) {
+      console.error('[Safari MCP] select_option returned empty value — retrying via AppleScript');
+      result = await safari.selectOption(args);
+    }
     return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
