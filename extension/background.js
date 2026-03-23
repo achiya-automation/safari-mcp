@@ -884,6 +884,8 @@ async function handleCommand(type, payload) {
           if (el.id) attrs += ` id="${el.id}"`;
           const al = el.getAttribute("aria-label");
           if (al) attrs += ` aria-label="${al}"`;
+          const title = el.getAttribute("title");
+          if (title) attrs += ` title="${title.substring(0, 80)}"`;
           if (el.value && ["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName)) {
             attrs += ` value="${String(el.value).substring(0, 50)}"`;
           }
@@ -892,6 +894,13 @@ async function handleCommand(type, payload) {
           if (el.disabled) attrs += " disabled";
           const ph = el.getAttribute("placeholder");
           if (ph) attrs += ` placeholder="${ph}"`;
+          // For interactive elements with no visible text — show alt/aria-describedby hint
+          if (interactive && el.tagName === "IMG" && el.alt) attrs += ` alt="${el.alt.substring(0, 80)}"`;
+          const ariaDesc = el.getAttribute("aria-describedby");
+          if (ariaDesc) {
+            const descEl = document.getElementById(ariaDesc);
+            if (descEl) attrs += ` described="${descEl.textContent.trim().substring(0, 80)}"`;
+          }
 
           // Self-closing for some tags
           if (["img", "input", "br", "hr"].includes(tag)) {

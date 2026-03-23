@@ -336,9 +336,12 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
       const result = await sendToExtension(extensionType, payload, timeout);
       // If extension returned null or "Element not found" for action commands,
       // fall back to AppleScript (which has better element discovery with helpers)
-      const isCspError = extensionType === 'evaluate' && typeof result === 'string' && (result.includes('unsafe-eval') || result.includes('trusted-types') || result.includes('Content Security Policy'));
-      const isFailed = result === null || (typeof result === 'string' && result.startsWith('Element not found')) || isCspError;
-      if (isFailed && _nullMeansFailure.has(extensionType)) {
+      const isCspError = typeof result === 'string' && (result.includes('unsafe-eval') || result.includes('trusted-types') || result.includes('Content Security Policy'));
+      const isFailed = result === null || (typeof result === 'string' && result.startsWith('Element not found'));
+      // CSP errors ALWAYS fall back to AppleScript (regardless of _nullMeansFailure)
+      if (isCspError) {
+        console.error(`[Safari MCP] ${extensionType} CSP blocked: ${result?.substring(0, 100)} (${Date.now() - t0}ms) — falling back to AppleScript`);
+      } else if (isFailed && _nullMeansFailure.has(extensionType)) {
         console.error(`[Safari MCP] ${extensionType} extension failed: ${result} (${Date.now() - t0}ms) — falling back to AppleScript`);
       } else {
         console.error(`[Safari MCP] ${extensionType} via extension (${Date.now() - t0}ms)`);
@@ -598,7 +601,7 @@ server.tool(
 
 server.tool(
   "safari_select_option",
-  "Select an option in a dropdown/select element",
+  "Select an option in a native <select> dropdown. Sets .value and dispatches change event. For custom dropdowns (React/LinkedIn), use safari_click on the dropdown trigger, then safari_click on the option instead.",
   {
     selector: z.string().describe("CSS selector of the select"),
     value: z.string().describe("Option value to select"),
@@ -877,7 +880,7 @@ server.tool(
 
 server.tool(
   "safari_evaluate",
-  "Execute JavaScript in the current page. WARNING: Some sites (e.g. Google Search Console) block this with Content Security Policy (Trusted Types). If blocked, use safari_snapshot + safari_click/fill with refs instead. For reading data, prefer safari_read_page or safari_snapshot.",
+  "Execute JavaScript in the current page. Automatically falls back to AppleScript when CSP blocks execution (e.g. Google Search Console, LinkedIn). For reading data, prefer safari_read_page or safari_snapshot. For interactions, prefer safari_click/fill with refs.",
   { script: z.string().describe("JavaScript code to execute") },
   async (args) => {
     const result = await extensionOrFallback(
