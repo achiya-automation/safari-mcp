@@ -341,24 +341,22 @@ async function handleCommand(type, payload) {
       // Without focusing the window, Safari may capture a different profile's window.
       let captureWindowId = _profileWindowId || null;
       if (tabId) {
-        // Get the tab's windowId to ensure we capture the right window
         try {
           const tabInfo = await browser.tabs.get(tabId);
           captureWindowId = tabInfo.windowId;
-          // Focus the window (brings profile to front) — critical for multi-profile setups
-          await browser.windows.update(captureWindowId, { focused: true });
+          // Focus window + activate tab IN PARALLEL (saves ~50ms)
+          await Promise.all([
+            browser.windows.update(captureWindowId, { focused: true }),
+            browser.tabs.update(tabId, { active: true })
+          ]);
         } catch (_) {}
-        // Make this tab active and VERIFY it became active
-        await browser.tabs.update(tabId, { active: true });
-        // Wait for visual switch + render — 200ms wasn't always enough
-        await new Promise(r => setTimeout(r, 350));
-        // Verify the correct tab is now active in this window
+        await new Promise(r => setTimeout(r, 300));
+        // Verify correct tab is active — retry once if wrong
         try {
           const activeTabs = await browser.tabs.query({ active: true, windowId: captureWindowId });
           if (activeTabs[0] && activeTabs[0].id !== tabId) {
-            // Wrong tab is active — retry once
             await browser.tabs.update(tabId, { active: true });
-            await new Promise(r => setTimeout(r, 300));
+            await new Promise(r => setTimeout(r, 250));
           }
         } catch (_) {}
       }
@@ -739,16 +737,25 @@ async function handleCommand(type, payload) {
               if (hasContent) {
                 ceResult = "ERROR: Closure/Medium editor detected — safari_fill cannot replace existing content without breaking the editor. Use safari_click to focus this element, then safari_type_text to type into it. To clear first, manually select all and delete via safari_press_key.";
               } else {
-                // Empty editor — safe to type char-by-char with full event sequence
+                // Empty editor — char-by-char with Enter handling (matches type_text strategy)
                 for (let ci = 0; ci < value.length; ci++) {
+                  const target = document.activeElement || el;
                   const ch = value[ci];
+                  if (ch === "\n") {
+                    target.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", keyCode: 13, code: "Enter", bubbles: true, cancelable: true }));
+                    target.dispatchEvent(new InputEvent("beforeinput", { inputType: "insertParagraph", bubbles: true, cancelable: true }));
+                    document.execCommand("insertParagraph", false, null);
+                    target.dispatchEvent(new InputEvent("input", { inputType: "insertParagraph", bubbles: true }));
+                    target.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", keyCode: 13, code: "Enter", bubbles: true }));
+                    continue;
+                  }
                   const kc = ch.charCodeAt(0);
-                  el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, keyCode: kc, bubbles: true, cancelable: true }));
-                  el.dispatchEvent(new KeyboardEvent("keypress", { key: ch, keyCode: kc, charCode: kc, bubbles: true, cancelable: true }));
-                  el.dispatchEvent(new InputEvent("beforeinput", { data: ch, inputType: "insertText", bubbles: true, cancelable: true }));
+                  target.dispatchEvent(new KeyboardEvent("keydown", { key: ch, keyCode: kc, bubbles: true, cancelable: true }));
+                  target.dispatchEvent(new KeyboardEvent("keypress", { key: ch, keyCode: kc, charCode: kc, bubbles: true, cancelable: true }));
+                  target.dispatchEvent(new InputEvent("beforeinput", { data: ch, inputType: "insertText", bubbles: true, cancelable: true }));
                   document.execCommand("insertText", false, ch);
-                  el.dispatchEvent(new InputEvent("input", { data: ch, inputType: "insertText", bubbles: true }));
-                  el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, keyCode: kc, bubbles: true }));
+                  target.dispatchEvent(new InputEvent("input", { data: ch, inputType: "insertText", bubbles: true }));
+                  target.dispatchEvent(new KeyboardEvent("keyup", { key: ch, keyCode: kc, bubbles: true }));
                 }
                 ceResult = "Filled contenteditable (Closure char-by-char, " + value.length + " chars)";
               }
@@ -1080,6 +1087,7 @@ async function handleCommand(type, payload) {
         // Without this, old refs remain on DOM and findByRef/CSS selector can target WRONG elements.
         document.querySelectorAll("[data-mcp-ref]").forEach(function(el) { el.removeAttribute("data-mcp-ref"); });
 
+        const getSR = window.__mcpGetShadowRoot || function(e) { return e.shadowRoot; };
         let id = 0;
         const MAX_ELEMENTS = 800;
         const MAX_DEPTH = 20;
@@ -1171,8 +1179,7 @@ async function handleCommand(type, payload) {
           }
 
           let children = "";
-          // Enter shadow root INLINE (not as afterthought) — critical for Reddit/custom elements
-          const getSR = window.__mcpGetShadowRoot || function(e) { return e.shadowRoot; };
+          // Enter shadow root INLINE — critical for Reddit/custom elements with closed shadow DOM
           const sr = getSR(el);
           if (sr) {
             // Shadow root replaces light DOM children in rendering
@@ -1198,20 +1205,7 @@ async function handleCommand(type, payload) {
         const root = rootSelector ? document.querySelector(rootSelector) : document.body;
         if (!root) return "Root element not found";
         let tree = walk(root, 0);
-        // Walk shadow roots that weren't caught inline (fallback for roots created AFTER monkey-patch)
-        const getSR2 = window.__mcpGetShadowRoot || function(e) { return e.shadowRoot; };
-        function walkShadows(node, depth) {
-          if (id >= MAX_ELEMENTS) return;
-          const all = node.querySelectorAll("*");
-          for (const el of all) {
-            const sr = getSR2(el);
-            if (sr) {
-              tree += walk(sr, depth);
-              walkShadows(sr, depth + 1); // Recurse into nested shadow roots
-            }
-          }
-        }
-        walkShadows(root, 1);
+        // Shadow roots are now walked INLINE inside walk() — no separate walkShadows needed.
         // Walk same-origin iframes
         const iframes = document.querySelectorAll("iframe");
         for (const iframe of iframes) {
@@ -1834,11 +1828,13 @@ function _deepQueryScript() {
   };
 
   window.__mcpDeepQueryAll = function(selector, limit) {
+    var getSR = window.__mcpGetShadowRoot || function(e) { return e.shadowRoot; };
     const results = [];
     function collect(root) {
       root.querySelectorAll(selector).forEach(el => { if (results.length < limit) results.push(el); });
       root.querySelectorAll("*").forEach(el => {
-        if (el.shadowRoot) collect(el.shadowRoot);
+        var sr = getSR(el);
+        if (sr) collect(sr);
       });
     }
     collect(document);
