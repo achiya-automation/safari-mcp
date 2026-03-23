@@ -599,6 +599,9 @@ async function handleCommand(type, payload) {
         // to trigger validation, touched state, and form state updates
         el.dispatchEvent(new Event("focus", { bubbles: true }));
         el.dispatchEvent(new Event("focusin", { bubbles: true }));
+        // Reset React's _valueTracker so React sees the new value as a real change
+        const tracker = el._valueTracker;
+        if (tracker) tracker.setValue("");
         const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
         const desc = Object.getOwnPropertyDescriptor(proto, "value");
         if (desc?.set) {
@@ -999,13 +1002,27 @@ async function handleCommand(type, payload) {
       return await execInTab((selector, value) => {
         const el = (window.__mcpDeepQuery || document.querySelector.bind(document))(selector);
         if (!el) return "Element not found";
-        // Use native setter for React controlled selects
+        el.focus();
+
+        // Reset React's _valueTracker so React sees the change as "new"
+        // Without this, React compares old===new and ignores the change event
+        const tracker = el._valueTracker;
+        if (tracker) tracker.setValue("");
+
+        // Use native setter to bypass React's synthetic event system
         const desc = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value");
         if (desc && desc.set) { desc.set.call(el, value); } else { el.value = value; }
+
+        // Also set selectedIndex for frameworks that track by index
+        for (let i = 0; i < el.options.length; i++) {
+          if (el.options[i].value === value) { el.selectedIndex = i; break; }
+        }
+
+        // Full event sequence: input → change → blur (React, Angular, Vue all covered)
         el.dispatchEvent(new Event("input", { bubbles: true }));
         el.dispatchEvent(new Event("change", { bubbles: true }));
         el.dispatchEvent(new Event("blur", { bubbles: true }));
-        return "Selected: " + el.value;
+        return "Selected: " + el.value + " (index " + el.selectedIndex + ")";
       }, [payload.selector, payload.value], tabId);
     }
 

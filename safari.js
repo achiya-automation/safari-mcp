@@ -886,7 +886,7 @@ export async function fill({ selector, value, ref }) {
   // Proper escaping order: backslashes first, then quotes
   const val = value.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, "");
   return runJS(
-    `(function(){try{var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';el.focus();if(el.isContentEditable||el.getAttribute('contenteditable')==='true'){el.textContent='';document.execCommand('insertText',false,'${val}');el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('blur',{bubbles:true}));el.dispatchEvent(new Event('focusout',{bubbles:true}));el.focus();return 'Filled contenteditable';}var proto=el.tagName==='TEXTAREA'?window.HTMLTextAreaElement.prototype:window.HTMLInputElement.prototype;var s=Object.getOwnPropertyDescriptor(proto,'value');if(s&&s.set){s.set.call(el,'${val}');}else{el.value='${val}';}el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));el.dispatchEvent(new Event('blur',{bubbles:true}));el.dispatchEvent(new Event('focusout',{bubbles:true}));el.focus();return 'Filled: '+el.value.substring(0,50);}catch(e){return 'ERR: '+e.message;}})()`
+    `(function(){try{var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';el.focus();if(el.isContentEditable||el.getAttribute('contenteditable')==='true'){el.textContent='';document.execCommand('insertText',false,'${val}');el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('blur',{bubbles:true}));el.dispatchEvent(new Event('focusout',{bubbles:true}));el.focus();return 'Filled contenteditable';}var t=el._valueTracker;if(t)t.setValue('');var proto=el.tagName==='TEXTAREA'?window.HTMLTextAreaElement.prototype:window.HTMLInputElement.prototype;var s=Object.getOwnPropertyDescriptor(proto,'value');if(s&&s.set){s.set.call(el,'${val}');}else{el.value='${val}';}el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));el.dispatchEvent(new Event('blur',{bubbles:true}));el.dispatchEvent(new Event('focusout',{bubbles:true}));el.focus();return 'Filled: '+el.value.substring(0,50);}catch(e){return 'ERR: '+e.message;}})()`
   );
 }
 
@@ -901,7 +901,7 @@ export async function selectOption({ selector, value }) {
   const sel = selector.replace(/'/g, "\\'");
   const val = value.replace(/'/g, "\\'");
   return runJS(
-    `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found';var d=Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value');if(d&&d.set){d.set.call(el,'${val}');}else{el.value='${val}';}el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));el.dispatchEvent(new Event('blur',{bubbles:true}));return 'Selected: '+el.value;})()`
+    `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found';el.focus();var t=el._valueTracker;if(t)t.setValue('');var d=Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value');if(d&&d.set){d.set.call(el,'${val}');}else{el.value='${val}';}for(var i=0;i<el.options.length;i++){if(el.options[i].value==='${val}'){el.selectedIndex=i;break;}}el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));el.dispatchEvent(new Event('blur',{bubbles:true}));return 'Selected: '+el.value+' (index '+el.selectedIndex+')';})()`
   );
 }
 
