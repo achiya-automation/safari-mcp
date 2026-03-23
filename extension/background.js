@@ -1014,8 +1014,42 @@ async function handleCommand(type, payload) {
         if (desc && desc.set) { desc.set.call(el, value); } else { el.value = value; }
 
         // Also set selectedIndex for frameworks that track by index
+        let matched = false;
         for (let i = 0; i < el.options.length; i++) {
-          if (el.options[i].value === value) { el.selectedIndex = i; break; }
+          if (el.options[i].value === value) { el.selectedIndex = i; matched = true; break; }
+        }
+        // Fuzzy match: strip Unicode control chars (RTL marks, zero-width chars) and compare
+        // LinkedIn uses U+200F (RLM) in option values, so "2-10" won't match "‏2‏ – ‏10‏"
+        if (!matched || el.value !== value) {
+          // Normalize: strip RTL marks, zero-width chars, normalize dashes & whitespace
+          const norm = function(s) {
+            return s.replace(/[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, "")
+              .replace(/[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/g, "-") // all dashes → hyphen
+              .replace(/\s*-\s*/g, "-") // normalize "2 - 10" → "2-10"
+              .replace(/\s+/g, " ").trim();
+          };
+          const cleanValue = norm(value);
+          for (let i = 0; i < el.options.length; i++) {
+            if (norm(el.options[i].value) === cleanValue || norm(el.options[i].text) === cleanValue) {
+              el.selectedIndex = i;
+              if (desc && desc.set) { desc.set.call(el, el.options[i].value); } else { el.value = el.options[i].value; }
+              matched = true;
+              break;
+            }
+          }
+          // Last resort: partial/includes match on normalized text
+          if (!matched) {
+            for (let i = 0; i < el.options.length; i++) {
+              const nv = norm(el.options[i].value), nt = norm(el.options[i].text);
+              if (nv.includes(cleanValue) || nt.includes(cleanValue) || cleanValue.includes(nv) || cleanValue.includes(nt)) {
+                if (i === 0 && el.options.length > 1) continue; // skip placeholder
+                el.selectedIndex = i;
+                if (desc && desc.set) { desc.set.call(el, el.options[i].value); } else { el.value = el.options[i].value; }
+                matched = true;
+                break;
+              }
+            }
+          }
         }
 
         // Full event sequence: input → change → blur (React, Angular, Vue all covered)
