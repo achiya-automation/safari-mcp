@@ -1016,12 +1016,13 @@ export async function pressKey({ key, modifiers = [] }) {
       return `Pressed: ${modifiers.join("+")}+${key} (via JS)`;
     }
 
-    // Cmd+V (paste) — the ONE shortcut that truly needs System Events
-    // because JS can't access system clipboard for paste without user gesture
+    // Cmd+V (paste) — needs System Events because JS can't access system clipboard
     if (k === "v") {
-      // Use Safari's Edit menu instead of keystroke — more reliable, targets Safari directly
+      // Activate Safari first (brings to front) — required for menu click to work
       await osascript(
-        `tell application "System Events"
+        `tell application "Safari" to activate
+        delay 0.3
+        tell application "System Events"
           tell process "Safari"
             click menu item "Paste" of menu "Edit" of menu bar 1
           end tell

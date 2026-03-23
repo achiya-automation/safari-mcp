@@ -198,6 +198,10 @@ async function handleCommand(type, payload) {
       }
 
       const updated = await browser.tabs.get(tabId);
+      // Update cache with new URL so subsequent commands target this tab
+      _cachedTabId = updated.id;
+      _cachedTabUrl = updated.url;
+      _cachedTabTime = Date.now();
       return { title: updated.title, url: updated.url };
     }
 
@@ -943,6 +947,10 @@ async function handleCommand(type, payload) {
       const updated = await browser.tabs.get(newTab.id);
       // Learn profile window from newly created tab
       if (!_profileWindowId) _profileWindowId = updated.windowId;
+      // CRITICAL: Set new tab as the target for subsequent commands
+      _cachedTabId = updated.id;
+      _cachedTabUrl = updated.url;
+      _cachedTabTime = Date.now();
       return { title: updated.title, url: updated.url, tabIndex: updated.index + 1 };
     }
 
@@ -1559,19 +1567,21 @@ async function _discoverProfileWindow() {
 }
 
 async function getTargetTab(tabUrl) {
+  // PRIORITY 1: Always prefer _cachedTabId from switch_tab — this is the "intent" tab.
+  // URL matching can pick the WRONG tab when multiple tabs share a domain.
+  // switch_tab sets _cachedTabId to the exact tab the user wants.
+  if (_cachedTabId && (Date.now() - _cachedTabTime) < TAB_CACHE_MS) {
+    try {
+      const cached = await browser.tabs.get(_cachedTabId);
+      if (cached && (!_profileWindowId || cached.windowId === _profileWindowId)) return cached;
+    } catch { _cachedTabId = null; }
+  }
+
+  // PRIORITY 2: URL-based search (when no switch_tab was called, or cache expired)
   if (tabUrl) {
-    // Fast path: if cached tab matches, skip querying all tabs
-    if (_cachedTabId && _cachedTabUrl === tabUrl && (Date.now() - _cachedTabTime) < TAB_CACHE_MS) {
-      try {
-        const tab = await browser.tabs.get(_cachedTabId);
-        if (tab.url && (tab.url.startsWith(tabUrl) || tabUrl.startsWith(tab.url.split("?")[0]))) return tab;
-      } catch {}
-    }
-    // Search within profile window first, then all windows
     const searchScope = _profileWindowId ? { windowId: _profileWindowId } : {};
     let all = await browser.tabs.query(searchScope);
     let match = all.find(t => t.url && (t.url.startsWith(tabUrl) || tabUrl.startsWith(t.url.split("?")[0])));
-    // If not found in profile window, search all windows (tab may have moved)
     if (!match && _profileWindowId) {
       all = await browser.tabs.query({});
       match = all.find(t => t.url && (t.url.startsWith(tabUrl) || tabUrl.startsWith(t.url.split("?")[0])));
@@ -1580,8 +1590,6 @@ async function getTargetTab(tabUrl) {
       _cachedTabId = match.id;
       _cachedTabUrl = tabUrl;
       _cachedTabTime = Date.now();
-      // Learn or update the profile window from this match
-      // (window may have been closed and reopened with a new ID)
       if (!_profileWindowId || match.windowId !== _profileWindowId) {
         if (_profileWindowId && match.windowId !== _profileWindowId) {
           console.log("Safari MCP: profile window changed:", _profileWindowId, "→", match.windowId);
@@ -1591,14 +1599,6 @@ async function getTargetTab(tabUrl) {
       }
       return match;
     }
-  }
-  // Prefer _cachedTabId (set by switch_tab and onActivated) over generic active tab query.
-  // This ensures switch_tab(7) → evaluate() targets tab 7 even if URL matching fails.
-  if (_cachedTabId) {
-    try {
-      const cached = await browser.tabs.get(_cachedTabId);
-      if (cached && (!_profileWindowId || cached.windowId === _profileWindowId)) return cached;
-    } catch {}
   }
   // If we know the profile window, get its active tab (not the user's personal window)
   if (_profileWindowId) {
