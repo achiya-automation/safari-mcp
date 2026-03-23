@@ -380,40 +380,13 @@ async function handleCommand(type, payload) {
     // --- Click & Input ---
     case "click": {
       return await execInTab((selector, text, x, y, ref) => {
-        // --- Element discovery (with shadow DOM + iframe support) ---
-        function querySelectorDeep(sel) {
-          let el = document.querySelector(sel);
-          if (el) return el;
-          // Shadow DOM (supports closed roots via monkey-patched getter)
-          const getSR = window.__mcpGetShadowRoot || function(e) { return e.shadowRoot; };
-          function searchShadows(root) {
-            const allEls = root.querySelectorAll("*");
-            for (let i = 0; i < allEls.length; i++) {
-              const sr = getSR(allEls[i]);
-              if (sr) {
-                el = sr.querySelector(sel); if (el) return el;
-                el = searchShadows(sr); if (el) return el;
-              }
-            }
-            return null;
-          }
-          el = searchShadows(document);
-          if (el) return el;
-          // Same-origin iframes
-          const iframes = document.querySelectorAll("iframe");
-          for (let i = 0; i < iframes.length; i++) {
-            try {
-              const doc = iframes[i].contentDocument;
-              if (doc) { el = doc.querySelector(sel); if (el) return el; }
-            } catch (_) {}
-          }
-          return null;
-        }
+        // Use shared deep query (defined by ensureHelpers / _deepQueryScript)
+        const dq = window.__mcpDeepQuery || document.querySelector.bind(document);
 
         // --- Ref lookup (uses data-mcp-ref attribute + stored ref data) ---
         function findByRef(refId) {
           // Try data-mcp-ref attribute first (set by snapshot)
-          let el = querySelectorDeep('[data-mcp-ref="' + refId + '"]');
+          let el = dq('[data-mcp-ref="' + refId + '"]');
           if (el) return el;
           // Fallback to stored ref metadata
           const refs = window.__mcpRefs;
@@ -427,9 +400,9 @@ async function handleCommand(type, payload) {
           }
           const m = refs[refId];
           if (m.id) { el = document.getElementById(m.id); if (el) return el; }
-          if (m.nameAttr) { el = document.querySelector('[name="' + m.nameAttr + '"]'); if (el) return el; }
-          if (m.al) { el = document.querySelector('[aria-label="' + m.al + '"]'); if (el) return el; }
-          if (m.ph) { el = document.querySelector('[placeholder="' + m.ph + '"]'); if (el) return el; }
+          if (m.nameAttr) { el = dq('[name="' + m.nameAttr + '"]'); if (el) return el; }
+          if (m.al) { el = dq('[aria-label="' + m.al + '"]'); if (el) return el; }
+          if (m.ph) { el = dq('[placeholder="' + m.ph + '"]'); if (el) return el; }
           // Coordinate fallback
           if (m.cx !== undefined && m.cy !== undefined) {
             window.scrollTo(window.scrollX, Math.max(0, m.cy - window.innerHeight / 2));
@@ -445,7 +418,7 @@ async function handleCommand(type, payload) {
           // Stale ref detection: findByRef returns a string starting with __STALE_REF__
           if (typeof el === "string" && el.startsWith("__STALE_REF__")) return el.substring(14);
         } else if (selector) {
-          el = querySelectorDeep(selector);
+          el = dq(selector);
         } else if (text) {
           const _isVis = function(e) { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
           const _isInteractive = function(tag) { return ["A","BUTTON","INPUT","SELECT","TEXTAREA","SUMMARY","DETAILS"].includes(tag); };
@@ -535,13 +508,9 @@ async function handleCommand(type, payload) {
           return "Element is DISABLED — cannot click: " + reason + ". Check if form requirements are met (required fields, permissions, etc.)";
         }
 
-        // --- React checkbox/radio fix: reset _valueTracker before click ---
-        // React tracks checked state via _valueTracker. Without reset, React compares
-        // old===new after our click, thinks nothing changed, and ignores the event.
-        // This is the same pattern as select_option and fill for React inputs.
+        // React checkbox/radio: reset _valueTracker so React sees the flip as "new"
         if (el.tagName === "INPUT" && (el.type === "checkbox" || el.type === "radio")) {
-          const tracker = el._valueTracker;
-          if (tracker) tracker.setValue(el.checked ? "true" : ""); // Set to CURRENT so React sees flip as "new"
+          (window.__mcpResetTracker || function(){})(el, el.checked ? "true" : "");
         }
 
         // --- Scroll into view + resolve click target ---
@@ -738,25 +707,7 @@ async function handleCommand(type, payload) {
                 ceResult = "ERROR: Closure/Medium editor detected — safari_fill cannot replace existing content without breaking the editor. Use safari_click to focus this element, then safari_type_text to type into it. To clear first, manually select all and delete via safari_press_key.";
               } else {
                 // Empty editor — char-by-char with Enter handling (matches type_text strategy)
-                for (let ci = 0; ci < value.length; ci++) {
-                  const target = document.activeElement || el;
-                  const ch = value[ci];
-                  if (ch === "\n") {
-                    target.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", keyCode: 13, code: "Enter", bubbles: true, cancelable: true }));
-                    target.dispatchEvent(new InputEvent("beforeinput", { inputType: "insertParagraph", bubbles: true, cancelable: true }));
-                    document.execCommand("insertParagraph", false, null);
-                    target.dispatchEvent(new InputEvent("input", { inputType: "insertParagraph", bubbles: true }));
-                    target.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", keyCode: 13, code: "Enter", bubbles: true }));
-                    continue;
-                  }
-                  const kc = ch.charCodeAt(0);
-                  target.dispatchEvent(new KeyboardEvent("keydown", { key: ch, keyCode: kc, bubbles: true, cancelable: true }));
-                  target.dispatchEvent(new KeyboardEvent("keypress", { key: ch, keyCode: kc, charCode: kc, bubbles: true, cancelable: true }));
-                  target.dispatchEvent(new InputEvent("beforeinput", { data: ch, inputType: "insertText", bubbles: true, cancelable: true }));
-                  document.execCommand("insertText", false, ch);
-                  target.dispatchEvent(new InputEvent("input", { data: ch, inputType: "insertText", bubbles: true }));
-                  target.dispatchEvent(new KeyboardEvent("keyup", { key: ch, keyCode: kc, bubbles: true }));
-                }
+                (window.__mcpClosureType || function(){})(value, el);
                 ceResult = "Filled contenteditable (Closure char-by-char, " + value.length + " chars)";
               }
             }
@@ -797,9 +748,7 @@ async function handleCommand(type, payload) {
         // to trigger validation, touched state, and form state updates
         el.dispatchEvent(new Event("focus", { bubbles: true }));
         el.dispatchEvent(new Event("focusin", { bubbles: true }));
-        // Reset React's _valueTracker so React sees the new value as a real change
-        const tracker = el._valueTracker;
-        if (tracker) tracker.setValue("");
+        (window.__mcpResetTracker || function(){})(el, "");
         const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
         const desc = Object.getOwnPropertyDescriptor(proto, "value");
         if (desc?.set) {
@@ -905,29 +854,7 @@ async function handleCommand(type, payload) {
           location.hostname.includes("medium.com")
         );
         if (isClosure) {
-          for (var ci = 0; ci < text.length; ci++) {
-            var ch = text[ci];
-            // Re-acquire activeElement on every iteration — Closure editors move cursor
-            // to new paragraph elements after Enter, which changes activeElement.
-            var target = document.activeElement || ae;
-            // Handle newlines: Enter key creates a new paragraph in Closure editor
-            if (ch === "\n") {
-              target.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", keyCode: 13, code: "Enter", bubbles: true, cancelable: true }));
-              target.dispatchEvent(new KeyboardEvent("keypress", { key: "Enter", keyCode: 13, charCode: 13, code: "Enter", bubbles: true, cancelable: true }));
-              target.dispatchEvent(new InputEvent("beforeinput", { inputType: "insertParagraph", bubbles: true, cancelable: true }));
-              document.execCommand("insertParagraph", false, null);
-              target.dispatchEvent(new InputEvent("input", { inputType: "insertParagraph", bubbles: true }));
-              target.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", keyCode: 13, code: "Enter", bubbles: true }));
-              continue;
-            }
-            var kc = ch.charCodeAt(0);
-            target.dispatchEvent(new KeyboardEvent("keydown", { key: ch, keyCode: kc, bubbles: true, cancelable: true }));
-            target.dispatchEvent(new KeyboardEvent("keypress", { key: ch, keyCode: kc, charCode: kc, bubbles: true, cancelable: true }));
-            target.dispatchEvent(new InputEvent("beforeinput", { data: ch, inputType: "insertText", bubbles: true, cancelable: true }));
-            document.execCommand("insertText", false, ch);
-            target.dispatchEvent(new InputEvent("input", { data: ch, inputType: "insertText", bubbles: true }));
-            target.dispatchEvent(new KeyboardEvent("keyup", { key: ch, keyCode: kc, bubbles: true }));
-          }
+          (window.__mcpClosureType || function(){})(text, ae);
           return "Typed " + text.length + " chars (Closure char-by-char)";
         }
 
@@ -1281,8 +1208,7 @@ async function handleCommand(type, payload) {
         const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
         const desc = Object.getOwnPropertyDescriptor(proto, "value");
         if (desc && desc.set) { desc.set.call(el, ""); } else { el.value = ""; }
-        const tracker = el._valueTracker;
-        if (tracker) tracker.setValue("x"); // Force React to see change
+        (window.__mcpResetTracker || function(){})(el, "x");
         el.dispatchEvent(new Event("input", { bubbles: true }));
         el.dispatchEvent(new Event("change", { bubbles: true }));
         el.dispatchEvent(new Event("blur", { bubbles: true }));
@@ -1297,10 +1223,7 @@ async function handleCommand(type, payload) {
         if (!el) return "Element not found: " + selector + " (for value: " + value + ")";
         el.focus();
 
-        // Reset React's _valueTracker so React sees the change as "new"
-        // Without this, React compares old===new and ignores the change event
-        const tracker = el._valueTracker;
-        if (tracker) tracker.setValue("");
+        (window.__mcpResetTracker || function(){})(el, "");
 
         // Use native setter to bypass React's synthetic event system
         const desc = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value");
@@ -1367,8 +1290,7 @@ async function handleCommand(type, payload) {
           if (el.tagName === "INPUT" && (el.type === "checkbox" || el.type === "radio")) {
             const want = f.value === "true" || f.value === "1" || f.value === "on";
             if (el.checked !== want) {
-              const tracker = el._valueTracker;
-              if (tracker) tracker.setValue(el.checked ? "true" : "");
+              (window.__mcpResetTracker || function(){})(el, el.checked ? "true" : "");
               el.click();
             }
             results.push((el.checked ? "Checked" : "Unchecked") + ": " + (f.selector));
@@ -1377,8 +1299,7 @@ async function handleCommand(type, payload) {
 
           // SELECT element
           if (el.tagName === "SELECT") {
-            const tracker = el._valueTracker;
-            if (tracker) tracker.setValue("");
+            (window.__mcpResetTracker || function(){})(el, "");
             const desc = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value");
             if (desc && desc.set) desc.set.call(el, f.value); else el.value = f.value;
             el.dispatchEvent(new Event("input", { bubbles: true }));
@@ -1401,8 +1322,7 @@ async function handleCommand(type, payload) {
           const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
           const desc = Object.getOwnPropertyDescriptor(proto, "value");
           if (desc && desc.set) desc.set.call(el, f.value); else el.value = f.value;
-          const tracker = el._valueTracker;
-          if (tracker) tracker.setValue("");
+          (window.__mcpResetTracker || function(){})(el, "");
           el.dispatchEvent(new Event("input", { bubbles: true }));
           el.dispatchEvent(new Event("change", { bubbles: true }));
           el.dispatchEvent(new Event("blur", { bubbles: true }));
@@ -1825,6 +1745,38 @@ function _deepQueryScript() {
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
     return true;
+  };
+
+  // Reset React's _valueTracker so React sees subsequent value changes as "new".
+  // Without this, React compares old===new and ignores our dispatched events.
+  window.__mcpResetTracker = function(el, prevValue) {
+    var t = el._valueTracker;
+    if (t) t.setValue(prevValue !== undefined ? prevValue : "");
+  };
+
+  // Shared Closure/Medium char-by-char typing with full keyboard event sequence.
+  // Handles Enter→insertParagraph, re-acquires activeElement per iteration.
+  // Used by fill (empty editor), type_text, and fill_form contenteditable.
+  window.__mcpClosureType = function(text, el) {
+    for (var i = 0; i < text.length; i++) {
+      var target = document.activeElement || el;
+      var ch = text[i];
+      if (ch === "\n") {
+        target.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", keyCode: 13, code: "Enter", bubbles: true, cancelable: true }));
+        target.dispatchEvent(new InputEvent("beforeinput", { inputType: "insertParagraph", bubbles: true, cancelable: true }));
+        document.execCommand("insertParagraph", false, null);
+        target.dispatchEvent(new InputEvent("input", { inputType: "insertParagraph", bubbles: true }));
+        target.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", keyCode: 13, code: "Enter", bubbles: true }));
+        continue;
+      }
+      var kc = ch.charCodeAt(0);
+      target.dispatchEvent(new KeyboardEvent("keydown", { key: ch, keyCode: kc, bubbles: true, cancelable: true }));
+      target.dispatchEvent(new KeyboardEvent("keypress", { key: ch, keyCode: kc, charCode: kc, bubbles: true, cancelable: true }));
+      target.dispatchEvent(new InputEvent("beforeinput", { data: ch, inputType: "insertText", bubbles: true, cancelable: true }));
+      document.execCommand("insertText", false, ch);
+      target.dispatchEvent(new InputEvent("input", { data: ch, inputType: "insertText", bubbles: true }));
+      target.dispatchEvent(new KeyboardEvent("keyup", { key: ch, keyCode: kc, bubbles: true }));
+    }
   };
 
   window.__mcpDeepQueryAll = function(selector, limit) {
