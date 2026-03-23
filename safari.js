@@ -59,7 +59,7 @@ startHelper();
 let _activeTabIndex = null; // null = use front document (default)
 let _activeTabURL = null;   // URL-based tracking (stable even when tabs shift)
 let _lastResolveTime = 0;   // Cache: skip resolve if verified recently
-const RESOLVE_CACHE_MS = 5000; // Re-verify tab every 5 seconds max
+const RESOLVE_CACHE_MS = 1500; // Re-verify tab every 1.5 seconds (was 5s — too stale)
 
 // ========== PROFILE TARGETING ==========
 // Set SAFARI_PROFILE env var to target a specific Safari profile window.
@@ -264,7 +264,8 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
   if (!idx && _activeTabIndex && (Date.now() - _lastResolveTime < RESOLVE_CACHE_MS)) {
     // Recently verified — use cached index (skip osascript call)
     idx = _activeTabIndex;
-  } else if (!idx && _activeTabURL && _activeTabURL !== 'about:blank' && _activeTabURL !== '') {
+  } else if (!idx && _activeTabURL && _activeTabURL !== '') {
+    // Always resolve — don't skip about:blank (it caused stale tab targeting)
     const resolved = await resolveActiveTab();
     if (resolved) { idx = resolved; _lastResolveTime = Date.now(); }
   }

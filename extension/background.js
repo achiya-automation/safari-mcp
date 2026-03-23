@@ -276,6 +276,12 @@ async function handleCommand(type, payload) {
 
     // --- Screenshot ---
     case "screenshot": {
+      // Ensure the tracked tab is visible before capture
+      // captureVisibleTab always captures the VISIBLE tab, not a specific tab by ID
+      if (tabId) {
+        await browser.tabs.update(tabId, { active: true });
+        await new Promise(r => setTimeout(r, 150));
+      }
       // Use JPEG with quality 50 to reduce size (~600KB PNG → ~60KB JPEG)
       // Critical for staying under 20MB context limit
       // Pass _profileWindowId to capture the correct window (not the frontmost one)
@@ -743,6 +749,10 @@ async function handleCommand(type, payload) {
       const target = tabs[payload.index - 1];
       if (!target) return "Tab not found at index " + payload.index;
       await browser.tabs.update(target.id, { active: true });
+      // CRITICAL: Update cached tab so subsequent commands target this tab via cache hit
+      _cachedTabId = target.id;
+      _cachedTabUrl = target.url;
+      _cachedTabTime = Date.now();
       return { title: target.title, url: target.url };
     }
 
@@ -1208,6 +1218,14 @@ async function getTargetTab(tabUrl) {
       }
       return match;
     }
+  }
+  // Prefer _cachedTabId (set by switch_tab and onActivated) over generic active tab query.
+  // This ensures switch_tab(7) → evaluate() targets tab 7 even if URL matching fails.
+  if (_cachedTabId) {
+    try {
+      const cached = await browser.tabs.get(_cachedTabId);
+      if (cached && (!_profileWindowId || cached.windowId === _profileWindowId)) return cached;
+    } catch {}
   }
   // If we know the profile window, get its active tab (not the user's personal window)
   if (_profileWindowId) {

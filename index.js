@@ -805,7 +805,7 @@ server.tool(
 
 server.tool(
   "safari_switch_tab",
-  "Switch to a specific tab by index (use safari_list_tabs to see indices)",
+  "Switch to a specific tab by index (use safari_list_tabs to see indices). All subsequent commands (click, fill, evaluate, screenshot, scroll) will target this tab. If commands seem to run on the wrong tab, call switch_tab again to re-anchor.",
   { index: z.coerce.number().describe("Tab index (starting from 1)") },
   async ({ index }) => {
     const result = await extensionOrFallback(
