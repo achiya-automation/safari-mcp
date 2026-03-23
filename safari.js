@@ -929,7 +929,7 @@ export async function fill({ selector, value, ref }) {
     `var pm=el.closest('.ProseMirror')||el.querySelector('.ProseMirror');if(pm){try{var v=(pm.pmViewDesc&&pm.pmViewDesc.view)||(pm.cmView&&pm.cmView.view);if(v&&v.state&&v.dispatch){var tr=v.state.tr;tr.replaceWith(0,v.state.doc.content.size,v.state.schema.text('${val}'));v.dispatch(tr);v.focus();return 'Filled CE (ProseMirror API)';}}catch(e){}}` +
     // Closure/Medium detection — return error, don't break
     `var isClosure=Object.keys(el).some(function(k){return k.startsWith('closure_uid_');})||location.hostname.includes('medium.com');if(isClosure){var hasContent=el.textContent&&el.textContent.trim().length>0;if(hasContent)return 'ERROR: Closure/Medium editor — use safari_type_text instead of fill';` +
-    `for(var ci=0;ci<'${val}'.length;ci++){var ch='${val}'[ci];var kc=ch.charCodeAt(0);el.dispatchEvent(new KeyboardEvent('keydown',{key:ch,keyCode:kc,bubbles:true}));document.execCommand('insertText',false,ch);el.dispatchEvent(new InputEvent('input',{data:ch,inputType:'insertText',bubbles:true}));el.dispatchEvent(new KeyboardEvent('keyup',{key:ch,keyCode:kc,bubbles:true}));}return 'Filled CE (Closure char-by-char)';}` +
+    `for(var ci=0;ci<'${val}'.length;ci++){var target=document.activeElement||el;var ch='${val}'[ci];if(ch==='\\n'){target.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',keyCode:13,bubbles:true}));document.execCommand('insertParagraph');target.dispatchEvent(new KeyboardEvent('keyup',{key:'Enter',keyCode:13,bubbles:true}));continue;}var kc=ch.charCodeAt(0);target.dispatchEvent(new KeyboardEvent('keydown',{key:ch,keyCode:kc,bubbles:true}));document.execCommand('insertText',false,ch);target.dispatchEvent(new InputEvent('input',{data:ch,inputType:'insertText',bubbles:true}));target.dispatchEvent(new KeyboardEvent('keyup',{key:ch,keyCode:kc,bubbles:true}));}return 'Filled CE (Closure char-by-char)';}` +
     // Default contenteditable: selectAll+delete+insert (safer than textContent='')
     `document.execCommand('selectAll');document.execCommand('delete');document.execCommand('insertText',false,'${val}');el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('blur',{bubbles:true}));return 'Filled contenteditable';}` +
     // Standard input/textarea with _valueTracker
@@ -940,7 +940,7 @@ export async function fill({ selector, value, ref }) {
 export async function clearField({ selector }) {
   const sel = selector.replace(/'/g, "\\'");
   return runJS(
-    `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found';el.value='';el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));return 'Cleared';})()`
+    `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';if(el.isContentEditable){el.focus();document.execCommand('selectAll');document.execCommand('delete');el.dispatchEvent(new Event('input',{bubbles:true}));return 'Cleared (contenteditable)';}var t=el._valueTracker;if(t)t.setValue('x');var p=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;var d=Object.getOwnPropertyDescriptor(p,'value');if(d&&d.set)d.set.call(el,'');else el.value='';el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));el.dispatchEvent(new Event('blur',{bubbles:true}));return 'Cleared';})()`
   );
 }
 
