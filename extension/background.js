@@ -460,6 +460,12 @@ async function handleCommand(type, payload) {
           return "Element not visible (display/visibility/opacity)";
         }
 
+        // --- Disabled check ---
+        if (el.disabled || el.getAttribute("aria-disabled") === "true") {
+          const reason = el.getAttribute("aria-label") || el.getAttribute("title") || el.textContent?.trim().substring(0, 60) || el.tagName;
+          return "Element is DISABLED — cannot click: " + reason + ". Check if form requirements are met (required fields, permissions, etc.)";
+        }
+
         // --- Scroll into view + resolve click target ---
         el.scrollIntoView({ block: "center", inline: "center" });
         const r = el.getBoundingClientRect();
