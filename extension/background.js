@@ -344,47 +344,75 @@ async function handleCommand(type, payload) {
         } else if (selector) {
           el = querySelectorDeep(selector);
         } else if (text) {
-          const attrEls = document.querySelectorAll("[aria-label],[placeholder],[title],[data-testid],[alt]");
-          for (let i = 0; i < attrEls.length; i++) {
-            const a = attrEls[i];
-            const vals = [a.getAttribute("aria-label"), a.getAttribute("placeholder"), a.getAttribute("title"), a.getAttribute("data-testid"), a.getAttribute("alt")].filter(Boolean);
-            if (vals.some(v => v === text || v.includes(text))) {
-              const r = a.getBoundingClientRect();
-              if (r.width > 0 && r.height > 0) { el = a; break; }
-            }
+          const _isVis = function(e) { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+          const _isInteractive = function(tag) { return ["A","BUTTON","INPUT","SELECT","TEXTAREA","SUMMARY","DETAILS"].includes(tag); };
+          // Tier 0: EXACT text on interactive elements (button, a, input) — highest priority
+          const interactiveEls = document.querySelectorAll("button, a, [role='button'], [role='link'], [role='tab'], input[type='submit'], input[type='button']");
+          for (let i = 0; i < interactiveEls.length; i++) {
+            const e = interactiveEls[i];
+            const t = (e.innerText || e.textContent || "").trim();
+            if (t === text && _isVis(e)) { el = e; break; }
           }
+          // Tier 1: Attribute matching (aria-label, placeholder, title, etc.)
           if (!el) {
-            const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
-            let best = null, bestArea = Infinity;
-            while (tw.nextNode()) {
-              const t = tw.currentNode.textContent.trim();
-              if (!t || !(t === text || t.includes(text))) continue;
-              const parent = tw.currentNode.parentElement;
-              if (!parent) continue;
-              const r = parent.getBoundingClientRect();
-              if (r.width > 0 && r.height > 0 && r.width * r.height < bestArea) {
-                best = parent; bestArea = r.width * r.height;
+            const attrEls = document.querySelectorAll("[aria-label],[placeholder],[title],[data-testid],[alt]");
+            for (let i = 0; i < attrEls.length; i++) {
+              const a = attrEls[i];
+              const vals = [a.getAttribute("aria-label"), a.getAttribute("placeholder"), a.getAttribute("title"), a.getAttribute("data-testid"), a.getAttribute("alt")].filter(Boolean);
+              if (vals.some(v => v === text) && _isVis(a)) { el = a; break; }
+            }
+            // Partial attribute match (includes) — lower priority
+            if (!el) {
+              for (let i = 0; i < attrEls.length; i++) {
+                const a = attrEls[i];
+                const vals = [a.getAttribute("aria-label"), a.getAttribute("placeholder"), a.getAttribute("title"), a.getAttribute("data-testid"), a.getAttribute("alt")].filter(Boolean);
+                if (vals.some(v => v.includes(text)) && _isVis(a)) { el = a; break; }
               }
             }
-            el = best;
           }
-          // Fallback: querySelectorAll + innerText check (catches virtual DOM, canvas labels, etc.)
+          // Tier 2: TreeWalker — EXACT text match first, then includes
+          if (!el) {
+            const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+            let exactBest = null, exactArea = Infinity, partialBest = null, partialArea = Infinity;
+            while (tw.nextNode()) {
+              const t = tw.currentNode.textContent.trim();
+              if (!t) continue;
+              const parent = tw.currentNode.parentElement;
+              if (!parent || !_isVis(parent)) continue;
+              const r = parent.getBoundingClientRect();
+              const area = r.width * r.height;
+              const isInteract = _isInteractive(parent.tagName);
+              // Exact match: prioritize interactive elements, then smallest
+              if (t === text) {
+                const score = isInteract ? area * 0.01 : area; // interactive gets 100x priority
+                if (score < exactArea) { exactBest = parent; exactArea = score; }
+              } else if (t.includes(text)) {
+                const score = isInteract ? area * 0.01 : area;
+                if (score < partialArea) { partialBest = parent; partialArea = score; }
+              }
+            }
+            el = exactBest || partialBest;
+          }
+          // Tier 3: Fallback querySelectorAll + innerText (virtual DOM, canvas labels, etc.)
           if (!el) {
             const allEls = document.querySelectorAll("*");
-            let best = null, bestArea = Infinity;
+            let exactBest = null, exactArea = Infinity, partialBest = null, partialArea = Infinity;
             for (let i = 0; i < allEls.length; i++) {
               const e = allEls[i];
               const it = (e.innerText || "").trim();
-              if (!it || !(it === text || it.includes(text))) continue;
-              // Prefer smallest container that isn't a huge wrapper
+              if (!it || !_isVis(e)) continue;
               const r = e.getBoundingClientRect();
-              if (r.width <= 0 || r.height <= 0) continue;
               const area = r.width * r.height;
-              if (area < bestArea) {
-                best = e; bestArea = area;
+              const isInteract = _isInteractive(e.tagName) || e.getAttribute("role") === "button";
+              if (it === text) {
+                const score = isInteract ? area * 0.01 : area;
+                if (score < exactArea) { exactBest = e; exactArea = score; }
+              } else if (it.includes(text)) {
+                const score = isInteract ? area * 0.01 : area;
+                if (score < partialArea) { partialBest = e; partialArea = score; }
               }
             }
-            el = best;
+            el = exactBest || partialBest;
           }
         } else if (x !== undefined && y !== undefined) {
           el = document.elementFromPoint(x, y);
@@ -409,6 +437,15 @@ async function handleCommand(type, payload) {
 
         el.dispatchEvent(new PointerEvent("pointerover", { ...p, buttons: 0 }));
         el.dispatchEvent(new MouseEvent("mouseover", { ...s, buttons: 0 }));
+        // Native <select>: synthetic click can't open the dropdown (browser security).
+        // Instead, focus + dispatch showPicker (Safari 16+) or return guidance.
+        if (el.tagName === "SELECT") {
+          el.focus();
+          try { el.showPicker(); return "Opened SELECT picker"; } catch (_) {}
+          // showPicker not available — return helpful message
+          return "SELECT element focused. Use safari_select_option to set a value, or safari_press_key with 'space' to open the dropdown.";
+        }
+
         el.dispatchEvent(new PointerEvent("pointerenter", { ...p, buttons: 0 }));
         el.dispatchEvent(new MouseEvent("mouseenter", { ...s, buttons: 0 }));
         el.dispatchEvent(new PointerEvent("pointermove", { ...p, buttons: 0 }));
