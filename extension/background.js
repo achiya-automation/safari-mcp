@@ -174,6 +174,29 @@ async function handleCommand(type, payload) {
       }).catch(() => {});
       await browser.tabs.update(tabId, { url: payload.url });
       await waitForTabLoad(tabId, payload.timeout || 30000);
+
+      // Smart loading detection: if page has loading indicators after load, try hard reload once
+      const hasContent = await execInTab(() => {
+        const body = document.body;
+        if (!body) return false;
+        // Check if page has meaningful content (not just spinners/loading)
+        const text = body.innerText.trim();
+        if (text.length < 50) return false; // Almost empty page
+        // Check for common loading indicators still visible
+        const loaders = document.querySelectorAll('[class*="loading"],[class*="spinner"],[class*="skeleton"],[aria-busy="true"]');
+        for (const l of loaders) {
+          const r = l.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) return false; // Visible loader = not ready
+        }
+        return true;
+      }, [], tabId).catch(() => true);
+
+      if (!hasContent) {
+        // Try hard reload once
+        await browser.tabs.reload(tabId, { bypassCache: true });
+        await waitForTabLoad(tabId, 15000);
+      }
+
       const updated = await browser.tabs.get(tabId);
       return { title: updated.title, url: updated.url };
     }
