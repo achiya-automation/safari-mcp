@@ -310,16 +310,24 @@ async function handleCommand(type, payload) {
 
     // --- Screenshot ---
     case "screenshot": {
-      // Ensure the tracked tab is visible before capture
-      // captureVisibleTab always captures the VISIBLE tab, not a specific tab by ID
+      // captureVisibleTab captures the VISIBLE tab in a specific window.
+      // We must: 1) activate the correct tab, 2) focus the correct window.
+      // Without focusing the window, Safari may capture a different profile's window.
+      let captureWindowId = _profileWindowId || null;
       if (tabId) {
+        // Get the tab's windowId to ensure we capture the right window
+        try {
+          const tabInfo = await browser.tabs.get(tabId);
+          captureWindowId = tabInfo.windowId;
+          // Focus the window (brings profile to front) — critical for multi-profile setups
+          await browser.windows.update(captureWindowId, { focused: true });
+        } catch (_) {}
+        // Make this tab active in its window
         await browser.tabs.update(tabId, { active: true });
-        await new Promise(r => setTimeout(r, 150));
+        await new Promise(r => setTimeout(r, 200)); // Wait for visual switch + render
       }
       // Use JPEG with quality 50 to reduce size (~600KB PNG → ~60KB JPEG)
-      // Critical for staying under 20MB context limit
-      // Pass _profileWindowId to capture the correct window (not the frontmost one)
-      const dataUrl = await browser.tabs.captureVisibleTab(_profileWindowId || null, {
+      const dataUrl = await browser.tabs.captureVisibleTab(captureWindowId, {
         format: "jpeg",
         quality: 50,
       });
@@ -464,6 +472,15 @@ async function handleCommand(type, payload) {
         if (el.disabled || el.getAttribute("aria-disabled") === "true") {
           const reason = el.getAttribute("aria-label") || el.getAttribute("title") || el.textContent?.trim().substring(0, 60) || el.tagName;
           return "Element is DISABLED — cannot click: " + reason + ". Check if form requirements are met (required fields, permissions, etc.)";
+        }
+
+        // --- React checkbox/radio fix: reset _valueTracker before click ---
+        // React tracks checked state via _valueTracker. Without reset, React compares
+        // old===new after our click, thinks nothing changed, and ignores the event.
+        // This is the same pattern as select_option and fill for React inputs.
+        if (el.tagName === "INPUT" && (el.type === "checkbox" || el.type === "radio")) {
+          const tracker = el._valueTracker;
+          if (tracker) tracker.setValue(el.checked ? "true" : ""); // Set to CURRENT so React sees flip as "new"
         }
 
         // --- Scroll into view + resolve click target ---

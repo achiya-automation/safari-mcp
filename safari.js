@@ -51,6 +51,21 @@ function startHelper() {
 
 startHelper();
 
+// ========== CLEANUP: kill helper when parent process exits ==========
+// Without this, safari-helper processes accumulate as zombies when MCP restarts
+function cleanupHelper() {
+  if (_helperProc) {
+    try { _helperProc.kill("SIGTERM"); } catch (_) {}
+    _helperProc = null;
+  }
+}
+process.on("exit", cleanupHelper);
+process.on("SIGINT", () => { cleanupHelper(); process.exit(0); });
+process.on("SIGTERM", () => { cleanupHelper(); process.exit(0); });
+// SIGHUP = terminal closed, uncaught = crash — still clean up
+process.on("SIGHUP", () => { cleanupHelper(); process.exit(0); });
+process.on("uncaughtException", (err) => { console.error("Uncaught:", err); cleanupHelper(); process.exit(1); });
+
 // ========== ACTIVE TAB TRACKING ==========
 // Instead of visually switching tabs (which interrupts the user),
 // we track which tab we're "working on" by URL (not index, because indices shift
