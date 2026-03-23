@@ -403,7 +403,9 @@ async function handleCommand(type, payload) {
           if (m.nameAttr) { el = dq('[name="' + m.nameAttr + '"]'); if (el) return el; }
           if (m.al) { el = dq('[aria-label="' + m.al + '"]'); if (el) return el; }
           if (m.ph) { el = dq('[placeholder="' + m.ph + '"]'); if (el) return el; }
-          // Coordinate fallback
+          // Type attribute fallback (input type="email", type="url", etc.)
+          if (m.inputType) { el = dq(m.tag.toLowerCase() + '[type="' + m.inputType + '"]'); if (el) return el; }
+          // Coordinate fallback — scroll into view then hit-test
           if (m.cx !== undefined && m.cy !== undefined) {
             window.scrollTo(window.scrollX, Math.max(0, m.cy - window.innerHeight / 2));
             el = document.elementFromPoint(m.cx - window.scrollX, m.cy - window.scrollY);
@@ -1072,6 +1074,7 @@ async function handleCommand(type, payload) {
             if (al) refs[refId].al = al;
             const ph = el.getAttribute("placeholder");
             if (ph) refs[refId].ph = ph;
+            if (el.type && el.tagName === "INPUT") refs[refId].inputType = el.type;
             refs[refId].cx = Math.round(r.left + r.width / 2 + window.scrollX);
             refs[refId].cy = Math.round(r.top + r.height / 2 + window.scrollY);
             attrs = ` ref="${refId}"`;
@@ -1129,8 +1132,27 @@ async function handleCommand(type, payload) {
           return `<${tag}${attrs}>${children}</${tag}>`;
         }
 
-        const root = rootSelector ? document.querySelector(rootSelector) : document.body;
-        if (!root) return "Root element not found";
+        let root = rootSelector ? document.querySelector(rootSelector) : document.body;
+        // Fallback: if selector not found, try common dialog/portal containers
+        // React portals, Radix UI, Headless UI, MUI all use these patterns
+        if (!root && rootSelector) {
+          const portalSelectors = [
+            '[role="dialog"]', '[role="alertdialog"]', 'dialog[open]',
+            '[data-radix-portal]', '[class*="modal"]', '[class*="Modal"]',
+            '[class*="dialog"]', '[class*="Dialog"]', '[id*="portal"]'
+          ];
+          for (const ps of portalSelectors) {
+            const candidate = document.querySelector(ps);
+            if (candidate) {
+              // If original selector was more specific (e.g. "[role=dialog] form"),
+              // try to find the target within the portal
+              const inner = candidate.querySelector(rootSelector.split(/\s+/).pop());
+              root = inner || candidate;
+              break;
+            }
+          }
+        }
+        if (!root) return "Element not found: " + rootSelector;
         let tree = walk(root, 0);
         // Shadow roots are now walked INLINE inside walk() — no separate walkShadows needed.
         // Walk same-origin iframes

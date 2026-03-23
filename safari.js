@@ -1650,7 +1650,9 @@ export async function evaluate({ script }) {
     }
   }
 
-  const result = await runJS(js);
+  // Wrap in try/catch to surface JS errors instead of swallowing them as "(no return value)"
+  const wrappedJs = `try { ${js} } catch(__mcpErr) { 'Error: ' + __mcpErr.message }`;
+  const result = await runJS(wrappedJs);
   if (result === null || result === undefined || result === '') {
     return '(no return value)';
   }
