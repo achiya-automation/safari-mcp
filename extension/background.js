@@ -709,31 +709,26 @@ async function handleCommand(type, payload) {
               (location.hostname.includes("medium.com"))
             );
             if (isClosure) {
-              // Closure Library editors need character-by-character input with full event sequence.
-              // execCommand("insertText") alone updates DOM but NOT Closure's internal state.
-              // Character events trigger Closure's keyboard handlers which update state properly.
-              const sel = window.getSelection();
-              if (sel.rangeCount) {
-                const range = document.createRange();
-                range.selectNodeContents(el);
-                range.collapse(false); // collapse to end
-                sel.removeAllRanges();
-                sel.addRange(range);
+              // Closure/Medium: fill (replace) is NOT SAFE — selectAll destroys editor structure.
+              // Return clear guidance so Claude uses type_text instead.
+              // If editor already has content, warn. If empty, type char-by-char.
+              const hasContent = el.textContent && el.textContent.trim().length > 0;
+              if (hasContent) {
+                ceResult = "ERROR: Closure/Medium editor detected — safari_fill cannot replace existing content without breaking the editor. Use safari_click to focus this element, then safari_type_text to type into it. To clear first, manually select all and delete via safari_press_key.";
+              } else {
+                // Empty editor — safe to type char-by-char with full event sequence
+                for (let ci = 0; ci < value.length; ci++) {
+                  const ch = value[ci];
+                  const kc = ch.charCodeAt(0);
+                  el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, keyCode: kc, bubbles: true, cancelable: true }));
+                  el.dispatchEvent(new KeyboardEvent("keypress", { key: ch, keyCode: kc, charCode: kc, bubbles: true, cancelable: true }));
+                  el.dispatchEvent(new InputEvent("beforeinput", { data: ch, inputType: "insertText", bubbles: true, cancelable: true }));
+                  document.execCommand("insertText", false, ch);
+                  el.dispatchEvent(new InputEvent("input", { data: ch, inputType: "insertText", bubbles: true }));
+                  el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, keyCode: kc, bubbles: true }));
+                }
+                ceResult = "Filled contenteditable (Closure char-by-char, " + value.length + " chars)";
               }
-              for (let ci = 0; ci < value.length; ci++) {
-                const ch = value[ci];
-                const kc = ch.charCodeAt(0);
-                // Full keyboard event sequence per character
-                el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, keyCode: kc, bubbles: true, cancelable: true }));
-                el.dispatchEvent(new KeyboardEvent("keypress", { key: ch, keyCode: kc, charCode: kc, bubbles: true, cancelable: true }));
-                // beforeinput fires naturally from execCommand, but we dispatch it explicitly
-                // for editors that rely on it (Closure's beforeinput handler updates state)
-                el.dispatchEvent(new InputEvent("beforeinput", { data: ch, inputType: "insertText", bubbles: true, cancelable: true }));
-                document.execCommand("insertText", false, ch);
-                el.dispatchEvent(new InputEvent("input", { data: ch, inputType: "insertText", bubbles: true }));
-                el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, keyCode: kc, bubbles: true }));
-              }
-              ceResult = "Filled contenteditable (Closure char-by-char, " + value.length + " chars)";
             }
           }
 
