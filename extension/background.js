@@ -78,6 +78,15 @@ async function connect() {
       const data = await res.json().catch(() => ({}));
       if (data.profile) {
         _targetProfile = data.profile;
+        // Verify this extension is running in the correct profile.
+        // Safari runs a separate service worker per profile — if this worker
+        // belongs to the personal profile, it must NOT poll for commands.
+        const isCorrectProfile = await _verifyProfileMatch(data.profile);
+        if (!isCorrectProfile) {
+          console.log(`Safari MCP: wrong profile — server wants "${data.profile}", disconnecting`);
+          updateBadge("OFF");
+          return; // Do NOT poll — let the correct profile's extension handle commands
+        }
         await _discoverProfileWindow();
       }
       isConnected = true;
@@ -1535,6 +1544,66 @@ browser.tabs.onRemoved.addListener((tabId) => {
     }
   }
 });
+
+// Verify this extension instance is running in the expected profile.
+// Safari extensions see only their own profile's windows/tabs.
+// If the server expects "אוטומציות" but this worker's windows don't match, we're in the wrong profile.
+async function _verifyProfileMatch(expectedProfile) {
+  try {
+    const allWindows = await browser.windows.getAll({ populate: true });
+    // Check if any window's tab titles contain the profile name pattern "ProfileName —"
+    // Safari profile windows show: "ProfileName — Tab Title" in window name
+    // But the extension only sees its OWN profile's windows, so we check if tabs exist at all.
+    // The key insight: if this extension is in the personal profile, it will see personal windows.
+    // We use a stored marker to identify which profile this extension belongs to.
+    const stored = await browser.storage.local.get("mcpVerifiedProfile").catch(() => ({}));
+    if (stored.mcpVerifiedProfile === expectedProfile) return true;
+    if (stored.mcpVerifiedProfile && stored.mcpVerifiedProfile !== expectedProfile) return false;
+
+    // First time: we don't know yet. Open a test tab, check if we can see it from
+    // the expected profile. Simpler approach: ask user via badge, or use a heuristic.
+    // Heuristic: create a unique marker in storage and check from the other side.
+    // Simplest: the server sends a nonce, the extension writes it to a tab title,
+    // and the AppleScript side verifies which window has it.
+
+    // Practical approach: try to find a window with profile-matching title via tab inspection
+    // Actually, the simplest reliable method: the extension opens a special URL,
+    // the server checks via AppleScript which profile window has that URL.
+    const nonce = `mcp-profile-check-${Date.now()}`;
+    const checkTab = await browser.tabs.create({
+      url: `data:text/html,<title>${nonce}</title>`,
+      active: false,
+    });
+    // Give it a moment to load
+    await new Promise(r => setTimeout(r, 500));
+
+    // Ask the server to verify which profile has this nonce
+    const verifyRes = await fetch(`${HTTP_URL}/verify-profile`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ nonce, expectedProfile }),
+      signal: AbortSignal.timeout(5000),
+    });
+    // Clean up test tab
+    await browser.tabs.remove(checkTab.id).catch(() => {});
+
+    if (verifyRes.ok) {
+      const result = await verifyRes.json();
+      if (result.match) {
+        await browser.storage.local.set({ mcpVerifiedProfile: expectedProfile });
+        return true;
+      } else {
+        await browser.storage.local.set({ mcpVerifiedProfile: result.actualProfile || "__personal__" });
+        return false;
+      }
+    }
+    // If verification endpoint doesn't exist yet, allow connection (backward compat)
+    return true;
+  } catch (err) {
+    console.warn("Safari MCP: profile verification error:", err.message);
+    return true; // Allow on error (backward compat)
+  }
+}
 
 // Discover which windowId belongs to the target profile.
 // Safari extensions are per-profile — browser.windows/tabs APIs only see this profile's windows.

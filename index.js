@@ -137,6 +137,51 @@ try {
       return;
     }
 
+    // POST /verify-profile — extension asks server to check which profile has a nonce tab
+    if (req.method === "POST" && req.url === "/verify-profile") {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", async () => {
+        try {
+          const { nonce, expectedProfile } = JSON.parse(body);
+          // Use AppleScript to find which window contains the nonce in a tab title
+          const safeNonce = nonce.replace(/"/g, '\\"');
+          const safeProfile = (expectedProfile || "").replace(/"/g, '\\"');
+          // Check via AppleScript — look for the nonce in the profile window
+          const { execFile } = await import("node:child_process");
+          const { promisify } = await import("node:util");
+          const execFileAsync = promisify(execFile);
+          const script = `tell application "Safari"
+            repeat with w in every window
+              repeat with t in every tab of w
+                if name of t contains "${safeNonce}" then
+                  if name of w starts with "${safeProfile} —" then
+                    return "match"
+                  else
+                    return "wrong:" & name of w
+                  end if
+                end if
+              end repeat
+            end repeat
+            return "notfound"
+          end tell`;
+          const { stdout } = await execFileAsync("osascript", ["-e", script], { timeout: 5000 });
+          const out = stdout.trim();
+          if (out === "match") {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ match: true }));
+          } else {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ match: false, actualProfile: out }));
+          }
+        } catch (err) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ match: false, error: err.message }));
+        }
+      });
+      return;
+    }
+
     // GET /proxy-check — secondary instances check if extension is connected
     if (req.method === "GET" && req.url === "/proxy-check") {
       res.writeHead(200, { "Content-Type": "application/json" });
