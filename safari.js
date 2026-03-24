@@ -103,14 +103,26 @@ const RESOLVE_CACHE_MS = 1500; // Re-verify tab every 1.5 seconds (was 5s — to
 // Set SAFARI_PROFILE env var to target a specific Safari profile window.
 // Safari shows profile windows as: "ProfileName — Tab Title"
 const SAFARI_PROFILE = process.env.SAFARI_PROFILE || null;
-let _targetWindowRef = 'front window'; // Updated by refreshTargetWindow()
+let _targetWindowRef = null; // null = not yet discovered. Updated by refreshTargetWindow()
 let _targetWindowCacheTime = 0;
 const TARGET_WINDOW_CACHE_MS = 5000;
+let _profileWindowMissing = false; // True when profile window is not found
+
+// Get the target window ref, falling back to 'front window' ONLY when no profile is configured
+function getTargetWindowRef() {
+  if (SAFARI_PROFILE) {
+    if (!_targetWindowRef) {
+      throw new Error(`Safari profile "${SAFARI_PROFILE}" window not found. Open the "${SAFARI_PROFILE}" profile in Safari first.`);
+    }
+    return _targetWindowRef;
+  }
+  return _targetWindowRef || 'front window';
+}
 
 async function refreshTargetWindow(force = false) {
   if (!SAFARI_PROFILE) return;
   const now = Date.now();
-  if (!force && _targetWindowRef !== 'front window' && (now - _targetWindowCacheTime) < TARGET_WINDOW_CACHE_MS) return;
+  if (!force && _targetWindowRef && (now - _targetWindowCacheTime) < TARGET_WINDOW_CACHE_MS) return;
   const safeProfile = SAFARI_PROFILE.replace(/"/g, '\\"');
   const result = await osascriptFast(
     `tell application "Safari"\n  repeat with w in every window\n    if name of w starts with "${safeProfile} \u2014" then return id of w\n  end repeat\n  return 0\nend tell`
@@ -119,6 +131,13 @@ async function refreshTargetWindow(force = false) {
   if (id > 0) {
     _targetWindowRef = `window id ${id}`;
     _targetWindowCacheTime = now;
+    _profileWindowMissing = false;
+  } else {
+    // Profile window not found — clear ref so getTargetWindowRef() will throw
+    _targetWindowRef = null;
+    _targetWindowCacheTime = 0;
+    _profileWindowMissing = true;
+    console.error(`[Safari MCP] WARNING: Profile "${SAFARI_PROFILE}" window not found — refusing to use front window`);
   }
 }
 
@@ -132,6 +151,12 @@ if (SAFARI_PROFILE) {
 function isStaleWindowError(err) {
   const msg = (err && (err.message || err.stderr || String(err))) || '';
   return /window id \d+/.test(msg) && /(-1728|-10006)/.test(msg);
+}
+
+// Safe fallback target: when no tab index is known, use the profile window's current tab
+// instead of "front document" which can target the user's personal profile window
+function getFallbackTarget() {
+  return SAFARI_PROFILE ? `current tab of ${getTargetWindowRef()}` : "front document";
 }
 
 // Quick JS execution — exposed for smart-wait checks in index.js
@@ -152,7 +177,7 @@ async function resolveActiveTab() {
     // Also returns tabCount so we can clamp stale indices
     const result = await osascriptFast(
       `tell application "Safari"
-        set w to ${_targetWindowRef}
+        set w to ${getTargetWindowRef()}
         set tabCount to count of tabs of w
         ${_activeTabIndex ? `try
           if tabCount >= ${_activeTabIndex} then
@@ -313,8 +338,8 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
   // ALWAYS fall back to _activeTabIndex — never clear it from resolve failures
   if (!idx) idx = _activeTabIndex;
   const target = idx
-    ? `tab ${idx} of ${_targetWindowRef}`
-    : "front document";
+    ? `tab ${idx} of ${getTargetWindowRef()}`
+    : getFallbackTarget();
   const script = `tell application "Safari" to do JavaScript "${escaped}" in ${target}`;
   try {
     if (script.length < 50000) {
@@ -331,14 +356,14 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
       if (_activeTabURL) {
         const newIdx = await resolveActiveTab();
         if (newIdx && newIdx !== idx) {
-          const newTarget = `tab ${newIdx} of ${_targetWindowRef}`;
+          const newTarget = `tab ${newIdx} of ${getTargetWindowRef()}`;
           const retryScript = `tell application "Safari" to do JavaScript "${escaped}" in ${newTarget}`;
           if (retryScript.length < 50000) return osascriptFast(retryScript, { timeout });
           return osascript(retryScript, { timeout });
         }
       }
       // If still can't resolve, try current tab of the window
-      const fallbackScript = `tell application "Safari" to do JavaScript "${escaped}" in current tab of ${_targetWindowRef}`;
+      const fallbackScript = `tell application "Safari" to do JavaScript "${escaped}" in current tab of ${getTargetWindowRef()}`;
       console.error(`[Safari MCP] Falling back to current tab`);
       if (fallbackScript.length < 50000) return osascriptFast(fallbackScript, { timeout });
       return osascript(fallbackScript, { timeout });
@@ -359,8 +384,8 @@ async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
   }
   if (!idx) idx = _activeTabIndex;
   const target = idx
-    ? `tab ${idx} of ${_targetWindowRef}`
-    : "front document";
+    ? `tab ${idx} of ${getTargetWindowRef()}`
+    : getFallbackTarget();
   // Write AppleScript to temp file — the JS is embedded inside the AppleScript
   const escaped = js
     .replace(/^\s*\/\/[^\n]*$/gm, '')  // Strip // comment-only lines before flattening
@@ -396,8 +421,8 @@ export async function navigate(url) {
     // Resolve tab by URL first (in case indices shifted)
     if (_activeTabURL) await resolveActiveTab();
     const navTarget = _activeTabIndex
-      ? `tab ${_activeTabIndex} of ${_targetWindowRef}`
-      : "front document";
+      ? `tab ${_activeTabIndex} of ${getTargetWindowRef()}`
+      : getFallbackTarget();
     // Step 0: Suppress onbeforeunload dialogs (prevents blocking navigation)
     await runJS("window.onbeforeunload=null", { timeout: 2000 }).catch(() => {});
 
@@ -428,8 +453,8 @@ export async function navigate(url) {
       if (parsed.blocked && url.startsWith("http://")) {
         const httpUrl = url.replace(/"/g, '\\"');
         const navTarget = _activeTabIndex
-          ? `tab ${_activeTabIndex} of ${_targetWindowRef}`
-          : `current tab of ${_targetWindowRef}`;
+          ? `tab ${_activeTabIndex} of ${getTargetWindowRef()}`
+          : `current tab of ${getTargetWindowRef()}`;
         await osascriptFast(
           `tell application "Safari" to set URL of ${navTarget} to "${httpUrl}"`
         );
@@ -805,8 +830,8 @@ async function _injectHelpersfast() {
   await refreshTargetWindow();
   let idx = _activeTabIndex;
   const target = idx
-    ? `tab ${idx} of ${_targetWindowRef}`
-    : "front document";
+    ? `tab ${idx} of ${getTargetWindowRef()}`
+    : getFallbackTarget();
   const script = `tell application "Safari" to do JavaScript "${_HELPERS_ESCAPED}" in ${target}`;
   return osascriptFast(script, { timeout: 15000 });
 }
@@ -1028,19 +1053,29 @@ export async function pressKey({ key, modifiers = [] }) {
       return `Pressed: ${modifiers.join("+")}+${key} (via JS)`;
     }
 
-    // Cmd+V (paste) — needs System Events because JS can't access system clipboard
+    // Cmd+V (paste) — read clipboard via AppleScript (no activate!), inject via JS
     if (k === "v") {
-      // Activate Safari first (brings to front) — required for menu click to work
-      await osascript(
-        `tell application "Safari" to activate
-        delay 0.3
-        tell application "System Events"
-          tell process "Safari"
-            click menu item "Paste" of menu "Edit" of menu bar 1
-          end tell
-        end tell`
-      );
-      return `Pressed: ${modifiers.join("+")}+v (via menu)`;
+      const clipText = await osascript(`the clipboard as text`).catch(() => "");
+      if (clipText) {
+        const escaped = clipText.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t");
+        await runJS(
+          `(function(){
+            var el = document.activeElement;
+            if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {
+              var start = el.selectionStart, end = el.selectionEnd;
+              var val = el.value;
+              el.value = val.substring(0, start) + '${escaped}' + val.substring(end);
+              el.selectionStart = el.selectionEnd = start + '${escaped}'.length;
+              el.dispatchEvent(new Event('input', {bubbles:true}));
+              el.dispatchEvent(new Event('change', {bubbles:true}));
+            } else {
+              document.execCommand('insertText', false, '${escaped}');
+            }
+            return 'Pasted';
+          })()`
+        );
+      }
+      return `Pressed: ${modifiers.join("+")}+v (via JS, no focus steal)`;
     }
 
     // Other Cmd shortcuts — dispatch JS KeyboardEvent
@@ -1253,12 +1288,12 @@ export async function screenshot({ fullPage = false } = {}) {
     if (_activeTabIndex) {
       try {
         const currentIdx = await osascriptFast(
-          `tell application "Safari" to return index of current tab of ${_targetWindowRef}`
+          `tell application "Safari" to return index of current tab of ${getTargetWindowRef()}`
         );
         if (Number(currentIdx) !== _activeTabIndex) {
           savedTabIdx = Number(currentIdx);
           await osascriptFast(
-            `tell application "Safari" to set current tab of ${_targetWindowRef} to tab ${_activeTabIndex} of ${_targetWindowRef}`
+            `tell application "Safari" to set current tab of ${getTargetWindowRef()} to tab ${_activeTabIndex} of ${getTargetWindowRef()}`
           );
           await new Promise(r => setTimeout(r, 200)); // Let Safari render the tab
         }
@@ -1268,19 +1303,19 @@ export async function screenshot({ fullPage = false } = {}) {
 
     // Try screencapture — use osascript's do shell script to bypass VS Code permission issue
     const windowId = !skipScreencapture ? await osascript(
-      `tell application "Safari" to return id of ${_targetWindowRef}`
+      `tell application "Safari" to return id of ${getTargetWindowRef()}`
     ).catch(() => null) : null;
 
     if (windowId) {
       try {
         if (fullPage) {
           const bounds = await osascript(
-            `tell application "Safari" to return bounds of ${_targetWindowRef}`
+            `tell application "Safari" to return bounds of ${getTargetWindowRef()}`
           );
           const dims = await runJS("JSON.stringify({h:document.documentElement.scrollHeight,w:document.documentElement.scrollWidth})");
           const { h, w } = JSON.parse(dims);
           await osascript(
-            `tell application "Safari" to set bounds of ${_targetWindowRef} to {0, 0, ${Number(w)}, ${Math.min(Number(h) + 100, 5000)}}`
+            `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {0, 0, ${Number(w)}, ${Math.min(Number(h) + 100, 5000)}}`
           );
           await new Promise((r) => setTimeout(r, 500));
           // Use do shell script to inherit osascript's Screen Recording permission
@@ -1289,7 +1324,7 @@ export async function screenshot({ fullPage = false } = {}) {
             { timeout: 15000 }
           );
           await osascript(
-            `tell application "Safari" to set bounds of ${_targetWindowRef} to {${bounds}}`
+            `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {${bounds}}`
           );
         } else {
           // Try direct execFile first (works if VS Code has Screen Recording permission)
@@ -1362,7 +1397,7 @@ export async function screenshot({ fullPage = false } = {}) {
     if (savedTabIdx) {
       try {
         await osascriptFast(
-          `tell application "Safari" to set current tab of ${_targetWindowRef} to tab ${savedTabIdx} of ${_targetWindowRef}`
+          `tell application "Safari" to set current tab of ${getTargetWindowRef()} to tab ${savedTabIdx} of ${getTargetWindowRef()}`
         );
       } catch (_) {}
     }
@@ -1426,7 +1461,7 @@ export async function screenshotElement({ selector }) {
     // Fallback: use screencapture + crop
     const tmpFile = join(tmpdir(), `safari-el-${Date.now()}.png`);
     try {
-      const windowId = await osascript(`tell application "Safari" to return id of ${_targetWindowRef}`).catch(() => null);
+      const windowId = await osascript(`tell application "Safari" to return id of ${getTargetWindowRef()}`).catch(() => null);
       if (!windowId) throw new Error("Cannot get Safari window ID");
 
       // Get element bounds relative to screen
@@ -1489,7 +1524,7 @@ export async function listTabs() {
     `tell application "Safari"
       set output to ""
       set tabIndex to 1
-      repeat with t in every tab of ${_targetWindowRef}
+      repeat with t in every tab of ${getTargetWindowRef()}
         if tabIndex > 1 then set output to output & linefeed
         set output to output & (tabIndex as text) & (ASCII character 9) & name of t & (ASCII character 9) & URL of t
         set tabIndex to tabIndex + 1
@@ -1510,15 +1545,24 @@ export async function newTab(url = "") {
   const safeUrl = url ? url.replace(/"/g, '\\"') : "";
   try {
     if (url) {
-      await osascript(`tell application "Safari"\ntell ${_targetWindowRef}\nset userTab to current tab\nmake new tab with properties {URL:"${safeUrl}"}\nset current tab to userTab\nend tell\nend tell`);
+      await osascript(`tell application "Safari"\ntell ${getTargetWindowRef()}\nset userTab to current tab\nmake new tab with properties {URL:"${safeUrl}"}\nset current tab to userTab\nend tell\nend tell`);
     } else {
-      await osascript(`tell application "Safari"\ntell ${_targetWindowRef}\nset userTab to current tab\nmake new tab\nset current tab to userTab\nend tell\nend tell`);
+      await osascript(`tell application "Safari"\ntell ${getTargetWindowRef()}\nset userTab to current tab\nmake new tab\nset current tab to userTab\nend tell\nend tell`);
     }
   } catch {
-    if (url) { await osascript(`tell application "Safari" to make new document with properties {URL:"${safeUrl}"}`); }
-    else { await osascript('tell application "Safari" to make new document'); }
+    if (SAFARI_PROFILE) {
+      // Profile mode: create tab inside the profile window, never use make new document (opens in front/personal window)
+      if (url) {
+        await osascript(`tell application "Safari" to tell ${getTargetWindowRef()} to make new tab with properties {URL:"${safeUrl}"}`);
+      } else {
+        await osascript(`tell application "Safari" to tell ${getTargetWindowRef()} to make new tab`);
+      }
+    } else {
+      if (url) { await osascript(`tell application "Safari" to make new document with properties {URL:"${safeUrl}"}`); }
+      else { await osascript('tell application "Safari" to make new document'); }
+    }
   }
-  const tabCount = await osascriptFast(`tell application "Safari" to return count of tabs of ${_targetWindowRef}`);
+  const tabCount = await osascriptFast(`tell application "Safari" to return count of tabs of ${getTargetWindowRef()}`);
   _activeTabIndex = Number(tabCount);
   _activeTabURL = url || null;
   _lastResolveTime = Date.now();
@@ -1544,13 +1588,13 @@ export async function newTab(url = "") {
 export async function closeTab() {
   if (_activeTabIndex) {
     await osascript(
-      `tell application "Safari" to close tab ${_activeTabIndex} of ${_targetWindowRef}`
+      `tell application "Safari" to close tab ${_activeTabIndex} of ${getTargetWindowRef()}`
     );
     _activeTabIndex = null;
     _activeTabURL = null;
   } else {
     await osascript(
-      `tell application "Safari" to close current tab of ${_targetWindowRef}`
+      `tell application "Safari" to close current tab of ${getTargetWindowRef()}`
     );
   }
   return "Tab closed";
@@ -1559,14 +1603,9 @@ export async function closeTab() {
 export async function switchTab(index) {
   const idx = Number(index);
   _activeTabIndex = idx;
-  // Visually switch the tab in Safari so screenshot/screencapture work correctly
-  try {
-    await osascriptFast(
-      `tell application "Safari" to set current tab of ${_targetWindowRef} to tab ${idx} of ${_targetWindowRef}`
-    );
-  } catch (e) {
-    console.error(`[Safari MCP] switchTab visual switch failed: ${e.message}`);
-  }
+  // Do NOT visually switch the tab — it brings the Safari window to foreground
+  // and interrupts the user. Visual switching only happens in screenshot() when needed.
+  // AppleScript `do JavaScript in tab N` works on background tabs without switching.
   // Get title+URL from the target tab
   const result = await runJS(
     `JSON.stringify({title:document.title,url:location.href})`,
@@ -1718,7 +1757,7 @@ export async function handleDialog({ action = "accept", text }) {
 
 export async function resizeWindow({ width, height }) {
   await osascript(
-    `tell application "Safari" to set bounds of ${_targetWindowRef} to {0, 0, ${Number(width)}, ${Number(height)}}`
+    `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {0, 0, ${Number(width)}, ${Number(height)}}`
   );
   return `Resized to ${width}x${height}`;
 }
@@ -1970,7 +2009,7 @@ export async function emulate({ device, width, height, userAgent, scale = 1 }) {
 
   // Resize Safari window to match device
   await osascript(
-    `tell application "Safari" to set bounds of ${_targetWindowRef} to {0, 0, ${w}, ${h + 100}}`
+    `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {0, 0, ${w}, ${h + 100}}`
   );
 
   // Override viewport meta and user agent if specified
@@ -2006,7 +2045,7 @@ export async function resetEmulation() {
   );
   // Maximize window
   await osascript(
-    `tell application "Safari" to set bounds of ${_targetWindowRef} to {0, 0, 1440, 900}`
+    `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {0, 0, 1440, 900}`
   );
   await runJS(
     `(async function(){location.reload();await new Promise(function(r){setTimeout(r,300)});for(var i=0;i<30;i++){if(document.readyState==='complete')break;await new Promise(function(r){setTimeout(r,200)});}return 'done';})()`
@@ -2035,10 +2074,15 @@ export async function clearConsoleCapture() {
 
 export async function savePDF({ path: pdfPath }) {
   const safePath = pdfPath.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "").replace(/\r/g, "");
-  // Use window.print() API + AppleScript to save as PDF
-  // Strategy: use osascript to print to PDF directly via CUPS (no UI at all)
+  // Save which app was active BEFORE we steal focus, so we can restore it
+  let previousApp = "";
   try {
-    // Method 1: Use Safari's native "Export as PDF" via AppleScript menu + clipboard paste for path
+    previousApp = (await osascript(
+      `tell application "System Events" to return name of first application process whose frontmost is true`
+    )).trim();
+  } catch (_) {}
+
+  try {
     await osascript(
       `tell application "Safari" to activate
       delay 0.3
@@ -2063,9 +2107,13 @@ export async function savePDF({ path: pdfPath }) {
       { timeout: 20000 }
     );
   } catch (err) {
+    // Restore focus even on failure
+    if (previousApp) await osascript(`tell application "${previousApp}" to activate`).catch(() => {});
     throw new Error(`PDF save failed: ${err.message}. Try granting Accessibility permission to Terminal/VS Code.`);
   }
   await new Promise((r) => setTimeout(r, 2000));
+  // Restore focus to the app user was working in
+  if (previousApp) await osascript(`tell application "${previousApp}" to activate`).catch(() => {});
   return `PDF saved to: ${pdfPath}`;
 }
 
@@ -3000,7 +3048,7 @@ export async function navigateAndRead(url, { maxLength = 50000 } = {}) {
   let targetUrl = url;
   if (!/^https?:\/\//i.test(targetUrl)) targetUrl = "https://" + targetUrl;
   const safeUrl = targetUrl.replace(/"/g, '\\"');
-  const navTarget = _activeTabIndex ? `tab ${_activeTabIndex} of ${_targetWindowRef}` : "front document";
+  const navTarget = _activeTabIndex ? `tab ${_activeTabIndex} of ${getTargetWindowRef()}` : getFallbackTarget();
   await osascriptFast(`tell application "Safari" to set URL of ${navTarget} to "${safeUrl}"`);
   // Single JS call: poll readyState + return page data — 1 call instead of 30+
   return runJS(

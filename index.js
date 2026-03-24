@@ -13,6 +13,9 @@ import { WebSocketServer } from "ws";
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 
+// ========== SESSION ID (unique per MCP process — enables per-session tab tracking) ==========
+const SESSION_ID = randomUUID().slice(0, 8);
+
 // ========== EXTENSION BRIDGE (WebSocket + HTTP polling) ==========
 const WS_PORT = 9223;
 const HTTP_PORT = 9224;
@@ -331,7 +334,7 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
     try {
       const t0 = Date.now();
       const tabUrl = safari.getActiveTabURL();
-      const payload = tabUrl ? { ...extensionPayload, tabUrl } : extensionPayload;
+      const payload = { ...extensionPayload, sessionId: SESSION_ID, ...(tabUrl ? { tabUrl } : {}) };
       const timeout = _commandTimeouts[extensionType] || 30000;
       const result = await sendToExtension(extensionType, payload, timeout);
       // If extension returned null or "Element not found" for action commands,
@@ -1020,7 +1023,7 @@ server.tool(
 
 server.tool(
   "safari_paste_image",
-  "Paste an image from a local file into the focused element. Copies to clipboard then Cmd+V. Works on Medium, dev.to, HackerNoon, TOI, etc. WARNING: This STEALS FOCUS — Safari comes to foreground briefly. Also briefly overwrites system clipboard (auto-restored).",
+  "Paste an image from a local file into the focused element via JS DataTransfer (no clipboard, no focus steal). Works on Medium, dev.to, HackerNoon, TOI, etc.",
   {
     filePath: z.string().describe("Absolute path to the image file (PNG, JPG, WebP)"),
   },

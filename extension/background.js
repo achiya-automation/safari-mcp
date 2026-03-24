@@ -155,7 +155,8 @@ async function executeAndReply(msg) {
 // ========== COMMAND HANDLERS ==========
 
 async function handleCommand(type, payload) {
-  const targetTab = await getTargetTab(payload.tabUrl);
+  const sessionId = payload.sessionId || _DEFAULT_SESSION;
+  const targetTab = await getTargetTab(payload.tabUrl, sessionId);
   const tabId = targetTab.id;
 
   // Safety: never operate on tabs outside the profile window
@@ -198,10 +199,8 @@ async function handleCommand(type, payload) {
       }
 
       const updated = await browser.tabs.get(tabId);
-      // Update cache with new URL so subsequent commands target this tab
-      _cachedTabId = updated.id;
-      _cachedTabUrl = updated.url;
-      _cachedTabTime = Date.now();
+      // Update this session's cache with new URL so subsequent commands target this tab
+      _setSessionTab(sessionId, updated.id, updated.url);
       return { title: updated.title, url: updated.url };
     }
 
@@ -336,29 +335,18 @@ async function handleCommand(type, payload) {
 
     // --- Screenshot ---
     case "screenshot": {
-      // captureVisibleTab captures the VISIBLE tab in a specific window.
-      // We must: 1) activate the correct tab, 2) focus the correct window.
-      // Without focusing the window, Safari may capture a different profile's window.
+      // Strategy: try captureVisibleTab WITHOUT focusing the window first.
+      // If it fails, fall back to AppleScript screencapture -l (which also doesn't steal focus).
+      // NEVER use browser.windows.update({ focused: true }) — it steals user's keyboard/mouse.
       let captureWindowId = _profileWindowId || null;
       if (tabId) {
         try {
           const tabInfo = await browser.tabs.get(tabId);
           captureWindowId = tabInfo.windowId;
-          // Focus window + activate tab IN PARALLEL (saves ~50ms)
-          await Promise.all([
-            browser.windows.update(captureWindowId, { focused: true }),
-            browser.tabs.update(tabId, { active: true })
-          ]);
+          // Only activate the correct tab — does NOT bring Safari window to foreground
+          await browser.tabs.update(tabId, { active: true });
         } catch (_) {}
-        await new Promise(r => setTimeout(r, 300));
-        // Verify correct tab is active — retry once if wrong
-        try {
-          const activeTabs = await browser.tabs.query({ active: true, windowId: captureWindowId });
-          if (activeTabs[0] && activeTabs[0].id !== tabId) {
-            await browser.tabs.update(tabId, { active: true });
-            await new Promise(r => setTimeout(r, 250));
-          }
-        } catch (_) {}
+        await new Promise(r => setTimeout(r, 150));
       }
       // Use JPEG with quality 50 to reduce size (~600KB PNG → ~60KB JPEG)
       try {
@@ -368,12 +356,14 @@ async function handleCommand(type, payload) {
         });
         return dataUrl.split(",")[1];
       } catch (screenshotErr) {
-        // Permission lost mid-session (macOS quirk) — signal MCP to use AppleScript fallback
+        // Permission lost or window not visible — signal MCP to use AppleScript fallback
+        // AppleScript uses screencapture -l<windowId> which captures without stealing focus
         const msg = screenshotErr.message || "";
-        if (msg.includes("permission") || msg.includes("screencapture") || msg.includes("Screen Recording")) {
+        if (msg.includes("permission") || msg.includes("screencapture") || msg.includes("Screen Recording") || msg.includes("visible")) {
           return "__SCREENSHOT_PERMISSION_DENIED__";
         }
-        throw screenshotErr;
+        // Any other error also falls back — better than stealing focus
+        return "__SCREENSHOT_PERMISSION_DENIED__";
       }
     }
 
@@ -915,10 +905,8 @@ async function handleCommand(type, payload) {
       const updated = await browser.tabs.get(newTab.id);
       // Learn profile window from newly created tab
       if (!_profileWindowId) { _profileWindowId = updated.windowId; browser.storage.local.set({ mcpProfileWindowId: _profileWindowId }).catch(() => {}); }
-      // CRITICAL: Set new tab as the target for subsequent commands
-      _cachedTabId = updated.id;
-      _cachedTabUrl = updated.url;
-      _cachedTabTime = Date.now();
+      // CRITICAL: Set new tab as the target for this session's subsequent commands
+      _setSessionTab(sessionId, updated.id, updated.url);
       return { title: updated.title, url: updated.url, tabIndex: updated.index + 1 };
     }
 
@@ -939,11 +927,10 @@ async function handleCommand(type, payload) {
       const tabs = await browser.tabs.query(query);
       const target = tabs[payload.index - 1];
       if (!target) return "Tab not found at index " + payload.index;
-      await browser.tabs.update(target.id, { active: true });
-      // CRITICAL: Update cached tab so subsequent commands target this tab via cache hit
-      _cachedTabId = target.id;
-      _cachedTabUrl = target.url;
-      _cachedTabTime = Date.now();
+      // Do NOT visually activate the tab — it brings Safari window to foreground.
+      // Just update the session cache so subsequent commands target this tab.
+      // Extension APIs (executeScript, etc.) work on background tabs without activation.
+      _setSessionTab(sessionId, target.id, target.url);
       return { title: target.title, url: target.url };
     }
 
@@ -1510,19 +1497,43 @@ async function handleCommand(type, payload) {
 
 // ========== HELPERS ==========
 
-let _cachedTabId = null;
-let _cachedTabUrl = null;
-let _cachedTabTime = 0;
+// Per-session tab cache: Map<sessionId, {tabId, tabUrl, time}>
+// Each MCP process has a unique sessionId — prevents sessions from overwriting each other's tab context
+const _sessionTabCache = new Map();
 const TAB_CACHE_MS = 3000; // Re-verify tab URL match every 3s
+const _DEFAULT_SESSION = "__default__"; // Fallback for commands without sessionId
+
+function _getSessionCache(sessionId) {
+  const sid = sessionId || _DEFAULT_SESSION;
+  if (!_sessionTabCache.has(sid)) {
+    _sessionTabCache.set(sid, { tabId: null, tabUrl: null, time: 0 });
+  }
+  return _sessionTabCache.get(sid);
+}
+
+function _setSessionTab(sessionId, tabId, tabUrl) {
+  const cache = _getSessionCache(sessionId);
+  cache.tabId = tabId;
+  cache.tabUrl = tabUrl || cache.tabUrl;
+  cache.time = Date.now();
+}
 
 browser.tabs.onActivated.addListener(({ tabId, windowId }) => {
-  // Only cache tab activations from the profile window — prevents cross-profile poisoning
+  // Only track activations from the profile window
   if (_profileWindowId && windowId !== _profileWindowId) return;
-  _cachedTabId = tabId;
+  // Do NOT update any session cache — onActivated fires for ALL tab switches
+  // (including those triggered by other sessions). Updating here is what caused
+  // the cross-session interference. Sessions track their own tabs explicitly.
 });
 
 browser.tabs.onRemoved.addListener((tabId) => {
-  if (_cachedTabId === tabId) { _cachedTabId = null; _cachedTabUrl = null; }
+  // Clean up any session that was tracking this tab
+  for (const [sid, cache] of _sessionTabCache) {
+    if (cache.tabId === tabId) {
+      cache.tabId = null;
+      cache.tabUrl = null;
+    }
+  }
 });
 
 // Discover which windowId belongs to the target profile.
@@ -1562,18 +1573,18 @@ async function _discoverProfileWindow() {
   }
 }
 
-async function getTargetTab(tabUrl) {
-  // PRIORITY 1: Always prefer _cachedTabId from switch_tab — this is the "intent" tab.
-  // URL matching can pick the WRONG tab when multiple tabs share a domain.
-  // switch_tab sets _cachedTabId to the exact tab the user wants.
-  if (_cachedTabId && (Date.now() - _cachedTabTime) < TAB_CACHE_MS) {
+async function getTargetTab(tabUrl, sessionId) {
+  const cache = _getSessionCache(sessionId);
+
+  // PRIORITY 1: This session's cached tab from new_tab/switch_tab/navigate
+  if (cache.tabId && (Date.now() - cache.time) < TAB_CACHE_MS) {
     try {
-      const cached = await browser.tabs.get(_cachedTabId);
+      const cached = await browser.tabs.get(cache.tabId);
       if (cached && (!_profileWindowId || cached.windowId === _profileWindowId)) return cached;
-    } catch { _cachedTabId = null; }
+    } catch { cache.tabId = null; }
   }
 
-  // PRIORITY 2: URL-based search (when no switch_tab was called, or cache expired)
+  // PRIORITY 2: URL-based search (session-specific tabUrl)
   if (tabUrl) {
     const searchScope = _profileWindowId ? { windowId: _profileWindowId } : {};
     let all = await browser.tabs.query(searchScope);
@@ -1583,9 +1594,7 @@ async function getTargetTab(tabUrl) {
       match = all.find(t => t.url && (t.url.startsWith(tabUrl) || tabUrl.startsWith(t.url.split("?")[0])));
     }
     if (match) {
-      _cachedTabId = match.id;
-      _cachedTabUrl = tabUrl;
-      _cachedTabTime = Date.now();
+      _setSessionTab(sessionId, match.id, tabUrl);
       if (!_profileWindowId || match.windowId !== _profileWindowId) {
         if (_profileWindowId && match.windowId !== _profileWindowId) {
           console.log("Safari MCP: profile window changed:", _profileWindowId, "→", match.windowId);
@@ -1597,46 +1606,28 @@ async function getTargetTab(tabUrl) {
       return match;
     }
   }
-  // If we know the profile window, get its active tab (not the user's personal window)
+  // PRIORITY 3: Active tab of the profile window (no session bias)
   if (_profileWindowId) {
     const tabs = await browser.tabs.query({ active: true, windowId: _profileWindowId });
-    if (tabs[0]) {
-      _cachedTabId = tabs[0].id;
-      return tabs[0];
-    }
-    // Profile window may have been closed and reopened — re-discover
+    if (tabs[0]) return tabs[0];
     console.warn("Safari MCP: profile window has no active tab, re-discovering...");
     await _discoverProfileWindow();
     if (_profileWindowId) {
       const retryTabs = await browser.tabs.query({ active: true, windowId: _profileWindowId });
-      if (retryTabs[0]) {
-        _cachedTabId = retryTabs[0].id;
-        return retryTabs[0];
-      }
+      if (retryTabs[0]) return retryTabs[0];
     }
   }
   return getActiveTab();
 }
 
 async function getActiveTab() {
-  if (_cachedTabId !== null) {
-    try {
-      const tab = await browser.tabs.get(_cachedTabId);
-      return tab; // Return even if not active — it's in the right window
-    } catch {}
-    _cachedTabId = null;
-  }
   // Prefer profile window if known
   if (_profileWindowId) {
     const tabs = await browser.tabs.query({ active: true, windowId: _profileWindowId });
-    if (tabs[0]) {
-      _cachedTabId = tabs[0].id;
-      return tabs[0];
-    }
+    if (tabs[0]) return tabs[0];
   }
   const tabs = await browser.tabs.query({ active: true, currentWindow: true });
   if (!tabs[0]) throw new Error("No active tab");
-  _cachedTabId = tabs[0].id;
   return tabs[0];
 }
 
