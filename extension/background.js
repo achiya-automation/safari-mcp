@@ -643,14 +643,24 @@ async function handleCommand(type, payload) {
           const pmEl = el.closest(".ProseMirror") || document.querySelector(".ProseMirror");
           if (!ceResult && pmEl) {
             try {
-              const view = pmEl.pmViewDesc && pmEl.pmViewDesc.view;
+              let view = pmEl.pmViewDesc && pmEl.pmViewDesc.view;
+              if (!view) { const keys = Object.keys(pmEl); for (let i=0;i<keys.length;i++) { const o=pmEl[keys[i]]; if(o&&o.state&&o.dispatch){view=o;break;} } }
               if (view && view.state && view.dispatch) {
                 const { state } = view;
-                const tr = state.tr.replaceWith(0, state.doc.content.size,
-                  state.schema.text ? state.schema.text(value) : state.schema.node("paragraph", null, state.schema.text(value)));
-                view.dispatch(tr);
-                view.focus();
-                ceResult = "Filled contenteditable (ProseMirror API)";
+                const doc = state.doc;
+                const hasContent = doc.textContent && doc.textContent.trim().length > 0;
+                if (hasContent) {
+                  const endPos = doc.content.size > 1 ? doc.content.size - 1 : doc.content.size;
+                  view.dispatch(state.tr.insertText(" " + value, endPos));
+                  view.focus();
+                  ceResult = "Filled contenteditable (ProseMirror append)";
+                } else {
+                  const tr = state.tr.replaceWith(0, doc.content.size,
+                    state.schema.text ? state.schema.text(value) : state.schema.node("paragraph", null, state.schema.text(value)));
+                  view.dispatch(tr);
+                  view.focus();
+                  ceResult = "Filled contenteditable (ProseMirror replace)";
+                }
               }
             } catch (e) { /* fall through */ }
           }
@@ -786,9 +796,10 @@ async function handleCommand(type, payload) {
         if (pmEl) {
           try {
             // Access view from multiple known locations
-            const view = (pmEl.pmViewDesc && pmEl.pmViewDesc.view)
+            let view = (pmEl.pmViewDesc && pmEl.pmViewDesc.view)
               || (pmEl.cmView && pmEl.cmView.view) // CodeMirror 6
               || null;
+            if (!view) { const keys = Object.keys(pmEl); for (let i=0;i<keys.length;i++) { const o=pmEl[keys[i]]; if(o&&o.state&&o.dispatch){view=o;break;} } }
             if (view && view.state && view.dispatch) {
               const { state } = view;
               const tr = state.tr.insertText(text);
