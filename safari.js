@@ -963,7 +963,7 @@ export async function fill({ selector, value, ref }) {
   return runJS(
     `(function(){try{var el=document.querySelector('${sel}');if(!el){var q=function(r){var a=r.querySelectorAll('*');for(var i=0;i<a.length;i++){if(a[i].shadowRoot){el=a[i].shadowRoot.querySelector('${sel}');if(el)return el;el=q(a[i].shadowRoot);if(el)return el;}}return null;};el=q(document);}if(!el)return 'Element not found: ${sel}';el.focus();if(el.isContentEditable||el.getAttribute('contenteditable')==='true'){` +
     // ProseMirror detection
-    `var pm=el.closest('.ProseMirror')||el.querySelector('.ProseMirror');if(pm){try{var v=(pm.pmViewDesc&&pm.pmViewDesc.view)||(pm.cmView&&pm.cmView.view);if(v&&v.state&&v.dispatch){var doc=v.state.doc;var hasContent=doc.textContent&&doc.textContent.trim().length>0;if(hasContent){var endPos=doc.content.size>1?doc.content.size-1:doc.content.size;v.dispatch(v.state.tr.insertText(' ${val}',endPos));v.focus();return 'Filled CE (ProseMirror append)';}else{var tr=v.state.tr;tr.replaceWith(0,doc.content.size,v.state.schema.text('${val}'));v.dispatch(tr);v.focus();return 'Filled CE (ProseMirror replace)';}}}catch(e){}}` +
+    `var pm=el.closest('.ProseMirror')||el.querySelector('.ProseMirror');if(pm){try{var v=null;if(pm.pmViewDesc&&pm.pmViewDesc.view)v=pm.pmViewDesc.view;else if(pm.cmView&&pm.cmView.view)v=pm.cmView.view;else{var keys=Object.keys(pm);for(var ki=0;ki<keys.length;ki++){var o=pm[keys[ki]];if(o&&o.state&&o.dispatch){v=o;break;}}}if(v&&v.state&&v.dispatch){var doc=v.state.doc;var hasContent=doc.textContent&&doc.textContent.trim().length>0;if(hasContent){var endPos=doc.content.size>1?doc.content.size-1:doc.content.size;v.dispatch(v.state.tr.insertText(' ${val}',endPos));v.focus();return 'Filled CE (ProseMirror append)';}else{var tr=v.state.tr;tr.replaceWith(0,doc.content.size,v.state.schema.text('${val}'));v.dispatch(tr);v.focus();return 'Filled CE (ProseMirror replace)';}}}catch(e){}}` +
     // Closure/Medium detection — return error, don't break
     `var isClosure=Object.keys(el).some(function(k){return k.startsWith('closure_uid_');})||location.hostname.includes('medium.com');if(isClosure){var hasContent=el.textContent&&el.textContent.trim().length>0;if(hasContent)return 'ERROR: Closure/Medium editor — use safari_type_text instead of fill';` +
     `for(var ci=0;ci<'${val}'.length;ci++){var target=document.activeElement||el;var ch='${val}'[ci];if(ch==='\\n'){target.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',keyCode:13,bubbles:true}));document.execCommand('insertParagraph');target.dispatchEvent(new KeyboardEvent('keyup',{key:'Enter',keyCode:13,bubbles:true}));continue;}var kc=ch.charCodeAt(0);target.dispatchEvent(new KeyboardEvent('keydown',{key:ch,keyCode:kc,bubbles:true}));document.execCommand('insertText',false,ch);target.dispatchEvent(new InputEvent('input',{data:ch,inputType:'insertText',bubbles:true}));target.dispatchEvent(new KeyboardEvent('keyup',{key:ch,keyCode:kc,bubbles:true}));}return 'Filled CE (Closure char-by-char)';}` +
@@ -1077,9 +1077,22 @@ export async function pressKey({ key, modifiers = [] }) {
               el.selectionStart = el.selectionEnd = start + '${escaped}'.length;
               el.dispatchEvent(new Event('input', {bubbles:true}));
               el.dispatchEvent(new Event('change', {bubbles:true}));
-            } else {
-              document.execCommand('insertText', false, '${escaped}');
+              return 'Pasted (input)';
             }
+            // ProseMirror: use native API to ensure state updates
+            var pm = el && el.closest && el.closest('.ProseMirror');
+            if (pm) {
+              var v = null;
+              if (pm.pmViewDesc && pm.pmViewDesc.view) v = pm.pmViewDesc.view;
+              else { var keys = Object.keys(pm); for (var i=0;i<keys.length;i++) { var o=pm[keys[i]]; if(o&&o.state&&o.dispatch){v=o;break;} } }
+              if (v && v.dispatch) {
+                v.dispatch(v.state.tr.insertText('${escaped}'));
+                v.focus();
+                return 'Pasted (ProseMirror)';
+              }
+            }
+            // Default: execCommand
+            document.execCommand('insertText', false, '${escaped}');
             return 'Pasted';
           })()`
         );
@@ -1152,7 +1165,7 @@ export async function typeText({ text, selector, ref }) {
   const result = await runJS(
     `(function(){var el=document.activeElement;if(!el)return 'No focused element';` +
     // ProseMirror: use native API
-    `var pm=el.closest&&el.closest('.ProseMirror');if(pm){try{var v=(pm.pmViewDesc&&pm.pmViewDesc.view);if(v&&v.dispatch){var tr=v.state.tr.insertText('${safeText}');v.dispatch(tr);v.focus();return 'Typed ${text.length} chars (ProseMirror)';}}catch(e){}}` +
+    `var pm=el.closest&&el.closest('.ProseMirror');if(pm){try{var v=null;if(pm.pmViewDesc&&pm.pmViewDesc.view)v=pm.pmViewDesc.view;else{var keys=Object.keys(pm);for(var ki=0;ki<keys.length;ki++){var o=pm[keys[ki]];if(o&&o.state&&o.dispatch){v=o;break;}}}if(v&&v.dispatch){var tr=v.state.tr.insertText('${safeText}');v.dispatch(tr);v.focus();return 'Typed ${text.length} chars (ProseMirror)';}}catch(e){}}` +
     // Closure/Medium: char-by-char with keyboard events + Enter handling
     `var isClosure=el.isContentEditable&&(Object.keys(el).some(function(k){return k.startsWith('closure_uid_');})||location.hostname.includes('medium.com'));` +
     `if(isClosure){var txt='${safeText}';for(var i=0;i<txt.length;i++){var target=document.activeElement||el;var ch=txt[i];if(ch==='\\n'){target.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',keyCode:13,bubbles:true}));document.execCommand('insertParagraph');target.dispatchEvent(new KeyboardEvent('keyup',{key:'Enter',keyCode:13,bubbles:true}));continue;}var kc=ch.charCodeAt(0);target.dispatchEvent(new KeyboardEvent('keydown',{key:ch,keyCode:kc,bubbles:true}));document.execCommand('insertText',false,ch);target.dispatchEvent(new InputEvent('input',{data:ch,inputType:'insertText',bubbles:true}));target.dispatchEvent(new KeyboardEvent('keyup',{key:ch,keyCode:kc,bubbles:true}));}return 'Typed ${text.length} chars (Closure char-by-char)';}` +
