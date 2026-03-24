@@ -764,7 +764,8 @@ server.tool(
       );
     } catch (err) {
       // If AppleScript screenshot failed (permission lost), retry via extension only
-      if (_extensionConnected && err.message && (err.message.includes("permission") || err.message.includes("screencapture") || err.message.includes("empty"))) {
+      // But only if we're not in profile mode (extension may be from wrong profile)
+      if (_extensionConnected && !_preferAppleScript && err.message && (err.message.includes("permission") || err.message.includes("screencapture") || err.message.includes("empty"))) {
         console.error("[Safari MCP] Screenshot AppleScript failed, retrying via extension only");
         base64 = await sendToExtension("screenshot", { fullPage }, 15000);
       } else {
