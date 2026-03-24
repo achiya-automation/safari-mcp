@@ -16,6 +16,13 @@ import { randomUUID } from "node:crypto";
 // ========== SESSION ID (unique per MCP process — enables per-session tab tracking) ==========
 const SESSION_ID = randomUUID().slice(0, 8);
 
+// ========== EXTENSION FOCUS SAFETY ==========
+// When SAFARI_PROFILE is set, the extension's browser.scripting.executeScript()
+// can steal window focus in Safari (bringing the automation window to front).
+// AppleScript's `do JavaScript in tab N of window id X` does NOT steal focus.
+// So when a profile is configured, we prefer the AppleScript path to avoid disruption.
+const _preferAppleScript = !!process.env.SAFARI_PROFILE;
+
 // ========== EXTENSION BRIDGE (WebSocket + HTTP polling) ==========
 const WS_PORT = 9223;
 const HTTP_PORT = 9224;
@@ -373,21 +380,19 @@ const _nullMeansFailure = new Set([
   // CSP fallback is handled separately via isCspError check.
 ]);
 
-// Try extension first, fall back to AppleScript
+// Try extension first, fall back to AppleScript.
+// When SAFARI_PROFILE is set, skip extension entirely — AppleScript doesn't steal focus.
 async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) {
-  if (_extensionConnected) {
+  if (_extensionConnected && !_preferAppleScript) {
     try {
       const t0 = Date.now();
       const tabUrl = safari.getActiveTabURL();
       const payload = { ...extensionPayload, sessionId: SESSION_ID, ...(tabUrl ? { tabUrl } : {}) };
       const timeout = _commandTimeouts[extensionType] || 30000;
       const result = await sendToExtension(extensionType, payload, timeout);
-      // If extension returned null or "Element not found" for action commands,
-      // fall back to AppleScript (which has better element discovery with helpers)
       const isCspError = typeof result === 'string' && (result.includes('unsafe-eval') || result.includes('trusted-types') || result.includes('Trusted Type') || result.includes('Content Security Policy'));
       const isPermissionDenied = typeof result === 'string' && result.includes('__SCREENSHOT_PERMISSION_DENIED__');
       const isFailed = result === null || (typeof result === 'string' && result.startsWith('Element not found'));
-      // Permission denied or CSP errors ALWAYS fall back to AppleScript
       if (isPermissionDenied) {
         console.error(`[Safari MCP] ${extensionType} permission denied (${Date.now() - t0}ms) — falling back to AppleScript`);
       } else if (isCspError) {
