@@ -1597,11 +1597,12 @@ async function _verifyProfileMatch(expectedProfile) {
         return false;
       }
     }
-    // If verification endpoint doesn't exist yet, allow connection (backward compat)
-    return true;
+    // Verification endpoint not available or non-200 — reject to be safe
+    console.log("Safari MCP: profile verification inconclusive — rejecting connection");
+    return false;
   } catch (err) {
-    console.warn("Safari MCP: profile verification error:", err.message);
-    return true; // Allow on error (backward compat)
+    console.warn("Safari MCP: profile verification error:", err.message, "— rejecting connection");
+    return false; // Reject on error — better to miss extension than operate in wrong profile
   }
 }
 

@@ -129,7 +129,11 @@ async function refreshTargetWindow(force = false) {
   ).catch(() => '0');
   const id = Number(result);
   if (id > 0) {
-    _targetWindowRef = `window id ${id}`;
+    const newRef = `window id ${id}`;
+    if (_targetWindowRef && _targetWindowRef !== newRef) {
+      console.error(`[Safari MCP] Profile window changed: ${_targetWindowRef} → ${newRef}`);
+    }
+    _targetWindowRef = newRef;
     _targetWindowCacheTime = now;
     _profileWindowMissing = false;
   } else {
@@ -145,6 +149,11 @@ async function refreshTargetWindow(force = false) {
 if (SAFARI_PROFILE) {
   await new Promise(r => setTimeout(r, 50)); // Let helper process initialize
   await refreshTargetWindow(true);
+  if (_targetWindowRef) {
+    console.error(`[Safari MCP] Profile "${SAFARI_PROFILE}" → targeting ${_targetWindowRef}`);
+  } else {
+    console.error(`[Safari MCP] WARNING: Profile "${SAFARI_PROFILE}" window NOT found at startup`);
+  }
 }
 
 // Detect stale window ID errors and invalidate cache
@@ -954,7 +963,7 @@ export async function fill({ selector, value, ref }) {
   return runJS(
     `(function(){try{var el=document.querySelector('${sel}');if(!el){var q=function(r){var a=r.querySelectorAll('*');for(var i=0;i<a.length;i++){if(a[i].shadowRoot){el=a[i].shadowRoot.querySelector('${sel}');if(el)return el;el=q(a[i].shadowRoot);if(el)return el;}}return null;};el=q(document);}if(!el)return 'Element not found: ${sel}';el.focus();if(el.isContentEditable||el.getAttribute('contenteditable')==='true'){` +
     // ProseMirror detection
-    `var pm=el.closest('.ProseMirror')||el.querySelector('.ProseMirror');if(pm){try{var v=(pm.pmViewDesc&&pm.pmViewDesc.view)||(pm.cmView&&pm.cmView.view);if(v&&v.state&&v.dispatch){var tr=v.state.tr;tr.replaceWith(0,v.state.doc.content.size,v.state.schema.text('${val}'));v.dispatch(tr);v.focus();return 'Filled CE (ProseMirror API)';}}catch(e){}}` +
+    `var pm=el.closest('.ProseMirror')||el.querySelector('.ProseMirror');if(pm){try{var v=(pm.pmViewDesc&&pm.pmViewDesc.view)||(pm.cmView&&pm.cmView.view);if(v&&v.state&&v.dispatch){var doc=v.state.doc;var hasContent=doc.textContent&&doc.textContent.trim().length>0;if(hasContent){var endPos=doc.content.size>1?doc.content.size-1:doc.content.size;v.dispatch(v.state.tr.insertText(' ${val}',endPos));v.focus();return 'Filled CE (ProseMirror append)';}else{var tr=v.state.tr;tr.replaceWith(0,doc.content.size,v.state.schema.text('${val}'));v.dispatch(tr);v.focus();return 'Filled CE (ProseMirror replace)';}}}catch(e){}}` +
     // Closure/Medium detection — return error, don't break
     `var isClosure=Object.keys(el).some(function(k){return k.startsWith('closure_uid_');})||location.hostname.includes('medium.com');if(isClosure){var hasContent=el.textContent&&el.textContent.trim().length>0;if(hasContent)return 'ERROR: Closure/Medium editor — use safari_type_text instead of fill';` +
     `for(var ci=0;ci<'${val}'.length;ci++){var target=document.activeElement||el;var ch='${val}'[ci];if(ch==='\\n'){target.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',keyCode:13,bubbles:true}));document.execCommand('insertParagraph');target.dispatchEvent(new KeyboardEvent('keyup',{key:'Enter',keyCode:13,bubbles:true}));continue;}var kc=ch.charCodeAt(0);target.dispatchEvent(new KeyboardEvent('keydown',{key:ch,keyCode:kc,bubbles:true}));document.execCommand('insertText',false,ch);target.dispatchEvent(new InputEvent('input',{data:ch,inputType:'insertText',bubbles:true}));target.dispatchEvent(new KeyboardEvent('keyup',{key:ch,keyCode:kc,bubbles:true}));}return 'Filled CE (Closure char-by-char)';}` +
@@ -1281,6 +1290,7 @@ export async function replaceEditorContent({ text }) {
 // ========== SCREENSHOT ==========
 
 export async function screenshot({ fullPage = false } = {}) {
+  await refreshTargetWindow();
   const tmpFile = join(tmpdir(), `safari-screenshot-${Date.now()}.png`);
   let savedTabIdx = null;
   try {
@@ -1586,6 +1596,7 @@ export async function newTab(url = "") {
 }
 
 export async function closeTab() {
+  await refreshTargetWindow();
   if (_activeTabIndex) {
     await osascript(
       `tell application "Safari" to close tab ${_activeTabIndex} of ${getTargetWindowRef()}`
@@ -1756,6 +1767,7 @@ export async function handleDialog({ action = "accept", text }) {
 // ========== WINDOW ==========
 
 export async function resizeWindow({ width, height }) {
+  await refreshTargetWindow();
   await osascript(
     `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {0, 0, ${Number(width)}, ${Number(height)}}`
   );
@@ -1993,6 +2005,7 @@ export async function pasteImageFromFile({ filePath }) {
 // ========== EMULATE (VIEWPORT) ==========
 
 export async function emulate({ device, width, height, userAgent, scale = 1 }) {
+  await refreshTargetWindow();
   const devices = {
     "iphone-14": { width: 390, height: 844, ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" },
     "iphone-14-pro-max": { width: 430, height: 932, ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" },
@@ -2039,6 +2052,7 @@ export async function emulate({ device, width, height, userAgent, scale = 1 }) {
 }
 
 export async function resetEmulation() {
+  await refreshTargetWindow();
   // Reset user agent
   await runJS(
     "delete Object.getOwnPropertyDescriptor(Navigator.prototype,'userAgent')||true"
@@ -2073,6 +2087,7 @@ export async function clearConsoleCapture() {
 // ========== PDF SAVE ==========
 
 export async function savePDF({ path: pdfPath }) {
+  await refreshTargetWindow();
   const safePath = pdfPath.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "").replace(/\r/g, "");
   // Save which app was active BEFORE we steal focus, so we can restore it
   let previousApp = "";
@@ -2083,8 +2098,12 @@ export async function savePDF({ path: pdfPath }) {
   } catch (_) {}
 
   try {
+    // When profile is set, bring the profile window to front (not just any Safari window)
+    const activateScript = SAFARI_PROFILE
+      ? `tell application "Safari"\n  set index of ${getTargetWindowRef()} to 1\n  activate\nend tell`
+      : `tell application "Safari" to activate`;
     await osascript(
-      `tell application "Safari" to activate
+      `${activateScript}
       delay 0.3
       tell application "System Events"
         tell process "Safari"
@@ -3045,6 +3064,7 @@ export async function scrollToElement({ selector, text, block = "center", timeou
 
 // Navigate + wait + read — the most common 3-step workflow
 export async function navigateAndRead(url, { maxLength = 50000 } = {}) {
+  await refreshTargetWindow();
   let targetUrl = url;
   if (!/^https?:\/\//i.test(targetUrl)) targetUrl = "https://" + targetUrl;
   const safeUrl = targetUrl.replace(/"/g, '\\"');
