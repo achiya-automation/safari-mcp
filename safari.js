@@ -366,16 +366,10 @@ function _helperNativeClick(x, y, doubleClick = false, timeout = 5000) {
 async function _getSafariWindowGeometry() {
   await refreshTargetWindow();
   const windowRef = getTargetWindowRef();
-  // Get window bounds: {x, y, width, height} in screen coordinates
-  // Use direct osascript (not daemon) — daemon sometimes returns empty for bounds
-  let boundsResult = await osascriptFast(
+  // Get window bounds — always use direct osascript (daemon returns empty for this)
+  const boundsResult = await osascript(
     `tell application "Safari" to get bounds of ${windowRef}`
   );
-  if (!boundsResult || !boundsResult.includes(",")) {
-    boundsResult = await osascript(
-      `tell application "Safari" to get bounds of ${windowRef}`
-    );
-  }
   // boundsResult = "x1, y1, x2, y2"
   const parts = boundsResult.split(",").map(s => Number(s.trim()));
   if (parts.length !== 4 || parts.some(isNaN)) {
