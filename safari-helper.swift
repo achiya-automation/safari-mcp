@@ -19,6 +19,17 @@ import CoreGraphics
 func performNativeClick(x: Double, y: Double, doubleClick: Bool = false) -> [String: Any] {
   let point = CGPoint(x: x, y: y)
 
+  // Save current mouse position so we can restore it after the click.
+  // This prevents the physical cursor from visibly jumping away from the user.
+  let savedPosition = CGEvent(source: nil)?.location ?? CGPoint.zero
+
+  // Restore mouse position when we exit — even if we return early on error.
+  defer {
+    if let restoreEvent = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: savedPosition, mouseButton: .left) {
+      restoreEvent.post(tap: .cghidEventTap)
+    }
+  }
+
   // Create mouse events
   guard let moveEvent = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left) else {
     return ["error": "Failed to create mouse move event"]
@@ -64,6 +75,7 @@ func performNativeClick(x: Double, y: Double, doubleClick: Bool = false) -> [Str
     upEvent.post(tap: .cghidEventTap)
   }
 
+  // defer will restore mouse position after this return
   return ["result": "clicked at (\(Int(x)),\(Int(y)))\(doubleClick ? " (double)" : "")"]
 }
 
