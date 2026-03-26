@@ -322,6 +322,70 @@ function _osascriptFastHelper(script, timeout) {
   });
 }
 
+// ========== NATIVE CLICK VIA CGEVENT ==========
+// Sends a CGEvent click command to the Swift helper daemon.
+// This produces isTrusted: true events — bypasses WAF protection (G2, etc.)
+
+function _helperNativeClick(x, y, doubleClick = false, timeout = 5000) {
+  return new Promise((resolve, reject) => {
+    if (!_helperProc) startHelper();
+    if (!_helperProc || !_helperProc.stdin) {
+      reject(new Error("safari-helper not available for native click"));
+      return;
+    }
+    let resolved = false;
+    const timer = setTimeout(() => {
+      if (resolved) return;
+      resolved = true;
+      const idx = _helperQueue.indexOf(cb);
+      if (idx >= 0) _helperQueue.splice(idx, 1);
+      reject(new Error("native click timeout"));
+    }, timeout);
+
+    function cb(line) {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed.error) reject(new Error(parsed.error));
+        else resolve(parsed.result ?? "");
+      } catch {
+        resolve(line);
+      }
+    }
+
+    _helperQueue.push(cb);
+    const cmd = { click: { x, y } };
+    if (doubleClick) cmd.click.double = true;
+    _helperProc.stdin.write(JSON.stringify(cmd) + "\n");
+  });
+}
+
+// Get Safari window bounds and toolbar height for coordinate calculation
+async function _getSafariWindowGeometry() {
+  await refreshTargetWindow();
+  const windowRef = getTargetWindowRef();
+  // Get window bounds: {x, y, width, height} in screen coordinates
+  const boundsResult = await osascriptFast(
+    `tell application "Safari" to get bounds of ${windowRef}`
+  );
+  // boundsResult = "x1, y1, x2, y2"
+  const parts = boundsResult.split(",").map(s => Number(s.trim()));
+  if (parts.length !== 4 || parts.some(isNaN)) {
+    throw new Error("Failed to parse Safari window bounds: " + boundsResult);
+  }
+  return {
+    windowX: parts[0],
+    windowY: parts[1],
+    windowRight: parts[2],
+    windowBottom: parts[3],
+    // Safari toolbar height: standard is ~74px (address bar + tab bar).
+    // This is approximate — varies with compact tabs, bookmarks bar, etc.
+    toolbarHeight: 74
+  };
+}
+
 // Run JavaScript in Safari — fastest path, no focus stealing
 // Uses osascriptFast (persistent process, ~5ms) for short scripts,
 // falls back to osascript (~80ms) for long scripts that exceed stdin limits
@@ -951,6 +1015,100 @@ export async function rightClick({ selector, x, y }) {
     );
   }
   throw new Error("rightClick requires selector or x/y coordinates");
+}
+
+// ========== NATIVE CLICK (OS-level CGEvent — produces isTrusted: true) ==========
+// Unlike JS clicks (dispatchEvent/element.click), CGEvent clicks are real OS input.
+// Sites with WAF protection (G2, Cloudflare, etc.) that check isTrusted will accept these.
+// Trade-off: this moves the physical mouse cursor and requires Safari to be visible.
+
+export async function nativeClick({ selector, text, x, y, ref, doubleClick = false }) {
+  await ensureHelpers();
+
+  // Step 1: Get element's viewport coordinates via JavaScript
+  let viewportCoords;
+  if (ref || selector || text) {
+    let jsExpr;
+    if (ref) {
+      jsExpr = `(function(){
+        var el = mcpFindRef('${ref}');
+        if (!el) return JSON.stringify({error: 'Element not found: ref=${ref}'});
+        el.scrollIntoView({block:'center', behavior:'instant'});
+        var rect = el.getBoundingClientRect();
+        return JSON.stringify({
+          x: Math.round(rect.left + rect.width / 2),
+          y: Math.round(rect.top + rect.height / 2),
+          tag: el.tagName,
+          text: (el.innerText || el.textContent || '').trim().substring(0, 50)
+        });
+      })()`;
+    } else if (selector) {
+      const sel = selector.replace(/'/g, "\\'");
+      jsExpr = `(function(){
+        var el = document.querySelector('${sel}');
+        if (!el) return JSON.stringify({error: 'Element not found: ${sel}'});
+        el.scrollIntoView({block:'center', behavior:'instant'});
+        var rect = el.getBoundingClientRect();
+        return JSON.stringify({
+          x: Math.round(rect.left + rect.width / 2),
+          y: Math.round(rect.top + rect.height / 2),
+          tag: el.tagName,
+          text: (el.innerText || el.textContent || '').trim().substring(0, 50)
+        });
+      })()`;
+    } else {
+      const safeText = text.replace(/'/g, "\\'");
+      jsExpr = `(function(){
+        var el = mcpFindText('${safeText}', true) || mcpFindText('${safeText}', false);
+        if (!el) return JSON.stringify({error: 'Element not found with text: ${safeText}'});
+        el.scrollIntoView({block:'center', behavior:'instant'});
+        var rect = el.getBoundingClientRect();
+        return JSON.stringify({
+          x: Math.round(rect.left + rect.width / 2),
+          y: Math.round(rect.top + rect.height / 2),
+          tag: el.tagName,
+          text: (el.innerText || el.textContent || '').trim().substring(0, 50)
+        });
+      })()`;
+    }
+
+    const result = await runJS(jsExpr);
+    try {
+      viewportCoords = JSON.parse(result);
+    } catch {
+      throw new Error("Failed to get element coordinates: " + result);
+    }
+    if (viewportCoords.error) {
+      throw new Error(viewportCoords.error);
+    }
+  } else if (x !== undefined && y !== undefined) {
+    // Direct viewport coordinates provided
+    viewportCoords = { x: Number(x), y: Number(y), tag: 'point', text: '' };
+  } else {
+    throw new Error("nativeClick requires selector, text, ref, or x/y coordinates");
+  }
+
+  // Step 2: Get Safari window position and toolbar geometry
+  const geo = await _getSafariWindowGeometry();
+
+  // Step 3: Calculate absolute screen coordinates
+  // screenX = windowLeft + viewportX
+  // screenY = windowTop + toolbarHeight + viewportY
+  const screenX = geo.windowX + viewportCoords.x;
+  const screenY = geo.windowY + geo.toolbarHeight + viewportCoords.y;
+
+  // Sanity check: ensure coordinates are within the window bounds
+  if (screenX < geo.windowX || screenX > geo.windowRight ||
+      screenY < geo.windowY || screenY > geo.windowBottom) {
+    console.error(`[Safari MCP] nativeClick: coords (${screenX},${screenY}) outside window bounds (${geo.windowX},${geo.windowY})-(${geo.windowRight},${geo.windowBottom}). Proceeding anyway.`);
+  }
+
+  // Step 4: Perform the native click via CGEvent
+  await _helperNativeClick(screenX, screenY, doubleClick);
+
+  const clickType = doubleClick ? 'Native double-clicked' : 'Native clicked';
+  const label = viewportCoords.tag + (viewportCoords.text ? ` "${viewportCoords.text}"` : '');
+  return `${clickType}: ${label} at screen (${screenX},${screenY})`;
 }
 
 // ========== FORM INPUT ==========

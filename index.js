@@ -359,11 +359,11 @@ function sendToExtension(type, payload = {}, timeoutMs = 30000) {
 
 // Per-command timeouts — fast commands get short timeouts, nav/screenshot get longer ones
 const _commandTimeouts = {
-  click: 10000, fill: 5000, read_page: 10000, get_source: 10000, evaluate: 15000,
+  click: 10000, fill: 5000, read_page: 30000, get_source: 10000, evaluate: 30000,
   type_text: 5000, press_key: 5000, scroll: 3000, scroll_to: 3000, scroll_to_element: 3000,
-  hover: 5000, list_tabs: 5000, new_tab: 15000, close_tab: 5000, switch_tab: 5000,
+  hover: 5000, list_tabs: 5000, new_tab: 15000, close_tab: 5000, switch_tab: 30000,
   wait_for: 30000, navigate: 30000, navigate_and_read: 30000, go_back: 10000, go_forward: 10000,
-  reload: 15000, screenshot: 15000, snapshot: 15000, click_and_read: 15000,
+  reload: 15000, screenshot: 15000, snapshot: 30000, click_and_read: 15000,
   double_click: 10000, right_click: 10000, clear_field: 5000, select_option: 5000, fill_form: 10000,
   get_url: 3000, get_title: 3000,
 };
@@ -618,6 +618,26 @@ server.tool(
       "right_click", { selector: args.selector, x: args.x, y: args.y },
       () => safari.rightClick(args)
     );
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+  }
+);
+
+// ========== NATIVE CLICK (OS-level, isTrusted: true) ==========
+
+server.tool(
+  "safari_native_click",
+  "OS-level mouse click via macOS CGEvent — produces isTrusted: true events that pass WAF/bot detection (G2, Cloudflare, etc.). Use when regular safari_click fails with 405/403 errors or form submissions are blocked. Trade-off: physically moves the mouse cursor and requires Safari window to be visible. Use ref (from snapshot), selector, text, or x/y. When using ref, always take a FRESH safari_snapshot first.",
+  {
+    ref: z.string().optional().describe("Ref ID from safari_snapshot (e.g. '0_5')"),
+    selector: z.string().optional().describe("CSS selector"),
+    text: z.string().optional().describe("Visible text to find and click"),
+    x: z.coerce.number().optional().describe("Viewport X coordinate"),
+    y: z.coerce.number().optional().describe("Viewport Y coordinate"),
+    doubleClick: z.boolean().optional().default(false).describe("Double-click instead of single click"),
+  },
+  async (args) => {
+    // Native click always uses AppleScript path (no extension) — it needs OS-level access
+    const result = await safari.nativeClick(args);
     return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
