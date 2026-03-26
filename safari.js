@@ -706,7 +706,7 @@ const INJECT_MCP_HELPERS = `if(window.__mcpVersion!==5){window.__mcpVersion=5;
     }
     var form=target.closest?target.closest('form'):null;
     if(form&&(target.type==='submit'||(target.tagName==='BUTTON'&&target.type!=='button'&&target.type!=='reset'))){
-      try{form.submit();}catch(e){}
+      try{form.requestSubmit?form.requestSubmit(target.type==='submit'?target:undefined):form.submit();}catch(e){}
     }
     return true;
   };

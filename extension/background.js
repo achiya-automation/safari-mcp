@@ -592,10 +592,16 @@ async function handleCommand(type, payload) {
           return "Navigated to: " + href;
         }
 
-        // Form submit fallback
+        // Form submit fallback — use requestSubmit to fire submit event + validation
         const form = el.closest ? el.closest("form") : null;
         if (form && (el.type === "submit" || (el.tagName === "BUTTON" && el.type !== "button" && el.type !== "reset"))) {
-          try { form.submit(); } catch (_) {}
+          try {
+            if (form.requestSubmit) {
+              form.requestSubmit(el.type === "submit" ? el : undefined);
+            } else {
+              form.submit();
+            }
+          } catch (_) {}
         }
 
         return "Clicked: " + el.tagName + (el.textContent ? ' "' + el.textContent.trim().substring(0, 50) + '"' : "");
