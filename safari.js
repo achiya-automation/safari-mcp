@@ -104,6 +104,7 @@ const RESOLVE_CACHE_MS = 1500; // Re-verify tab every 1.5 seconds (was 5s — to
 // Safari shows profile windows as: "ProfileName — Tab Title"
 const SAFARI_PROFILE = process.env.SAFARI_PROFILE || null;
 let _targetWindowRef = null; // null = not yet discovered. Updated by refreshTargetWindow()
+let _targetWindowId = null;  // Numeric window ID (for CGEvent window targeting)
 let _targetWindowCacheTime = 0;
 const TARGET_WINDOW_CACHE_MS = 5000;
 let _profileWindowMissing = false; // True when profile window is not found
@@ -134,11 +135,13 @@ async function refreshTargetWindow(force = false) {
       console.error(`[Safari MCP] Profile window changed: ${_targetWindowRef} → ${newRef}`);
     }
     _targetWindowRef = newRef;
+    _targetWindowId = id;
     _targetWindowCacheTime = now;
     _profileWindowMissing = false;
   } else {
     // Profile window not found — clear ref so getTargetWindowRef() will throw
     _targetWindowRef = null;
+    _targetWindowId = null;
     _targetWindowCacheTime = 0;
     _profileWindowMissing = true;
     console.error(`[Safari MCP] WARNING: Profile "${SAFARI_PROFILE}" window not found — refusing to use front window`);
@@ -326,7 +329,7 @@ function _osascriptFastHelper(script, timeout) {
 // Sends a CGEvent click command to the Swift helper daemon.
 // This produces isTrusted: true events — bypasses WAF protection (G2, etc.)
 
-function _helperNativeClick(x, y, doubleClick = false, timeout = 5000) {
+function _helperNativeClick(x, y, doubleClick = false, windowId = 0, timeout = 5000) {
   return new Promise((resolve, reject) => {
     if (!_helperProc) startHelper();
     if (!_helperProc || !_helperProc.stdin) {
@@ -358,22 +361,23 @@ function _helperNativeClick(x, y, doubleClick = false, timeout = 5000) {
     _helperQueue.push(cb);
     const cmd = { click: { x, y } };
     if (doubleClick) cmd.click.double = true;
+    if (windowId) cmd.click.windowId = windowId;
     _helperProc.stdin.write(JSON.stringify(cmd) + "\n");
   });
 }
 
-// Get Safari window bounds and toolbar height for coordinate calculation
+// Get Safari window bounds, toolbar height, and window ID for coordinate calculation
 async function _getSafariWindowGeometry() {
   await refreshTargetWindow();
   const windowRef = getTargetWindowRef();
-  // Get window bounds — always use direct osascript (daemon returns empty for this)
+  // Get window bounds + window ID — always use direct osascript (daemon returns empty for this)
   const boundsResult = await osascript(
-    `tell application "Safari" to get bounds of ${windowRef}`
+    `tell application "Safari"\n  set b to bounds of ${windowRef}\n  set wid to id of ${windowRef}\n  return (item 1 of b as text) & "," & (item 2 of b as text) & "," & (item 3 of b as text) & "," & (item 4 of b as text) & "," & (wid as text)\nend tell`
   );
-  // boundsResult = "x1, y1, x2, y2"
+  // boundsResult = "x1, y1, x2, y2, windowId"
   const parts = boundsResult.split(",").map(s => Number(s.trim()));
-  if (parts.length !== 4 || parts.some(isNaN)) {
-    throw new Error("Failed to parse Safari window bounds: " + boundsResult);
+  if (parts.length !== 5 || parts.some(isNaN)) {
+    throw new Error("Failed to parse Safari window geometry: " + boundsResult);
   }
   return {
     windowX: parts[0],
@@ -382,7 +386,9 @@ async function _getSafariWindowGeometry() {
     windowBottom: parts[3],
     // Safari toolbar height: standard is ~74px (address bar + tab bar).
     // This is approximate — varies with compact tabs, bookmarks bar, etc.
-    toolbarHeight: 74
+    toolbarHeight: 74,
+    // CGWindow ID for background click targeting (no mouse move, no focus steal)
+    windowId: parts[4]
   };
 }
 
@@ -1103,8 +1109,8 @@ export async function nativeClick({ selector, text, x, y, ref, doubleClick = fal
     console.error(`[Safari MCP] nativeClick: coords (${screenX},${screenY}) outside window bounds (${geo.windowX},${geo.windowY})-(${geo.windowRight},${geo.windowBottom}). Proceeding anyway.`);
   }
 
-  // Step 4: Perform the native click via CGEvent
-  await _helperNativeClick(screenX, screenY, doubleClick);
+  // Step 4: Perform the native click via CGEvent (targeted to specific window — no mouse move, no focus steal)
+  await _helperNativeClick(screenX, screenY, doubleClick, geo.windowId);
 
   const clickType = doubleClick ? 'Native double-clicked' : 'Native clicked';
   const label = viewportCoords.tag + (viewportCoords.text ? ` "${viewportCoords.text}"` : '');

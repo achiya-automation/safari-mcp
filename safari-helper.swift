@@ -4,55 +4,102 @@
 //
 // Input: JSON lines on stdin
 //   {"script": "full applescript"}           — run AppleScript
-//   {"click": {"x": 500, "y": 300}}         — CGEvent click at screen coords
-//   {"click": {"x": 500, "y": 300, "double": true}}  — CGEvent double-click
+//   {"click": {"x": 500, "y": 300, "windowId": 4127}}  — CGEvent click targeted to window
+//   {"click": {"x": 500, "y": 300, "windowId": 4127, "double": true}}  — double-click
+//   (windowId is optional — if omitted, falls back to global post)
 // Output: JSON lines {"result": "..."} or {"error": "..."} on stdout
 
 import Foundation
 import Darwin
 import CoreGraphics
+import AppKit
 
 // ========== CGEvent Native Click ==========
 // Performs a REAL OS-level mouse click that produces isTrusted: true in the browser.
 // Requires Accessibility permissions (same as AppleScript automation).
 
-func performNativeClick(x: Double, y: Double, doubleClick: Bool = false) -> [String: Any] {
+func performNativeClick(x: Double, y: Double, doubleClick: Bool = false, windowId: Int64 = 0) -> [String: Any] {
   let point = CGPoint(x: x, y: y)
 
-  // Save current mouse position so we can restore it after the click.
-  // This prevents the physical cursor from visibly jumping away from the user.
-  let savedPosition = CGEvent(source: nil)?.location ?? CGPoint.zero
+  // --- Window-targeted click ---
+  // When windowId is provided, we set CGEventField.windowNumber on the event.
+  // This sends the click to the specific window WITHOUT moving the physical mouse
+  // and WITHOUT bringing Safari to the foreground.
+  // When windowId is 0 (not provided), fall back to global post (legacy behavior).
 
-  // Restore mouse position when we exit — even if we return early on error.
-  defer {
-    if let restoreEvent = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: savedPosition, mouseButton: .left) {
-      restoreEvent.post(tap: .cghidEventTap)
+  // Get Safari PID for process-targeted event posting (when windowId is set)
+  var safariPID: pid_t = 0
+  if windowId > 0 {
+    let ws = NSWorkspace.shared
+    for app in ws.runningApplications {
+      if app.bundleIdentifier == "com.apple.Safari" {
+        safariPID = app.processIdentifier
+        break
+      }
+    }
+    if safariPID == 0 {
+      return ["error": "Safari process not found"]
     }
   }
 
-  // Create mouse events
-  guard let moveEvent = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left) else {
-    return ["error": "Failed to create mouse move event"]
+  // Helper: configure event with window targeting
+  // kCGMouseEventWindowUnderMousePointer = 91 (not bridged to Swift CGEventField)
+  // kCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent = 92
+  let kWindowField = CGEventField(rawValue: 91)! // windowUnderMousePointer
+  let kWindowHandlerField = CGEventField(rawValue: 92)! // windowThatCanHandleThisEvent
+
+  func configureEvent(_ event: CGEvent) {
+    if windowId > 0 {
+      // Target the specific window — the event goes to that window
+      // even if it's behind other windows, and the mouse stays where it is.
+      event.setIntegerValueField(kWindowField, value: windowId)
+      event.setIntegerValueField(kWindowHandlerField, value: windowId)
+    }
   }
+
+  // Helper: post event — to Safari process if targeted, global otherwise
+  func postEvent(_ event: CGEvent) {
+    if windowId > 0 {
+      event.postToPid(safariPID)
+    } else {
+      event.post(tap: .cghidEventTap)
+    }
+  }
+
+  if windowId == 0 {
+    // Legacy path: no window targeting. Move mouse + restore (old behavior).
+    let savedPosition = CGEvent(source: nil)?.location ?? CGPoint.zero
+    defer {
+      if let restoreEvent = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: savedPosition, mouseButton: .left) {
+        restoreEvent.post(tap: .cghidEventTap)
+      }
+    }
+    guard let moveEvent = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left) else {
+      return ["error": "Failed to create mouse move event"]
+    }
+    moveEvent.post(tap: .cghidEventTap)
+    usleep(20_000)
+  }
+  // When windowId > 0, we do NOT move the mouse at all.
+
+  // Create mouse down/up events at the target coordinates
   guard let downEvent = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left) else {
     return ["error": "Failed to create mouse down event"]
   }
   guard let upEvent = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left) else {
     return ["error": "Failed to create mouse up event"]
   }
-
-  // Move mouse to position first (some apps need this)
-  moveEvent.post(tap: .cghidEventTap)
-  usleep(20_000) // 20ms settle
+  configureEvent(downEvent)
+  configureEvent(upEvent)
 
   if doubleClick {
     // First click
     downEvent.setIntegerValueField(.mouseEventClickState, value: 1)
     upEvent.setIntegerValueField(.mouseEventClickState, value: 1)
-    downEvent.post(tap: .cghidEventTap)
-    usleep(50_000) // 50ms between down/up
-    upEvent.post(tap: .cghidEventTap)
-    usleep(50_000) // 50ms between clicks
+    postEvent(downEvent)
+    usleep(50_000)
+    postEvent(upEvent)
+    usleep(50_000)
 
     // Second click
     guard let down2 = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left) else {
@@ -61,22 +108,24 @@ func performNativeClick(x: Double, y: Double, doubleClick: Bool = false) -> [Str
     guard let up2 = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left) else {
       return ["error": "Failed to create second mouse up event"]
     }
+    configureEvent(down2)
+    configureEvent(up2)
     down2.setIntegerValueField(.mouseEventClickState, value: 2)
     up2.setIntegerValueField(.mouseEventClickState, value: 2)
-    down2.post(tap: .cghidEventTap)
+    postEvent(down2)
     usleep(50_000)
-    up2.post(tap: .cghidEventTap)
+    postEvent(up2)
   } else {
     // Single click
     downEvent.setIntegerValueField(.mouseEventClickState, value: 1)
     upEvent.setIntegerValueField(.mouseEventClickState, value: 1)
-    downEvent.post(tap: .cghidEventTap)
-    usleep(50_000) // 50ms between down/up for reliability
-    upEvent.post(tap: .cghidEventTap)
+    postEvent(downEvent)
+    usleep(50_000)
+    postEvent(upEvent)
   }
 
-  // defer will restore mouse position after this return
-  return ["result": "clicked at (\(Int(x)),\(Int(y)))\(doubleClick ? " (double)" : "")"]
+  let targetInfo = windowId > 0 ? " (window \(windowId), background)" : ""
+  return ["result": "clicked at (\(Int(x)),\(Int(y)))\(doubleClick ? " (double)" : "")\(targetInfo)"]
 }
 
 // ========== Response Helper ==========
@@ -91,8 +140,8 @@ func respond(_ obj: [String: Any]) {
   fflush(stdout)
 }
 
-// ========== CLI Mode: --click X Y ==========
-// For direct invocation: swift safari-helper.swift --click 500 300
+// ========== CLI Mode: --click X Y [--window WID] [--double] ==========
+// For direct invocation: safari-helper --click 500 300 --window 4127
 
 let args = CommandLine.arguments
 if args.count >= 4 && args[1] == "--click" {
@@ -100,8 +149,19 @@ if args.count >= 4 && args[1] == "--click" {
     respond(["error": "Invalid coordinates: \(args[2]) \(args[3])"])
     exit(1)
   }
-  let isDouble = args.count >= 5 && args[4] == "--double"
-  let result = performNativeClick(x: x, y: y, doubleClick: isDouble)
+  var isDouble = false
+  var windowId: Int64 = 0
+  var i = 4
+  while i < args.count {
+    if args[i] == "--double" {
+      isDouble = true
+    } else if args[i] == "--window" && i + 1 < args.count {
+      windowId = Int64(args[i + 1]) ?? 0
+      i += 1
+    }
+    i += 1
+  }
+  let result = performNativeClick(x: x, y: y, doubleClick: isDouble, windowId: windowId)
   respond(result)
   exit(result["error"] != nil ? 1 : 0)
 }
@@ -122,7 +182,8 @@ while let line = readLine(strippingNewline: true) {
      let x = clickData["x"] as? Double,
      let y = clickData["y"] as? Double {
     let isDouble = (clickData["double"] as? Bool) ?? false
-    respond(performNativeClick(x: x, y: y, doubleClick: isDouble))
+    let windowId = Int64((clickData["windowId"] as? Int) ?? 0)
+    respond(performNativeClick(x: x, y: y, doubleClick: isDouble, windowId: windowId))
     continue
   }
 
