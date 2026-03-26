@@ -511,17 +511,24 @@ export async function navigate(url) {
       { timeout: 10000 }
     );
 
-    // Step 2: Poll readyState via JS (runs in Safari, doesn't block daemon)
-    const result = await runJS(
-      `(async function(){
-        for(var i=0;i<80;i++){
-          if(document.readyState==='complete')break;
-          await new Promise(function(r){setTimeout(r,200)});
+    // Step 2: Poll readyState synchronously from Node.js side
+    // (AppleScript do JavaScript doesn't await async Promises — returns immediately)
+    let result = '{}';
+    for (let poll = 0; poll < 80; poll++) {
+      await new Promise(r => setTimeout(r, 200));
+      try {
+        const state = await runJS('document.readyState', { timeout: 5000 });
+        if (state === 'complete' || state === 'interactive') {
+          result = await runJS(
+            `JSON.stringify({title:document.title,url:location.href,blocked:document.title.includes('cannot open')||document.title.includes('אין אפשרות')})`,
+            { timeout: 5000 }
+          );
+          if (state === 'complete') break;
+          // interactive = DOM ready but resources still loading — wait a bit more
+          if (poll > 10) break; // Don't wait forever for 'complete' if interactive after 2s
         }
-        return JSON.stringify({title:document.title,url:location.href,blocked:document.title.includes('cannot open')||document.title.includes('אין אפשרות')});
-      })()`,
-      { timeout: 30000 }
-    );
+      } catch { /* page still loading, retry */ }
+    }
 
     // Inject click helpers in background (non-blocking, for subsequent clicks)
     _injectHelpersfast().catch(() => {});
@@ -537,15 +544,20 @@ export async function navigate(url) {
         await osascriptFast(
           `tell application "Safari" to set URL of ${navTarget} to "${httpUrl}"`
         );
-        const retry = await runJS(
-          `(async function(){
-            for(var i=0;i<40;i++){
-              if(document.readyState==='complete')break;
-              await new Promise(function(r){setTimeout(r,300)});
+        // Poll readyState for HTTP retry (same sync approach)
+        let retryResult = '{}';
+        for (let rp = 0; rp < 40; rp++) {
+          await new Promise(r => setTimeout(r, 300));
+          try {
+            const rs = await runJS('document.readyState', { timeout: 5000 });
+            if (rs === 'complete' || rs === 'interactive') {
+              retryResult = await runJS('JSON.stringify({title:document.title,url:location.href})', { timeout: 5000 });
+              if (rs === 'complete') break;
+              if (rp > 8) break;
             }
-            return JSON.stringify({title:document.title,url:location.href});
-          })()`
-        );
+          } catch { /* retry */ }
+        }
+        const retry = retryResult;
         // Update URL tracking with actual URL after HTTP retry
         try {
           const retryParsed = JSON.parse(retry);
