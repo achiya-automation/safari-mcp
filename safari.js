@@ -750,6 +750,16 @@ const INJECT_MCP_HELPERS = `if(window.__mcpVersion!==5){window.__mcpVersion=5;
       var hit=window.mcpElementFromPoint(x,y);
       if(!hit)continue;
       if(base===hit||base.contains(hit)||hit.contains(base))return window.mcpPickActionable(hit)||hit;
+      // Overlay pattern: transparent button/link overlays a text label (e.g. dropdown items).
+      // If the hit is an interactive element sharing a nearby common ancestor, prefer it.
+      var hitAction=window.mcpPickActionable(hit);
+      if(hitAction&&hitAction!==base&&hitAction.matches&&hitAction.matches('button,a[href],[role="button"],[role="option"],[role="menuitem"]')){
+        var p=base.parentElement;
+        for(var k=0;k<4&&p;k++){
+          if(p.contains(hitAction))return hitAction;
+          p=p.parentElement;
+        }
+      }
     }
     return base;
   };
@@ -1874,23 +1884,32 @@ export async function evaluate({ script }) {
   const isSimpleExpression = !js.includes(';') && !js.includes('\n') && !js.startsWith('var ') && !js.startsWith('let ') && !js.startsWith('const ');
 
   if (!isIIFE && !isSimpleExpression) {
-    if (!js.includes('return ') && !js.includes('return;')) {
-      const lines = js.split('\n');
-      for (let i = lines.length - 1; i >= 0; i--) {
-        const line = lines[i].trim();
-        if (!line || line.startsWith('//')) continue;
-        if (line.endsWith('}') || line.startsWith('var ') || line.startsWith('let ') || line.startsWith('const ')) break;
-        lines[i] = 'return ' + lines[i];
-        break;
-      }
+    const lines = js.split('\n');
+    let addedReturn = false;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line || line.startsWith('//')) continue;
+      if (line.startsWith('return ') || line.startsWith('return;')) { addedReturn = true; break; }
+      if (line.endsWith('}') || line.startsWith('var ') || line.startsWith('let ') || line.startsWith('const ')) break;
+      lines[i] = 'return ' + lines[i];
+      addedReturn = true;
+      break;
+    }
+    if (addedReturn) {
       js = '(function(){' + lines.join('\n') + '})()';
     } else {
-      js = '(function(){' + js + '})()';
+      // Last line ends with } (if/else/for/while) or starts with var/let/const — can't prepend return.
+      // Use indirect eval to capture completion value. Falls back to plain IIFE on CSP-strict pages.
+      // eslint-disable-next-line no-eval
+      const escaped = js.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n').replace(/\r/g, '\\r');
+      js = "(function(){ try { return (0,eval)('" + escaped + "') } catch(_e) { " + js.replace(/\n/g, ' ') + " } })()";
     }
   }
 
-  // Wrap in try/catch to surface JS errors instead of swallowing them as "(no return value)"
-  const wrappedJs = `try { ${js} } catch(__mcpErr) { 'Error: ' + __mcpErr.message }`;
+  // Wrap in IIFE with try/catch. Safari's `do JavaScript` only returns values from single expressions —
+  // multi-statement scripts (var x; try{} x) return nothing. So the entire wrapper must be one IIFE.
+  const wrappedJs = `(function(){ try { return (${js}); } catch(__mcpErr) { return 'Error: ' + __mcpErr.message; } })()`;
+  if (process.env.MCP_DEBUG) console.error('[evaluate] wrapped:', wrappedJs.substring(0, 300));
   const result = await runJS(wrappedJs);
   if (result === null || result === undefined || result === '') {
     return '(no return value)';

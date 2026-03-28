@@ -8,6 +8,9 @@ let pollAbort = null;
 let _targetProfile = null;   // Profile name from server (e.g. "אוטומציות")
 let _profileWindowId = null; // Discovered windowId for the profile
 let _enabled = true;         // Toggle from popup — when false, stops polling and rejects commands
+let _reconnectTimer = null;  // Single reconnect timer — prevents exponential growth
+let _reconnectDelay = 3000;  // Current backoff delay (resets on successful connect)
+const _RECONNECT_MAX = 60000; // Max backoff: 60 seconds
 
 // ========== GLOBAL ERROR HANDLER ==========
 // Prevent unhandled errors from crashing the service worker
@@ -32,6 +35,8 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!_enabled) {
       isConnected = false;
       if (pollAbort) { try { pollAbort.abort(); } catch {} pollAbort = null; }
+      if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
+      _reconnectDelay = 3000;
       updateBadge("OFF");
     } else {
       updateBadge("");
@@ -90,25 +95,33 @@ async function connect() {
         await _discoverProfileWindow();
       }
       isConnected = true;
+      _reconnectDelay = 3000; // Reset backoff on success
       updateBadge("ON");
       pollForCommands();
       return;
     }
   } catch {}
 
-  // Server not available — use alarm to retry (keeps worker from dying)
+  // Server not available — single retry with exponential backoff
   isConnected = false;
   updateBadge("");
   scheduleReconnect();
 }
 
 function scheduleReconnect() {
-  // Immediate retry with setTimeout (works while service worker is alive)
-  // PLUS alarm as backup (wakes up terminated service worker — Safari minimum 1 minute)
-  setTimeout(connect, 3000);  // Fast retry: 3 seconds
-  setTimeout(() => { if (!isConnected) connect(); }, 10000); // Retry again at 10s
+  // Cancel any existing reconnect to prevent exponential growth
+  if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
+
+  // Single timer with exponential backoff (3s → 6s → 12s → ... → 60s max)
+  _reconnectTimer = setTimeout(() => {
+    _reconnectTimer = null;
+    connect();
+  }, _reconnectDelay);
+  _reconnectDelay = Math.min(_reconnectDelay * 2, _RECONNECT_MAX);
+
+  // Alarm as backup — wakes terminated service worker (Safari minimum 1 minute)
   try {
-    browser.alarms.create("reconnect", { delayInMinutes: 1 }); // Backup: alarm wakes terminated worker
+    browser.alarms.create("reconnect", { delayInMinutes: 1 });
   } catch {}
 }
 
@@ -118,21 +131,28 @@ async function pollForCommands() {
       pollAbort = new AbortController();
       // Long-poll: server holds connection open until a command arrives or timeout
       // This active fetch keeps the service worker alive in Safari
+      // 90s safety timeout prevents stuck connections from blocking forever
+      const timeout = setTimeout(() => pollAbort.abort(), 90000);
       const res = await fetch(`${HTTP_URL}/poll`, {
         signal: pollAbort.signal,
       });
+      clearTimeout(timeout);
       if (res.status === 200) {
         const msg = await res.json();
         await executeAndReply(msg);
       }
       // 204 = no command, loop immediately to keep connection active
     } catch (err) {
-      if (err.name === "AbortError") return; // Intentional abort
-      // Server gone — fast reconnect (server may have restarted)
+      if (err.name === "AbortError") {
+        // If still connected, this was a safety timeout — reconnect
+        if (isConnected && _enabled) { pollForCommands(); return; }
+        return; // Intentional abort (disable/new connect)
+      }
+      // Server gone — reconnect via shared scheduler (prevents duplicate timers)
       isConnected = false;
       updateBadge("");
-      console.log("Safari MCP: poll failed, reconnecting in 2s...", err.message);
-      setTimeout(connect, 2000);
+      console.log("Safari MCP: poll failed, reconnecting...", err.message);
+      scheduleReconnect();
       return;
     }
   }
@@ -1931,8 +1951,9 @@ async function waitForTabSettled(tabId, timeout = 3000) {
 browser.alarms.create("keepalive", { periodInMinutes: 1 });
 browser.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "keepalive" || alarm.name === "reconnect") {
-    if (!isConnected && _enabled) {
-      connect();
+    // Only reconnect if disconnected, enabled, and no reconnect already scheduled
+    if (!isConnected && _enabled && !_reconnectTimer) {
+      scheduleReconnect();
     }
   }
 });
