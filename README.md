@@ -372,13 +372,30 @@ The Safari MCP Extension is **optional but recommended**. Without it, ~80% of fu
 
 ### Installing the Extension
 
-1. Open the `extension/` folder in the repo
-2. In Safari → Settings → Advanced → enable **Show features for web developers**
-3. Safari → Develop → **Allow Unsigned Extensions**
-4. Safari → Settings → Extensions → enable **Safari MCP Bridge**
-5. The extension connects automatically to the MCP server on port `9224`
+The extension requires a one-time build with Xcode (free, included with macOS):
 
-The extension icon in Safari's toolbar shows connection status:
+**Prerequisites:** Xcode (install from App Store — free)
+
+```bash
+# 1. Build the extension app
+cd safari-mcp
+xcodebuild -project "xcode/Safari MCP/Safari MCP.xcodeproj" \
+  -scheme "Safari MCP (macOS)" -configuration Release build
+
+# 2. Find and open the built app
+open ~/Library/Developer/Xcode/DerivedData/Safari_MCP-*/Build/Products/Release/Safari\ MCP.app
+```
+
+Then in Safari:
+1. Safari → Settings → Advanced → enable **Show features for web developers**
+2. Safari → Develop → **Allow Unsigned Extensions** (required each Safari restart)
+3. Safari → Settings → Extensions → enable **Safari MCP Bridge**
+
+The extension connects automatically to the MCP server on port `9224`.
+
+> **Note:** "Allow Unsigned Extensions" resets every time Safari restarts. You'll need to re-enable it in the Develop menu after each restart. The extension itself stays installed.
+
+**Toolbar icon status:**
 - **ON** — connected to MCP server
 - **OFF** — manually disabled via popup
 - *(no badge)* — server not running, will auto-reconnect
