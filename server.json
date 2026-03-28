@@ -1,0 +1,22 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.achiya-automation/safari-mcp",
+  "description": "Native Safari browser automation for AI agents — 80 tools via AppleScript, zero Chrome overhead, keeps logins. macOS only.",
+  "repository": {
+    "url": "https://github.com/achiya-automation/safari-mcp",
+    "source": "github"
+  },
+  "version": "2.1.1",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "safari-mcp",
+      "version": "2.1.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtime": "node",
+      "environmentVariables": []
+    }
+  ]
+}
