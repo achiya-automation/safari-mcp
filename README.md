@@ -328,21 +328,60 @@ Add to your MCP client config:
 
 ## Architecture
 
+Safari MCP uses a **dual-engine** architecture — the Extension is preferred for speed and advanced capabilities, with AppleScript as an always-available fallback:
+
 ```
 Claude/Cursor/AI Agent
         ↓ MCP Protocol (stdio)
    Safari MCP Server (Node.js)
-        ↓ Persistent osascript process (~5ms/cmd)
-   AppleScript → Safari
-        ↓ do JavaScript in tab N
-   Page DOM (your real browser)
+        ↓                    ↓
+   Extension (HTTP)     AppleScript + Swift daemon
+   (~5-20ms/cmd)        (~5ms/cmd, always available)
+        ↓                    ↓
+   Content Script       do JavaScript in tab N
+        ↓                    ↓
+   Page DOM ←←←←←←←←←← Page DOM
 ```
 
 **Key design decisions:**
-- **Persistent osascript process** — one long-running process instead of spawning per command (16x faster)
+- **Dual engine with automatic fallback** — Extension is preferred; if not connected, AppleScript handles everything seamlessly
+- **Persistent Swift helper** — one long-running process instead of spawning per command (16x faster)
 - **Tab-indexed operations** — all JS runs on a specific tab by index, never steals visual focus
 - **JS-first approach** — typing, clicking, file upload all use JavaScript events (no System Events keyboard conflicts)
 - **No `activate`** — Safari is never brought to foreground
+
+---
+
+## Safari Extension (Optional)
+
+The Safari MCP Extension is **optional but recommended**. Without it, ~80% of functionality works via AppleScript alone. The extension adds capabilities that AppleScript cannot provide:
+
+### What the Extension Adds
+
+| Capability | With Extension | AppleScript Only |
+|-----------|:--------------:|:----------------:|
+| Closed Shadow DOM (Reddit, Web Components) | ✅ Full access | ❌ Invisible |
+| Strict CSP sites | ✅ Bypasses via MAIN world | ❌ Often blocked |
+| React/Vue/Angular state manipulation | ✅ Deep (Fiber, ProseMirror) | ⚠️ Basic |
+| Loading state detection (spinners, skeletons) | ✅ Smart detection | ❌ No |
+| Dialog handling (alert/confirm) | ❌ | ✅ Only AppleScript |
+| Native OS-level click (CGEvent) | ❌ | ✅ Only AppleScript |
+| PDF export | ❌ | ✅ Only AppleScript |
+
+> **When do you need the extension?** If you're automating modern SPAs with closed shadow DOM (e.g., Reddit), sites with strict Content Security Policy, or framework-heavy editors (Draft.js, ProseMirror, Slate).
+
+### Installing the Extension
+
+1. Open the `extension/` folder in the repo
+2. In Safari → Settings → Advanced → enable **Show features for web developers**
+3. Safari → Develop → **Allow Unsigned Extensions**
+4. Safari → Settings → Extensions → enable **Safari MCP Bridge**
+5. The extension connects automatically to the MCP server on port `9224`
+
+The extension icon in Safari's toolbar shows connection status:
+- **ON** — connected to MCP server
+- **OFF** — manually disabled via popup
+- *(no badge)* — server not running, will auto-reconnect
 
 ---
 
