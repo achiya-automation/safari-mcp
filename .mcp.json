@@ -1,0 +1,8 @@
+{
+  "name": "Safari MCP",
+  "description": "Native Safari browser automation for AI agents — 80 tools, zero Chrome overhead",
+  "command": "npx",
+  "args": ["safari-mcp"],
+  "env": {},
+  "tags": ["browser-automation", "safari", "macos", "webkit"]
+}
