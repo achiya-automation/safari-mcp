@@ -1,6 +1,6 @@
 {
   "name": "safari-mcp",
-  "version": "2.0.1",
+  "version": "2.1.0",
   "description": "Safari browser automation for AI agents — native macOS, zero Chrome overhead. 80 tools via AppleScript + JavaScript.",
   "type": "module",
   "main": "index.js",
@@ -22,7 +22,12 @@
     "claude",
     "cursor",
     "ai-agent",
-    "applescript"
+    "applescript",
+    "apple-silicon",
+    "web-automation",
+    "anthropic",
+    "windsurf",
+    "continue-dev"
   ],
   "author": "Achiya Automation <info@achiya-automation.com>",
   "license": "MIT",
@@ -39,6 +44,17 @@
   },
   "os": [
     "darwin"
+  ],
+  "files": [
+    "index.js",
+    "safari.js",
+    "safari-helper",
+    "safari-helper.swift",
+    "extension/",
+    "xcode/",
+    "glama.json",
+    "LICENSE",
+    "README.md"
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
