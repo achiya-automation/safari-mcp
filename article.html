@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>I Replaced Chrome DevTools MCP with Safari and My MacBook Stopped Overheating</title>
+</head>
+<body>
+<article>
+<h1>I Replaced Chrome DevTools MCP with Safari and My MacBook Stopped Overheating</h1>
+
+<img src="https://github.com/achiya-automation/safari-mcp/releases/download/v2.1.1/medium-safari-mcp-cover.png" alt="Safari MCP vs Chrome — native browser automation">
+
+<p>Three weeks ago I made a change that cut my MacBook Pro's average CPU temperature by roughly 15 degrees Celsius during work hours. I didn't buy a cooling pad. I stopped using Chrome.</p>
+
+<p>Not for browsing — I hadn't used Chrome for browsing in years. I stopped using it as the invisible backbone of my AI coding workflow.</p>
+
+<p>If you use Claude Code, Cursor, or any MCP-enabled AI tool with browser automation, there's a good chance Chrome is running in the background right now, eating 8–15% of your CPU.</p>
+
+<h2>The Setup That Was Cooking My Laptop</h2>
+
+<p>I run an automation consulting business. My daily workflow involves Claude Code connected to several MCP servers. The browser MCP server was Chrome DevTools MCP, which works by launching Chrome with a remote debugging port.</p>
+
+<p>Chrome with a debug port open idles at 8–15% CPU on an M2 MacBook Pro. During active automation it spikes to 25–40%. Chrome alone was consuming 200–400MB of RAM before a single page loaded.</p>
+
+<p>Safari was already open. All my logins were there. Gmail, GitHub, AWS console, client dashboards. I was running two browsers while the browser I actually needed was right there, already authenticated.</p>
+
+<h2>Why Safari?</h2>
+
+<p>Apple doesn't give you Chrome's hooks. What Safari does have is AppleScript — you can run arbitrary JavaScript in any Safari tab from an external process. It gives you access to the actual DOM of the actual browser where you're logged in.</p>
+
+<p>That was the starting point. It became <a href="https://github.com/achiya-automation/safari-mcp">Safari MCP</a> — 80 tools for native Safari browser automation via AppleScript + a Swift daemon.</p>
+
+<h2>What Changed</h2>
+
+<p>The first thing I noticed was silence. The fans stopped. Safari MCP uses about 30MB of memory. Idle CPU sits at 0.1%. During active automation it bumps to 2–5%.</p>
+
+<p>I stopped re-authenticating. The agent uses my real Safari with all my existing sessions. GitHub logged in. AWS logged in. Client portals logged in.</p>
+
+<p>Safari stopped stealing my focus. Every command targets a specific tab by index. Tabs open in the background. Clicks target specific window IDs without moving the cursor.</p>
+
+<h2>Getting Started</h2>
+
+<p><code>npm install safari-mcp</code></p>
+
+<p>Two files. MIT licensed. Works with Claude Code, Cursor, Windsurf, Claude Desktop, VS Code + Continue.</p>
+
+<p>GitHub: <a href="https://github.com/achiya-automation/safari-mcp">github.com/achiya-automation/safari-mcp</a></p>
+
+<p>I've been running this for three weeks in production. The fans have not come on once during browser automation.</p>
+
+<p><strong>If you could build an MCP browser server for Firefox using its remote debugging protocol, what would that architecture look like — and would WebExtensions make it easier or harder than AppleScript?</strong></p>
+
+</article>
+</body>
+</html>
