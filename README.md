@@ -9,6 +9,8 @@
 [![Node.js](https://img.shields.io/badge/Node.js-18%2B-green)](https://nodejs.org/)
 [![macOS](https://img.shields.io/badge/macOS-only-blue)](https://www.apple.com/macos/)
 [![MCP](https://img.shields.io/badge/MCP-compatible-purple)](https://modelcontextprotocol.io)
+[![npm downloads](https://img.shields.io/npm/dm/safari-mcp)](https://www.npmjs.com/package/safari-mcp)
+[![GitHub stars](https://img.shields.io/github/stars/achiya-automation/safari-mcp?style=social)](https://github.com/achiya-automation/safari-mcp/stargazers)
 [![achiya-automation/safari-mcp MCP server](https://glama.ai/mcp/servers/achiya-automation/safari-mcp/badges/score.svg)](https://glama.ai/mcp/servers/achiya-automation/safari-mcp)
 
 **80 tools** · **Zero dependencies** · **~5ms per command** · **60% less CPU than Chrome**
