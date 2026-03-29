@@ -17,6 +17,8 @@
 
 [Quick Start](#quick-start) · [All 80 Tools](#tools-80) · [Why Safari MCP?](#safari-mcp-vs-alternatives) · [Architecture](#architecture)
 
+![Safari MCP Demo](https://github.com/achiya-automation/safari-mcp/releases/download/v2.1.2/safari-mcp-demo.gif)
+
 </div>
 
 ---
