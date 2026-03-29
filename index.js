@@ -12,6 +12,20 @@ import * as safari from "./safari.js";
 import { WebSocketServer } from "ws";
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+
+// ========== SINGLETON: kill stale instances from previous sessions ==========
+try {
+  const myPid = process.pid;
+  const lines = execFileSync("pgrep", ["-af", "node.*/safari-mcp/index\\.js"], { encoding: "utf8" }).trim().split("\n");
+  for (const line of lines) {
+    const pid = parseInt(line.split(/\s+/)[0], 10);
+    if (pid && pid !== myPid) {
+      try { process.kill(pid, "SIGTERM"); } catch {}
+      console.error(`[Safari MCP] Killed stale instance PID ${pid}`);
+    }
+  }
+} catch {}
 
 // ========== SESSION ID (unique per MCP process — enables per-session tab tracking) ==========
 const SESSION_ID = randomUUID().slice(0, 8);
