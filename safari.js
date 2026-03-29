@@ -1158,26 +1158,36 @@ export async function fill({ selector, value, ref }) {
     `var t=el._valueTracker;if(t)t.setValue('');var proto=el.tagName==='TEXTAREA'?window.HTMLTextAreaElement.prototype:window.HTMLInputElement.prototype;var s=Object.getOwnPropertyDescriptor(proto,'value');if(s&&s.set){s.set.call(el,'${val}');}else{el.value='${val}';}el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));el.dispatchEvent(new Event('blur',{bubbles:true}));el.dispatchEvent(new Event('focusout',{bubbles:true}));el.focus();return 'Filled: '+el.value.substring(0,50);}catch(e){return 'ERR: '+e.message;}})()`
   );
 
-  // Closure/Medium editor: use native paste (isTrusted: true) via AppleScript
+  // Closure/Medium editor: insert line-by-line via execCommand in small batches
+  // No focus stealing, no System Events, no clipboard manipulation.
+  // Medium's Closure editor accepts execCommand('insertText') for individual lines
+  // and execCommand('insertParagraph') for line breaks — the key is doing it
+  // within a single do-JavaScript call so the mutation observer stays in sync.
   if (result === "__CLOSURE_NATIVE_PASTE__") {
-    const rawValue = value; // unescaped original
-    // Step 1: Save current clipboard
-    const savedClip = await osascript(`the clipboard as text`).catch(() => "");
-    // Step 2: Set clipboard to our text
-    const escaped = rawValue.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-    await osascript(`set the clipboard to "${escaped}"`);
-    // Step 3: Small delay for clipboard to sync
-    await new Promise(r => setTimeout(r, 100));
-    // Step 4: Send Cmd+V via System Events (produces isTrusted: true paste)
-    await osascript(`tell application "System Events" to keystroke "v" using command down`);
-    // Step 5: Wait for paste to process
-    await new Promise(r => setTimeout(r, 500));
-    // Step 6: Restore clipboard
-    if (savedClip) {
-      const savedEscaped = savedClip.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-      await osascript(`set the clipboard to "${savedEscaped}"`).catch(() => {});
-    }
-    return "Filled CE (Closure native paste)";
+    const rawValue = value;
+    // Split into lines, escape each for JS string
+    const lines = rawValue.split('\n');
+    // Build a JS script that inserts line by line
+    const lineInserts = lines.map((line, i) => {
+      const escaped = line.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+      if (i === 0) {
+        return escaped.length > 0 ? `document.execCommand('insertText',false,'${escaped}');` : '';
+      }
+      return `document.execCommand('insertParagraph');` +
+        (escaped.length > 0 ? `document.execCommand('insertText',false,'${escaped}');` : '');
+    }).join('');
+
+    const fillResult = await runJS(
+      `(function(){` +
+      `var el=document.querySelector('${selector.replace(/'/g, "\\'")}');` +
+      `if(!el)return 'Element not found';` +
+      `el.focus();el.click();` +
+      `var sel=window.getSelection();if(sel.rangeCount){var r=document.createRange();r.selectNodeContents(el);r.collapse(false);sel.removeAllRanges();sel.addRange(r);}` +
+      lineInserts +
+      `return 'Filled CE (Closure line-by-line)';` +
+      `})()`
+    );
+    return fillResult;
   }
 
   return result;
