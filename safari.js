@@ -1146,22 +1146,41 @@ export async function fill({ selector, value, ref }) {
   const sel = selector.replace(/'/g, "\\'");
   // Proper escaping order: backslashes first, then quotes
   const val = value.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, "");
-  return runJS(
+  const result = await runJS(
     `(function(){try{var el=document.querySelector('${sel}');if(!el){var q=function(r){var a=r.querySelectorAll('*');for(var i=0;i<a.length;i++){if(a[i].shadowRoot){el=a[i].shadowRoot.querySelector('${sel}');if(el)return el;el=q(a[i].shadowRoot);if(el)return el;}}return null;};el=q(document);}if(!el)return 'Element not found: ${sel}';el.focus();if(el.isContentEditable||el.getAttribute('contenteditable')==='true'){` +
     // ProseMirror detection
     `var pm=el.closest('.ProseMirror')||el.querySelector('.ProseMirror');if(pm){try{var v=null;if(pm.pmViewDesc&&pm.pmViewDesc.view)v=pm.pmViewDesc.view;else if(pm.cmView&&pm.cmView.view)v=pm.cmView.view;else{var keys=Object.keys(pm);for(var ki=0;ki<keys.length;ki++){var o=pm[keys[ki]];if(o&&o.state&&o.dispatch){v=o;break;}}}if(v&&v.state&&v.dispatch){var doc=v.state.doc;var hasContent=doc.textContent&&doc.textContent.trim().length>0;if(hasContent){var endPos=doc.content.size>1?doc.content.size-1:doc.content.size;v.dispatch(v.state.tr.insertText(' ${val}',endPos));v.focus();return 'Filled CE (ProseMirror append)';}else{var tr=v.state.tr;tr.replaceWith(0,doc.content.size,v.state.schema.text('${val}'));v.dispatch(tr);v.focus();return 'Filled CE (ProseMirror replace)';}}}catch(e){}}` +
-    // Closure/Medium detection — use synthetic clipboard paste (what users actually do)
-    `var isClosure=Object.keys(el).some(function(k){return k.startsWith('closure_uid_');})||location.hostname.includes('medium.com');if(isClosure){` +
-    `el.focus();if(el.textContent&&el.textContent.trim().length>0){document.execCommand('selectAll');}` +
-    `var pasteText='${val}';var dt=new DataTransfer();dt.setData('text/plain',pasteText);var pe=new ClipboardEvent('paste',{clipboardData:dt,bubbles:true,cancelable:true});el.dispatchEvent(pe);` +
-    `if(!el.textContent||el.textContent.trim().length===0){` +
-    `var lines=pasteText.split('\\n');for(var li=0;li<lines.length;li++){if(li>0){document.execCommand('insertParagraph');}if(lines[li].length>0){document.execCommand('insertText',false,lines[li]);}}` +
-    `}return 'Filled CE (Closure paste)';}` +
+    // Closure/Medium detection — signal for native paste
+    `var isClosure=Object.keys(el).some(function(k){return k.startsWith('closure_uid_');})||location.hostname.includes('medium.com');if(isClosure){return '__CLOSURE_NATIVE_PASTE__';}` +
     // Default contenteditable: selectAll+delete+insert (safer than textContent='')
     `document.execCommand('selectAll');document.execCommand('delete');document.execCommand('insertText',false,'${val}');el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('blur',{bubbles:true}));return 'Filled contenteditable';}` +
     // Standard input/textarea with _valueTracker
     `var t=el._valueTracker;if(t)t.setValue('');var proto=el.tagName==='TEXTAREA'?window.HTMLTextAreaElement.prototype:window.HTMLInputElement.prototype;var s=Object.getOwnPropertyDescriptor(proto,'value');if(s&&s.set){s.set.call(el,'${val}');}else{el.value='${val}';}el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));el.dispatchEvent(new Event('blur',{bubbles:true}));el.dispatchEvent(new Event('focusout',{bubbles:true}));el.focus();return 'Filled: '+el.value.substring(0,50);}catch(e){return 'ERR: '+e.message;}})()`
   );
+
+  // Closure/Medium editor: use native paste (isTrusted: true) via AppleScript
+  if (result === "__CLOSURE_NATIVE_PASTE__") {
+    const rawValue = value; // unescaped original
+    // Step 1: Save current clipboard
+    const savedClip = await osascript(`the clipboard as text`).catch(() => "");
+    // Step 2: Set clipboard to our text
+    const escaped = rawValue.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    await osascript(`set the clipboard to "${escaped}"`);
+    // Step 3: Small delay for clipboard to sync
+    await new Promise(r => setTimeout(r, 100));
+    // Step 4: Send Cmd+V via System Events (produces isTrusted: true paste)
+    await osascript(`tell application "System Events" to keystroke "v" using command down`);
+    // Step 5: Wait for paste to process
+    await new Promise(r => setTimeout(r, 500));
+    // Step 6: Restore clipboard
+    if (savedClip) {
+      const savedEscaped = savedClip.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+      await osascript(`set the clipboard to "${savedEscaped}"`).catch(() => {});
+    }
+    return "Filled CE (Closure native paste)";
+  }
+
+  return result;
 }
 
 export async function clearField({ selector }) {
