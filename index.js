@@ -17,6 +17,8 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 MB cap on POST body — prevents DoS
+
 // ========== SINGLETON: kill stale instances from previous sessions ==========
 // NOTE: Claude Code VSCode may start 2 instances simultaneously (~40ms apart).
 // Only kill instances running >10 seconds (truly stale), not fresh siblings.
@@ -132,8 +134,11 @@ function _startMemoryMonitor() {
 }
 
 // Cleanup on exit
+let _cleaningUp = false;
 for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
   process.on(sig, async () => {
+    if (_cleaningUp) return; // Prevent double-exit on rapid signal repeat
+    _cleaningUp = true;
     await _cleanupTabs();
     process.exit(0);
   });
@@ -257,7 +262,6 @@ try {
     }
 
     // POST /result — extension sends command result
-    const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 MB cap — prevents DoS from large payloads
     if (req.method === "POST" && req.url === "/result") {
       let body = "";
       req.on("data", (chunk) => { body += chunk; if (body.length > MAX_BODY_SIZE) { res.writeHead(413); res.end("Payload too large"); req.destroy(); } });
@@ -309,9 +313,9 @@ try {
           const safeNonce = String(nonce).replace(/[^0-9]/g, '');  // nonce is numeric only
           const safeProfile = (expectedProfile || "").replace(/[^\p{L}\p{N}\s\-_]/gu, '');  // whitelist: letters, numbers, spaces, hyphens, underscores
           // Check via AppleScript — look for the nonce in the profile window
-          const { execFile } = await import("node:child_process");
-          const { promisify } = await import("node:util");
-          const execFileAsync = promisify(execFile);
+          const { execFile: execFileCb } = await import("node:child_process");
+          const { promisify: pfy } = await import("node:util");
+          const execFileAsync = pfy(execFileCb);
           const script = `tell application "Safari"
             repeat with w in every window
               repeat with t in every tab of w

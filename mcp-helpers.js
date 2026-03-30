@@ -75,6 +75,8 @@ if (window.__mcpVersion !== 5) {
     if (!window.mcpIsVisible(el)) return false;
     if (el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
     if (el.matches && el.matches('input[type="hidden"]')) return false;
+    var cs = window.getComputedStyle(el);
+    if (cs && cs.pointerEvents === 'none') return false;
     return true;
   };
   window.mcpPickActionable = function(el) {

@@ -242,6 +242,7 @@ async function handleCommand(type, payload) {
       await browser.tabs.goBack(tabId);
       await waitForTabSettled(tabId, 3000);
       const updated = await browser.tabs.get(tabId);
+      _setSessionTab(sessionId, updated.id, updated.url);
       return { title: updated.title, url: updated.url };
     }
 
@@ -249,6 +250,7 @@ async function handleCommand(type, payload) {
       await browser.tabs.goForward(tabId);
       await waitForTabSettled(tabId, 3000);
       const updated = await browser.tabs.get(tabId);
+      _setSessionTab(sessionId, updated.id, updated.url);
       return { title: updated.title, url: updated.url };
     }
 
@@ -524,7 +526,7 @@ async function handleCommand(type, payload) {
 
         // --- Visibility check ---
         const cs = window.getComputedStyle(el);
-        if (cs.display === "none" || cs.visibility === "hidden" || cs.opacity === "0") {
+        if (cs.display === "none" || cs.visibility === "hidden" || cs.visibility === "collapse" || parseFloat(cs.opacity) === 0) {
           return "Element not visible (display/visibility/opacity)";
         }
 
