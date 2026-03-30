@@ -1,0 +1,170 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [2.1.5] - 2026-03-30
+
+### Fixed
+
+- Memory protection: prevent system crashes from WebKit memory leaks in long-running sessions
+
+## [2.1.4] - 2026-03-29
+
+### Fixed
+
+- ClipboardEvent paste fallback for modern editors that block synthetic input events
+
+## [2.1.3] - 2026-03-29
+
+### Fixed
+
+- Singleton process management: kill stale MCP instances on startup
+- Sibling instance detection: don't kill instances started by Claude Code VSCode
+
+## [2.1.2] - 2026-03-29
+
+### Added
+
+- Closure/Medium editor fill via `execCommand` line-by-line insertion
+- Native paste for Closure/Medium editors via System Events `Cmd+V`
+- Demo GIF in README
+
+### Fixed
+
+- Closure/Medium fill without focus stealing
+- Closure/Medium editor fill via synthetic clipboard paste
+
+## [2.1.1] - 2026-03-28
+
+### Added
+
+- Official MCP Registry support (`server.json`)
+- `mcpName` field for registry identification
+- `mcp.json` for Cursor Directory / Open Plugins
+
+## [2.1.0] - 2026-03-28
+
+### Added
+
+- `safari_native_click` tool: OS-level mouse click via CGEvent (produces `isTrusted` events)
+- Window-targeted native click: no mouse movement, no focus steal
+- Extension reconnect with exponential backoff
+- Architecture documentation for the dual-engine system
+
+### Fixed
+
+- Native click saves/restores mouse position (no cursor stealing)
+- Window bounds fallback to direct osascript
+- `navigate()` properly waits for page load via sync polling
+
+## [2.0.1] - 2026-03-23
+
+### Added
+
+- Closed Shadow DOM support with screenshot verification
+- React `_valueTracker` reset for LinkedIn/React app compatibility
+- Fuzzy matching in `select_option` for RTL text and dashes
+- CSP fallback strategy chain for `evaluate`
+- Smart loading detection with auto hard reload
+- Disabled element detection in `click` with clear error messages
+- Per-session tab tracking with profile separation
+- `glama.json` server metadata
+
+### Changed
+
+- Click text matching: 3-layer matching (exact, deepest, contains)
+- `switch_tab` performs visual switch with stale ref warnings
+- Richer `snapshot` output
+- Closure editor fill improvements
+
+### Fixed
+
+- Tab targeting: commands run on the correct tab after `switch_tab`
+- Extension blocked in personal profile to prevent window focus jumping
+- Extension skipped when `SAFARI_PROFILE` is set (AppleScript avoids focus steal)
+- LinkedIn ProseMirror view detection and paste behavior
+- Medium editor: auto-detection, clear error on fill failure, character-by-character mode
+- `fill_form`, `type_text`, `press_key`, `scroll`, and `click` bugs from deep audit
+- Checkbox React state synchronization
+- `select_option` retry via AppleScript fallback
+- Screenshot fallback respects `_preferAppleScript`
+- AppleScript `clearField` for contenteditable elements
+- `requestSubmit` used instead of `form.submit` for WAF compatibility
+
+### Performance
+
+- Extension v2.1 with HTTP polling, profiles, and command queue
+
+## [2.0.0] - 2026-03-19
+
+### Added
+
+- Safari Web Extension engine: 5-20ms operations with real cookies and logins
+- Dual-engine architecture: Extension (preferred) + AppleScript daemon (fallback)
+- WebSocket bridge connecting Safari Extension to MCP tools
+- Pure JS React click with full PointerEvent sequence and Fiber fallback
+- OS-level click for React/Airtable/virtual DOM apps via CGEvent
+- Tab tracking by URL to prevent hijacking user tabs
+- Profile separation via `SAFARI_PROFILE` environment variable
+
+### Changed
+
+- Extension always targets the MCP tab, not the active tab
+- Reverted to AppleScript-first for `newTab` to preserve cookies/logins
+
+### Fixed
+
+- Handle `EADDRINUSE` on WebSocket port 9223 gracefully
+- Click on `<a>` tags with href navigates directly as fallback
+- React click with coordinates on synthetic events and parent traversal
+- Evaluate return values and virtual DOM scroll-to-text
+- Tab tracking: resolve by URL in single osascript call
+- Screenshot: switch to target tab before capture, restore after
+- Critical bugs in type casting, evaluate returns, virtual DOM clicks, and new tab navigation
+- Removed broken persistent osascript process (136x faster)
+
+### Performance
+
+- Tab caching and `world:MAIN` context for faster execution
+- `click_and_read` combined operation
+- TreeWalker text search with cached click helpers
+- Click payload reduced from 3KB to 200B with retry pattern
+- Pre-inject helpers on navigate
+- Cached tab resolve with attribute-aware text search
+- Combined navigate + newTab into single osascript calls
+
+## [1.0.0] - 2026-03-18
+
+### Added
+
+- Initial release with 80 MCP tools for native Safari browser automation
+- Navigation: `navigate`, `go_back`, `go_forward`, `reload`, `new_tab`, `close_tab`, `switch_tab`, `list_tabs`
+- Interaction: `click`, `fill`, `select_option`, `press_key`, `type_text`, `hover`, `drag`, `scroll`, `double_click`, `right_click`
+- Forms: `fill_form`, `fill_and_submit`, `detect_forms`, `clear_field`, `upload_file`
+- Reading: `read_page`, `snapshot`, `get_source`, `get_element`, `query_all`, `extract_links`, `extract_images`, `extract_tables`, `extract_meta`
+- Screenshots: `screenshot`, `screenshot_element`, `save_pdf`
+- JavaScript: `evaluate`, `run_script`, `click_and_read`, `click_and_wait`, `navigate_and_read`
+- Network: `start_network_capture`, `network`, `network_details`, `clear_network`, `mock_route`, `clear_mocks`, `throttle_network`
+- Storage: `get_cookies`, `set_cookie`, `delete_cookies`, `local_storage`, `set_local_storage`, `delete_local_storage`, `session_storage`, `set_session_storage`, `delete_session_storage`, `get_indexed_db`, `list_indexed_dbs`, `export_storage`, `import_storage`
+- Console: `start_console`, `get_console`, `console_filter`, `clear_console`
+- Accessibility: `accessibility_snapshot`, `analyze_page`, `get_computed_style`
+- Clipboard: `clipboard_read`, `clipboard_write`, `paste_image`
+- Emulation: `emulate`, `resize`, `reset_emulation`, `override_geolocation`
+- Waiting: `wait`, `wait_for`, `wait_for_new_tab`
+- Other: `handle_dialog`, `performance_metrics`, `css_coverage`, `replace_editor`
+- Built on AppleScript + JavaScript injection via `osascript`
+- Tab safety: per-session tracking to never hijack user tabs
+- macOS-native: zero browser overhead, no Chrome/Chromium dependency
+
+[2.1.5]: https://github.com/achiya-automation/safari-mcp/compare/v2.1.4...v2.1.5
+[2.1.4]: https://github.com/achiya-automation/safari-mcp/compare/v2.1.3...v2.1.4
+[2.1.3]: https://github.com/achiya-automation/safari-mcp/compare/v2.1.2...v2.1.3
+[2.1.2]: https://github.com/achiya-automation/safari-mcp/compare/v2.1.1...v2.1.2
+[2.1.1]: https://github.com/achiya-automation/safari-mcp/compare/v2.1.0...v2.1.1
+[2.1.0]: https://github.com/achiya-automation/safari-mcp/compare/v2.0.1...v2.1.0
+[2.0.1]: https://github.com/achiya-automation/safari-mcp/compare/v2.0.0...v2.0.1
+[2.0.0]: https://github.com/achiya-automation/safari-mcp/compare/v1.0.0...v2.0.0
+[1.0.0]: https://github.com/achiya-automation/safari-mcp/releases/tag/v1.0.0

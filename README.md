@@ -9,13 +9,14 @@
 [![Node.js](https://img.shields.io/badge/Node.js-18%2B-green)](https://nodejs.org/)
 [![macOS](https://img.shields.io/badge/macOS-only-blue)](https://www.apple.com/macos/)
 [![MCP](https://img.shields.io/badge/MCP-compatible-purple)](https://modelcontextprotocol.io)
+[![CI](https://github.com/achiya-automation/safari-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/achiya-automation/safari-mcp/actions/workflows/ci.yml)
 [![npm downloads](https://img.shields.io/npm/dm/safari-mcp)](https://www.npmjs.com/package/safari-mcp)
 [![GitHub stars](https://img.shields.io/github/stars/achiya-automation/safari-mcp?style=social)](https://github.com/achiya-automation/safari-mcp/stargazers)
 [![achiya-automation/safari-mcp MCP server](https://glama.ai/mcp/servers/achiya-automation/safari-mcp/badges/score.svg)](https://glama.ai/mcp/servers/achiya-automation/safari-mcp)
 
 **80 tools** · **Zero dependencies** · **~5ms per command** · **60% less CPU than Chrome**
 
-[Quick Start](#quick-start) · [All 80 Tools](#tools-80) · [Why Safari MCP?](#safari-mcp-vs-alternatives) · [Architecture](#architecture)
+[Quick Start](#quick-start) · [All 80 Tools](#tools-80) · [Examples](examples/) · [Why Safari MCP?](#safari-mcp-vs-alternatives) · [Architecture](#architecture) · [Changelog](CHANGELOG.md)
 
 ![Safari MCP Demo](https://github.com/achiya-automation/safari-mcp/releases/download/v2.1.2/safari-mcp-showcase.gif)
 
@@ -63,6 +64,12 @@
 
 ### Install
 
+**Option A — npm (recommended):**
+```bash
+npm install -g safari-mcp
+```
+
+**Option B — from source:**
 ```bash
 git clone https://github.com/achiya-automation/safari-mcp.git
 cd safari-mcp
@@ -447,7 +454,9 @@ Safari MCP works with any MCP-compatible client:
 
 ## Contributing
 
-PRs welcome! The codebase is two files:
+PRs welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for setup instructions.
+
+The codebase is two files:
 - `safari.js` — Safari automation layer (AppleScript + JavaScript)
 - `index.js` — MCP server with tool definitions
 
