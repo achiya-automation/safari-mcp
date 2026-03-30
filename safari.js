@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { readFile, writeFile, unlink, appendFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 // Extension bridge is handled by index.js (WebSocket server on port 9223)
 
@@ -673,7 +674,12 @@ export async function getPageSource({ maxLength = 200000 } = {}) {
 
 // Inject click helpers ONCE per page (cached on window.__mcp)
 // Includes: mcpClick (full event sequence), mcpReactClick (React Fiber), mcpFindText (fast TreeWalker)
-const INJECT_MCP_HELPERS = `if(window.__mcpVersion!==5){window.__mcpVersion=5;
+// Loaded from mcp-helpers.js at startup — enables syntax highlighting, linting, and easier maintenance
+const INJECT_MCP_HELPERS = readFileSync(join(__dirname, 'mcp-helpers.js'), 'utf8');
+
+// NOTE: Helper code previously inlined here (~300 lines) is now in mcp-helpers.js
+/* eslint-disable */
+const _LEGACY_INLINE_START = `if(window.__mcpVersion!==5){window.__mcpVersion=5;
   window.__mcpRefs=window.__mcpRefs||{};
   window.__mcpCachedRoots=null;
   window.__mcpRootsDirty=true;
@@ -1773,7 +1779,7 @@ export async function screenshotElement({ selector }) {
       await execFileAsync("screencapture", ["-l" + windowId, "-o", "-x", tmpFile]);
       const { x, y, w, h } = JSON.parse(bounds);
       // Use sips to crop (macOS built-in)
-      const toolbarHeight = 52; // Safari toolbar approximate height
+      const toolbarHeight = 74; // Safari toolbar approximate height (matches _getSafariWindowGeometry)
       const cropFile = join(tmpdir(), `safari-el-crop-${Date.now()}.png`);
       await execFileAsync("sips", [
         "-c", String(h), String(w),
@@ -2439,6 +2445,7 @@ export async function savePDF({ path: pdfPath }) {
 // instead of guessing CSS selectors. Much faster, no hallucination risk.
 
 let _snapshotGen = 0;
+export function getNextSnapshotGen() { return _snapshotGen++; }
 
 export async function takeSnapshot({ selector } = {}) {
   const gen = _snapshotGen++;
@@ -2793,7 +2800,13 @@ export async function importStorageState({ state }) {
   const parsed = typeof state === "string" ? JSON.parse(state) : state;
   const esc = (s) => String(s).replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/"/g, '\\"').replace(/\n/g, "\\n").replace(/\r/g, "");
   const cmds = [];
-  if (parsed.cookies) cmds.push(`document.cookie='${esc(parsed.cookies)}'`);
+  // Cookies must be set one at a time — document.cookie only accepts one cookie per assignment
+  if (parsed.cookies) {
+    const cookiePairs = String(parsed.cookies).split(/;\s*/);
+    for (const pair of cookiePairs) {
+      if (pair.trim()) cmds.push(`document.cookie='${esc(pair.trim())}'`);
+    }
+  }
   if (parsed.localStorage) {
     for (const [k, v] of Object.entries(parsed.localStorage)) {
       cmds.push(`localStorage.setItem('${esc(k)}','${esc(v)}')`);
@@ -3368,8 +3381,9 @@ export async function navigateAndRead(url, { maxLength = 50000 } = {}) {
   const safeUrl = targetUrl.replace(/"/g, '\\"');
   const navTarget = _activeTabIndex ? `tab ${_activeTabIndex} of ${getTargetWindowRef()}` : getFallbackTarget();
   await osascriptFast(`tell application "Safari" to set URL of ${navTarget} to "${safeUrl}"`);
+  _activeTabURL = targetUrl;
   // Single JS call: poll readyState + return page data — 1 call instead of 30+
-  return runJS(
+  const navResult = await runJS(
     `(async function(){
       for(var i=0;i<60;i++){
         if(document.readyState==='complete')break;
@@ -3379,6 +3393,12 @@ export async function navigateAndRead(url, { maxLength = 50000 } = {}) {
     })()`,
     { timeout: 30000 }
   );
+  // Update _activeTabURL with the actual URL after navigation
+  try {
+    const parsed = JSON.parse(navResult);
+    if (parsed.url && parsed.url !== 'about:blank') _activeTabURL = parsed.url;
+  } catch {}
+  return navResult;
 }
 
 // Click + wait for navigation or element — common after clicking a link/button
@@ -3474,11 +3494,6 @@ export async function analyzePage() {
 }
 
 // ========== GRACEFUL SHUTDOWN ==========
-function cleanup() {
-  if (_helperProc) { try { _helperProc.kill(); } catch {} _helperProc = null; }
-  _drainHelperQueue("shutting down");
-}
-
-process.on("exit", cleanup);
-process.on("SIGINT", () => { cleanup(); process.exit(0); });
-process.on("SIGTERM", () => { cleanup(); process.exit(0); });
+// NOTE: Signal handlers are registered at the top of the file (cleanupHelper + process.exit).
+// _drainHelperQueue is called from cleanupHelper via process.on("exit").
+process.on("exit", () => { _drainHelperQueue("shutting down"); });

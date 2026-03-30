@@ -81,9 +81,17 @@ let _memoryCheckTimer = null;
 function _startMemoryMonitor() {
   _memoryCheckTimer = setInterval(async () => {
     try {
-      const psOut = execFileSync("bash", ["-c",
-        "ps aux | grep -i 'WebKit\\|WebContent' | grep -v grep | awk '{sum+=$6} END {print sum/1024}'"
-      ], { encoding: "utf8" }).trim();
+      // Use pgrep + ps directly — avoids spawning bash, grep, awk pipeline
+      let psOut = "0";
+      try {
+        const pids = execFileSync("pgrep", ["-f", "WebKit|WebContent"], { encoding: "utf8" }).trim();
+        if (pids) {
+          const pidList = pids.split("\n").join(",");
+          psOut = execFileSync("ps", ["-p", pidList, "-o", "rss="], { encoding: "utf8" }).trim();
+          const totalKB = psOut.split("\n").reduce((sum, l) => sum + (parseInt(l.trim(), 10) || 0), 0);
+          psOut = String(totalKB / 1024);
+        }
+      } catch { psOut = "0"; }
       const webkitMB = parseFloat(psOut) || 0;
       if (webkitMB > WEBKIT_MEMORY_LIMIT_MB && _openedTabs.size > 1) {
         console.error(`[Safari MCP] ⚠️ WebKit using ${Math.round(webkitMB)}MB (limit: ${WEBKIT_MEMORY_LIMIT_MB}MB) — closing oldest MCP tab`);
@@ -491,7 +499,7 @@ const _commandTimeouts = {
   wait_for: 30000, navigate: 30000, navigate_and_read: 30000, go_back: 10000, go_forward: 10000,
   reload: 15000, screenshot: 15000, snapshot: 30000, click_and_read: 15000,
   double_click: 10000, right_click: 10000, clear_field: 5000, select_option: 5000, fill_form: 10000,
-  get_url: 3000, get_title: 3000,
+  replace_editor: 10000, get_url: 3000, get_title: 3000,
 };
 
 // Commands where null result means failure (should fall back to AppleScript)
@@ -628,8 +636,9 @@ server.tool(
   "PREFERRED way to see page state. Returns accessibility tree with ref IDs for every interactive element. Use refs with click/fill/type instead of CSS selectors. Workflow: snapshot → see refs → click({ref:'0_5'}). PREFER THIS over safari_screenshot (cheaper, structured text vs heavy image) and over safari_read_page (includes interactive refs). Use safari_screenshot only when you need to see visual layout/styling.",
   { selector: z.string().optional().describe("CSS selector for subtree (default: full page)") },
   async (args) => {
+    const gen = safari.getNextSnapshotGen();
     const result = await extensionOrFallback(
-      "snapshot", { selector: args.selector },
+      "snapshot", { selector: args.selector, gen },
       () => safari.takeSnapshot(args)
     );
     return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
@@ -1083,20 +1092,36 @@ server.tool(
     // Get current tab list
     const beforeRaw = await extensionOrFallback("list_tabs", {}, () => safari.listTabs());
     const beforeTabs = typeof beforeRaw === 'string' ? JSON.parse(beforeRaw) : beforeRaw;
-    const beforeUrls = new Set(beforeTabs.map(t => t.url));
+    const beforeIds = new Set(beforeTabs.map(t => `${t.index}:${t.url}`));
+    const beforeCount = beforeTabs.length;
 
-    // Poll for new tab
+    // Poll for new tab — detect by count increase + new entries (handles about:blank tabs)
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 500));
       const nowRaw = await extensionOrFallback("list_tabs", {}, () => safari.listTabs());
       const nowTabs = typeof nowRaw === 'string' ? JSON.parse(nowRaw) : nowRaw;
-      for (const tab of nowTabs) {
-        if (!beforeUrls.has(tab.url) && tab.url !== 'about:blank') {
-          if (urlContains && !tab.url.includes(urlContains)) continue;
-          // Switch to new tab
-          await extensionOrFallback("switch_tab", { index: tab.index }, () => safari.switchTab(tab.index));
-          return { content: [{ type: "text", text: `Found new tab: ${tab.title} (${tab.url})` }] };
+      if (nowTabs.length > beforeCount) {
+        // Find the new tab(s) — could be about:blank initially (OAuth popups)
+        for (const tab of nowTabs) {
+          if (!beforeIds.has(`${tab.index}:${tab.url}`)) {
+            // Wait briefly for about:blank to resolve to actual URL
+            if (tab.url === 'about:blank') {
+              await new Promise(r => setTimeout(r, 1000));
+              const refreshed = await extensionOrFallback("list_tabs", {}, () => safari.listTabs());
+              const refreshedTabs = typeof refreshed === 'string' ? JSON.parse(refreshed) : refreshed;
+              const resolved = refreshedTabs.find(t => t.index === tab.index);
+              if (resolved && resolved.url !== 'about:blank') {
+                if (urlContains && !resolved.url.includes(urlContains)) continue;
+                await extensionOrFallback("switch_tab", { index: resolved.index }, () => safari.switchTab(resolved.index));
+                return { content: [{ type: "text", text: `Found new tab: ${resolved.title} (${resolved.url})` }] };
+              }
+              continue;
+            }
+            if (urlContains && !tab.url.includes(urlContains)) continue;
+            await extensionOrFallback("switch_tab", { index: tab.index }, () => safari.switchTab(tab.index));
+            return { content: [{ type: "text", text: `Found new tab: ${tab.title} (${tab.url})` }] };
+          }
         }
       }
     }

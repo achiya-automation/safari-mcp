@@ -957,7 +957,9 @@ async function handleCommand(type, payload) {
       // Learn profile window from newly created tab
       if (!_profileWindowId) { _profileWindowId = updated.windowId; browser.storage.local.set({ mcpProfileWindowId: _profileWindowId }).catch(() => {}); }
       // CRITICAL: Set new tab as the target for this session's subsequent commands
-      _setSessionTab(sessionId, updated.id, updated.url);
+      // Use the requested URL (not updated.url) when page hasn't loaded yet (still about:blank)
+      const trackUrl = (updated.url && updated.url !== "about:blank") ? updated.url : (payload.url || updated.url);
+      _setSessionTab(sessionId, updated.id, trackUrl);
       return { title: updated.title, url: updated.url, tabIndex: updated.index + 1 };
     }
 
@@ -1049,7 +1051,7 @@ async function handleCommand(type, payload) {
 
     // --- Snapshot (accessibility tree with ref IDs) ---
     case "snapshot": {
-      return await execInTab((rootSelector) => {
+      return await execInTab((rootSelector, snapshotGen) => {
         // Clean ALL stale data-mcp-ref attributes from previous snapshots.
         // Without this, old refs remain on DOM and findByRef/CSS selector can target WRONG elements.
         document.querySelectorAll("[data-mcp-ref]").forEach(function(el) { el.removeAttribute("data-mcp-ref"); });
@@ -1099,7 +1101,7 @@ async function handleCommand(type, payload) {
 
           const interactive = isInteractive(el);
           const currentId = id++;
-          const refId = "0_" + currentId;
+          const refId = snapshotGen + "_" + currentId;
 
           let attrs = "";
           if (interactive) {
@@ -1209,7 +1211,7 @@ async function handleCommand(type, payload) {
           tree += "\n[WARNING: Snapshot truncated at " + MAX_ELEMENTS + " elements. Use selector parameter to focus on a specific section.]";
         }
         return tree;
-      }, [payload.selector || null], tabId);
+      }, [payload.selector || null, payload.gen != null ? payload.gen : 0], tabId);
     }
 
     // --- Double Click ---
@@ -1768,15 +1770,26 @@ async function getActiveTab() {
   return tabs[0];
 }
 
+// Track which tabs already have the deep query helpers injected
+const _helpersInjected = new Set();
+// Clean up when tabs are removed or navigated
+browser.tabs.onRemoved.addListener((tabId) => { _helpersInjected.delete(tabId); });
+browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === "loading") _helpersInjected.delete(tabId);
+});
+
 async function execInTab(func, args = [], tabId = null) {
   const id = tabId || (await getActiveTab()).id;
   try {
-    // Auto-inject deep query helpers (idempotent — only defines once per page)
-    await browser.scripting.executeScript({
-      target: { tabId: id },
-      world: "MAIN",
-      func: _deepQueryScript,
-    }).catch(() => {});
+    // Auto-inject deep query helpers — skip if already injected for this tab+page
+    if (!_helpersInjected.has(id)) {
+      await browser.scripting.executeScript({
+        target: { tabId: id },
+        world: "MAIN",
+        func: _deepQueryScript,
+      }).catch(() => {});
+      _helpersInjected.add(id);
+    }
 
     const results = await browser.scripting.executeScript({
       target: { tabId: id },

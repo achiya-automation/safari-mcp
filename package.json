@@ -1,6 +1,6 @@
 {
   "name": "safari-mcp",
-  "version": "2.1.8",
+  "version": "2.2.0",
   "mcpName": "io.github.achiya-automation/safari-mcp",
   "description": "Safari browser automation for AI agents — native macOS, zero Chrome overhead. 80 tools via AppleScript + JavaScript.",
   "type": "module",
@@ -49,6 +49,7 @@
   "files": [
     "index.js",
     "safari.js",
+    "mcp-helpers.js",
     "safari-helper",
     "safari-helper.swift",
     "extension/",
