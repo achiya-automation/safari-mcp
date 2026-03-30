@@ -1647,16 +1647,20 @@ async function _verifyProfileMatch(expectedProfile) {
     await new Promise(r => setTimeout(r, 500));
 
     // Ask the server to verify which profile has this nonce
-    const verifyRes = await fetch(`${HTTP_URL}/verify-profile`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ nonce, expectedProfile }),
-      signal: AbortSignal.timeout(5000),
-    });
-    // Clean up test tab
-    await browser.tabs.remove(checkTab.id).catch(() => {});
+    let verifyRes;
+    try {
+      verifyRes = await fetch(`${HTTP_URL}/verify-profile`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ nonce, expectedProfile }),
+        signal: AbortSignal.timeout(5000),
+      });
+    } finally {
+      // Always clean up test tab — even if fetch fails
+      await browser.tabs.remove(checkTab.id).catch(() => {});
+    }
 
-    if (verifyRes.ok) {
+    if (verifyRes && verifyRes.ok) {
       const result = await verifyRes.json();
       if (result.match) {
         await browser.storage.local.set({ mcpVerifiedProfile: expectedProfile });

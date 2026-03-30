@@ -94,7 +94,7 @@ function _startMemoryMonitor() {
       // Use pgrep + ps directly — avoids spawning bash, grep, awk pipeline
       let psOut = "0";
       try {
-        const pids = execFileSync("pgrep", ["-f", "WebKit|WebContent"], { encoding: "utf8" }).trim();
+        const pids = execFileSync("pgrep", ["-Ef", "WebKit|WebContent"], { encoding: "utf8" }).trim();
         if (pids) {
           const pidList = pids.split("\n").join(",");
           psOut = execFileSync("ps", ["-p", pidList, "-o", "rss="], { encoding: "utf8" }).trim();
@@ -111,8 +111,17 @@ function _startMemoryMonitor() {
         }
         if (oldestIdx !== null) {
           try {
-            safari.setActiveTabIndex(oldestIdx);
-            await safari.closeTab();
+            // Re-resolve by URL before closing (indices shift as tabs change)
+            const info = _openedTabs.get(oldestIdx);
+            if (info?.url) {
+              const tabs = await safari.listTabs();
+              const parsed = typeof tabs === 'string' ? JSON.parse(tabs) : tabs;
+              const match = parsed.find(t => t.url === info.url);
+              if (match) {
+                safari.setActiveTabIndex(match.index);
+                await safari.closeTab();
+              }
+            }
           } catch {}
           _untrackTab(oldestIdx);
         }
@@ -248,9 +257,10 @@ try {
     }
 
     // POST /result — extension sends command result
+    const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 MB cap — prevents DoS from large payloads
     if (req.method === "POST" && req.url === "/result") {
       let body = "";
-      req.on("data", (chunk) => (body += chunk));
+      req.on("data", (chunk) => { body += chunk; if (body.length > MAX_BODY_SIZE) { res.writeHead(413); res.end("Payload too large"); req.destroy(); } });
       req.on("end", () => {
         try {
           const msg = JSON.parse(body);
@@ -291,7 +301,7 @@ try {
     // POST /verify-profile — extension asks server to check which profile has a nonce tab
     if (req.method === "POST" && req.url === "/verify-profile") {
       let body = "";
-      req.on("data", (chunk) => (body += chunk));
+      req.on("data", (chunk) => { body += chunk; if (body.length > MAX_BODY_SIZE) { res.writeHead(413); res.end("Payload too large"); req.destroy(); } });
       req.on("end", async () => {
         try {
           const { nonce, expectedProfile } = JSON.parse(body);
@@ -343,7 +353,7 @@ try {
     // POST /proxy-command — secondary instances send commands through primary
     if (req.method === "POST" && req.url === "/proxy-command") {
       let body = "";
-      req.on("data", (chunk) => (body += chunk));
+      req.on("data", (chunk) => { body += chunk; if (body.length > MAX_BODY_SIZE) { res.writeHead(413); res.end("Payload too large"); req.destroy(); } });
       req.on("end", async () => {
         try {
           const { type, payload } = JSON.parse(body);
@@ -391,6 +401,7 @@ setTimeout(() => {
 }, 2000);
 
 async function _checkPrimaryExtension() {
+  if (_isExtensionHost) return; // Already hosting — stop polling
   try {
     const res = await fetch(`http://127.0.0.1:${HTTP_PORT}/proxy-check`, {
       method: "GET",
@@ -1126,12 +1137,16 @@ server.tool(
               if (resolved && resolved.url !== 'about:blank') {
                 if (urlContains && !resolved.url.includes(urlContains)) continue;
                 await extensionOrFallback("switch_tab", { index: resolved.index }, () => safari.switchTab(resolved.index));
+                safari.setActiveTabIndex(resolved.index);
+                safari.setActiveTabURL(resolved.url);
                 return { content: [{ type: "text", text: `Found new tab: ${resolved.title} (${resolved.url})` }] };
               }
               continue;
             }
             if (urlContains && !tab.url.includes(urlContains)) continue;
             await extensionOrFallback("switch_tab", { index: tab.index }, () => safari.switchTab(tab.index));
+            safari.setActiveTabIndex(tab.index);
+            safari.setActiveTabURL(tab.url);
             return { content: [{ type: "text", text: `Found new tab: ${tab.title} (${tab.url})` }] };
           }
         }

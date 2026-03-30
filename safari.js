@@ -6,7 +6,7 @@
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve as resolvePath } from "node:path";
 import { readFile, writeFile, unlink, appendFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -84,11 +84,9 @@ function cleanupHelper() {
     _helperProc = null;
   }
 }
+// Signal handlers (SIGINT/SIGTERM/SIGHUP) are registered in index.js only.
+// cleanupHelper runs via process.on("exit"), which fires when index.js calls process.exit().
 process.on("exit", cleanupHelper);
-process.on("SIGINT", () => { cleanupHelper(); process.exit(0); });
-process.on("SIGTERM", () => { cleanupHelper(); process.exit(0); });
-// SIGHUP = terminal closed, uncaught = crash — still clean up
-process.on("SIGHUP", () => { cleanupHelper(); process.exit(0); });
 process.on("uncaughtException", (err) => { console.error("Uncaught:", err); cleanupHelper(); process.exit(1); });
 
 // ========== ACTIVE TAB TRACKING ==========
@@ -2170,8 +2168,7 @@ export async function drag({ sourceSelector, targetSelector, sourceX, sourceY, t
 // ========== FILE PATH SAFETY ==========
 // Prevent reading sensitive system files via upload/paste tools
 function _validateFilePath(filePath) {
-  const { resolve } = require("node:path");
-  const resolved = resolve(filePath);
+  const resolved = resolvePath(filePath);
   if (resolved.includes('..')) throw new Error("Path traversal not allowed: " + filePath);
   const blocked = ['.ssh', '.gnupg', '.aws', '.config/gcloud', 'credentials', '.env', '.npmrc', '.netrc', 'id_rsa', 'id_ed25519', '.keychain'];
   const lower = resolved.toLowerCase();
@@ -2198,10 +2195,10 @@ export async function uploadFile({ selector, filePath }) {
         repeat with w in every window
           if exists sheet 1 of w then
             try
-              click button "ביטול" of sheet 1 of w
+              click button "Cancel" of sheet 1 of w
             on error
               try
-                click button "Cancel" of sheet 1 of w
+                click button "ביטול" of sheet 1 of w
               on error
                 key code 53
               end try
@@ -2659,6 +2656,7 @@ export async function takeSnapshot({ selector, _gen } = {}) {
       }
 
       window.__mcpRefs = {};
+      window.__mcpRefsTime = Date.now();
       var root = ${root};
       if (!root) return 'Element not found';
       walk(root, 0);
