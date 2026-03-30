@@ -69,7 +69,12 @@
 npm install -g safari-mcp
 ```
 
-**Option B — from source:**
+**Option B — Homebrew:**
+```bash
+brew install achiya-automation/tap/safari-mcp
+```
+
+**Option C — from source:**
 ```bash
 git clone https://github.com/achiya-automation/safari-mcp.git
 cd safari-mcp
@@ -139,6 +144,29 @@ Add to your MCP client config:
 }
 ```
 </details>
+
+---
+
+## Usage Workflow
+
+The recommended pattern for AI agents using Safari MCP:
+
+```
+1. safari_snapshot        → Get page state (accessibility tree)
+2. safari_click/fill/...  → Interact with elements by ref
+3. safari_snapshot        → Verify the result
+```
+
+**Element targeting** — tools accept multiple targeting strategies:
+
+| Strategy | Example | Best for |
+|----------|---------|----------|
+| CSS selector | `#login-btn`, `.submit` | Unique elements |
+| Visible text | `"Sign In"`, `"Submit"` | Buttons, links |
+| Coordinates | `x: 100, y: 200` | Canvas, custom widgets |
+| Ref from snapshot | `ref: "e42"` | Any element from accessibility tree |
+
+> **Tip:** Start with `safari_snapshot` to get element refs, then use refs for precise targeting. This is faster and more reliable than CSS selectors.
 
 ---
 
@@ -317,6 +345,20 @@ Add to your MCP client config:
 
 ---
 
+## Security
+
+Safari MCP runs locally on your Mac with minimal attack surface:
+
+| Aspect | Detail |
+|--------|--------|
+| Network | **No remote connections** — all communication is local (stdio + localhost) |
+| Permissions | macOS system permissions required (Screen Recording for screenshots) |
+| Data | No telemetry, no analytics, no data sent anywhere |
+| Extension | Communicates only with `localhost:9224`, validated by Safari |
+| Code | Fully open source (MIT) — audit every line |
+
+---
+
 ## Safari MCP vs Alternatives
 
 | Feature | Safari MCP | Chrome DevTools MCP | Playwright MCP |
@@ -334,6 +376,23 @@ Add to your MCP client config:
 | Performance trace | ❌ | ✅ | ❌ |
 
 > **Tip:** Use Safari MCP for daily browsing tasks (95% of work) and Chrome DevTools MCP only for Lighthouse/Performance audits.
+
+### Safari MCP Servers Comparison
+
+| Feature | **safari-mcp** | MCPSafari | safari-mcp-server |
+|---------|:--------------:|:---------:|:-----------------:|
+| Tools | **80** | 23 | ~10 |
+| License | **MIT** | None | MIT |
+| Install | npm / Homebrew | Binary | npm |
+| Storage (cookies, localStorage) | **10 tools** | None | None |
+| Data extraction (tables, links) | **5 tools** | None | None |
+| Network mocking | **Yes** | No | No |
+| Device emulation | **Yes** | No | No |
+| File upload (no dialog) | **Yes** | No | No |
+| PDF export | **Yes** | No | No |
+| Console capture | **4 tools** | 1 | No |
+| Performance metrics | **Yes** | No | No |
+| Fallback engine | **Dual (Extension + AppleScript)** | Extension only | WebDriver |
 
 ---
 
