@@ -7,7 +7,7 @@ import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { readFile, writeFile, unlink } from "node:fs/promises";
+import { readFile, writeFile, unlink, appendFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 // Extension bridge is handled by index.js (WebSocket server on port 9223)
 
@@ -99,6 +99,16 @@ let _activeTabURL = null;   // URL-based tracking (stable even when tabs shift)
 let _lastResolveTime = 0;   // Cache: skip resolve if verified recently
 const RESOLVE_CACHE_MS = 1500; // Re-verify tab every 1.5 seconds (was 5s — too stale)
 
+// ========== DIAGNOSTIC LOG ==========
+// File-based log for profile/focus issues — survives MCP restart, visible to user
+const _LOG_FILE = '/tmp/safari-mcp-profile.log';
+function _logProfile(msg) {
+  const ts = new Date().toISOString().replace('T', ' ').substring(0, 19);
+  const line = `[${ts}] ${msg}\n`;
+  console.error(`[Safari MCP] ${msg}`);
+  appendFile(_LOG_FILE, line).catch(() => {});
+}
+
 // ========== PROFILE TARGETING ==========
 // Set SAFARI_PROFILE env var to target a specific Safari profile window.
 // Safari shows profile windows as: "ProfileName — Tab Title"
@@ -106,7 +116,7 @@ const SAFARI_PROFILE = process.env.SAFARI_PROFILE || null;
 let _targetWindowRef = null; // null = not yet discovered. Updated by refreshTargetWindow()
 let _targetWindowId = null;  // Numeric window ID (for CGEvent window targeting)
 let _targetWindowCacheTime = 0;
-const TARGET_WINDOW_CACHE_MS = 5000;
+const TARGET_WINDOW_CACHE_MS = 2000; // Reduced from 5s — faster detection of window changes
 let _profileWindowMissing = false; // True when profile window is not found
 
 // Get the target window ref, falling back to 'front window' ONLY when no profile is configured
@@ -125,14 +135,16 @@ async function refreshTargetWindow(force = false) {
   const now = Date.now();
   if (!force && _targetWindowRef && (now - _targetWindowCacheTime) < TARGET_WINDOW_CACHE_MS) return;
   const safeProfile = SAFARI_PROFILE.replace(/"/g, '\\"');
+  // Find profile window by name AND verify the window ID still matches
   const result = await osascriptFast(
-    `tell application "Safari"\n  repeat with w in every window\n    if name of w starts with "${safeProfile} \u2014" then return id of w\n  end repeat\n  return 0\nend tell`
-  ).catch(() => '0');
-  const id = Number(result);
+    `tell application "Safari"\n  repeat with w in every window\n    if name of w starts with "${safeProfile} \u2014" then return (id of w as text) & "|" & name of w\n  end repeat\n  return "0|"\nend tell`
+  ).catch(() => '0|');
+  const [idStr, windowName] = String(result).split('|');
+  const id = Number(idStr);
   if (id > 0) {
     const newRef = `window id ${id}`;
     if (_targetWindowRef && _targetWindowRef !== newRef) {
-      console.error(`[Safari MCP] Profile window changed: ${_targetWindowRef} → ${newRef}`);
+      _logProfile(`Profile window changed: ${_targetWindowRef} → ${newRef} ("${windowName}")`);
     }
     _targetWindowRef = newRef;
     _targetWindowId = id;
@@ -144,8 +156,36 @@ async function refreshTargetWindow(force = false) {
     _targetWindowId = null;
     _targetWindowCacheTime = 0;
     _profileWindowMissing = true;
-    console.error(`[Safari MCP] WARNING: Profile "${SAFARI_PROFILE}" window not found — refusing to use front window`);
+    _logProfile(`WARNING: Profile "${SAFARI_PROFILE}" window not found — refusing to use front window`);
   }
+}
+
+// Background verification: periodically check that cached window ID still belongs to profile
+if (SAFARI_PROFILE) {
+  setInterval(async () => {
+    if (!_targetWindowRef || !_targetWindowId) return;
+    try {
+      const name = await osascriptFast(
+        `tell application "Safari" to return name of ${_targetWindowRef}`
+      ).catch(() => '');
+      if (name && !name.startsWith(`${SAFARI_PROFILE} \u2014`)) {
+        // Window ID no longer belongs to profile — invalidate cache immediately
+        _logProfile(`SAFETY: Window ${_targetWindowRef} no longer belongs to profile "${SAFARI_PROFILE}" (name: "${name}") — invalidating`);
+        _targetWindowRef = null;
+        _targetWindowId = null;
+        _targetWindowCacheTime = 0;
+        _profileWindowMissing = true;
+        // Try to rediscover immediately
+        await refreshTargetWindow(true);
+      }
+    } catch {
+      // Window might have been closed — invalidate and rediscover
+      _targetWindowRef = null;
+      _targetWindowId = null;
+      _targetWindowCacheTime = 0;
+      await refreshTargetWindow(true);
+    }
+  }, 3000); // Check every 3 seconds
 }
 
 // Initialize profile window at startup (ES module top-level await)
@@ -153,9 +193,9 @@ if (SAFARI_PROFILE) {
   await new Promise(r => setTimeout(r, 50)); // Let helper process initialize
   await refreshTargetWindow(true);
   if (_targetWindowRef) {
-    console.error(`[Safari MCP] Profile "${SAFARI_PROFILE}" → targeting ${_targetWindowRef}`);
+    _logProfile(`Startup: Profile "${SAFARI_PROFILE}" → targeting ${_targetWindowRef}`);
   } else {
-    console.error(`[Safari MCP] WARNING: Profile "${SAFARI_PROFILE}" window NOT found at startup`);
+    _logProfile(`WARNING: Profile "${SAFARI_PROFILE}" window NOT found at startup`);
   }
 }
 
@@ -1527,29 +1567,34 @@ export async function replaceEditorContent({ text }) {
 export async function screenshot({ fullPage = false } = {}) {
   await refreshTargetWindow();
   const tmpFile = join(tmpdir(), `safari-screenshot-${Date.now()}.png`);
-  let savedTabIdx = null;
   try {
-    // If working on a background tab, temporarily switch to it for screenshot
+    // Check if target tab is a background tab — if so, use JS screenshot to avoid tab jumping
+    let isBackgroundTab = false;
     if (_activeTabIndex) {
       try {
         const currentIdx = await osascriptFast(
           `tell application "Safari" to return index of current tab of ${getTargetWindowRef()}`
         );
-        if (Number(currentIdx) !== _activeTabIndex) {
-          savedTabIdx = Number(currentIdx);
-          await osascriptFast(
-            `tell application "Safari" to set current tab of ${getTargetWindowRef()} to tab ${_activeTabIndex} of ${getTargetWindowRef()}`
-          );
-          await new Promise(r => setTimeout(r, 200)); // Let Safari render the tab
-        }
+        isBackgroundTab = Number(currentIdx) !== _activeTabIndex;
       } catch (_) {}
     }
-    const skipScreencapture = false; // Always try screencapture now
+    // When on a background tab, go straight to JS-based screenshot (no tab switch, no focus steal)
+    const skipScreencapture = isBackgroundTab;
 
     // Try screencapture — use osascript's do shell script to bypass VS Code permission issue
     const windowId = !skipScreencapture ? await osascript(
       `tell application "Safari" to return id of ${getTargetWindowRef()}`
     ).catch(() => null) : null;
+
+    // Save frontmost app BEFORE screencapture (it may steal focus on macOS Tahoe)
+    let previousApp = null;
+    if (windowId) {
+      try {
+        previousApp = (await osascriptFast(
+          `tell application "System Events" to return name of first application process whose frontmost is true`
+        )).trim();
+      } catch (_) {}
+    }
 
     if (windowId) {
       try {
@@ -1584,6 +1629,12 @@ export async function screenshot({ fullPage = false } = {}) {
               { timeout: 15000 }
             );
           }
+        }
+        // Restore focus if screencapture stole it (common on macOS Tahoe)
+        if (previousApp && previousApp !== "Safari") {
+          await osascriptFast(
+            `tell application "${previousApp}" to activate`
+          ).catch(() => {});
         }
         // Compress: convert PNG to JPEG (50% quality) + resize to max 1200px width
         // Cuts ~600KB PNG → ~60KB JPEG — critical for staying under 20MB context limit
@@ -1638,14 +1689,6 @@ export async function screenshot({ fullPage = false } = {}) {
     throw new Error("screencapture failed — Screen Recording permission may have been lost. Grant permission in System Settings → Privacy & Security → Screen Recording, then restart Safari.");
   } finally {
     await unlink(tmpFile).catch(() => {});
-    // Restore user's tab if we switched
-    if (savedTabIdx) {
-      try {
-        await osascriptFast(
-          `tell application "Safari" to set current tab of ${getTargetWindowRef()} to tab ${savedTabIdx} of ${getTargetWindowRef()}`
-        );
-      } catch (_) {}
-    }
   }
 }
 

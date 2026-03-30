@@ -92,6 +92,11 @@ async function connect() {
           updateBadge("OFF");
           return; // Do NOT poll — let the correct profile's extension handle commands
         }
+        // Notify server that we passed profile verification
+        await fetch(`${HTTP_URL}/extension-verified`, {
+          method: "POST",
+          signal: AbortSignal.timeout(3000),
+        }).catch(() => {});
         await _discoverProfileWindow();
       }
       isConnected = true;

@@ -235,13 +235,27 @@ try {
 
     // POST /connect — extension announces it's alive
     if (req.method === "POST" && req.url === "/connect") {
-      if (!_extensionConnected) {
+      // When SAFARI_PROFILE is set, don't mark as connected until profile is verified.
+      // A personal-profile extension connecting first would incorrectly set the flag.
+      if (!process.env.SAFARI_PROFILE && !_extensionConnected) {
         _extensionConnected = true;
         console.error("[Safari MCP] Extension connected via HTTP polling");
       }
       _extensionLastPollTime = Date.now();
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "connected", profile: process.env.SAFARI_PROFILE || null }));
+      return;
+    }
+
+    // POST /extension-verified — extension confirmed it's in the correct profile
+    if (req.method === "POST" && req.url === "/extension-verified") {
+      if (!_extensionConnected) {
+        _extensionConnected = true;
+        console.error("[Safari MCP] Extension connected and profile-verified via HTTP polling");
+      }
+      _extensionLastPollTime = Date.now();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "verified" }));
       return;
     }
 
