@@ -650,7 +650,7 @@ export async function reload(hardReload = false) {
 
 export async function readPage({ selector, maxLength = 50000 } = {}) {
   if (selector) {
-    const sel = selector.replace(/'/g, "\\'");
+    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
     return runJS(
       `(function(){
         var el = document.querySelector('${sel}');
@@ -851,11 +851,21 @@ const INJECT_MCP_HELPERS = `if(window.__mcpVersion!==5){window.__mcpVersion=5;
         clientX:r.left+r.width/2,clientY:r.top+r.height/2,pageX:r.left+r.width/2+window.scrollX,pageY:r.top+r.height/2+window.scrollY,
         preventDefault:function(){},stopPropagation:function(){},nativeEvent:new MouseEvent(type||'click'),persist:function(){},bubbles:true,cancelable:true};
     }
+    // For React radio/checkbox inputs, onChange is the primary handler (not onClick)
+    var isToggle=startNode.tagName==='INPUT'&&(startNode.type==='radio'||startNode.type==='checkbox');
+    function tryOnChange(propsObj,targetNode){
+      if(!isToggle||!propsObj.onChange)return false;
+      var newChecked=startNode.type==='radio'?true:!startNode.checked;
+      propsObj.onChange({target:{value:startNode.value,checked:newChecked,type:startNode.type,name:startNode.name,id:startNode.id,tagName:'INPUT'},
+        currentTarget:targetNode,preventDefault:function(){},stopPropagation:function(){},nativeEvent:new Event('change'),persist:function(){},bubbles:true,cancelable:true,type:'change'});
+      return true;
+    }
     var node=startNode;
     for(var depth=0;depth<15&&node;depth++){
       var pk=Object.keys(node).find(function(k){return k.startsWith('__reactProps$')});
       if(pk&&node[pk]){
         var props=node[pk];
+        if(tryOnChange(props,node))return true;
         if(props.onClick){props.onClick(makeSynth(node,'click'));return true}
         if(props.onMouseDown){props.onMouseDown(makeSynth(node,'mousedown'));return true}
         if(props.onPointerDown){props.onPointerDown(makeSynth(node,'pointerdown'));return true}
@@ -865,6 +875,7 @@ const INJECT_MCP_HELPERS = `if(window.__mcpVersion!==5){window.__mcpVersion=5;
         var f=node[fk];
         while(f){
           if(f.memoizedProps){
+            if(tryOnChange(f.memoizedProps,node))return true;
             if(f.memoizedProps.onClick){f.memoizedProps.onClick(makeSynth(node,'click'));return true}
             if(f.memoizedProps.onMouseDown){f.memoizedProps.onMouseDown(makeSynth(node,'mousedown'));return true}
             if(f.memoizedProps.onPointerDown){f.memoizedProps.onPointerDown(makeSynth(node,'pointerdown'));return true}
@@ -1033,14 +1044,14 @@ export async function click({ selector, text, x, y, ref }) {
   }
 
   if (selector) {
-    const sel = selector.replace(/'/g, "\\'");
+    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
     return clickWithRetry(
       `(function(){var el=mcpQuerySelectorDeep('${sel}');if(!el)return 'Element not found: ${sel}';var target=mcpClickWithReact(el);return 'Clicked: '+target.tagName+((target.innerText||target.textContent)?(' "'+(target.innerText||target.textContent).trim().substring(0,50)+'"'):'');})()`
     );
   }
 
   if (text) {
-    const safeText = text.replace(/'/g, "\\'");
+    const safeText = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
     return clickWithRetry(
       `(function(){var el=mcpFindText('${safeText}',true)||mcpFindText('${safeText}',false);if(!el)return 'Element not found with text: ${safeText}';var target=mcpClickWithReact(el);return 'Clicked: '+target.tagName+' "'+((target.innerText||target.textContent)||'').trim().substring(0,50)+'"';})()`
     );
@@ -1057,7 +1068,7 @@ export async function click({ selector, text, x, y, ref }) {
 export async function doubleClick({ selector, x, y, ref }) {
   if (ref) selector = refSelector(ref);
   if (selector) {
-    const sel = selector.replace(/'/g, "\\'");
+    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
     return runJS(
       `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';el.scrollIntoView({block:'center'});el.dispatchEvent(new MouseEvent('dblclick',{bubbles:true,cancelable:true}));return 'Double-clicked: '+el.tagName;})()`
     );
@@ -1072,7 +1083,7 @@ export async function doubleClick({ selector, x, y, ref }) {
 
 export async function rightClick({ selector, x, y }) {
   if (selector) {
-    const sel = selector.replace(/'/g, "\\'");
+    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
     return runJS(
       `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';el.scrollIntoView({block:'center'});el.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true,button:2}));return 'Right-clicked: '+el.tagName;})()`
     );
@@ -1111,7 +1122,7 @@ export async function nativeClick({ selector, text, x, y, ref, doubleClick = fal
         });
       })()`;
     } else if (selector) {
-      const sel = selector.replace(/'/g, "\\'");
+      const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
       jsExpr = `(function(){
         var el = document.querySelector('${sel}');
         if (!el) return JSON.stringify({error: 'Element not found: ${sel}'});
@@ -1125,7 +1136,7 @@ export async function nativeClick({ selector, text, x, y, ref, doubleClick = fal
         });
       })()`;
     } else {
-      const safeText = text.replace(/'/g, "\\'");
+      const safeText = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
       jsExpr = `(function(){
         var el = mcpFindText('${safeText}', true) || mcpFindText('${safeText}', false);
         if (!el) return JSON.stringify({error: 'Element not found with text: ${safeText}'});
@@ -1183,7 +1194,7 @@ export async function nativeClick({ selector, text, x, y, ref, doubleClick = fal
 
 export async function fill({ selector, value, ref }) {
   if (ref) selector = refSelector(ref);
-  const sel = selector.replace(/'/g, "\\'");
+  const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
   // Proper escaping order: backslashes first, then quotes
   const val = value.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, "");
   const result = await runJS(
@@ -1237,14 +1248,14 @@ export async function fill({ selector, value, ref }) {
 }
 
 export async function clearField({ selector }) {
-  const sel = selector.replace(/'/g, "\\'");
+  const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
   return runJS(
     `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';if(el.isContentEditable){el.focus();document.execCommand('selectAll');document.execCommand('delete');el.dispatchEvent(new Event('input',{bubbles:true}));return 'Cleared (contenteditable)';}var t=el._valueTracker;if(t)t.setValue('x');var p=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;var d=Object.getOwnPropertyDescriptor(p,'value');if(d&&d.set)d.set.call(el,'');else el.value='';el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));el.dispatchEvent(new Event('blur',{bubbles:true}));return 'Cleared';})()`
   );
 }
 
 export async function selectOption({ selector, value }) {
-  const sel = selector.replace(/'/g, "\\'");
+  const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
   const val = value.replace(/'/g, "\\'");
   return runJS(
     `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found';el.focus();var t=el._valueTracker;if(t)t.setValue('');var d=Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value');if(d&&d.set){d.set.call(el,'${val}');}else{el.value='${val}';}var m=false;for(var i=0;i<el.options.length;i++){if(el.options[i].value==='${val}'){el.selectedIndex=i;m=true;break;}}if(!m||el.value!=='${val}'){var norm=function(s){return s.replace(/[\\u200B-\\u200F\\u202A-\\u202E\\u2066-\\u2069\\uFEFF]/g,'').replace(/[\\u2010-\\u2015\\u2212\\uFE58\\uFE63\\uFF0D]/g,'-').replace(/\\s*-\\s*/g,'-').replace(/\\s+/g,' ').trim();};var cv=norm('${val}');for(var i=0;i<el.options.length;i++){if(norm(el.options[i].value)===cv||norm(el.options[i].text)===cv){el.selectedIndex=i;if(d&&d.set){d.set.call(el,el.options[i].value);}else{el.value=el.options[i].value;}m=true;break;}}if(!m){for(var i=0;i<el.options.length;i++){var nv=norm(el.options[i].value),nt=norm(el.options[i].text);if(nv.indexOf(cv)>=0||nt.indexOf(cv)>=0||cv.indexOf(nv)>=0||cv.indexOf(nt)>=0){if(i===0&&el.options.length>1)continue;el.selectedIndex=i;if(d&&d.set){d.set.call(el,el.options[i].value);}else{el.value=el.options[i].value;}m=true;break;}}}}el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));el.dispatchEvent(new Event('blur',{bubbles:true}));return 'Selected: '+el.value+' (index '+el.selectedIndex+')';})()`
@@ -1412,7 +1423,7 @@ export async function pressKey({ key, modifiers = [] }) {
 export async function typeText({ text, selector, ref }) {
   if (ref) selector = refSelector(ref);
   if (selector) {
-    const sel = selector.replace(/'/g, "\\'");
+    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
     await runJS(`document.querySelector('${sel}')?.focus()`);
     // Quick poll for focus to settle (was 200ms fixed sleep)
     await new Promise((r) => setTimeout(r, 30));
@@ -1695,7 +1706,7 @@ export async function screenshot({ fullPage = false } = {}) {
 // ========== ELEMENT SCREENSHOT ==========
 
 export async function screenshotElement({ selector }) {
-  const sel = selector.replace(/'/g, "\\'");
+  const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
   // Use html2canvas-like approach: capture element via SVG foreignObject
   const result = await runJS(
     `(async function(){
@@ -1999,14 +2010,14 @@ export async function evaluate({ script }) {
 // ========== ELEMENT INFO ==========
 
 export async function getElementInfo({ selector }) {
-  const sel = selector.replace(/'/g, "\\'");
+  const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
   return runJS(
     `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found';var r=el.getBoundingClientRect();return JSON.stringify({tag:el.tagName,text:el.textContent.trim().substring(0,200),href:el.href||'',value:el.value||'',visible:r.width>0&&r.height>0,rect:{x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)},attrs:Object.fromEntries([...el.attributes].map(function(a){return[a.name,a.value.substring(0,100)]}))})})()`
   );
 }
 
 export async function querySelectorAll({ selector, limit = 20 }) {
-  const sel = selector.replace(/'/g, "\\'");
+  const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
   return runJS(
     `JSON.stringify([...document.querySelectorAll('${sel}')].slice(0,${Number(limit)}).map(function(el,i){return{index:i,tag:el.tagName,text:el.textContent.trim().substring(0,100),href:el.href||undefined,value:el.value||undefined}}))`
   );
@@ -2017,7 +2028,7 @@ export async function querySelectorAll({ selector, limit = 20 }) {
 export async function hover({ selector, x, y, ref }) {
   if (ref) selector = refSelector(ref);
   if (selector) {
-    const sel = selector.replace(/'/g, "\\'");
+    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
     return runJS(
       `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found';el.scrollIntoView({block:'center'});el.dispatchEvent(new MouseEvent('mouseover',{bubbles:true}));el.dispatchEvent(new MouseEvent('mouseenter',{bubbles:true}));return 'Hovered: '+el.tagName;})()`
     );
@@ -2034,7 +2045,7 @@ export async function hover({ selector, x, y, ref }) {
 
 export async function handleDialog({ action = "accept", text }) {
   if (text !== undefined) {
-    const safeText = text.replace(/'/g, "\\'");
+    const safeText = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
     await runJS(
       `window.__mcp_dialog_response='${safeText}';window.__origPrompt=window.prompt;window.prompt=function(){var r=window.__mcp_dialog_response;window.prompt=window.__origPrompt;return r;}`
     );
@@ -2148,7 +2159,7 @@ export async function uploadFile({ selector, filePath }) {
     end tell`
   ).catch(() => {}); // Ignore if no dialog open
 
-  const sel = selector.replace(/'/g, "\\'");
+  const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
   const { basename, extname } = await import("node:path");
   const fileName = basename(filePath);
   const ext = extname(filePath).toLowerCase().replace(".", "");
@@ -3170,7 +3181,7 @@ export async function overrideGeolocation({ latitude, longitude, accuracy = 100 
 // ========== COMPUTED STYLES ==========
 
 export async function getComputedStyles({ selector, properties }) {
-  const sel = selector.replace(/'/g, "\\'");
+  const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
   const propsFilter = properties
     ? `.filter(function(p){return [${properties.map((p) => `'${p}'`).join(",")}].includes(p)})`
     : "";
@@ -3309,14 +3320,14 @@ export async function detectForms() {
 
 export async function scrollToElement({ selector, text, block = "center", timeout = 10000 }) {
   if (selector) {
-    const sel = selector.replace(/'/g, "\\'");
+    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
     return runJS(
       `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';el.scrollIntoView({behavior:'smooth',block:'${block}'});var r=el.getBoundingClientRect();return 'Scrolled to: '+el.tagName+' at y='+Math.round(r.y);})()`
     );
   }
   if (text) {
     // Virtual DOM scroll: scroll down repeatedly until text appears (for Airtable, etc.)
-    const safeText = text.replace(/'/g, "\\'");
+    const safeText = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
     return runJS(
       `(async function(){
         var deadline = Date.now() + ${Number(timeout)};

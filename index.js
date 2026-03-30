@@ -170,8 +170,19 @@ function _setupExtensionListener(ws) {
 // ========== HTTP POLLING SERVER (for Safari extensions — WebSocket blocked) ==========
 try {
   const httpServer = createServer((req, res) => {
-    // CORS headers for extension
-    res.setHeader("Access-Control-Allow-Origin", "*");
+    // CORS headers — restricted to browser extension origin only.
+    // Safari extensions use moz-extension:// or safari-web-extension:// origins.
+    // "*" was a security risk: any webpage could POST to localhost:9224 and execute MCP commands.
+    const origin = req.headers.origin || "";
+    const isSafeOrigin = !origin || origin.startsWith("safari-web-extension://") || origin.startsWith("moz-extension://") || origin.startsWith("chrome-extension://");
+    if (isSafeOrigin) {
+      res.setHeader("Access-Control-Allow-Origin", origin || "*");
+    } else {
+      // Block cross-origin requests from web pages
+      res.writeHead(403);
+      res.end("Forbidden: cross-origin request blocked");
+      return;
+    }
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
