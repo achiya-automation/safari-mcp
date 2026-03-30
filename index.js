@@ -13,6 +13,9 @@ import { WebSocketServer } from "ws";
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // ========== SINGLETON: kill stale instances from previous sessions ==========
 // NOTE: Claude Code VSCode may start 2 instances simultaneously (~40ms apart).
@@ -66,11 +69,18 @@ function _untrackTab(tabIndex) {
 async function _cleanupTabs() {
   if (_openedTabs.size === 0) return;
   console.error(`[Safari MCP] Cleanup: closing ${_openedTabs.size} MCP-opened tabs`);
-  const indices = [..._openedTabs.keys()].sort((a, b) => b - a);
-  for (const idx of indices) {
+  // Close by URL (not index) — indices shift as tabs are closed
+  const urlsToClose = [..._openedTabs.values()].map(v => v.url).filter(Boolean);
+  for (const url of urlsToClose) {
     try {
-      safari.setActiveTabIndex(idx);
-      await safari.closeTab();
+      // Re-resolve index by URL before each close (indices shift after each closure)
+      const tabs = await safari.listTabs();
+      const parsed = typeof tabs === 'string' ? JSON.parse(tabs) : tabs;
+      const match = parsed.find(t => t.url === url);
+      if (match) {
+        safari.setActiveTabIndex(match.index);
+        await safari.closeTab();
+      }
     } catch {}
   }
   _openedTabs.clear();
@@ -286,8 +296,8 @@ try {
         try {
           const { nonce, expectedProfile } = JSON.parse(body);
           // Use AppleScript to find which window contains the nonce in a tab title
-          const safeNonce = nonce.replace(/"/g, '\\"');
-          const safeProfile = (expectedProfile || "").replace(/"/g, '\\"');
+          const safeNonce = String(nonce).replace(/[^0-9]/g, '');  // nonce is numeric only
+          const safeProfile = (expectedProfile || "").replace(/[^\p{L}\p{N}\s\-_]/gu, '');  // whitelist: letters, numbers, spaces, hyphens, underscores
           // Check via AppleScript — look for the nonce in the profile window
           const { execFile } = await import("node:child_process");
           const { promisify } = await import("node:util");
@@ -494,7 +504,7 @@ function sendToExtension(type, payload = {}, timeoutMs = 30000) {
 // Per-command timeouts — fast commands get short timeouts, nav/screenshot get longer ones
 const _commandTimeouts = {
   click: 10000, fill: 5000, read_page: 30000, get_source: 10000, evaluate: 30000,
-  type_text: 5000, press_key: 5000, scroll: 3000, scroll_to: 3000, scroll_to_element: 3000,
+  type_text: 5000, press_key: 5000, scroll: 3000, scroll_to: 3000, scroll_to_element: 15000,
   hover: 5000, list_tabs: 5000, new_tab: 15000, close_tab: 5000, switch_tab: 30000,
   wait_for: 30000, navigate: 30000, navigate_and_read: 30000, go_back: 10000, go_forward: 10000,
   reload: 15000, screenshot: 15000, snapshot: 30000, click_and_read: 15000,
@@ -547,9 +557,11 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
   return result;
 }
 
+// Read version from package.json to avoid hardcoded mismatch
+const _pkgVersion = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'package.json'), 'utf8')).version;
 const server = new McpServer({
   name: "safari-mcp",
-  version: "1.0.0",
+  version: _pkgVersion,
   description: "Safari browser automation - lightweight, keeps logins",
 });
 
@@ -639,7 +651,7 @@ server.tool(
     const gen = safari.getNextSnapshotGen();
     const result = await extensionOrFallback(
       "snapshot", { selector: args.selector, gen },
-      () => safari.takeSnapshot(args)
+      () => safari.takeSnapshot({ ...args, _gen: gen })
     );
     return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }

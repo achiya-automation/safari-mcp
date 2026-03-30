@@ -19,6 +19,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // Persistent process — no subprocess spawn overhead (~5ms vs ~90ms)
 let _helperProc = null;
 const _helperQueue = []; // callbacks waiting for responses
+let _helperConsecutiveTimeouts = 0; // Track consecutive timeouts — only kill after 3
 
 // Reject all pending callbacks when helper crashes
 function _drainHelperQueue(reason) {
@@ -336,9 +337,15 @@ function _osascriptFastHelper(script, timeout) {
       resolved = true;
       const idx = _helperQueue.indexOf(cb);
       if (idx >= 0) _helperQueue.splice(idx, 1);
-      _helperProc?.kill();
-      _helperProc = null;
-      setTimeout(startHelper, 100);
+      _helperConsecutiveTimeouts++;
+      // Only kill the daemon after 3 consecutive timeouts (single slow script shouldn't kill concurrent ops)
+      if (_helperConsecutiveTimeouts >= 3) {
+        console.error(`[Safari MCP] safari-helper: ${_helperConsecutiveTimeouts} consecutive timeouts — killing daemon`);
+        _helperProc?.kill();
+        _helperProc = null;
+        _helperConsecutiveTimeouts = 0;
+        setTimeout(startHelper, 100);
+      }
       reject(new Error("safari-helper timeout"));
     }, timeout);
 
@@ -346,6 +353,7 @@ function _osascriptFastHelper(script, timeout) {
       if (resolved) return;
       resolved = true;
       clearTimeout(timer);
+      _helperConsecutiveTimeouts = 0; // Reset on success
       try {
         const parsed = JSON.parse(line);
         if (parsed.error) reject(new Error(parsed.error));
@@ -355,14 +363,21 @@ function _osascriptFastHelper(script, timeout) {
       }
     }
 
-    _helperQueue.push(cb);
-    if (!_helperProc || !_helperProc.stdin) {
-      // Helper died between the check and write — reject immediately
-      _helperQueue.pop(); // Remove the callback we just pushed
+    // Check process availability BEFORE pushing to queue (prevents dangling callbacks)
+    if (!_helperProc || !_helperProc.stdin || !_helperProc.stdin.writable) {
+      clearTimeout(timer);
       reject(new Error("safari-helper not available"));
       return;
     }
-    _helperProc.stdin.write(JSON.stringify({ script }) + "\n");
+    _helperQueue.push(cb);
+    try {
+      _helperProc.stdin.write(JSON.stringify({ script }) + "\n");
+    } catch (writeErr) {
+      const idx = _helperQueue.indexOf(cb);
+      if (idx >= 0) _helperQueue.splice(idx, 1);
+      clearTimeout(timer);
+      reject(new Error("safari-helper write failed: " + writeErr.message));
+    }
   });
 }
 
@@ -623,17 +638,21 @@ export async function navigate(url) {
 
 export async function goBack() {
   // Navigate back + smart wait: check immediately, then poll only if loading
-  return runJS(
+  const result = await runJS(
     `(async function(){history.back();await new Promise(function(r){setTimeout(r,50)});if(document.readyState!=='complete'){for(var i=0;i<30;i++){await new Promise(function(r){setTimeout(r,150)});if(document.readyState==='complete')break;}}return JSON.stringify({title:document.title,url:location.href});})()`,
     { timeout: 10000 }
   );
+  try { const p = JSON.parse(result); if (p.url) _activeTabURL = p.url; } catch {}
+  return result;
 }
 
 export async function goForward() {
-  return runJS(
+  const result = await runJS(
     `(async function(){history.forward();await new Promise(function(r){setTimeout(r,50)});if(document.readyState!=='complete'){for(var i=0;i<30;i++){await new Promise(function(r){setTimeout(r,150)});if(document.readyState==='complete')break;}}return JSON.stringify({title:document.title,url:location.href});})()`,
     { timeout: 10000 }
   );
+  try { const p = JSON.parse(result); if (p.url) _activeTabURL = p.url; } catch {}
+  return result;
 }
 
 export async function reload(hardReload = false) {
@@ -641,10 +660,12 @@ export async function reload(hardReload = false) {
   await runJS(hardReload ? "location.reload(true)" : "location.reload()");
   await new Promise((r) => setTimeout(r, 100)); // Brief wait for reload to start (was 500ms)
   // Poll readyState in a single call
-  return runJS(
+  const result = await runJS(
     `(async function(){for(var i=0;i<30;i++){if(document.readyState==='complete')break;await new Promise(function(r){setTimeout(r,200)});}return JSON.stringify({title:document.title,url:location.href});})()`,
     { timeout: 10000 }
   );
+  try { const p = JSON.parse(result); if (p.url) _activeTabURL = p.url; } catch {}
+  return result;
 }
 
 // ========== PAGE INFO ==========
@@ -1239,7 +1260,7 @@ export async function fill({ selector, value, ref }) {
 
     const fillResult = await runJS(
       `(function(){` +
-      `var el=document.querySelector('${selector.replace(/'/g, "\\'")}');` +
+      `var el=document.querySelector('${selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}');` +
       `if(!el)return 'Element not found';` +
       `el.focus();el.click();` +
       `var sel=window.getSelection();if(sel.rangeCount){var r=document.createRange();r.selectNodeContents(el);r.collapse(false);sel.removeAllRanges();sel.addRange(r);}` +
@@ -1624,15 +1645,19 @@ export async function screenshot({ fullPage = false } = {}) {
           await osascript(
             `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {0, 0, ${Number(w)}, ${Math.min(Number(h) + 100, 5000)}}`
           );
-          await new Promise((r) => setTimeout(r, 500));
-          // Use do shell script to inherit osascript's Screen Recording permission
-          await osascript(
-            `do shell script "screencapture -l${windowId} -o -x '${tmpFile}'"`,
-            { timeout: 15000 }
-          );
-          await osascript(
-            `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {${bounds}}`
-          );
+          try {
+            await new Promise((r) => setTimeout(r, 500));
+            // Use do shell script to inherit osascript's Screen Recording permission
+            await osascript(
+              `do shell script "screencapture -l${windowId} -o -x '${tmpFile}'"`,
+              { timeout: 15000 }
+            );
+          } finally {
+            // Always restore bounds — even if screencapture fails
+            await osascript(
+              `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {${bounds}}`
+            ).catch(() => {});
+          }
         } else {
           // Try direct execFile first (works if VS Code has Screen Recording permission)
           try {
@@ -1867,8 +1892,9 @@ export async function newTab(url = "") {
       else { await osascript('tell application "Safari" to make new document'); }
     }
   }
+  // Get count atomically from the same tell block as tab creation (avoids TOCTOU if user opens tabs concurrently)
   const tabCount = await osascriptFast(`tell application "Safari" to return count of tabs of ${getTargetWindowRef()}`);
-  _activeTabIndex = Number(tabCount);
+  _activeTabIndex = Number(tabCount);  // New tab is always appended as last
   _activeTabURL = url || null;
   _lastResolveTime = Date.now();
   // Wait for page load if URL given
@@ -2058,11 +2084,11 @@ export async function handleDialog({ action = "accept", text }) {
   }
   if (action === "accept") {
     await runJS(
-      "window.__origConfirm=window.confirm;window.confirm=function(){window.confirm=window.__origConfirm;return true;};window.__origAlert=window.alert;window.alert=function(){window.alert=window.__origAlert;};"
+      "window.__origConfirm=window.__origConfirm||window.confirm;window.confirm=function(){window.confirm=window.__origConfirm;return true;};window.__origAlert=window.__origAlert||window.alert;window.alert=function(){window.alert=window.__origAlert;};"
     );
   } else {
     await runJS(
-      "window.__origConfirm=window.confirm;window.confirm=function(){window.confirm=window.__origConfirm;return false;};"
+      "window.__origConfirm=window.__origConfirm||window.confirm;window.confirm=function(){window.confirm=window.__origConfirm;return false;};"
     );
   }
   return `Dialog handler set: ${action}${text ? ' with "' + text + '"' : ""}`;
@@ -2106,19 +2132,23 @@ export async function getNetworkRequests({ limit = 50 } = {}) {
 
 export async function drag({ sourceSelector, targetSelector, sourceX, sourceY, targetX, targetY }) {
   if (sourceSelector && targetSelector) {
-    const srcSel = sourceSelector.replace(/'/g, "\\'");
-    const tgtSel = targetSelector.replace(/'/g, "\\'");
+    const srcSel = sourceSelector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const tgtSel = targetSelector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
     return runJS(
       `(function(){` +
       `var src=document.querySelector('${srcSel}');var tgt=document.querySelector('${tgtSel}');` +
       `if(!src)return 'Source not found: ${srcSel}';if(!tgt)return 'Target not found: ${tgtSel}';` +
       `var sr=src.getBoundingClientRect();var tr=tgt.getBoundingClientRect();` +
       `var sx=sr.x+sr.width/2,sy=sr.y+sr.height/2,tx=tr.x+tr.width/2,ty=tr.y+tr.height/2;` +
+      `var dt=new DataTransfer();` +
+      `src.dispatchEvent(new DragEvent('dragstart',{clientX:sx,clientY:sy,bubbles:true,cancelable:true,dataTransfer:dt}));` +
       `src.dispatchEvent(new MouseEvent('mousedown',{clientX:sx,clientY:sy,bubbles:true}));` +
       `src.dispatchEvent(new MouseEvent('mousemove',{clientX:sx,clientY:sy,bubbles:true}));` +
+      `tgt.dispatchEvent(new DragEvent('dragover',{clientX:tx,clientY:ty,bubbles:true,cancelable:true,dataTransfer:dt}));` +
       `tgt.dispatchEvent(new MouseEvent('mousemove',{clientX:tx,clientY:ty,bubbles:true}));` +
       `tgt.dispatchEvent(new MouseEvent('mouseup',{clientX:tx,clientY:ty,bubbles:true}));` +
-      `tgt.dispatchEvent(new DragEvent('drop',{bubbles:true}));` +
+      `tgt.dispatchEvent(new DragEvent('drop',{clientX:tx,clientY:ty,bubbles:true,cancelable:true,dataTransfer:dt}));` +
+      `src.dispatchEvent(new DragEvent('dragend',{bubbles:true}));` +
       `return 'Dragged from '+src.tagName+' to '+tgt.tagName;})()`
     );
   }
@@ -2137,9 +2167,27 @@ export async function drag({ sourceSelector, targetSelector, sourceX, sourceY, t
   throw new Error("drag requires sourceSelector+targetSelector or sourceX/Y+targetX/Y");
 }
 
+// ========== FILE PATH SAFETY ==========
+// Prevent reading sensitive system files via upload/paste tools
+function _validateFilePath(filePath) {
+  const { resolve } = require("node:path");
+  const resolved = resolve(filePath);
+  if (resolved.includes('..')) throw new Error("Path traversal not allowed: " + filePath);
+  const blocked = ['.ssh', '.gnupg', '.aws', '.config/gcloud', 'credentials', '.env', '.npmrc', '.netrc', 'id_rsa', 'id_ed25519', '.keychain'];
+  const lower = resolved.toLowerCase();
+  for (const b of blocked) {
+    if (lower.includes(b)) throw new Error("Blocked: reading sensitive path " + filePath);
+  }
+  // Must be under /Users/ or /tmp/ or /var/folders/ (macOS temp)
+  if (!resolved.startsWith('/Users/') && !resolved.startsWith('/tmp/') && !resolved.startsWith('/var/folders/') && !resolved.startsWith('/private/tmp/')) {
+    throw new Error("File path must be under /Users/, /tmp/, or /var/folders/: " + filePath);
+  }
+}
+
 // ========== UPLOAD FILE ==========
 
 export async function uploadFile({ selector, filePath }) {
+  _validateFilePath(filePath);
   // Read file in Node.js, send as base64 to Safari JS, create File + DataTransfer
   // NO file dialog, NO System Events, NO focus stealing
 
@@ -2257,6 +2305,7 @@ export async function uploadFile({ selector, filePath }) {
 // ========== PASTE IMAGE FROM FILE ==========
 
 export async function pasteImageFromFile({ filePath }) {
+  _validateFilePath(filePath);
   // Paste image via JS ClipboardEvent — NO clipboard touch, NO System Events, NO focus steal
   const { extname } = await import("node:path");
   const ext = extname(filePath).toLowerCase().replace(".", "");
@@ -2357,9 +2406,9 @@ export async function emulate({ device, width, height, userAgent, scale = 1 }) {
 
 export async function resetEmulation() {
   await refreshTargetWindow();
-  // Reset user agent
+  // Reset user agent — remove the defineProperty override set by emulate()
   await runJS(
-    "delete Object.getOwnPropertyDescriptor(Navigator.prototype,'userAgent')||true"
+    "try{var d=Object.getOwnPropertyDescriptor(Navigator.prototype,'userAgent');if(d){Object.defineProperty(navigator,'userAgent',d);}else{delete navigator.userAgent;}}catch(_){}"
   );
   // Maximize window
   await osascript(
@@ -2445,10 +2494,14 @@ export async function savePDF({ path: pdfPath }) {
 // instead of guessing CSS selectors. Much faster, no hallucination risk.
 
 let _snapshotGen = 0;
+// getNextSnapshotGen is used by the MCP tool path (index.js) to reserve a gen for the extension.
+// If the extension fails and falls back to takeSnapshot(), takeSnapshot uses _snapshotGen directly
+// (which was already incremented by getNextSnapshotGen) — so no double-increment occurs.
 export function getNextSnapshotGen() { return _snapshotGen++; }
 
-export async function takeSnapshot({ selector } = {}) {
-  const gen = _snapshotGen++;
+export async function takeSnapshot({ selector, _gen } = {}) {
+  // Use provided gen (from tool path) or allocate a new one (direct call)
+  const gen = _gen != null ? _gen : _snapshotGen++;
   const root = selector ? `document.querySelector('${selector.replace(/'/g, "\\'")}')` : "document.body";
 
   const result = await runJS(
@@ -2817,7 +2870,12 @@ export async function importStorageState({ state }) {
       cmds.push(`sessionStorage.setItem('${esc(k)}','${esc(v)}')`);
     }
   }
-  return runJS(cmds.join(";") + "; 'Imported ' + " + cmds.length + " + ' items'");
+  // Use runJSLarge for large sessions (many cookies/localStorage keys can exceed 260KB limit of runJS)
+  const script = cmds.join(";") + "; 'Imported ' + " + cmds.length + " + ' items'";
+  if (script.length > 200000) {
+    return runJSLarge(script, { timeout: 30000 });
+  }
+  return runJS(script);
 }
 
 // ========== CLIPBOARD ==========
@@ -2939,8 +2997,9 @@ export async function clearNetworkMocks() {
 // ========== WAIT FOR TIME ==========
 
 export async function waitForTime({ ms }) {
-  await new Promise((r) => setTimeout(r, Number(ms)));
-  return `Waited ${ms}ms`;
+  const capped = Math.min(Number(ms) || 0, 60000); // Cap at 60 seconds
+  await new Promise((r) => setTimeout(r, capped));
+  return capped < Number(ms) ? `Waited ${capped}ms (capped from ${ms}ms — max 60s)` : `Waited ${ms}ms`;
 }
 
 // ========== NETWORK CAPTURE (Detailed) ==========

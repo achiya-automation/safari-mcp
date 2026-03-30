@@ -67,7 +67,7 @@ if (window.__mcpVersion !== 5) {
   window.mcpIsVisible = function(el) {
     if (!el || el.nodeType !== 1 || !el.isConnected) return false;
     var cs = window.getComputedStyle(el);
-    if (!cs || cs.display === 'none' || cs.visibility === 'hidden' || cs.visibility === 'collapse' || cs.pointerEvents === 'none' || cs.opacity === '0') return false;
+    if (!cs || cs.display === 'none' || cs.visibility === 'hidden' || cs.visibility === 'collapse' || parseFloat(cs.opacity) === 0) return false;
     var r = el.getBoundingClientRect();
     return r.width > 0 && r.height > 0;
   };

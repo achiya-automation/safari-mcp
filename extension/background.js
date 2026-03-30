@@ -1825,7 +1825,13 @@ async function execInAllFrames(func, args = [], tabId = null) {
   }
 }
 
-function waitForTabLoad(tabId, timeout = 30000) {
+async function waitForTabLoad(tabId, timeout = 30000) {
+  // Check if already complete BEFORE registering listeners (prevents missing instant-complete events)
+  try {
+    const tab = await browser.tabs.get(tabId);
+    if (tab.status === "complete") return;
+  } catch { return; } // Tab already gone
+
   return new Promise((resolve) => {
     function cleanup() {
       clearTimeout(timer);
