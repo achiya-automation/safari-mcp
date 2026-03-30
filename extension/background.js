@@ -1548,6 +1548,8 @@ async function handleCommand(type, payload) {
 const _sessionTabCache = new Map();
 const TAB_CACHE_MS = 3000; // Re-verify tab URL match every 3s
 const _DEFAULT_SESSION = "__default__"; // Fallback for commands without sessionId
+const SESSION_MAX_AGE_MS = 5 * 60 * 1000; // 5 min — prune stale sessions
+const MAX_SESSIONS = 50; // Hard cap on session cache size
 
 function _getSessionCache(sessionId) {
   const sid = sessionId || _DEFAULT_SESSION;
@@ -1556,6 +1558,29 @@ function _getSessionCache(sessionId) {
   }
   return _sessionTabCache.get(sid);
 }
+
+// Prune stale sessions — runs every 60s
+function _pruneSessionCache() {
+  const now = Date.now();
+  for (const [sid, cache] of _sessionTabCache) {
+    if (sid === _DEFAULT_SESSION) continue;
+    // Remove sessions with no active tab that haven't been used in 5 min
+    if (!cache.tabId && (now - cache.time) > SESSION_MAX_AGE_MS) {
+      _sessionTabCache.delete(sid);
+    }
+  }
+  // Hard cap: if still too many, remove oldest
+  if (_sessionTabCache.size > MAX_SESSIONS) {
+    const sorted = [..._sessionTabCache.entries()]
+      .filter(([sid]) => sid !== _DEFAULT_SESSION)
+      .sort((a, b) => a[1].time - b[1].time);
+    while (_sessionTabCache.size > MAX_SESSIONS && sorted.length) {
+      const [sid] = sorted.shift();
+      _sessionTabCache.delete(sid);
+    }
+  }
+}
+setInterval(_pruneSessionCache, 60000);
 
 function _setSessionTab(sessionId, tabId, tabUrl) {
   const cache = _getSessionCache(sessionId);

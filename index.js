@@ -46,6 +46,77 @@ try {
 // ========== SESSION ID (unique per MCP process — enables per-session tab tracking) ==========
 const SESSION_ID = randomUUID().slice(0, 8);
 
+// ========== MEMORY GUARD: track & auto-close MCP-opened tabs ==========
+const MAX_TABS = parseInt(process.env.MCP_MAX_TABS || "6", 10);
+const MEMORY_CHECK_INTERVAL_MS = parseInt(process.env.MCP_MEMORY_CHECK_MS || "60000", 10);
+const WEBKIT_MEMORY_LIMIT_MB = parseInt(process.env.MCP_WEBKIT_LIMIT_MB || "3000", 10);
+
+// Track tabs opened by THIS session (index → {url, openedAt})
+const _openedTabs = new Map();
+
+function _trackTab(tabIndex, url) {
+  _openedTabs.set(tabIndex, { url: url || "", openedAt: Date.now() });
+}
+
+function _untrackTab(tabIndex) {
+  _openedTabs.delete(tabIndex);
+}
+
+// Close all MCP-opened tabs on process exit
+async function _cleanupTabs() {
+  if (_openedTabs.size === 0) return;
+  console.error(`[Safari MCP] Cleanup: closing ${_openedTabs.size} MCP-opened tabs`);
+  const indices = [..._openedTabs.keys()].sort((a, b) => b - a);
+  for (const idx of indices) {
+    try {
+      safari.setActiveTabIndex(idx);
+      await safari.closeTab();
+    } catch {}
+  }
+  _openedTabs.clear();
+}
+
+// Periodic memory check — if WebKit exceeds limit, close oldest MCP tabs
+let _memoryCheckTimer = null;
+function _startMemoryMonitor() {
+  _memoryCheckTimer = setInterval(async () => {
+    try {
+      const psOut = execFileSync("bash", ["-c",
+        "ps aux | grep -i 'WebKit\\|WebContent' | grep -v grep | awk '{sum+=$6} END {print sum/1024}'"
+      ], { encoding: "utf8" }).trim();
+      const webkitMB = parseFloat(psOut) || 0;
+      if (webkitMB > WEBKIT_MEMORY_LIMIT_MB && _openedTabs.size > 1) {
+        console.error(`[Safari MCP] ⚠️ WebKit using ${Math.round(webkitMB)}MB (limit: ${WEBKIT_MEMORY_LIMIT_MB}MB) — closing oldest MCP tab`);
+        let oldestIdx = null, oldestTime = Infinity;
+        for (const [idx, info] of _openedTabs) {
+          if (info.openedAt < oldestTime) { oldestTime = info.openedAt; oldestIdx = idx; }
+        }
+        if (oldestIdx !== null) {
+          try {
+            safari.setActiveTabIndex(oldestIdx);
+            await safari.closeTab();
+          } catch {}
+          _untrackTab(oldestIdx);
+        }
+      }
+    } catch {}
+  }, MEMORY_CHECK_INTERVAL_MS);
+  _memoryCheckTimer.unref();
+}
+
+// Cleanup on exit
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(sig, async () => {
+    await _cleanupTabs();
+    process.exit(0);
+  });
+}
+process.on("exit", () => {
+  if (_openedTabs.size > 0) {
+    console.error(`[Safari MCP] Exit: ${_openedTabs.size} tabs were tracked for cleanup`);
+  }
+});
+
 // ========== EXTENSION FOCUS SAFETY ==========
 // When SAFARI_PROFILE is set, the extension's browser.scripting.executeScript()
 // can steal window focus in Safari (bringing the automation window to front).
@@ -894,6 +965,22 @@ server.tool(
   "Open a new tab, optionally with a URL",
   { url: z.string().optional().describe("URL to open (empty for blank tab)") },
   async ({ url }) => {
+    // Enforce tab limit — close oldest MCP tab if at max
+    if (_openedTabs.size >= MAX_TABS) {
+      let oldestIdx = null, oldestTime = Infinity;
+      for (const [idx, info] of _openedTabs) {
+        if (info.openedAt < oldestTime) { oldestTime = info.openedAt; oldestIdx = idx; }
+      }
+      if (oldestIdx !== null) {
+        console.error(`[Safari MCP] Tab limit (${MAX_TABS}) reached — closing oldest tab #${oldestIdx}`);
+        try {
+          safari.setActiveTabIndex(oldestIdx);
+          await safari.closeTab();
+        } catch {}
+        _untrackTab(oldestIdx);
+      }
+    }
+
     const result = await extensionOrFallback(
       "new_tab", { url },
       () => safari.newTab(url)
@@ -901,6 +988,7 @@ server.tool(
     // Sync safari.js tracking when extension handled new_tab
     if (result?.tabIndex) {
       safari.setActiveTabIndex(result.tabIndex);
+      _trackTab(result.tabIndex, url);
     }
     if (result?.url) {
       safari.setActiveTabURL(result.url);
@@ -914,7 +1002,9 @@ server.tool(
   "Close the current tab",
   {},
   async () => {
+    const activeIdx = safari.getActiveTabIndex();
     const result = await extensionOrFallback("close_tab", {}, () => safari.closeTab());
+    if (activeIdx !== null) _untrackTab(activeIdx);
     return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
@@ -1720,5 +1810,6 @@ server.tool(
 
 // ========== START SERVER ==========
 
+_startMemoryMonitor();
 const transport = new StdioServerTransport();
 await server.connect(transport);
