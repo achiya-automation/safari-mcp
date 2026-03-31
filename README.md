@@ -530,13 +530,18 @@ The codebase is two files:
 
 ---
 
-## Support
+## Sponsors
 
 Safari MCP is free and open source. If it saves you time or CPU cycles, consider supporting its development:
 
-<a href="https://paypal.me/achiyaC123"><img src="https://img.shields.io/badge/Support-PayPal-blue?logo=paypal" alt="Support via PayPal"></a>
+<a href="https://paypal.me/achiyaC123"><img src="https://img.shields.io/badge/Sponsor-PayPal-blue?logo=paypal" alt="Sponsor via PayPal"></a>
 
-Your support helps keep this project maintained and improving.
+Your support funds:
+- 🧪 Testing across macOS versions and Safari releases
+- 🛠️ New tools and features
+- 📖 Documentation and examples
+
+<!-- Sponsors will be listed here -->
 
 ---
 
