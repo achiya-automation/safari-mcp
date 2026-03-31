@@ -1,0 +1,156 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640">
+  <defs>
+    <!-- Background gradient -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0a0e1a"/>
+      <stop offset="50%" stop-color="#111832"/>
+      <stop offset="100%" stop-color="#1a1040"/>
+    </linearGradient>
+
+    <!-- Accent glow -->
+    <radialGradient id="glowCenter" cx="50%" cy="40%" r="35%">
+      <stop offset="0%" stop-color="#006CFF" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#006CFF" stop-opacity="0"/>
+    </radialGradient>
+
+    <radialGradient id="glowTopRight" cx="80%" cy="20%" r="25%">
+      <stop offset="0%" stop-color="#8b5cf6" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#8b5cf6" stop-opacity="0"/>
+    </radialGradient>
+
+    <radialGradient id="glowBottomLeft" cx="20%" cy="80%" r="25%">
+      <stop offset="0%" stop-color="#006CFF" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#006CFF" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Compass needle gradient -->
+    <linearGradient id="needleNorth" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#ff3b30"/>
+      <stop offset="100%" stop-color="#cc2d24"/>
+    </linearGradient>
+    <linearGradient id="needleSouth" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#c0c8d8"/>
+    </linearGradient>
+
+    <!-- Dot pattern -->
+    <pattern id="dots" x="0" y="0" width="40" height="40" patternUnits="userSpaceOnUse">
+      <circle cx="20" cy="20" r="0.8" fill="#ffffff" opacity="0.06"/>
+    </pattern>
+
+    <!-- Grid line pattern -->
+    <pattern id="grid" x="0" y="0" width="80" height="80" patternUnits="userSpaceOnUse">
+      <path d="M 80 0 L 0 0 0 80" fill="none" stroke="#ffffff" stroke-width="0.3" opacity="0.03"/>
+    </pattern>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1280" height="640" fill="url(#bgGrad)"/>
+  <rect width="1280" height="640" fill="url(#grid)"/>
+  <rect width="1280" height="640" fill="url(#dots)"/>
+
+  <!-- Ambient glow -->
+  <rect width="1280" height="640" fill="url(#glowCenter)"/>
+  <rect width="1280" height="640" fill="url(#glowTopRight)"/>
+  <rect width="1280" height="640" fill="url(#glowBottomLeft)"/>
+
+  <!-- Subtle top edge highlight -->
+  <line x1="0" y1="0" x2="1280" y2="0" stroke="#006CFF" stroke-width="2" opacity="0.4"/>
+
+  <!-- Decorative floating dots -->
+  <circle cx="100" cy="80" r="2" fill="#006CFF" opacity="0.2"/>
+  <circle cx="320" cy="560" r="1.5" fill="#006CFF" opacity="0.15"/>
+  <circle cx="520" cy="60" r="1" fill="#8b5cf6" opacity="0.2"/>
+  <circle cx="700" cy="580" r="2.5" fill="#006CFF" opacity="0.1"/>
+  <circle cx="900" cy="90" r="1.5" fill="#8b5cf6" opacity="0.15"/>
+  <circle cx="1100" cy="540" r="2" fill="#006CFF" opacity="0.12"/>
+  <circle cx="1200" cy="120" r="1" fill="#8b5cf6" opacity="0.18"/>
+  <circle cx="180" cy="500" r="1.5" fill="#006CFF" opacity="0.1"/>
+  <circle cx="450" cy="100" r="1" fill="#ffffff" opacity="0.08"/>
+  <circle cx="850" cy="500" r="1.5" fill="#ffffff" opacity="0.06"/>
+  <circle cx="1050" cy="70" r="2" fill="#006CFF" opacity="0.08"/>
+  <circle cx="600" cy="590" r="1" fill="#8b5cf6" opacity="0.1"/>
+  <circle cx="200" cy="300" r="1.5" fill="#8b5cf6" opacity="0.08"/>
+  <circle cx="1080" cy="350" r="2" fill="#006CFF" opacity="0.06"/>
+  <circle cx="80" cy="420" r="1" fill="#006CFF" opacity="0.12"/>
+  <circle cx="1220" cy="450" r="1.5" fill="#8b5cf6" opacity="0.1"/>
+
+  <!-- Code bracket motifs -->
+  <text x="60" y="200" font-family="SF Mono, Menlo, monospace" font-size="56" font-weight="200" fill="#006CFF" opacity="0.06">{</text>
+  <text x="1190" y="480" font-family="SF Mono, Menlo, monospace" font-size="56" font-weight="200" fill="#8b5cf6" opacity="0.06">}</text>
+  <text x="1080" y="120" font-family="SF Mono, Menlo, monospace" font-size="32" font-weight="200" fill="#006CFF" opacity="0.04">&lt;/&gt;</text>
+  <text x="120" y="530" font-family="SF Mono, Menlo, monospace" font-size="28" font-weight="200" fill="#8b5cf6" opacity="0.04">{ }</text>
+
+  <!-- ========== Safari Compass Icon (centered, larger) ========== -->
+  <g transform="translate(640, 200)">
+    <!-- Outer ring glow -->
+    <circle cx="0" cy="0" r="95" fill="none" stroke="#006CFF" stroke-width="1.2" opacity="0.15"/>
+    <circle cx="0" cy="0" r="102" fill="none" stroke="#006CFF" stroke-width="0.6" opacity="0.08"/>
+
+    <!-- Main compass circle -->
+    <circle cx="0" cy="0" r="84" fill="none" stroke="#ffffff" stroke-width="3" opacity="0.9"/>
+
+    <!-- Tick marks (cardinal) -->
+    <line x1="0" y1="-84" x2="0" y2="-71" stroke="#ffffff" stroke-width="2.5" opacity="0.8"/>
+    <line x1="84" y1="0" x2="71" y2="0" stroke="#ffffff" stroke-width="2.5" opacity="0.8"/>
+    <line x1="0" y1="84" x2="0" y2="71" stroke="#ffffff" stroke-width="2.5" opacity="0.8"/>
+    <line x1="-84" y1="0" x2="-71" y2="0" stroke="#ffffff" stroke-width="2.5" opacity="0.8"/>
+
+    <!-- Tick marks (ordinal) -->
+    <line x1="59.4" y1="-59.4" x2="50.2" y2="-50.2" stroke="#ffffff" stroke-width="1.5" opacity="0.4"/>
+    <line x1="59.4" y1="59.4" x2="50.2" y2="50.2" stroke="#ffffff" stroke-width="1.5" opacity="0.4"/>
+    <line x1="-59.4" y1="59.4" x2="-50.2" y2="50.2" stroke="#ffffff" stroke-width="1.5" opacity="0.4"/>
+    <line x1="-59.4" y1="-59.4" x2="-50.2" y2="-50.2" stroke="#ffffff" stroke-width="1.5" opacity="0.4"/>
+
+    <!-- Compass needle (rotated 35deg like Safari) -->
+    <g transform="rotate(-35)">
+      <!-- North half (red) -->
+      <polygon points="0,-62 10,0 0,8 -10,0" fill="url(#needleNorth)" opacity="0.9"/>
+      <!-- South half (white) -->
+      <polygon points="0,62 10,0 0,-8 -10,0" fill="url(#needleSouth)" opacity="0.85"/>
+    </g>
+
+    <!-- Center dot -->
+    <circle cx="0" cy="0" r="4.5" fill="#ffffff" opacity="0.9"/>
+    <circle cx="0" cy="0" r="2" fill="#006CFF" opacity="1"/>
+  </g>
+
+  <!-- ========== Text Content (centered below compass) ========== -->
+
+  <!-- "Safari MCP" title -->
+  <text x="640" y="365" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Helvetica Neue', Arial, sans-serif" font-size="72" font-weight="700" fill="#ffffff" text-anchor="middle" letter-spacing="-1">
+    Safari<tspan fill="#006CFF"> MCP</tspan>
+  </text>
+
+  <!-- Thin separator line -->
+  <line x1="530" y1="385" x2="750" y2="385" stroke="#006CFF" stroke-width="2" opacity="0.5"/>
+
+  <!-- Subtitle -->
+  <text x="640" y="420" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Helvetica Neue', Arial, sans-serif" font-size="24" font-weight="300" fill="#a0aec0" text-anchor="middle" letter-spacing="0.5">
+    Native browser automation for AI agents
+  </text>
+
+  <!-- Stats line -->
+  <g transform="translate(640, 475)">
+    <!-- Stat badges -->
+    <rect x="-360" y="-16" width="134" height="32" rx="16" fill="#006CFF" opacity="0.12" stroke="#006CFF" stroke-width="0.8" stroke-opacity="0.3"/>
+    <text x="-293" y="6" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Helvetica Neue', Arial, sans-serif" font-size="14" font-weight="500" fill="#6CA8FF" text-anchor="middle" letter-spacing="0.3">80+ Tools</text>
+
+    <rect x="-204" y="-16" width="148" height="32" rx="16" fill="#8b5cf6" opacity="0.1" stroke="#8b5cf6" stroke-width="0.8" stroke-opacity="0.25"/>
+    <text x="-130" y="6" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Helvetica Neue', Arial, sans-serif" font-size="14" font-weight="500" fill="#a78bfa" text-anchor="middle" letter-spacing="0.3">macOS Native</text>
+
+    <rect x="-34" y="-16" width="110" height="32" rx="16" fill="#006CFF" opacity="0.08" stroke="#006CFF" stroke-width="0.8" stroke-opacity="0.2"/>
+    <text x="21" y="6" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Helvetica Neue', Arial, sans-serif" font-size="14" font-weight="500" fill="#6CA8FF" text-anchor="middle" letter-spacing="0.3">~5ms</text>
+
+    <rect x="98" y="-16" width="146" height="32" rx="16" fill="#8b5cf6" opacity="0.1" stroke="#8b5cf6" stroke-width="0.8" stroke-opacity="0.25"/>
+    <text x="171" y="6" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Helvetica Neue', Arial, sans-serif" font-size="14" font-weight="500" fill="#a78bfa" text-anchor="middle" letter-spacing="0.3">MIT License</text>
+  </g>
+
+  <!-- GitHub URL -->
+  <text x="640" y="550" font-family="SF Mono, Menlo, monospace" font-size="16" font-weight="400" fill="#4a5568" text-anchor="middle" letter-spacing="0.5">
+    github.com/achiya-automation/safari-mcp
+  </text>
+
+  <!-- Bottom subtle border -->
+  <line x1="0" y1="639" x2="1280" y2="639" stroke="#006CFF" stroke-width="1" opacity="0.2"/>
+</svg>
