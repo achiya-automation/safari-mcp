@@ -133,48 +133,73 @@ async function _cleanupTabs() {
   _openedTabs.clear();
 }
 
-// Periodic memory check — if WebKit exceeds limit, close oldest MCP tabs
+// Periodic memory check — proactive monitoring with warning + action thresholds
+const WEBKIT_WARNING_THRESHOLD_MB = Math.round(WEBKIT_MEMORY_LIMIT_MB * 0.7); // 70% = warning
 let _memoryCheckTimer = null;
-function _startMemoryMonitor() {
-  _memoryCheckTimer = setInterval(async () => {
+let _lastMemoryWarningTime = 0;
+
+function _getWebKitMemoryMB() {
+  try {
+    const pids = execFileSync("pgrep", ["-Ef", "WebKit|WebContent"], { encoding: "utf8" }).trim();
+    if (!pids) return 0;
+    const pidList = pids.split("\n").join(",");
+    const psOut = execFileSync("ps", ["-p", pidList, "-o", "rss="], { encoding: "utf8" }).trim();
+    const totalKB = psOut.split("\n").reduce((sum, l) => sum + (parseInt(l.trim(), 10) || 0), 0);
+    return totalKB / 1024;
+  } catch { return 0; }
+}
+
+async function _closeOldestMCPTab() {
+  let oldestIdx = null, oldestTime = Infinity;
+  for (const [idx, info] of _openedTabs) {
+    if (info.openedAt < oldestTime) { oldestTime = info.openedAt; oldestIdx = idx; }
+  }
+  if (oldestIdx !== null) {
     try {
-      // Use pgrep + ps directly — avoids spawning bash, grep, awk pipeline
-      let psOut = "0";
-      try {
-        const pids = execFileSync("pgrep", ["-Ef", "WebKit|WebContent"], { encoding: "utf8" }).trim();
-        if (pids) {
-          const pidList = pids.split("\n").join(",");
-          psOut = execFileSync("ps", ["-p", pidList, "-o", "rss="], { encoding: "utf8" }).trim();
-          const totalKB = psOut.split("\n").reduce((sum, l) => sum + (parseInt(l.trim(), 10) || 0), 0);
-          psOut = String(totalKB / 1024);
-        }
-      } catch { psOut = "0"; }
-      const webkitMB = parseFloat(psOut) || 0;
-      if (webkitMB > WEBKIT_MEMORY_LIMIT_MB && _openedTabs.size > 1) {
-        console.error(`[Safari MCP] ⚠️ WebKit using ${Math.round(webkitMB)}MB (limit: ${WEBKIT_MEMORY_LIMIT_MB}MB) — closing oldest MCP tab`);
-        let oldestIdx = null, oldestTime = Infinity;
-        for (const [idx, info] of _openedTabs) {
-          if (info.openedAt < oldestTime) { oldestTime = info.openedAt; oldestIdx = idx; }
-        }
-        if (oldestIdx !== null) {
-          try {
-            // Re-resolve by URL before closing (indices shift as tabs change)
-            const info = _openedTabs.get(oldestIdx);
-            if (info?.url) {
-              const tabs = await safari.listTabs();
-              const parsed = typeof tabs === 'string' ? JSON.parse(tabs) : tabs;
-              const match = parsed.find(t => t.url === info.url);
-              if (match) {
-                safari.setActiveTabIndex(match.index);
-                await safari.closeTab();
-              }
-            }
-          } catch {}
-          _untrackTab(oldestIdx);
+      const info = _openedTabs.get(oldestIdx);
+      if (info?.url) {
+        const tabs = await safari.listTabs();
+        const parsed = typeof tabs === 'string' ? JSON.parse(tabs) : tabs;
+        const match = parsed.find(t => t.url === info.url);
+        if (match) {
+          safari.setActiveTabIndex(match.index);
+          await safari.closeTab();
         }
       }
     } catch {}
-  }, MEMORY_CHECK_INTERVAL_MS);
+    _untrackTab(oldestIdx);
+  }
+}
+
+function _startMemoryMonitor() {
+  const checkInterval = Math.min(MEMORY_CHECK_INTERVAL_MS, 30000); // Max 30s between checks
+  _memoryCheckTimer = setInterval(async () => {
+    try {
+      const webkitMB = _getWebKitMemoryMB();
+      if (webkitMB <= 0) return;
+
+      // Warning threshold — log only (once per 5 min)
+      if (webkitMB > WEBKIT_WARNING_THRESHOLD_MB && webkitMB <= WEBKIT_MEMORY_LIMIT_MB) {
+        if (Date.now() - _lastMemoryWarningTime > 300000) {
+          console.error(`[Safari MCP] ⚠️ WebKit memory warning: ${Math.round(webkitMB)}MB (threshold: ${WEBKIT_WARNING_THRESHOLD_MB}MB, limit: ${WEBKIT_MEMORY_LIMIT_MB}MB) — ${_openedTabs.size} MCP tabs open`);
+          _lastMemoryWarningTime = Date.now();
+        }
+      }
+
+      // Action threshold — close oldest tabs (up to 2) to recover memory
+      if (webkitMB > WEBKIT_MEMORY_LIMIT_MB && _openedTabs.size > 1) {
+        console.error(`[Safari MCP] 🔴 WebKit over limit: ${Math.round(webkitMB)}MB — closing oldest MCP tabs`);
+        await _closeOldestMCPTab();
+        // If still over limit and have more tabs, close another
+        if (_openedTabs.size > 1) {
+          const afterMB = _getWebKitMemoryMB();
+          if (afterMB > WEBKIT_MEMORY_LIMIT_MB) {
+            await _closeOldestMCPTab();
+          }
+        }
+      }
+    } catch {}
+  }, checkInterval);
   _memoryCheckTimer.unref();
 }
 
@@ -1241,12 +1266,17 @@ server.tool(
         // Find the new tab(s) — could be about:blank initially (OAuth popups)
         for (const tab of nowTabs) {
           if (!beforeIds.has(`${tab.index}:${tab.url}`)) {
-            // Wait briefly for about:blank to resolve to actual URL
+            // Wait for about:blank to resolve to actual URL — dynamic polling instead of fixed delay
             if (tab.url === 'about:blank') {
-              await new Promise(r => setTimeout(r, 1000));
-              const refreshed = await extensionOrFallback("list_tabs", {}, () => safari.listTabs());
-              const refreshedTabs = typeof refreshed === 'string' ? JSON.parse(refreshed) : refreshed;
-              const resolved = refreshedTabs.find(t => t.index === tab.index);
+              let resolved = null;
+              for (let attempt = 0; attempt < 10; attempt++) {
+                await new Promise(r => setTimeout(r, 300)); // 300ms intervals, max 3s total
+                const refreshed = await extensionOrFallback("list_tabs", {}, () => safari.listTabs());
+                const refreshedTabs = typeof refreshed === 'string' ? JSON.parse(refreshed) : refreshed;
+                resolved = refreshedTabs.find(t => t.index === tab.index);
+                if (resolved && resolved.url !== 'about:blank') break;
+                resolved = null;
+              }
               if (resolved && resolved.url !== 'about:blank') {
                 if (urlContains && !resolved.url.includes(urlContains)) continue;
                 await extensionOrFallback("switch_tab", { index: resolved.index }, () => safari.switchTab(resolved.index));

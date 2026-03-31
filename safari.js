@@ -89,6 +89,49 @@ function cleanupHelper() {
 process.on("exit", cleanupHelper);
 process.on("uncaughtException", (err) => { console.error("Uncaught:", err); cleanupHelper(); process.exit(1); });
 
+// ========== CLIPBOARD LOCK ==========
+// Prevents concurrent clipboard operations from clobbering the user's clipboard.
+// While locked, any new clipboard operation waits until the current one completes.
+let _clipboardLocked = false;
+let _clipboardRestoreTimer = null;
+
+async function _acquireClipboardLock(timeoutMs = 10000) {
+  const start = Date.now();
+  while (_clipboardLocked) {
+    if (Date.now() - start > timeoutMs) {
+      throw new Error("Clipboard lock timeout — another operation is still using the clipboard. Try again shortly.");
+    }
+    await new Promise(r => setTimeout(r, 50));
+  }
+  _clipboardLocked = true;
+}
+
+function _releaseClipboardLock() {
+  _clipboardLocked = false;
+}
+
+// Save current clipboard and return it for later restore
+async function _saveClipboard() {
+  try {
+    const { stdout } = await execFileAsync("pbpaste", []);
+    return stdout;
+  } catch { return null; }
+}
+
+// Restore clipboard immediately (no async setTimeout leak)
+async function _restoreClipboard(savedContent) {
+  if (savedContent === null) return;
+  try {
+    await new Promise((resolve, reject) => {
+      const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
+      proc.stdin.write(savedContent);
+      proc.stdin.end();
+      proc.on("close", resolve);
+      proc.on("error", reject);
+    });
+  } catch {}
+}
+
 // ========== ACTIVE TAB TRACKING ==========
 // Instead of visually switching tabs (which interrupts the user),
 // we track which tab we're "working on" by URL (not index, because indices shift
@@ -97,7 +140,8 @@ process.on("uncaughtException", (err) => { console.error("Uncaught:", err); clea
 let _activeTabIndex = null; // null = use front document (default)
 let _activeTabURL = null;   // URL-based tracking (stable even when tabs shift)
 let _lastResolveTime = 0;   // Cache: skip resolve if verified recently
-const RESOLVE_CACHE_MS = 0; // Always re-verify — cached indices go stale when tabs open/close
+let _lastTabCount = null;   // Track tab count for smart cache invalidation
+const RESOLVE_CACHE_MS = 500; // Brief cache — invalidated on tab count change
 
 // ========== DIAGNOSTIC LOG ==========
 // File-based log for profile/focus issues — survives MCP restart, visible to user
@@ -116,7 +160,7 @@ const SAFARI_PROFILE = process.env.SAFARI_PROFILE || null;
 let _targetWindowRef = null; // null = not yet discovered. Updated by refreshTargetWindow()
 let _targetWindowId = null;  // Numeric window ID (for CGEvent window targeting)
 let _targetWindowCacheTime = 0;
-const TARGET_WINDOW_CACHE_MS = 2000; // Reduced from 5s — faster detection of window changes
+const TARGET_WINDOW_CACHE_MS = 1000; // Short cache — fast detection of window changes
 let _profileWindowMissing = false; // True when profile window is not found
 
 // Get the target window ref, falling back to 'front window' ONLY when no profile is configured
@@ -250,9 +294,10 @@ async function resolveActiveTab() {
     if (resultStr.includes(':')) {
       // Not found — clamp stale index to tabCount
       const tabCount = Number(resultStr.split(':')[1]) || 1;
+      _lastTabCount = tabCount;
       _activeTabURL = null;
       if (_activeTabIndex && _activeTabIndex > tabCount) {
-        console.error(`[Safari MCP] Tab ghost fix: index ${_activeTabIndex} > tabCount ${tabCount}, clamping to ${tabCount}`);
+        console.error(`[Safari MCP] Tab ghost proactive fix: index ${_activeTabIndex} > tabCount ${tabCount}, clamping to ${tabCount}`);
         _activeTabIndex = tabCount;
       }
       return _activeTabIndex;
@@ -498,11 +543,11 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
     .replace(/\t/g, " ");
   // Resolve tab: explicit tabIndex > cached index > URL-tracked tab > front document
   let idx = tabIndex;
-  if (!idx && _activeTabIndex && (Date.now() - _lastResolveTime < RESOLVE_CACHE_MS)) {
-    // Recently verified — use cached index (skip osascript call)
+  if (!idx && _activeTabIndex && _activeTabURL && (Date.now() - _lastResolveTime < RESOLVE_CACHE_MS)) {
+    // Recently verified and tab count unchanged — use cached index
     idx = _activeTabIndex;
   } else if (!idx && _activeTabURL && _activeTabURL !== '') {
-    // Always resolve — don't skip about:blank (it caused stale tab targeting)
+    // Resolve by URL — verify index is still correct
     const resolved = await resolveActiveTab();
     if (resolved) { idx = resolved; _lastResolveTime = Date.now(); }
   }
@@ -523,10 +568,12 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
     if (idx && (msg.includes("Can't get tab") || msg.includes("-1728"))) {
       console.error(`[Safari MCP] Tab ghost detected (tab ${idx}), re-resolving...`);
       _lastResolveTime = 0; // Force re-resolve
+      _lastTabCount = null;  // Invalidate tab count cache
       _activeTabIndex = null;
       if (_activeTabURL) {
         const newIdx = await resolveActiveTab();
         if (newIdx && newIdx !== idx) {
+          console.error(`[Safari MCP] Tab ghost resolved: ${idx} → ${newIdx}`);
           const newTarget = `tab ${newIdx} of ${getTargetWindowRef()}`;
           const retryScript = `tell application "Safari" to do JavaScript "${escaped}" in ${newTarget}`;
           if (retryScript.length < 50000) return osascriptFast(retryScript, { timeout });
@@ -953,6 +1000,8 @@ export async function nativeClick({ selector, text, x, y, ref, doubleClick = fal
   }
 
   // Step 4: Perform the native click via CGEvent (targeted to specific window — no mouse move, no focus steal)
+  // MUST have windowId — legacy path (windowId=0) moves mouse and may steal focus
+  if (!geo.windowId) throw new Error("Cannot native-click without Safari window ID — would move mouse and steal focus");
   await _helperNativeClick(screenX, screenY, doubleClick, geo.windowId);
 
   const clickType = doubleClick ? 'Native double-clicked' : 'Native clicked';
@@ -1111,12 +1160,10 @@ export async function pressKey({ key, modifiers = [] }) {
       // Cross-origin iframe: JS can't paste into it, use CGEvent Cmd+V (no focus steal)
       const activeTag = await runJS(`document.activeElement ? document.activeElement.tagName : ''`);
       if (activeTag === 'IFRAME') {
-        try {
-          const geo = await _getSafariWindowGeometry();
-          await _helperNativeKeyboard(9, ["cmd"], geo.windowId);
-        } catch {
-          await _helperNativeKeyboard(9, ["cmd"], 0);
-        }
+        // MUST have windowId — windowId=0 would steal focus and move mouse
+        const geo = await _getSafariWindowGeometry();
+        if (!geo.windowId) throw new Error("Cannot paste into iframe without Safari window ID — would steal focus");
+        await _helperNativeKeyboard(9, ["cmd"], geo.windowId);
         await new Promise(r => setTimeout(r, 300));
         return `Pressed: ${modifiers.join("+")}+v (CGEvent Cmd+V into iframe, no focus steal)`;
       }
@@ -1212,51 +1259,42 @@ export async function pressKey({ key, modifiers = [] }) {
 // 4. Restore clipboard
 // Requires nativeClick to have focused the input inside the iframe first.
 async function _nativeTypeViaClipboard(text) {
-  // Save current clipboard
-  let savedClipboard = null;
+  await _acquireClipboardLock();
   try {
-    const { stdout } = await execFileAsync("pbpaste", []);
-    savedClipboard = stdout;
-  } catch {}
+    // Save current clipboard
+    const savedClipboard = await _saveClipboard();
 
-  // Set clipboard to our text via pipe (safe from shell injection)
-  await new Promise((resolve, reject) => {
-    const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
-    proc.stdin.write(text);
-    proc.stdin.end();
-    proc.on("close", resolve);
-    proc.on("error", reject);
-  });
+    // Set clipboard to our text via pipe (safe from shell injection)
+    await new Promise((resolve, reject) => {
+      const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
+      proc.stdin.write(text);
+      proc.stdin.end();
+      proc.on("close", resolve);
+      proc.on("error", reject);
+    });
 
-  // Paste via CGEvent Cmd+V targeted to Safari window — NO activate, NO focus steal
-  try {
+    // Paste via CGEvent Cmd+V targeted to Safari window — NO activate, NO focus steal
+    // MUST have windowId — global CGEvent (windowId=0) would steal focus and move mouse
     const geo = await _getSafariWindowGeometry();
+    if (!geo.windowId) {
+      // Can't get window ID — restore clipboard and throw
+      await _restoreClipboard(savedClipboard);
+      _releaseClipboardLock();
+      throw new Error("Cannot native-paste without Safari window ID — would steal focus");
+    }
     // keyCode 9 = V key, flags: ["cmd"]
     await _helperNativeKeyboard(9, ["cmd"], geo.windowId);
-  } catch {
-    // Fallback: try without windowId (global)
-    await _helperNativeKeyboard(9, ["cmd"], 0);
+
+    // Wait for paste to settle, then restore clipboard immediately
+    await new Promise(r => setTimeout(r, 300));
+    await _restoreClipboard(savedClipboard);
+    _releaseClipboardLock();
+
+    return `Typed ${text.length} chars (native paste into iframe)`;
+  } catch (err) {
+    _releaseClipboardLock();
+    throw err;
   }
-
-  // Wait for paste to settle
-  await new Promise(r => setTimeout(r, 300));
-
-  // Restore clipboard after delay
-  if (savedClipboard !== null) {
-    setTimeout(async () => {
-      try {
-        await new Promise((resolve, reject) => {
-          const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
-          proc.stdin.write(savedClipboard);
-          proc.stdin.end();
-          proc.on("close", resolve);
-          proc.on("error", reject);
-        });
-      } catch {}
-    }, 3000);
-  }
-
-  return `Typed ${text.length} chars (native paste into iframe)`;
 }
 
 export async function typeText({ text, selector, ref }) {
@@ -1449,6 +1487,7 @@ export async function screenshot({ fullPage = false } = {}) {
     ).catch(() => null) : null;
 
     // Save frontmost app BEFORE screencapture (it may steal focus on macOS Tahoe)
+    // Restore it immediately after capture to minimize disruption
     let previousApp = null;
     if (windowId) {
       try {
@@ -1721,6 +1760,7 @@ export async function newTab(url = "") {
   _activeTabIndex = Number(tabCount);  // New tab is always appended as last
   _activeTabURL = url || null;
   _lastResolveTime = Date.now();
+  _lastTabCount = Number(tabCount);  // Update tab count cache
   // Wait for page load if URL given
   if (url) {
     try {
@@ -1753,6 +1793,8 @@ export async function closeTab() {
       `tell application "Safari" to close current tab of ${getTargetWindowRef()}`
     );
   }
+  _lastTabCount = null;    // Invalidate — tab count changed
+  _lastResolveTime = 0;    // Force re-resolve on next operation
   return "Tab closed";
 }
 
@@ -2264,52 +2306,81 @@ export async function clearConsoleCapture() {
 
 export async function savePDF({ path: pdfPath }) {
   await refreshTargetWindow();
-  const safePath = pdfPath.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "").replace(/\r/g, "");
-  // Save which app was active BEFORE we steal focus, so we can restore it
-  let previousApp = "";
-  try {
-    previousApp = (await osascript(
-      `tell application "System Events" to return name of first application process whose frontmost is true`
-    )).trim();
-  } catch (_) {}
+  // NO focus stealing — uses screencapture + Python Quartz to generate PDF
 
+  // Step 1: Get full page dimensions
+  const dims = await runJS("JSON.stringify({h:document.documentElement.scrollHeight,w:document.documentElement.scrollWidth})");
+  const { h, w } = JSON.parse(dims);
+
+  // Step 2: Save current bounds and resize to capture full page
+  const origBounds = await osascript(
+    `tell application "Safari" to return bounds of ${getTargetWindowRef()}`
+  );
+  const captureHeight = Math.min(Number(h) + 100, 16000);
+  await osascript(
+    `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {0, 0, ${Number(w)}, ${captureHeight}}`
+  );
+  await new Promise(r => setTimeout(r, 500)); // Let page reflow
+
+  // Step 3: Take screenshot via screencapture -l (window-targeted, NO focus steal)
+  const windowId = await osascript(
+    `tell application "Safari" to return id of ${getTargetWindowRef()}`
+  );
+  const tmpPng = join(tmpdir(), `safari-mcp-pdf-${Date.now()}.png`);
   try {
-    // When profile is set, bring the profile window to front (not just any Safari window)
-    const activateScript = SAFARI_PROFILE
-      ? `tell application "Safari"\n  set index of ${getTargetWindowRef()} to 1\n  activate\nend tell`
-      : `tell application "Safari" to activate`;
+    // Use do shell script to inherit osascript's Screen Recording permission
     await osascript(
-      `${activateScript}
-      delay 0.3
-      tell application "System Events"
-        tell process "Safari"
-          click menu item "Export as PDF…" of menu "File" of menu bar 1
-          delay 1
-          -- Use clipboard to paste path (immune to keyboard layout)
-          set the clipboard to "${safePath}"
-          delay 0.1
-          keystroke "g" using {command down, shift down}
-          delay 0.8
-          keystroke "a" using {command down}
-          delay 0.1
-          keystroke "v" using {command down}
-          delay 0.3
-          key code 36
-          delay 1
-          key code 36
-        end tell
-      end tell`,
-      { timeout: 20000 }
+      `do shell script "screencapture -l${windowId} -o -x '${tmpPng}'"`,
+      { timeout: 15000 }
     );
   } catch (err) {
-    // Restore focus even on failure
-    if (previousApp) await osascript(`tell application "${previousApp}" to activate`).catch(() => {});
-    throw new Error(`PDF save failed: ${err.message}. Try granting Accessibility permission to Terminal/VS Code.`);
+    // Restore bounds on failure
+    await osascript(`tell application "Safari" to set bounds of ${getTargetWindowRef()} to {${origBounds}}`).catch(() => {});
+    throw new Error(`PDF screenshot capture failed: ${err.message}`);
   }
-  await new Promise((r) => setTimeout(r, 2000));
-  // Restore focus to the app user was working in
-  if (previousApp) await osascript(`tell application "${previousApp}" to activate`).catch(() => {});
-  return `PDF saved to: ${pdfPath}`;
+
+  // Step 4: Restore original bounds
+  await osascript(
+    `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {${origBounds}}`
+  ).catch(() => {});
+
+  // Step 5: Convert screenshot to PDF using Python3 + macOS Quartz (no external deps)
+  const safePdfPath = pdfPath.replace(/'/g, "'\\''");
+  const safePngPath = tmpPng.replace(/'/g, "'\\''");
+  try {
+    await execFileAsync("python3", ["-c", `
+import sys
+from Quartz import CGImageSourceCreateWithURL, CGImageSourceCreateImageAtIndex, CGImageGetWidth, CGImageGetHeight, CGPDFContextCreateWithURL, CGRectMake, CGPDFContextBeginPage, CGPDFContextEndPage, CGContextDrawImage
+from CoreFoundation import CFURLCreateFromFileSystemRepresentation
+
+png_path = b'${safePngPath}'
+pdf_path = b'${safePdfPath}'
+
+src_url = CFURLCreateFromFileSystemRepresentation(None, png_path, len(png_path), False)
+img_src = CGImageSourceCreateWithURL(src_url, None)
+if not img_src:
+    print("ERROR: failed to read screenshot", file=sys.stderr); sys.exit(1)
+img = CGImageSourceCreateImageAtIndex(img_src, 0, None)
+if not img:
+    print("ERROR: failed to decode image", file=sys.stderr); sys.exit(1)
+w = CGImageGetWidth(img)
+h = CGImageGetHeight(img)
+
+pdf_url = CFURLCreateFromFileSystemRepresentation(None, pdf_path, len(pdf_path), False)
+ctx = CGPDFContextCreateWithURL(pdf_url, CGRectMake(0, 0, w, h), None)
+CGPDFContextBeginPage(ctx, None)
+CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), img)
+CGPDFContextEndPage(ctx)
+del ctx
+print(f"OK {w}x{h}")
+`.trim()], { timeout: 15000 });
+  } catch (err) {
+    throw new Error(`PDF conversion failed: ${err.message}`);
+  } finally {
+    unlink(tmpPng).catch(() => {});
+  }
+
+  return `PDF saved to: ${pdfPath} (image-based, no focus stealing)`;
 }
 
 // ========== SNAPSHOT — ref-based interaction (like Chrome DevTools MCP) ==========
@@ -2714,40 +2785,37 @@ export async function clipboardRead() {
 }
 
 export async function clipboardWrite({ text, restore = true }) {
-  // Save current clipboard
-  let oldClipboard = null;
-  if (restore) {
-    try {
-      const { stdout } = await execFileAsync("pbpaste", []);
-      oldClipboard = stdout;
-    } catch {}
+  await _acquireClipboardLock();
+  try {
+    // Save current clipboard
+    const oldClipboard = restore ? await _saveClipboard() : null;
+
+    // Use spawn + stdin pipe — safe from shell injection (no shell involved)
+    await new Promise((resolve, reject) => {
+      const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
+      proc.stdin.write(text);
+      proc.stdin.end();
+      proc.on("close", resolve);
+      proc.on("error", reject);
+    });
+
+    // Restore clipboard after 2 seconds (reduced from 5s — shorter exposure window)
+    if (restore && oldClipboard !== null) {
+      if (_clipboardRestoreTimer) clearTimeout(_clipboardRestoreTimer);
+      _clipboardRestoreTimer = setTimeout(async () => {
+        await _restoreClipboard(oldClipboard);
+        _clipboardRestoreTimer = null;
+        _releaseClipboardLock();
+      }, 2000);
+      return `Copied ${text.length} chars to clipboard (will restore in 2s)`;
+    }
+
+    _releaseClipboardLock();
+    return `Copied ${text.length} chars to clipboard`;
+  } catch (err) {
+    _releaseClipboardLock();
+    throw err;
   }
-
-  // Use spawn + stdin pipe — safe from shell injection (no shell involved)
-  await new Promise((resolve, reject) => {
-    const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
-    proc.stdin.write(text);
-    proc.stdin.end();
-    proc.on("close", resolve);
-    proc.on("error", reject);
-  });
-
-  // Schedule clipboard restore after 5 seconds (gives time to paste)
-  if (restore && oldClipboard !== null) {
-    setTimeout(async () => {
-      try {
-        await new Promise((resolve, reject) => {
-          const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
-          proc.stdin.write(oldClipboard);
-          proc.stdin.end();
-          proc.on("close", resolve);
-          proc.on("error", reject);
-        });
-      } catch {}
-    }, 5000);
-  }
-
-  return `Copied ${text.length} chars to clipboard${restore ? " (will restore in 5s)" : ""}`;
 }
 
 // ========== NETWORK MOCKING ==========

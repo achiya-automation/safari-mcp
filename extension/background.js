@@ -37,6 +37,7 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (pollAbort) { try { pollAbort.abort(); } catch {} pollAbort = null; }
       if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
       _reconnectDelay = 3000;
+      _stopHeartbeat();
       updateBadge("OFF");
     } else {
       updateBadge("");
@@ -102,6 +103,7 @@ async function connect() {
       isConnected = true;
       _reconnectDelay = 3000; // Reset backoff on success
       updateBadge("ON");
+      _startHeartbeat(); // Keep service worker alive between polls
       pollForCommands();
       return;
     }
@@ -2108,10 +2110,25 @@ async function waitForTabSettled(tabId, timeout = 3000) {
   // No else needed — if not loading, page is already settled
 }
 
-// ========== KEEP-ALIVE VIA ALARMS ==========
+// ========== KEEP-ALIVE VIA ALARMS + HEARTBEAT ==========
 // Safari kills service workers after ~30s of inactivity.
-// browser.alarms re-wakes the worker and reconnects if needed.
-// The active fetch() in pollForCommands() keeps the worker alive while connected.
+// Three-layer strategy:
+// 1. Active fetch() in pollForCommands() keeps the worker alive while connected
+// 2. Storage write every 20s keeps the worker alive between polls (Safari counts storage access as activity)
+// 3. browser.alarms (1 min minimum) re-wakes the worker if it was terminated
+let _heartbeatTimer = null;
+function _startHeartbeat() {
+  if (_heartbeatTimer) return;
+  _heartbeatTimer = setInterval(() => {
+    if (_enabled) {
+      browser.storage.local.set({ _heartbeat: Date.now() }).catch(() => {});
+    }
+  }, 20000); // Every 20s — keeps service worker alive between alarm intervals
+}
+function _stopHeartbeat() {
+  if (_heartbeatTimer) { clearInterval(_heartbeatTimer); _heartbeatTimer = null; }
+}
+
 browser.alarms.create("keepalive", { periodInMinutes: 1 });
 browser.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "keepalive" || alarm.name === "reconnect") {
@@ -2119,6 +2136,8 @@ browser.alarms.onAlarm.addListener((alarm) => {
     if (!isConnected && _enabled && !_reconnectTimer) {
       scheduleReconnect();
     }
+    // Restart heartbeat in case it was lost on worker restart
+    if (_enabled && !_heartbeatTimer) _startHeartbeat();
   }
 });
 

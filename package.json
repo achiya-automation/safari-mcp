@@ -1,6 +1,6 @@
 {
   "name": "safari-mcp",
-  "version": "2.6.1",
+  "version": "2.7.0",
   "mcpName": "io.github.achiya-automation/safari-mcp",
   "description": "Safari browser automation for AI agents — native macOS, zero Chrome overhead. 80 tools via AppleScript + JavaScript.",
   "type": "module",
@@ -28,11 +28,20 @@
     "web-automation",
     "anthropic",
     "windsurf",
-    "continue-dev"
+    "continue-dev",
+    "devtools",
+    "testing",
+    "scraping",
+    "screenshot",
+    "ai-automation"
   ],
   "author": "Achiya Automation <info@achiya-automation.com>",
   "license": "MIT",
-  "homepage": "https://github.com/achiya-automation/safari-mcp",
+  "homepage": "https://achiya-automation.com",
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/achiya-automation"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/achiya-automation/safari-mcp.git"
@@ -53,7 +62,6 @@
     "safari-helper",
     "safari-helper.swift",
     "extension/",
-    "xcode/",
     "glama.json",
     "LICENSE",
     "README.md"
