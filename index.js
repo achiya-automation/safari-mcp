@@ -75,6 +75,16 @@ function _isURLOwned(url) {
     const ownedBase = normalize(owned);
     if (urlBase === ownedBase) return true;
   }
+  // Same-origin redirect: if a tab navigated from an owned URL to a different path
+  // on the same origin (e.g. /login/device → /login/device/select_account), it's still ours
+  try {
+    const urlOrigin = new URL(url).origin;
+    for (const owned of _ownedTabURLs) {
+      try {
+        if (new URL(owned).origin === urlOrigin && urlBase.startsWith(normalize(owned))) return true;
+      } catch {}
+    }
+  } catch {}
   return false;
 }
 
@@ -1117,23 +1127,29 @@ server.tool(
       }
     }
 
-    const result = await extensionOrFallback(
+    const rawResult = await extensionOrFallback(
       "new_tab", { url },
       () => safari.newTab(url)
     );
+    // AppleScript fallback returns a JSON string; extension returns an object — normalize
+    let result = rawResult;
+    if (typeof rawResult === 'string') {
+      try { result = JSON.parse(rawResult); } catch {}
+    }
     // Sync safari.js tracking when extension handled new_tab
     if (result?.tabIndex) {
       safari.setActiveTabIndex(result.tabIndex);
       _trackTab(result.tabIndex, url);
     }
-    if (result?.url) {
+    if (result?.url || url) {
       // Prefer requested URL over about:blank for tracking (page hasn't loaded yet)
-      const trackUrl = (result.url === 'about:blank' && url) ? url : result.url;
+      const trackUrl = (!result?.url || result.url === 'about:blank') && url ? url : result.url;
       safari.setActiveTabURL(trackUrl);
       // Also register actual URL (may differ from requested due to redirects)
       _addOwnedURL(trackUrl);
+      if (url && url !== trackUrl) _addOwnedURL(url);  // also own the requested URL (handles www redirects)
     }
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return { content: [{ type: "text", text: typeof rawResult === 'string' ? rawResult : JSON.stringify(result) }] };
   }
 );
 
