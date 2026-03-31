@@ -21,6 +21,7 @@
 
 <a href="vscode:mcp/install?%7B%22safari-mcp%22%3A%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D%7D"><img src="https://img.shields.io/badge/VS_Code-Install_MCP_Server-0078d4?logo=visual-studio-code&logoColor=white" alt="Install in VS Code"></a>
 <a href="https://insiders.vscode.dev/redirect?url=vscode-insiders:mcp/install?%7B%22safari-mcp%22%3A%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D%7D"><img src="https://img.shields.io/badge/VS_Code_Insiders-Install_MCP_Server-24bfa5?logo=visual-studio-code&logoColor=white" alt="Install in VS Code Insiders"></a>
+<a href="https://paypal.me/achiyaC123"><img src="https://img.shields.io/badge/Sponsor-PayPal-blue?logo=paypal" alt="Sponsor"></a>
 
 **80 tools** · **Zero dependencies** · **~5ms per command** · **60% less CPU than Chrome**
 
@@ -526,6 +527,16 @@ PRs welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for setup instructions.
 The codebase is two files:
 - `safari.js` — Safari automation layer (AppleScript + JavaScript)
 - `index.js` — MCP server with tool definitions
+
+---
+
+## Support
+
+Safari MCP is free and open source. If it saves you time or CPU cycles, consider supporting its development:
+
+<a href="https://paypal.me/achiyaC123"><img src="https://img.shields.io/badge/Support-PayPal-blue?logo=paypal" alt="Support via PayPal"></a>
+
+Your support helps keep this project maintained and improving.
 
 ---
 
