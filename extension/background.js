@@ -850,7 +850,7 @@ async function handleCommand(type, payload) {
     }
 
     case "type_text": {
-      return await execInTab((text, selector) => {
+      const result = await execInTab((text, selector) => {
         if (selector) { const el = (window.__mcpDeepQuery || document.querySelector.bind(document))(selector); if (el) el.focus(); }
 
         // === Strategy 1: ProseMirror native API ===
@@ -943,6 +943,32 @@ async function handleCommand(type, payload) {
         }
         return "Typed " + text.length + " chars";
       }, [payload.text, payload.selector], tabId);
+
+      // Fallback: if typing failed in main frame, try all frames (cross-origin iframes)
+      if (result === "Typed 0 chars" || !result) {
+        const iframeResult = await execInAllFrames((text) => {
+          const el = document.activeElement;
+          if (!el || el === document.body) return null;
+          // Try execCommand insert
+          const ok = document.execCommand("insertText", false, text);
+          if (ok) return "Typed " + text.length + " chars (iframe execCommand)";
+          // Fallback: contenteditable or input
+          if (el.isContentEditable) {
+            el.textContent = text;
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            return "Typed " + text.length + " chars (iframe contenteditable)";
+          }
+          if ("value" in el) {
+            el.value = text;
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+            return "Typed " + text.length + " chars (iframe input)";
+          }
+          return null;
+        }, [payload.text], tabId);
+        if (iframeResult) return iframeResult;
+      }
+      return result;
     }
 
     case "press_key": {
