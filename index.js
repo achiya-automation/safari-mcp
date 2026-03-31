@@ -68,10 +68,11 @@ const _ownedTabURLs = new Set();
 function _isURLOwned(url) {
   if (!url) return false;
   if (_ownedTabURLs.has(url)) return true;
-  // Match ignoring query params / fragments (URL may change slightly after load)
-  const urlBase = url.split('?')[0].split('#')[0];
+  // Match ignoring query params / fragments / trailing slashes (URL may change slightly after load)
+  const normalize = (u) => u.split('?')[0].split('#')[0].replace(/\/+$/, '');
+  const urlBase = normalize(url);
   for (const owned of _ownedTabURLs) {
-    const ownedBase = owned.split('?')[0].split('#')[0];
+    const ownedBase = normalize(owned);
     if (urlBase === ownedBase) return true;
   }
   return false;
@@ -1126,9 +1127,11 @@ server.tool(
       _trackTab(result.tabIndex, url);
     }
     if (result?.url) {
-      safari.setActiveTabURL(result.url);
+      // Prefer requested URL over about:blank for tracking (page hasn't loaded yet)
+      const trackUrl = (result.url === 'about:blank' && url) ? url : result.url;
+      safari.setActiveTabURL(trackUrl);
       // Also register actual URL (may differ from requested due to redirects)
-      _addOwnedURL(result.url);
+      _addOwnedURL(trackUrl);
     }
     return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }

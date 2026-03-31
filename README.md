@@ -1,18 +1,30 @@
 <div align="center">
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/banner.svg">
+  <source media="(prefers-color-scheme: light)" srcset="assets/banner.svg">
+  <img src="assets/banner.svg" alt="Safari MCP — Native browser automation for AI agents" width="100%">
+</picture>
+
+<br/>
+
 # 🦁 Safari MCP
 
 **The only MCP server for Safari — native browser automation for AI agents.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![GitHub release](https://img.shields.io/github/v/release/achiya-automation/safari-mcp)](https://github.com/achiya-automation/safari-mcp/releases)
+[![npm version](https://img.shields.io/npm/v/safari-mcp)](https://www.npmjs.com/package/safari-mcp)
+[![npm downloads](https://img.shields.io/npm/dm/safari-mcp)](https://www.npmjs.com/package/safari-mcp)
+[![CI](https://github.com/achiya-automation/safari-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/achiya-automation/safari-mcp/actions/workflows/ci.yml)
 [![Node.js](https://img.shields.io/badge/Node.js-18%2B-green)](https://nodejs.org/)
 [![macOS](https://img.shields.io/badge/macOS-only-blue)](https://www.apple.com/macos/)
 [![MCP](https://img.shields.io/badge/MCP-compatible-purple)](https://modelcontextprotocol.io)
-[![CI](https://github.com/achiya-automation/safari-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/achiya-automation/safari-mcp/actions/workflows/ci.yml)
-[![npm downloads](https://img.shields.io/npm/dm/safari-mcp)](https://www.npmjs.com/package/safari-mcp)
 [![GitHub stars](https://img.shields.io/github/stars/achiya-automation/safari-mcp?style=social)](https://github.com/achiya-automation/safari-mcp/stargazers)
 [![achiya-automation/safari-mcp MCP server](https://glama.ai/mcp/servers/achiya-automation/safari-mcp/badges/score.svg)](https://glama.ai/mcp/servers/achiya-automation/safari-mcp)
+
+<a href="vscode:mcp/install?%7B%22safari-mcp%22%3A%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D%7D"><img src="https://img.shields.io/badge/VS_Code-Install_MCP_Server-0078d4?logo=visual-studio-code&logoColor=white" alt="Install in VS Code"></a>
+<a href="https://insiders.vscode.dev/redirect?url=vscode-insiders:mcp/install?%7B%22safari-mcp%22%3A%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D%7D"><img src="https://img.shields.io/badge/VS_Code_Insiders-Install_MCP_Server-24bfa5?logo=visual-studio-code&logoColor=white" alt="Install in VS Code Insiders"></a>
 
 **80 tools** · **Zero dependencies** · **~5ms per command** · **60% less CPU than Chrome**
 
