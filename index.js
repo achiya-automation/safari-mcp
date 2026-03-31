@@ -59,11 +59,45 @@ const WEBKIT_MEMORY_LIMIT_MB = parseInt(process.env.MCP_WEBKIT_LIMIT_MB || "3000
 // Track tabs opened by THIS session (index → {url, openedAt})
 const _openedTabs = new Map();
 
+// ========== TAB OWNERSHIP: prevent operating on user's tabs ==========
+// Tracks URLs of tabs opened by this MCP session.
+// Any tool that modifies a tab (navigate, click, fill, etc.) is blocked
+// unless the current tab was opened via safari_new_tab.
+const _ownedTabURLs = new Set();
+
+function _isURLOwned(url) {
+  if (!url) return false;
+  if (_ownedTabURLs.has(url)) return true;
+  // Match ignoring query params / fragments (URL may change slightly after load)
+  const urlBase = url.split('?')[0].split('#')[0];
+  for (const owned of _ownedTabURLs) {
+    const ownedBase = owned.split('?')[0].split('#')[0];
+    if (urlBase === ownedBase) return true;
+  }
+  return false;
+}
+
+function _addOwnedURL(url) {
+  if (url && url !== 'about:blank' && url !== 'favorites://') _ownedTabURLs.add(url);
+}
+
+function _removeOwnedURL(url) {
+  if (url) _ownedTabURLs.delete(url);
+}
+
+function _updateOwnedURL(oldUrl, newUrl) {
+  _removeOwnedURL(oldUrl);
+  _addOwnedURL(newUrl);
+}
+
 function _trackTab(tabIndex, url) {
   _openedTabs.set(tabIndex, { url: url || "", openedAt: Date.now() });
+  _addOwnedURL(url);
 }
 
 function _untrackTab(tabIndex) {
+  const info = _openedTabs.get(tabIndex);
+  if (info?.url) _removeOwnedURL(info.url);
   _openedTabs.delete(tabIndex);
 }
 
@@ -539,9 +573,43 @@ const _nullMeansFailure = new Set([
   // CSP fallback is handled separately via isCspError check.
 ]);
 
+// Operations that don't need tab ownership (read-only or tab management)
+const _noOwnershipCheck = new Set([
+  // Tab management
+  "new_tab", "list_tabs", "close_tab", "switch_tab",
+  // Read-only — don't modify the page
+  "read_page", "get_source", "snapshot", "accessibility_snapshot",
+  "get_element", "query_all", "screenshot", "screenshot_element",
+  "get_console", "list_console_messages", "start_console",
+  "get_network", "list_network_requests", "start_network_capture",
+  "network", "network_details", "console_filter",
+  "performance_metrics", "css_coverage", "get_computed_style",
+  "extract_images", "extract_links", "extract_meta", "extract_tables",
+  "get_cookies", "local_storage", "session_storage",
+  "get_indexed_db", "list_indexed_dbs", "detect_forms",
+  "save_pdf", "analyze_page",
+]);
+
 // Try extension first, fall back to AppleScript.
 // When SAFARI_PROFILE is set, skip extension entirely — AppleScript doesn't steal focus.
 async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) {
+  // ========== TAB OWNERSHIP GUARD ==========
+  // Block operations on tabs not opened by this MCP session.
+  // Once any tab has been opened via new_tab, ALL subsequent operations
+  // must target an owned tab. This prevents navigating/clicking in user's tabs.
+  if (!_noOwnershipCheck.has(extensionType)) {
+    const currentUrl = safari.getActiveTabURL();
+    if (_ownedTabURLs.size === 0) {
+      // No tabs opened yet — block everything except read-only ops
+      const msg = `⚠️ Tab safety: no tabs opened yet. Call safari_new_tab first before "${extensionType}".`;
+      console.error(`[Safari MCP] ${msg}`);
+      throw new Error(msg);
+    } else if (currentUrl && !_isURLOwned(currentUrl)) {
+      const msg = `⚠️ Tab safety: refusing "${extensionType}" — current tab (${currentUrl}) was not opened by this MCP session. Use safari_new_tab or safari_switch_tab to target your own tab.`;
+      console.error(`[Safari MCP] ${msg}`);
+      throw new Error(msg);
+    }
+  }
   if (_extensionConnected && !_preferAppleScript) {
     try {
       const t0 = Date.now();
@@ -587,10 +655,13 @@ server.tool(
   "Navigate to a URL in Safari. Waits for page to fully load.",
   { url: z.string().describe("URL to navigate to") },
   async ({ url }) => {
+    const oldUrl = safari.getActiveTabURL();
     const result = await extensionOrFallback(
       "navigate", { url },
       () => safari.navigate(url)
     );
+    // Update ownership: old URL → new URL (tab is still ours, just different URL)
+    if (oldUrl) _updateOwnedURL(oldUrl, url);
     return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
@@ -681,6 +752,7 @@ server.tool(
     timeout: z.coerce.number().optional().describe("Load timeout in ms (default: 30000)"),
   },
   async ({ url, maxLength, timeout }) => {
+    const oldUrl = safari.getActiveTabURL();
     const result = await extensionOrFallback(
       "navigate_and_read", { url, maxLength, timeout },
       async () => {
@@ -688,6 +760,8 @@ server.tool(
         return safari.readPage({ maxLength });
       }
     );
+    // Update ownership: old URL → new URL
+    if (oldUrl) _updateOwnedURL(oldUrl, url);
     return { content: [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result) }] };
   }
 );
@@ -1053,6 +1127,8 @@ server.tool(
     }
     if (result?.url) {
       safari.setActiveTabURL(result.url);
+      // Also register actual URL (may differ from requested due to redirects)
+      _addOwnedURL(result.url);
     }
     return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
@@ -1075,6 +1151,20 @@ server.tool(
   "Switch to a specific tab by index (use safari_list_tabs to see indices). All subsequent commands (click, fill, evaluate, screenshot, scroll) will target this tab. If commands seem to run on the wrong tab, call switch_tab again to re-anchor.",
   { index: z.coerce.number().describe("Tab index (starting from 1)") },
   async ({ index }) => {
+    // Tab ownership check: verify target tab is one we opened
+    if (_ownedTabURLs.size > 0) {
+      // Get target tab's URL via list_tabs before switching
+      try {
+        const tabs = await safari.listTabs();
+        const parsed = typeof tabs === 'string' ? JSON.parse(tabs) : tabs;
+        const target = parsed.find(t => t.index === index);
+        if (target && target.url && !_isURLOwned(target.url)) {
+          const msg = `⚠️ Tab safety: refusing switch_tab to index ${index} (${target.url}) — not opened by this MCP session. Use safari_new_tab to open your own tab.`;
+          console.error(`[Safari MCP] ${msg}`);
+          return { content: [{ type: "text", text: msg }], isError: true };
+        }
+      } catch {}
+    }
     const result = await extensionOrFallback(
       "switch_tab", { index },
       () => safari.switchTab(index)

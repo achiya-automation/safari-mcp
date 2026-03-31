@@ -198,6 +198,17 @@ async function handleCommand(type, payload) {
     throw new Error("Tab belongs to a different profile — refusing to operate on personal tabs");
   }
 
+  // ========== TAB OWNERSHIP GUARD ==========
+  // Block write operations on tabs not opened by this session.
+  // new_tab is always allowed (it creates owned tabs). Read-only ops are allowed on any tab.
+  if (type !== "new_tab" && !_readOnlyCommands.has(type) && !_isTabOwnedBySession(sessionId, tabId)) {
+    const anyOwned = _sessionOwnedTabs.has(sessionId) && _sessionOwnedTabs.get(sessionId).size > 0;
+    if (anyOwned) {
+      throw new Error(`⚠️ Tab safety: refusing "${type}" on tab ${tabId} (${targetTab.url || 'unknown'}) — not opened by this MCP session. Use safari_new_tab first.`);
+    }
+    // If no tabs owned yet, allow operation (backward compatibility for sessions that don't use new_tab)
+  }
+
   switch (type) {
     // --- Navigation ---
     case "navigate": {
@@ -1018,6 +1029,8 @@ async function handleCommand(type, payload) {
       // Use the requested URL (not updated.url) when page hasn't loaded yet (still about:blank)
       const trackUrl = (updated.url && updated.url !== "about:blank") ? updated.url : (payload.url || updated.url);
       _setSessionTab(sessionId, updated.id, trackUrl);
+      // Register tab as owned by this session
+      _addOwnedTab(sessionId, updated.id);
       return { title: updated.title, url: updated.url, tabIndex: updated.index + 1 };
     }
 
@@ -1026,8 +1039,12 @@ async function handleCommand(type, payload) {
         const query = _profileWindowId ? { windowId: _profileWindowId } : { currentWindow: true };
         const tabs = await browser.tabs.query(query);
         const target = tabs[payload.index - 1];
-        if (target) await browser.tabs.remove(target.id);
+        if (target) {
+          _removeOwnedTab(sessionId, target.id);
+          await browser.tabs.remove(target.id);
+        }
       } else {
+        _removeOwnedTab(sessionId, tabId);
         await browser.tabs.remove(tabId);
       }
       return "Tab closed";
@@ -1615,6 +1632,42 @@ const TAB_CACHE_MS = 3000; // Re-verify tab URL match every 3s
 const _DEFAULT_SESSION = "__default__"; // Fallback for commands without sessionId
 const SESSION_MAX_AGE_MS = 5 * 60 * 1000; // 5 min — prune stale sessions
 const MAX_SESSIONS = 50; // Hard cap on session cache size
+
+// ========== TAB OWNERSHIP: track tabs opened by each MCP session ==========
+// Prevents operating on user's tabs — only tabs created via new_tab are "owned".
+const _sessionOwnedTabs = new Map(); // sessionId → Set<tabId>
+
+function _addOwnedTab(sessionId, tabId) {
+  const sid = sessionId || _DEFAULT_SESSION;
+  if (!_sessionOwnedTabs.has(sid)) _sessionOwnedTabs.set(sid, new Set());
+  _sessionOwnedTabs.get(sid).add(tabId);
+}
+
+function _removeOwnedTab(sessionId, tabId) {
+  const sid = sessionId || _DEFAULT_SESSION;
+  const set = _sessionOwnedTabs.get(sid);
+  if (set) set.delete(tabId);
+}
+
+function _isTabOwnedBySession(sessionId, tabId) {
+  const sid = sessionId || _DEFAULT_SESSION;
+  const set = _sessionOwnedTabs.get(sid);
+  return set ? set.has(tabId) : false;
+}
+
+// Read-only commands that don't modify the page — allowed on any tab
+const _readOnlyCommands = new Set([
+  "list_tabs", "read_page", "get_source", "snapshot", "accessibility_snapshot",
+  "get_element", "query_all", "screenshot", "screenshot_element",
+  "console_messages", "network_requests", "list_console_messages",
+  "list_network_requests", "get_console_message", "get_network_request",
+  "start_console", "start_network_capture", "network", "network_details",
+  "console_filter", "performance_metrics", "css_coverage", "get_computed_style",
+  "extract_images", "extract_links", "extract_meta", "extract_tables",
+  "get_cookies", "local_storage", "session_storage",
+  "get_indexed_db", "list_indexed_dbs", "detect_forms",
+  "save_pdf", "analyze_page",
+]);
 
 function _getSessionCache(sessionId) {
   const sid = sessionId || _DEFAULT_SESSION;
