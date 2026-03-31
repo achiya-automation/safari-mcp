@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] - 2026-03-31
+
+### Added
+
+- CGEvent native keyboard support in Swift helper — send keystrokes to Safari without activating the window or stealing focus
+- Cross-origin iframe typing: `typeText` and `pressKey` (Cmd+V) now detect when the active element is an iframe and use native CGEvent paste instead of JavaScript
+
+### Fixed
+
+- Focus stealing: `_nativeTypeViaClipboard` and `pressKey` Cmd+V for iframes no longer activate Safari or use System Events — all done via background CGEvent targeting
+
 ## [2.1.5] - 2026-03-30
 
 ### Fixed

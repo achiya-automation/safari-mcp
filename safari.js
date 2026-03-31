@@ -420,6 +420,44 @@ function _helperNativeClick(x, y, doubleClick = false, windowId = 0, timeout = 5
   });
 }
 
+// Sends a CGEvent keyboard command to the Swift helper daemon.
+// No focus stealing — sends key events directly to the target window via PID.
+function _helperNativeKeyboard(keyCode, flags = [], windowId = 0, timeout = 5000) {
+  return new Promise((resolve, reject) => {
+    if (!_helperProc) startHelper();
+    if (!_helperProc || !_helperProc.stdin || !_helperProc.stdin.writable) {
+      reject(new Error("safari-helper not available for native keyboard"));
+      return;
+    }
+    let resolved = false;
+    const timer = setTimeout(() => {
+      if (resolved) return;
+      resolved = true;
+      const idx = _helperQueue.indexOf(cb);
+      if (idx >= 0) _helperQueue.splice(idx, 1);
+      reject(new Error("native keyboard timeout"));
+    }, timeout);
+
+    function cb(line) {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed.error) reject(new Error(parsed.error));
+        else resolve(parsed.result ?? "");
+      } catch {
+        resolve(line);
+      }
+    }
+
+    _helperQueue.push(cb);
+    const cmd = { keyboard: { keyCode, flags } };
+    if (windowId) cmd.keyboard.windowId = windowId;
+    _helperProc.stdin.write(JSON.stringify(cmd) + "\n");
+  });
+}
+
 // Get Safari window bounds, toolbar height, and window ID for coordinate calculation
 async function _getSafariWindowGeometry() {
   await refreshTargetWindow();
@@ -1070,24 +1108,17 @@ export async function pressKey({ key, modifiers = [] }) {
 
     // Cmd+V (paste) — read clipboard via AppleScript (no activate!), inject via JS
     if (k === "v") {
-      // Cross-origin iframe: JS can't paste into it, use System Events
+      // Cross-origin iframe: JS can't paste into it, use CGEvent Cmd+V (no focus steal)
       const activeTag = await runJS(`document.activeElement ? document.activeElement.tagName : ''`);
       if (activeTag === 'IFRAME') {
-        const activateScript = SAFARI_PROFILE
-          ? `tell application "Safari"\n  set index of ${getTargetWindowRef()} to 1\n  activate\nend tell`
-          : `tell application "Safari" to activate`;
-        await osascript(
-          `${activateScript}
-          delay 0.2
-          tell application "System Events"
-            tell process "Safari"
-              keystroke "v" using command down
-            end tell
-          end tell`,
-          { timeout: 10000 }
-        );
+        try {
+          const geo = await _getSafariWindowGeometry();
+          await _helperNativeKeyboard(9, ["cmd"], geo.windowId);
+        } catch {
+          await _helperNativeKeyboard(9, ["cmd"], 0);
+        }
         await new Promise(r => setTimeout(r, 300));
-        return `Pressed: ${modifiers.join("+")}+v (native System Events into iframe)`;
+        return `Pressed: ${modifiers.join("+")}+v (CGEvent Cmd+V into iframe, no focus steal)`;
       }
 
       const clipText = await osascript(`the clipboard as text`).catch(() => "");
@@ -1174,42 +1205,55 @@ export async function pressKey({ key, modifiers = [] }) {
 }
 
 // Native typing via clipboard paste — for cross-origin iframes (Intercom, Zendesk, etc.)
-// JS can't access content inside cross-origin iframes, so we use OS-level System Events:
+// JS can't access content inside cross-origin iframes, so we use OS-level CGEvent:
 // 1. Save current clipboard
 // 2. Set clipboard to our text
-// 3. Cmd+V via System Events (goes to whatever is focused, including iframe content)
+// 3. Cmd+V via CGEvent keyboard (targeted to window — NO focus steal, NO activate)
 // 4. Restore clipboard
 // Requires nativeClick to have focused the input inside the iframe first.
 async function _nativeTypeViaClipboard(text) {
   // Save current clipboard
-  const savedClipboard = await osascriptFast(`the clipboard as text`).catch(() => null);
+  let savedClipboard = null;
+  try {
+    const { stdout } = await execFileAsync("pbpaste", []);
+    savedClipboard = stdout;
+  } catch {}
 
-  // Set clipboard to our text
-  const escaped = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '');
-  await osascriptFast(`set the clipboard to "${escaped}"`);
+  // Set clipboard to our text via pipe (safe from shell injection)
+  await new Promise((resolve, reject) => {
+    const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
+    proc.stdin.write(text);
+    proc.stdin.end();
+    proc.on("close", resolve);
+    proc.on("error", reject);
+  });
 
-  // Bring Safari (profile window) to front and paste via System Events
-  const activateScript = SAFARI_PROFILE
-    ? `tell application "Safari"\n  set index of ${getTargetWindowRef()} to 1\n  activate\nend tell`
-    : `tell application "Safari" to activate`;
-  await osascript(
-    `${activateScript}
-    delay 0.2
-    tell application "System Events"
-      tell process "Safari"
-        keystroke "v" using command down
-      end tell
-    end tell`,
-    { timeout: 10000 }
-  );
+  // Paste via CGEvent Cmd+V targeted to Safari window — NO activate, NO focus steal
+  try {
+    const geo = await _getSafariWindowGeometry();
+    // keyCode 9 = V key, flags: ["cmd"]
+    await _helperNativeKeyboard(9, ["cmd"], geo.windowId);
+  } catch {
+    // Fallback: try without windowId (global)
+    await _helperNativeKeyboard(9, ["cmd"], 0);
+  }
 
   // Wait for paste to settle
   await new Promise(r => setTimeout(r, 300));
 
-  // Restore clipboard
-  if (savedClipboard) {
-    const restoredEscaped = savedClipboard.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '');
-    await osascriptFast(`set the clipboard to "${restoredEscaped}"`).catch(() => {});
+  // Restore clipboard after delay
+  if (savedClipboard !== null) {
+    setTimeout(async () => {
+      try {
+        await new Promise((resolve, reject) => {
+          const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
+          proc.stdin.write(savedClipboard);
+          proc.stdin.end();
+          proc.on("close", resolve);
+          proc.on("error", reject);
+        });
+      } catch {}
+    }, 3000);
   }
 
   return `Typed ${text.length} chars (native paste into iframe)`;

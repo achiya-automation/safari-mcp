@@ -128,6 +128,57 @@ func performNativeClick(x: Double, y: Double, doubleClick: Bool = false, windowI
   return ["result": "clicked at (\(Int(x)),\(Int(y)))\(doubleClick ? " (double)" : "")\(targetInfo)"]
 }
 
+// ========== CGEvent Native Keyboard ==========
+// Sends keyboard events (keystrokes, shortcuts) targeted to a specific window
+// WITHOUT activating Safari or stealing focus. Same principle as native click.
+
+func performNativeKeyboard(keyCode: UInt16, flags: CGEventFlags = [], windowId: Int64 = 0) -> [String: Any] {
+  // Get Safari PID
+  var safariPID: pid_t = 0
+  if windowId > 0 {
+    let ws = NSWorkspace.shared
+    for app in ws.runningApplications {
+      if app.bundleIdentifier == "com.apple.Safari" {
+        safariPID = app.processIdentifier
+        break
+      }
+    }
+    if safariPID == 0 {
+      return ["error": "Safari process not found"]
+    }
+  }
+
+  let kWindowField = CGEventField(rawValue: 91)!
+  let kWindowHandlerField = CGEventField(rawValue: 92)!
+
+  guard let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true) else {
+    return ["error": "Failed to create key down event"]
+  }
+  guard let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else {
+    return ["error": "Failed to create key up event"]
+  }
+
+  keyDown.flags = flags
+  keyUp.flags = flags
+
+  if windowId > 0 {
+    keyDown.setIntegerValueField(kWindowField, value: windowId)
+    keyDown.setIntegerValueField(kWindowHandlerField, value: windowId)
+    keyUp.setIntegerValueField(kWindowField, value: windowId)
+    keyUp.setIntegerValueField(kWindowHandlerField, value: windowId)
+    keyDown.postToPid(safariPID)
+    usleep(30_000)
+    keyUp.postToPid(safariPID)
+  } else {
+    keyDown.post(tap: .cghidEventTap)
+    usleep(30_000)
+    keyUp.post(tap: .cghidEventTap)
+  }
+
+  let targetInfo = windowId > 0 ? " (window \(windowId), background)" : ""
+  return ["result": "key \(keyCode) pressed\(targetInfo)"]
+}
+
 // ========== Response Helper ==========
 
 func respond(_ obj: [String: Any]) {
@@ -166,6 +217,24 @@ if args.count >= 4 && args[1] == "--click" {
   exit(result["error"] != nil ? 1 : 0)
 }
 
+// ========== CLI Mode: --paste --window WID ==========
+// Convenience: Cmd+V via CGEvent (no activate needed)
+if args.count >= 2 && args[1] == "--paste" {
+  var windowId: Int64 = 0
+  var i = 2
+  while i < args.count {
+    if args[i] == "--window" && i + 1 < args.count {
+      windowId = Int64(args[i + 1]) ?? 0
+      i += 1
+    }
+    i += 1
+  }
+  // keyCode 9 = V key
+  let result = performNativeKeyboard(keyCode: 9, flags: .maskCommand, windowId: windowId)
+  respond(result)
+  exit(result["error"] != nil ? 1 : 0)
+}
+
 // ========== Daemon Mode: JSON lines on stdin ==========
 
 while let line = readLine(strippingNewline: true) {
@@ -187,9 +256,31 @@ while let line = readLine(strippingNewline: true) {
     continue
   }
 
+  // Handle CGEvent keyboard command
+  // {"keyboard": {"keyCode": 9, "flags": ["cmd"], "windowId": 4127}}
+  // keyCode 9 = V, flags: cmd/shift/alt/ctrl
+  if let kbData = json["keyboard"] as? [String: Any],
+     let keyCode = kbData["keyCode"] as? Int {
+    let windowId = Int64((kbData["windowId"] as? Int) ?? 0)
+    var flags: CGEventFlags = []
+    if let flagNames = kbData["flags"] as? [String] {
+      for f in flagNames {
+        switch f.lowercased() {
+          case "cmd": flags.insert(.maskCommand)
+          case "shift": flags.insert(.maskShift)
+          case "alt", "option": flags.insert(.maskAlternate)
+          case "ctrl", "control": flags.insert(.maskControl)
+          default: break
+        }
+      }
+    }
+    respond(performNativeKeyboard(keyCode: UInt16(keyCode), flags: flags, windowId: windowId))
+    continue
+  }
+
   // Handle AppleScript command
   guard let script = json["script"] as? String else {
-    respond(["error": "invalid input — expected 'script' or 'click'"])
+    respond(["error": "invalid input — expected 'script', 'click', or 'keyboard'"])
     continue
   }
 
