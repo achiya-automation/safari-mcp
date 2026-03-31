@@ -1,10 +1,6 @@
 <div align="center">
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/banner.svg">
-  <source media="(prefers-color-scheme: light)" srcset="assets/banner.svg">
-  <img src="assets/banner.svg" alt="Safari MCP — Native browser automation for AI agents" width="100%">
-</picture>
+<img src="social-preview.png" alt="Safari MCP — Native browser automation for AI agents" width="100%">
 
 <br/>
 
