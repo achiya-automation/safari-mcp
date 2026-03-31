@@ -1070,6 +1070,26 @@ export async function pressKey({ key, modifiers = [] }) {
 
     // Cmd+V (paste) — read clipboard via AppleScript (no activate!), inject via JS
     if (k === "v") {
+      // Cross-origin iframe: JS can't paste into it, use System Events
+      const activeTag = await runJS(`document.activeElement ? document.activeElement.tagName : ''`);
+      if (activeTag === 'IFRAME') {
+        const activateScript = SAFARI_PROFILE
+          ? `tell application "Safari"\n  set index of ${getTargetWindowRef()} to 1\n  activate\nend tell`
+          : `tell application "Safari" to activate`;
+        await osascript(
+          `${activateScript}
+          delay 0.2
+          tell application "System Events"
+            tell process "Safari"
+              keystroke "v" using command down
+            end tell
+          end tell`,
+          { timeout: 10000 }
+        );
+        await new Promise(r => setTimeout(r, 300));
+        return `Pressed: ${modifiers.join("+")}+v (native System Events into iframe)`;
+      }
+
       const clipText = await osascript(`the clipboard as text`).catch(() => "");
       if (clipText) {
         const escaped = clipText.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t");
@@ -1153,6 +1173,48 @@ export async function pressKey({ key, modifiers = [] }) {
   return `Pressed: ${modifiers.length ? modifiers.join("+") + "+" : ""}${key}`;
 }
 
+// Native typing via clipboard paste — for cross-origin iframes (Intercom, Zendesk, etc.)
+// JS can't access content inside cross-origin iframes, so we use OS-level System Events:
+// 1. Save current clipboard
+// 2. Set clipboard to our text
+// 3. Cmd+V via System Events (goes to whatever is focused, including iframe content)
+// 4. Restore clipboard
+// Requires nativeClick to have focused the input inside the iframe first.
+async function _nativeTypeViaClipboard(text) {
+  // Save current clipboard
+  const savedClipboard = await osascriptFast(`the clipboard as text`).catch(() => null);
+
+  // Set clipboard to our text
+  const escaped = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '');
+  await osascriptFast(`set the clipboard to "${escaped}"`);
+
+  // Bring Safari (profile window) to front and paste via System Events
+  const activateScript = SAFARI_PROFILE
+    ? `tell application "Safari"\n  set index of ${getTargetWindowRef()} to 1\n  activate\nend tell`
+    : `tell application "Safari" to activate`;
+  await osascript(
+    `${activateScript}
+    delay 0.2
+    tell application "System Events"
+      tell process "Safari"
+        keystroke "v" using command down
+      end tell
+    end tell`,
+    { timeout: 10000 }
+  );
+
+  // Wait for paste to settle
+  await new Promise(r => setTimeout(r, 300));
+
+  // Restore clipboard
+  if (savedClipboard) {
+    const restoredEscaped = savedClipboard.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '');
+    await osascriptFast(`set the clipboard to "${restoredEscaped}"`).catch(() => {});
+  }
+
+  return `Typed ${text.length} chars (native paste into iframe)`;
+}
+
 export async function typeText({ text, selector, ref }) {
   if (ref) selector = refSelector(ref);
   if (selector) {
@@ -1160,6 +1222,13 @@ export async function typeText({ text, selector, ref }) {
     await runJS(`document.querySelector('${sel}')?.focus()`);
     // Quick poll for focus to settle (was 200ms fixed sleep)
     await new Promise((r) => setTimeout(r, 30));
+  }
+
+  // Cross-origin iframe detection: JS can't access content inside cross-origin iframes.
+  // When activeElement is an IFRAME, use native clipboard paste via System Events.
+  const activeTag = await runJS(`document.activeElement ? document.activeElement.tagName : ''`);
+  if (activeTag === 'IFRAME') {
+    return await _nativeTypeViaClipboard(text);
   }
 
   // Use execCommand("insertText") — the ONLY approach that works for BOTH:
@@ -1180,6 +1249,11 @@ export async function typeText({ text, selector, ref }) {
     // Fallback for inputs where execCommand failed
     `if('value' in el){var start=el.selectionStart||0;el.value=el.value.substring(0,start)+'${safeText}'+el.value.substring(el.selectionEnd||start);el.selectionStart=el.selectionEnd=start+${text.length};el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));return 'Typed '+${text.length}+' chars via value set';}return 'Could not type';})()`
   );
+
+  // If JS typing failed and we're somehow in an iframe context, try native fallback
+  if (result === 'Could not type') {
+    return await _nativeTypeViaClipboard(text);
+  }
 
   return result;
 }
