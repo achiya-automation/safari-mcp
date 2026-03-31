@@ -12,3 +12,4 @@
 - [ ] All existing tools still work
 - [ ] New tools have proper error handling
 - [ ] README updated (if adding new tools)
+- [ ] All code, comments, and commit messages in English

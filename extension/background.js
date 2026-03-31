@@ -5,7 +5,7 @@
 const HTTP_URL = "http://127.0.0.1:9224";
 let isConnected = false;
 let pollAbort = null;
-let _targetProfile = null;   // Profile name from server (e.g. "אוטומציות")
+let _targetProfile = null;   // Profile name from server (e.g. "Automations")
 let _profileWindowId = null; // Discovered windowId for the profile
 let _enabled = true;         // Toggle from popup — when false, stops polling and rejects commands
 let _reconnectTimer = null;  // Single reconnect timer — prevents exponential growth
@@ -1735,7 +1735,7 @@ browser.tabs.onRemoved.addListener((tabId) => {
 
 // Verify this extension instance is running in the expected profile.
 // Safari extensions see only their own profile's windows/tabs.
-// If the server expects "אוטומציות" but this worker's windows don't match, we're in the wrong profile.
+// If the server expects a specific profile but this worker's windows don't match, we're in the wrong profile.
 async function _verifyProfileMatch(expectedProfile) {
   try {
     const allWindows = await browser.windows.getAll({ populate: true });

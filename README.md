@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="social-preview.png" alt="Safari MCP — Native browser automation for AI agents" width="100%">
+<img src="social-preview.png" alt="Safari MCP Server — 80 native browser automation tools for AI agents on macOS" width="100%">
 
 <br/>
 

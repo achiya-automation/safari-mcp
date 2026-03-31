@@ -1,7 +1,7 @@
 // MCP Click/Interaction Helpers — injected into every page
 // This file is loaded by safari.js at startup, escaped, and injected via AppleScript `do JavaScript`.
 // It is also used by the extension's execInTab for the AppleScript fallback path.
-// IMPORTANT: Keep this file compatible with all browsers — no ES6+ modules, use var where possible.
+// IMPORTANT: Keep compatible with all browsers — no ES6+ modules, use var where possible.
 
 if (window.__mcpVersion !== 5) {
   window.__mcpVersion = 5;

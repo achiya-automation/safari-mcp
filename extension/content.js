@@ -1,6 +1,6 @@
 // Content script — runs at document_start in MAIN world (before page scripts)
 // Purpose: Monkey-patch attachShadow to capture CLOSED shadow roots.
-// Without this, Reddit 2026 and other sites using closed shadow DOM
+// Without this, Reddit and other sites using closed shadow DOM
 // are invisible to snapshot/click/fill.
 // Runs in MAIN world via manifest "world": "MAIN" — no script injection needed,
 // so CSP cannot block it.

@@ -3,7 +3,7 @@
 // 1. Safari Web Extension (fast, ~5-20ms, keeps logins) — when extension is connected
 // 2. AppleScript + Swift daemon (~5ms, keeps logins) — always available
 //
-// Extension transport: WebSocket (Chrome) OR HTTP polling (Safari — WebSocket blocked by Apple)
+// Extension transport: HTTP polling (Safari — WebSocket blocked by Apple)
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -82,6 +82,13 @@ function _isURLOwned(url) {
     for (const owned of _ownedTabURLs) {
       try {
         if (new URL(owned).origin === urlOrigin && urlBase.startsWith(normalize(owned))) return true;
+      } catch {}
+    }
+    // Broader same-origin check: if we own ANY URL on this origin, treat all same-origin URLs as owned.
+    // This handles redirects like /article/new → /article/edit/ID where path prefix doesn't match.
+    for (const owned of _ownedTabURLs) {
+      try {
+        if (new URL(owned).origin === urlOrigin) return true;
       } catch {}
     }
   } catch {}
@@ -635,15 +642,19 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
   // must target an owned tab. This prevents navigating/clicking in user's tabs.
   if (!_noOwnershipCheck.has(extensionType)) {
     const currentUrl = safari.getActiveTabURL();
-    if (_ownedTabURLs.size === 0) {
+    if (_ownedTabURLs.size === 0 && _openedTabs.size === 0) {
       // No tabs opened yet — block everything except read-only ops
       const msg = `⚠️ Tab safety: no tabs opened yet. Call safari_new_tab first before "${extensionType}".`;
       console.error(`[Safari MCP] ${msg}`);
       throw new Error(msg);
     } else if (currentUrl && !_isURLOwned(currentUrl)) {
-      const msg = `⚠️ Tab safety: refusing "${extensionType}" — current tab (${currentUrl}) was not opened by this MCP session. Use safari_new_tab or safari_switch_tab to target your own tab.`;
-      console.error(`[Safari MCP] ${msg}`);
-      throw new Error(msg);
+      // about:blank tabs are owned if we have any tracked tabs (new_tab creates them at about:blank)
+      const isBlankOwned = (currentUrl === 'about:blank' || currentUrl === 'missing value') && _openedTabs.size > 0;
+      if (!isBlankOwned) {
+        const msg = `⚠️ Tab safety: refusing "${extensionType}" — current tab (${currentUrl}) was not opened by this MCP session. Use safari_new_tab or safari_switch_tab to target your own tab.`;
+        console.error(`[Safari MCP] ${msg}`);
+        throw new Error(msg);
+      }
     }
   }
   if (_extensionConnected && !_preferAppleScript) {
@@ -1203,9 +1214,13 @@ server.tool(
         const parsed = typeof tabs === 'string' ? JSON.parse(tabs) : tabs;
         const target = parsed.find(t => t.index === index);
         if (target && target.url && !_isURLOwned(target.url)) {
-          const msg = `⚠️ Tab safety: refusing switch_tab to index ${index} (${target.url}) — not opened by this MCP session. Use safari_new_tab to open your own tab.`;
-          console.error(`[Safari MCP] ${msg}`);
-          return { content: [{ type: "text", text: msg }], isError: true };
+          // about:blank / missing value tabs are owned if tracked in _openedTabs
+          const isBlankOwned = (target.url === 'about:blank' || target.url === 'missing value') && _openedTabs.has(index);
+          if (!isBlankOwned) {
+            const msg = `⚠️ Tab safety: refusing switch_tab to index ${index} (${target.url}) — not opened by this MCP session. Use safari_new_tab to open your own tab.`;
+            console.error(`[Safari MCP] ${msg}`);
+            return { content: [{ type: "text", text: msg }], isError: true };
+          }
         }
       } catch {}
     }

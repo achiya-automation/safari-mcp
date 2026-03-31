@@ -659,7 +659,7 @@ export async function navigate(url) {
         const state = await runJS('document.readyState', { timeout: 5000 });
         if (state === 'complete' || state === 'interactive') {
           result = await runJS(
-            `JSON.stringify({title:document.title,url:location.href,blocked:document.title.includes('cannot open')||document.title.includes('אין אפשרות')})`,
+            `JSON.stringify({title:document.title,url:location.href,blocked:document.title.includes('cannot open')||document.title.includes('\u05D0\u05D9\u05DF \u05D0\u05E4\u05E9\u05E8\u05D5\u05EA')})`,
             { timeout: 5000 }
           );
           if (state === 'complete') break;
@@ -2069,7 +2069,7 @@ export async function uploadFile({ selector, filePath }) {
               click button "Cancel" of sheet 1 of w
             on error
               try
-                click button "ביטול" of sheet 1 of w
+                click button "\u05D1\u05D9\u05D8\u05D5\u05DC" of sheet 1 of w  -- "Cancel" in Hebrew locale
               on error
                 key code 53
               end try
