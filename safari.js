@@ -378,10 +378,11 @@ function _osascriptFastHelper(script, timeout) {
     const timer = setTimeout(() => {
       if (resolved) return;
       resolved = true;
+      // DON'T remove from queue — replace with no-op consumer to maintain FIFO order.
+      // Without this, the late response would be consumed by the NEXT callback in the queue.
       const idx = _helperQueue.indexOf(cb);
-      if (idx >= 0) _helperQueue.splice(idx, 1);
+      if (idx >= 0) _helperQueue[idx] = () => {}; // Consume and discard late response
       _helperConsecutiveTimeouts++;
-      // Only kill the daemon after 3 consecutive timeouts (single slow script shouldn't kill concurrent ops)
       if (_helperConsecutiveTimeouts >= 3) {
         console.error(`[Safari MCP] safari-helper: ${_helperConsecutiveTimeouts} consecutive timeouts — killing daemon`);
         _helperProc?.kill();
@@ -396,7 +397,7 @@ function _osascriptFastHelper(script, timeout) {
       if (resolved) return;
       resolved = true;
       clearTimeout(timer);
-      _helperConsecutiveTimeouts = 0; // Reset on success
+      _helperConsecutiveTimeouts = 0;
       try {
         const parsed = JSON.parse(line);
         if (parsed.error) reject(new Error(parsed.error));
@@ -406,7 +407,6 @@ function _osascriptFastHelper(script, timeout) {
       }
     }
 
-    // Check process availability BEFORE pushing to queue (prevents dangling callbacks)
     if (!_helperProc || !_helperProc.stdin || !_helperProc.stdin.writable) {
       clearTimeout(timer);
       reject(new Error("safari-helper not available"));
@@ -440,7 +440,7 @@ function _helperNativeClick(x, y, doubleClick = false, windowId = 0, timeout = 5
       if (resolved) return;
       resolved = true;
       const idx = _helperQueue.indexOf(cb);
-      if (idx >= 0) _helperQueue.splice(idx, 1);
+      if (idx >= 0) _helperQueue[idx] = () => {}; // No-op consumer for late response
       reject(new Error("native click timeout"));
     }, timeout);
 
@@ -479,7 +479,7 @@ function _helperNativeKeyboard(keyCode, flags = [], windowId = 0, timeout = 5000
       if (resolved) return;
       resolved = true;
       const idx = _helperQueue.indexOf(cb);
-      if (idx >= 0) _helperQueue.splice(idx, 1);
+      if (idx >= 0) _helperQueue[idx] = () => {}; // No-op consumer for late response
       reject(new Error("native keyboard timeout"));
     }, timeout);
 
@@ -1164,7 +1164,7 @@ export async function pressKey({ key, modifiers = [] }) {
         const geo = await _getSafariWindowGeometry();
         if (!geo.windowId) throw new Error("Cannot paste into iframe without Safari window ID — would steal focus");
         await _helperNativeKeyboard(9, ["cmd"], geo.windowId);
-        await new Promise(r => setTimeout(r, 300));
+        await new Promise(r => setTimeout(r, 100)); // 100ms is enough for Cmd+V to process
         return `Pressed: ${modifiers.join("+")}+v (CGEvent Cmd+V into iframe, no focus steal)`;
       }
 
@@ -1277,22 +1277,22 @@ async function _nativeTypeViaClipboard(text) {
     // MUST have windowId — global CGEvent (windowId=0) would steal focus and move mouse
     const geo = await _getSafariWindowGeometry();
     if (!geo.windowId) {
-      // Can't get window ID — restore clipboard and throw
+      // Can't get window ID — restore clipboard and let catch block release lock
       await _restoreClipboard(savedClipboard);
-      _releaseClipboardLock();
       throw new Error("Cannot native-paste without Safari window ID — would steal focus");
     }
     // keyCode 9 = V key, flags: ["cmd"]
     await _helperNativeKeyboard(9, ["cmd"], geo.windowId);
 
     // Wait for paste to settle, then restore clipboard immediately
-    await new Promise(r => setTimeout(r, 300));
+    await new Promise(r => setTimeout(r, 100)); // 100ms is enough for Cmd+V to process
     await _restoreClipboard(savedClipboard);
     _releaseClipboardLock();
 
     return `Typed ${text.length} chars (native paste into iframe)`;
   } catch (err) {
-    _releaseClipboardLock();
+    // Ensure lock is released on ANY error (including the windowId check above)
+    if (_clipboardLocked) _releaseClipboardLock();
     throw err;
   }
 }
@@ -1486,11 +1486,12 @@ export async function screenshot({ fullPage = false } = {}) {
       `tell application "Safari" to return id of ${getTargetWindowRef()}`
     ).catch(() => null) : null;
 
-    // Save frontmost app BEFORE screencapture (it may steal focus on macOS Tahoe)
-    // Restore it immediately after capture to minimize disruption
+    // On macOS Tahoe, screencapture -l may briefly steal focus.
+    // Save frontmost app so we can detect if focus was stolen and restore it.
     let previousApp = null;
     if (windowId) {
       try {
+        // Use NSWorkspace via AppleScript (lighter than System Events — no AX needed)
         previousApp = (await osascriptFast(
           `tell application "System Events" to return name of first application process whose frontmost is true`
         )).trim();
@@ -1680,6 +1681,8 @@ export async function screenshotElement({ selector }) {
       if (data.length > 100) return data.toString("base64");
     } catch (e) {
       await unlink(tmpFile).catch(() => {});
+      // Also clean cropFile if it was created before the error
+      await unlink(tmpFile.replace('safari-el-', 'safari-el-crop-')).catch(() => {});
       throw new Error(`Element screenshot failed: ${e.message}`);
     }
   }
@@ -2776,11 +2779,15 @@ export async function importStorageState({ state }) {
 // ========== CLIPBOARD ==========
 
 export async function clipboardRead() {
+  // Acquire lock to avoid reading during a write/restore cycle
+  await _acquireClipboardLock(3000); // Short timeout — reads are fast
   try {
     const text = await execFileAsync("pbpaste", []);
     return text.stdout;
   } catch {
     return "(clipboard empty or contains non-text data)";
+  } finally {
+    _releaseClipboardLock();
   }
 }
 

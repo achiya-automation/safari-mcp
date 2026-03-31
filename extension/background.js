@@ -185,7 +185,9 @@ async function executeAndReply(msg) {
       body: JSON.stringify(response),
       signal: AbortSignal.timeout(5000),
     });
-  } catch {}
+  } catch (err) {
+    console.warn("Safari MCP Bridge: failed to send result to server:", err.message);
+  }
 }
 
 // ========== COMMAND HANDLERS ==========
@@ -1725,6 +1727,10 @@ browser.tabs.onRemoved.addListener((tabId) => {
       cache.tabUrl = null;
     }
   }
+  // Also remove from owned tabs — prevents stale ownership on externally closed tabs
+  for (const [sid, ownedSet] of _sessionOwnedTabs) {
+    ownedSet.delete(tabId);
+  }
 });
 
 // Verify this extension instance is running in the expected profile.
@@ -1774,7 +1780,13 @@ async function _verifyProfileMatch(expectedProfile) {
     }
 
     if (verifyRes && verifyRes.ok) {
-      const result = await verifyRes.json();
+      let result;
+      try {
+        result = await verifyRes.json();
+      } catch {
+        console.warn("Safari MCP: profile verification response invalid JSON — rejecting");
+        return false;
+      }
       if (result.match) {
         await browser.storage.local.set({ mcpVerifiedProfile: expectedProfile });
         return true;
