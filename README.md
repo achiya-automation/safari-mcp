@@ -541,7 +541,7 @@ Your support funds:
 - 🛠️ New tools and features
 - 📖 Documentation and examples
 
-<!-- Sponsors will be listed here -->
+[Become the first sponsor!](https://paypal.me/achiyaC123)
 
 ---
 
