@@ -405,7 +405,7 @@ async function handleCommand(type, payload) {
 
     // --- Click & Input ---
     case "click": {
-      return await execInTab((selector, text, x, y, ref) => {
+      const result = await execInTab((selector, text, x, y, ref) => {
         // Use shared deep query (defined by ensureHelpers / _deepQueryScript)
         const dq = window.__mcpDeepQuery || document.querySelector.bind(document);
 
@@ -633,6 +633,36 @@ async function handleCommand(type, payload) {
 
         return "Clicked: " + el.tagName + (el.textContent ? ' "' + el.textContent.trim().substring(0, 50) + '"' : "");
       }, [payload.selector, payload.text, payload.x, payload.y, payload.ref], tabId);
+
+      // Fallback: if element not found in main frame, try all frames (cross-origin iframes)
+      if (result && (result.startsWith("Element not found") || result === "No click target")) {
+        const iframeResult = await execInAllFrames((selector, text) => {
+          let el = null;
+          if (selector) {
+            el = document.querySelector(selector);
+          } else if (text) {
+            // Search interactive elements by text
+            const candidates = document.querySelectorAll("button, a, [role='button'], input[type='submit']");
+            for (let i = 0; i < candidates.length; i++) {
+              const t = (candidates[i].innerText || candidates[i].textContent || "").trim();
+              if (t === text) { el = candidates[i]; break; }
+            }
+            // Fuzzy: contains match
+            if (!el) {
+              for (let i = 0; i < candidates.length; i++) {
+                const t = (candidates[i].innerText || candidates[i].textContent || "").trim();
+                if (t.includes(text) || text.includes(t)) { el = candidates[i]; break; }
+              }
+            }
+          }
+          if (!el) return null;
+          el.scrollIntoView({ block: "center", behavior: "instant" });
+          el.click();
+          return "Clicked (iframe): " + el.tagName + (el.textContent ? ' "' + el.textContent.trim().substring(0, 50) + '"' : "");
+        }, [payload.selector, payload.text], tabId);
+        if (iframeResult) return iframeResult;
+      }
+      return result;
     }
 
     // --- Click + Read (combo — saves 1 full MCP round-trip) ---

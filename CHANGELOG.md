@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.1] - 2026-03-31
+
+### Fixed
+
+- Click in cross-origin iframes: Extension now falls back to `allFrames: true` when element not found in main frame, enabling clicks on buttons inside Intercom, Zendesk, and other cross-origin iframe widgets — zero focus stealing
+
 ## [2.5.0] - 2026-03-31
 
 ### Added
