@@ -97,7 +97,7 @@ process.on("uncaughtException", (err) => { console.error("Uncaught:", err); clea
 let _activeTabIndex = null; // null = use front document (default)
 let _activeTabURL = null;   // URL-based tracking (stable even when tabs shift)
 let _lastResolveTime = 0;   // Cache: skip resolve if verified recently
-const RESOLVE_CACHE_MS = 1500; // Re-verify tab every 1.5 seconds (was 5s — too stale)
+const RESOLVE_CACHE_MS = 0; // Always re-verify — cached indices go stale when tabs open/close
 
 // ========== DIAGNOSTIC LOG ==========
 // File-based log for profile/focus issues — survives MCP restart, visible to user
