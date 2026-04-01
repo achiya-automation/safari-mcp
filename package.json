@@ -4,6 +4,7 @@
   "mcpName": "io.github.achiya-automation/safari-mcp",
   "description": "Safari browser automation for AI agents — native macOS, zero Chrome overhead. 80 tools via AppleScript + JavaScript.",
   "type": "module",
+  "types": "index.d.ts",
   "main": "index.js",
   "bin": {
     "safari-mcp": "index.js"
@@ -64,7 +65,8 @@
     "extension/",
     "glama.json",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "index.d.ts"
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
