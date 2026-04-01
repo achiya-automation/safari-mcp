@@ -15,11 +15,23 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           registry-url: https://registry.npmjs.org
 
       - run: npm ci
 
-      - run: npm publish --provenance --access public
+      - name: Check if version already published
+        id: check
+        run: |
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          if npm view safari-mcp@$PACKAGE_VERSION version 2>/dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Publish to npm
+        if: steps.check.outputs.exists == 'false'
+        run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
