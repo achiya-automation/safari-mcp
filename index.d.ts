@@ -209,7 +209,6 @@ export interface SafariTab {
 }
 
 // ========== MODULE DECLARATION ==========
-// ========== MODULE DECLARATION ==========
 export interface McpServer {
   connect(transport: unknown): Promise<void>;
   tool(name: string, description: string, schema: unknown, handler: (input: unknown) => Promise<MCPToolResult>): unknown;
