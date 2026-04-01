@@ -177,6 +177,7 @@ let _targetWindowId = null;  // Numeric window ID (for CGEvent window targeting)
 let _targetWindowCacheTime = 0;
 const TARGET_WINDOW_CACHE_MS = 1000; // Short cache — fast detection of window changes
 let _profileWindowMissing = false; // True when profile window is not found
+let _focusGuardActive = false; // True when an outer caller already handles focus save/restore
 
 // Get the target window ref, falling back to 'front window' ONLY when no profile is configured
 function getTargetWindowRef() {
@@ -305,6 +306,7 @@ function _helperHideSafari(timeout = 2000) {
   });
 }
 
+export function setFocusGuard(active) { _focusGuardActive = active; }
 export function getActiveTabIndex() { return _activeTabIndex; }
 export function setActiveTabIndex(idx) { _activeTabIndex = idx; }
 export function getActiveTabURL() { return _activeTabURL; }
@@ -375,8 +377,9 @@ async function resolveActiveTab() {
 async function osascript(script, { timeout = 10000 } = {}) {
   if (!(await isSafariRunning())) throw safariNotRunningError();
   // Save frontmost app via daemon BEFORE subprocess (~0.1ms)
-  const targetsSafari = script.includes('tell application "Safari"');
-  const frontApp = targetsSafari ? await _helperGetFrontApp() : null;
+  // Skip if an outer caller (extensionOrFallback) already handles focus
+  const shouldGuardFocus = !_focusGuardActive;
+  const frontApp = shouldGuardFocus ? await _helperGetFrontApp() : null;
   try {
     const { stdout } = await execFileAsync("osascript", ["-e", script], {
       timeout,
@@ -397,7 +400,7 @@ async function osascript(script, { timeout = 10000 } = {}) {
     throw new Error(`AppleScript error: ${err.stderr || err.message}`);
   } finally {
     // Hide Safari via daemon if it stole focus (~1ms)
-    if (frontApp?.bundleId && frontApp.bundleId !== 'com.apple.Safari') {
+    if (shouldGuardFocus && frontApp?.bundleId && frontApp.bundleId !== 'com.apple.Safari') {
       const current = await _helperGetFrontApp();
       if (current?.bundleId === 'com.apple.Safari') {
         _helperHideSafari().catch(() => {});
@@ -583,23 +586,6 @@ function _helperGetFrontApp(timeout = 2000) {
   });
 }
 
-function _helperActivateApp(bundleId, timeout = 2000) {
-  return new Promise((resolve) => {
-    if (!_helperProc || !_helperProc.stdin?.writable || !bundleId) { resolve(); return; }
-    let resolved = false;
-    const timer = setTimeout(() => { if (!resolved) { resolved = true; resolve(); } }, timeout);
-    function cb() {
-      if (resolved) return;
-      resolved = true;
-      clearTimeout(timer);
-      resolve();
-    }
-    _helperQueue.push(cb);
-    try { _helperProc.stdin.write(JSON.stringify({ activateApp: bundleId }) + '\n'); }
-    catch { clearTimeout(timer); resolve(); }
-  });
-}
-
 // Get Safari window bounds, toolbar height, and window ID for coordinate calculation
 async function _getSafariWindowGeometry() {
   await refreshTargetWindow();
@@ -713,7 +699,9 @@ async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
   const tmpFile = join(tmpdir(), `safari-mcp-${Date.now()}.scpt`);
   await writeFile(tmpFile, appleScript, "utf8");
   // Save frontmost app via daemon before subprocess execution
-  const frontApp = await _helperGetFrontApp();
+  // Skip if outer caller already handles focus
+  const shouldGuard = !_focusGuardActive;
+  const frontApp = shouldGuard ? await _helperGetFrontApp() : null;
   try {
     const { stdout } = await execFileAsync("osascript", [tmpFile], {
       timeout,
@@ -723,7 +711,7 @@ async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
   } finally {
     unlink(tmpFile).catch(() => {});
     // Hide Safari via daemon if it stole focus (~1ms)
-    if (frontApp?.bundleId && frontApp.bundleId !== 'com.apple.Safari') {
+    if (shouldGuard && frontApp?.bundleId && frontApp.bundleId !== 'com.apple.Safari') {
       const current = await _helperGetFrontApp();
       if (current?.bundleId === 'com.apple.Safari') {
         _helperHideSafari().catch(() => {});
@@ -1593,15 +1581,11 @@ export async function screenshot({ fullPage = false } = {}) {
     ).catch(() => null) : null;
 
     // On macOS Tahoe, screencapture -l may briefly steal focus.
-    // Save frontmost app so we can detect if focus was stolen and restore it.
-    let previousApp = null;
+    // Save frontmost app via daemon so we can hide Safari if it stole focus.
+    let previousBundleId = null;
     if (windowId) {
-      try {
-        // Use NSWorkspace via AppleScript (lighter than System Events — no AX needed)
-        previousApp = (await osascriptFast(
-          `tell application "System Events" to return name of first application process whose frontmost is true`
-        )).trim();
-      } catch (_) {}
+      const fa = await _helperGetFrontApp();
+      previousBundleId = fa?.bundleId || null;
     }
 
     if (windowId) {
@@ -1642,11 +1626,12 @@ export async function screenshot({ fullPage = false } = {}) {
             );
           }
         }
-        // Restore focus if screencapture stole it (common on macOS Tahoe)
-        if (previousApp && previousApp !== "Safari") {
-          await osascriptFast(
-            `tell application "${previousApp}" to activate`
-          ).catch(() => {});
+        // Hide Safari if screencapture stole focus (common on macOS Tahoe)
+        if (previousBundleId && previousBundleId !== "com.apple.Safari") {
+          const cur = await _helperGetFrontApp();
+          if (cur?.bundleId === "com.apple.Safari") {
+            await _helperHideSafari().catch(() => {});
+          }
         }
         // Compress: convert PNG to JPEG (50% quality) + resize to max 1200px width
         // Cuts ~600KB PNG → ~60KB JPEG — critical for staying under 20MB context limit

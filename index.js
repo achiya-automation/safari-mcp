@@ -669,38 +669,44 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
   // ========== FOCUS PRESERVATION ==========
   // Safari AppleScript/extension can steal focus (bring Safari window to front).
   // Save the frontmost app before the operation and restore it after if Safari stole focus.
+  // Set focusGuard flag so inner osascript/runJSLarge calls skip their own focus logic.
   const savedApp = await safari.saveFrontmostApp();
+  safari.setFocusGuard(true);
 
   let result;
   let usedExtension = false;
-  if (_extensionConnected && !_preferAppleScript) {
-    try {
-      const t0 = Date.now();
-      const tabUrl = safari.getActiveTabURL();
-      const payload = { ...extensionPayload, sessionId: SESSION_ID, ...(tabUrl ? { tabUrl } : {}) };
-      const timeout = _commandTimeouts[extensionType] || 30000;
-      result = await sendToExtension(extensionType, payload, timeout);
-      const isCspError = typeof result === 'string' && (result.includes('unsafe-eval') || result.includes('trusted-types') || result.includes('Trusted Type') || result.includes('Content Security Policy'));
-      const isPermissionDenied = typeof result === 'string' && result.includes('__SCREENSHOT_PERMISSION_DENIED__');
-      const isFailed = result === null || (typeof result === 'string' && result.startsWith('Element not found'));
-      if (isPermissionDenied) {
-        console.error(`[Safari MCP] ${extensionType} permission denied (${Date.now() - t0}ms) — falling back to AppleScript`);
-      } else if (isCspError) {
-        console.error(`[Safari MCP] ${extensionType} CSP blocked: ${result?.substring(0, 100)} (${Date.now() - t0}ms) — falling back to AppleScript`);
-      } else if (isFailed && _nullMeansFailure.has(extensionType)) {
-        console.error(`[Safari MCP] ${extensionType} extension failed: ${result} (${Date.now() - t0}ms) — falling back to AppleScript`);
-      } else {
-        console.error(`[Safari MCP] ${extensionType} via extension (${Date.now() - t0}ms)`);
-        usedExtension = true;
+  try {
+    if (_extensionConnected && !_preferAppleScript) {
+      try {
+        const t0 = Date.now();
+        const tabUrl = safari.getActiveTabURL();
+        const payload = { ...extensionPayload, sessionId: SESSION_ID, ...(tabUrl ? { tabUrl } : {}) };
+        const timeout = _commandTimeouts[extensionType] || 30000;
+        result = await sendToExtension(extensionType, payload, timeout);
+        const isCspError = typeof result === 'string' && (result.includes('unsafe-eval') || result.includes('trusted-types') || result.includes('Trusted Type') || result.includes('Content Security Policy'));
+        const isPermissionDenied = typeof result === 'string' && result.includes('__SCREENSHOT_PERMISSION_DENIED__');
+        const isFailed = result === null || (typeof result === 'string' && result.startsWith('Element not found'));
+        if (isPermissionDenied) {
+          console.error(`[Safari MCP] ${extensionType} permission denied (${Date.now() - t0}ms) — falling back to AppleScript`);
+        } else if (isCspError) {
+          console.error(`[Safari MCP] ${extensionType} CSP blocked: ${result?.substring(0, 100)} (${Date.now() - t0}ms) — falling back to AppleScript`);
+        } else if (isFailed && _nullMeansFailure.has(extensionType)) {
+          console.error(`[Safari MCP] ${extensionType} extension failed: ${result} (${Date.now() - t0}ms) — falling back to AppleScript`);
+        } else {
+          console.error(`[Safari MCP] ${extensionType} via extension (${Date.now() - t0}ms)`);
+          usedExtension = true;
+        }
+      } catch (err) {
+        console.error(`[Safari MCP] ${extensionType} extension failed: ${err.message} — falling back to AppleScript`);
       }
-    } catch (err) {
-      console.error(`[Safari MCP] ${extensionType} extension failed: ${err.message} — falling back to AppleScript`);
     }
-  }
-  if (!usedExtension) {
-    const t0 = Date.now();
-    result = await fallbackFn();
-    console.error(`[Safari MCP] ${extensionType} via AppleScript (${Date.now() - t0}ms)`);
+    if (!usedExtension) {
+      const t0 = Date.now();
+      result = await fallbackFn();
+      console.error(`[Safari MCP] ${extensionType} via AppleScript (${Date.now() - t0}ms)`);
+    }
+  } finally {
+    safari.setFocusGuard(false);
   }
 
   // Restore focus if Safari stole it

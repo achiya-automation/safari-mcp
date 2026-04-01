@@ -285,17 +285,6 @@ while let line = readLine(strippingNewline: true) {
     continue
   }
 
-  // Handle activateApp — activate app by bundle ID (native, ~1ms)
-  if let bundleId = json["activateApp"] as? String {
-    if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).first {
-      app.activate()
-      respond(["result": "activated \(bundleId)"])
-    } else {
-      respond(["error": "app not found: \(bundleId)"])
-    }
-    continue
-  }
-
   // Handle hideSafari — hide Safari to prevent focus stealing (native, ~1ms)
   if json["hideSafari"] != nil {
     if let safariApp = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Safari").first {
@@ -309,7 +298,7 @@ while let line = readLine(strippingNewline: true) {
 
   // Handle AppleScript command
   guard let script = json["script"] as? String else {
-    respond(["error": "invalid input — expected 'script', 'click', 'keyboard', 'getFrontApp', or 'activateApp'"])
+    respond(["error": "invalid input — expected 'script', 'click', 'keyboard', 'getFrontApp', or 'hideSafari'"])
     continue
   }
 
