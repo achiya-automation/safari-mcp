@@ -65,7 +65,8 @@
     "extension/",
     "glama.json",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "index.d.ts"
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
