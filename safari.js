@@ -273,6 +273,28 @@ function getFallbackTarget() {
 // Quick JS execution — exposed for smart-wait checks in index.js
 export async function runJSQuick(js) { return runJS(js); }
 
+// ========== FOCUS PRESERVATION ==========
+// Safari AppleScript can steal focus (bring Safari window to front).
+// These helpers let the caller save/restore focus around any operation.
+export async function saveFrontmostApp() {
+  try {
+    return (await osascriptFast(
+      'tell application "System Events" to return name of first application process whose frontmost is true'
+    )).trim() || null;
+  } catch { return null; }
+}
+export async function restoreFocusIfStolen(savedApp) {
+  if (!savedApp || savedApp === "Safari") return;
+  try {
+    const current = (await osascriptFast(
+      'tell application "System Events" to return name of first application process whose frontmost is true'
+    )).trim();
+    if (current === "Safari") {
+      await osascriptFast(`tell application "${savedApp}" to activate`).catch(() => {});
+    }
+  } catch {}
+}
+
 export function getActiveTabIndex() { return _activeTabIndex; }
 export function setActiveTabIndex(idx) { _activeTabIndex = idx; }
 export function getActiveTabURL() { return _activeTabURL; }
