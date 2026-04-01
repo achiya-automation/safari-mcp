@@ -278,11 +278,35 @@ while let line = readLine(strippingNewline: true) {
     continue
   }
 
-  // Handle AppleScript command
-  guard let script = json["script"] as? String else {
-    respond(["error": "invalid input — expected 'script', 'click', or 'keyboard'"])
+  // Handle getFrontApp — returns frontmost application bundle ID (native, ~0.1ms)
+  if json["getFrontApp"] != nil {
+    let frontApp = NSWorkspace.shared.frontmostApplication
+    respond(["result": frontApp?.localizedName ?? "", "bundleId": frontApp?.bundleIdentifier ?? ""])
     continue
   }
+
+  // Handle activateApp — activate app by bundle ID (native, ~1ms)
+  if let bundleId = json["activateApp"] as? String {
+    if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).first {
+      app.activate()
+      respond(["result": "activated \(bundleId)"])
+    } else {
+      respond(["error": "app not found: \(bundleId)"])
+    }
+    continue
+  }
+
+  // Handle AppleScript command
+  guard let script = json["script"] as? String else {
+    respond(["error": "invalid input — expected 'script', 'click', 'keyboard', 'getFrontApp', or 'activateApp'"])
+    continue
+  }
+
+  // ========== FOCUS PRESERVATION ==========
+  // Save the frontmost app BEFORE executing AppleScript.
+  // Safari AppleScript can steal focus — we restore it immediately after (~1ms).
+  let savedFrontApp = NSWorkspace.shared.frontmostApplication
+  let wasSafari = savedFrontApp?.bundleIdentifier == "com.apple.Safari"
 
   guard let nsScript = NSAppleScript(source: script) else {
     respond(["error": "failed to compile AppleScript"])
@@ -291,6 +315,13 @@ while let line = readLine(strippingNewline: true) {
 
   var errorDict: NSDictionary?
   let result = nsScript.executeAndReturnError(&errorDict)
+
+  // Restore focus if Safari stole it (only if caller wasn't already in Safari)
+  if !wasSafari,
+     let saved = savedFrontApp,
+     NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.Safari" {
+    saved.activate()
+  }
 
   if let error = errorDict {
     let msg = (error["NSAppleScriptErrorMessage"] as? String) ?? "AppleScript error"

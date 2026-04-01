@@ -275,24 +275,17 @@ export async function runJSQuick(js) { return runJS(js); }
 
 // ========== FOCUS PRESERVATION ==========
 // Safari AppleScript can steal focus (bring Safari window to front).
-// These helpers let the caller save/restore focus around any operation.
+// These helpers use the native Swift daemon (~0.1ms) instead of AppleScript (~90ms).
 export async function saveFrontmostApp() {
-  try {
-    return (await osascriptFast(
-      'tell application "System Events" to return name of first application process whose frontmost is true'
-    )).trim() || null;
-  } catch { return null; }
+  const app = await _helperGetFrontApp();
+  return app?.bundleId || null;
 }
-export async function restoreFocusIfStolen(savedApp) {
-  if (!savedApp || savedApp === "Safari") return;
-  try {
-    const current = (await osascriptFast(
-      'tell application "System Events" to return name of first application process whose frontmost is true'
-    )).trim();
-    if (current === "Safari") {
-      await osascriptFast(`tell application "${savedApp}" to activate`).catch(() => {});
-    }
-  } catch {}
+export async function restoreFocusIfStolen(savedBundleId) {
+  if (!savedBundleId || savedBundleId === "com.apple.Safari") return;
+  const current = await _helperGetFrontApp();
+  if (current?.bundleId === "com.apple.Safari") {
+    await _helperActivateApp(savedBundleId);
+  }
 }
 
 export function getActiveTabIndex() { return _activeTabIndex; }
@@ -364,6 +357,9 @@ async function resolveActiveTab() {
 // Run AppleScript — uses execFile (safe, isolated, for complex scripts)
 async function osascript(script, { timeout = 10000 } = {}) {
   if (!(await isSafariRunning())) throw safariNotRunningError();
+  // Save frontmost app via daemon BEFORE subprocess (~0.1ms)
+  const targetsSafari = script.includes('tell application "Safari"');
+  const frontApp = targetsSafari ? await _helperGetFrontApp() : null;
   try {
     const { stdout } = await execFileAsync("osascript", ["-e", script], {
       timeout,
@@ -382,6 +378,11 @@ async function osascript(script, { timeout = 10000 } = {}) {
       }
     }
     throw new Error(`AppleScript error: ${err.stderr || err.message}`);
+  } finally {
+    // Restore focus via daemon AFTER subprocess (~1ms)
+    if (frontApp?.bundleId && frontApp.bundleId !== 'com.apple.Safari') {
+      _helperActivateApp(frontApp.bundleId).catch(() => {});
+    }
   }
 }
 
@@ -542,6 +543,43 @@ function _helperNativeKeyboard(keyCode, flags = [], windowId = 0, timeout = 5000
   });
 }
 
+// ========== NATIVE FOCUS OPERATIONS VIA DAEMON ==========
+// Uses NSRunningApplication — ~0.1ms for get, ~1ms for activate (vs ~90ms AppleScript)
+
+function _helperGetFrontApp(timeout = 2000) {
+  return new Promise((resolve) => {
+    if (!_helperProc || !_helperProc.stdin?.writable) { resolve(null); return; }
+    let resolved = false;
+    const timer = setTimeout(() => { if (!resolved) { resolved = true; resolve(null); } }, timeout);
+    function cb(line) {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      try { resolve(JSON.parse(line)); } catch { resolve(null); }
+    }
+    _helperQueue.push(cb);
+    try { _helperProc.stdin.write('{"getFrontApp":true}\n'); }
+    catch { clearTimeout(timer); resolve(null); }
+  });
+}
+
+function _helperActivateApp(bundleId, timeout = 2000) {
+  return new Promise((resolve) => {
+    if (!_helperProc || !_helperProc.stdin?.writable || !bundleId) { resolve(); return; }
+    let resolved = false;
+    const timer = setTimeout(() => { if (!resolved) { resolved = true; resolve(); } }, timeout);
+    function cb() {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      resolve();
+    }
+    _helperQueue.push(cb);
+    try { _helperProc.stdin.write(JSON.stringify({ activateApp: bundleId }) + '\n'); }
+    catch { clearTimeout(timer); resolve(); }
+  });
+}
+
 // Get Safari window bounds, toolbar height, and window ID for coordinate calculation
 async function _getSafariWindowGeometry() {
   await refreshTargetWindow();
@@ -654,6 +692,8 @@ async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
   const appleScript = `tell application "Safari" to do JavaScript "${escaped}" in ${target}`;
   const tmpFile = join(tmpdir(), `safari-mcp-${Date.now()}.scpt`);
   await writeFile(tmpFile, appleScript, "utf8");
+  // Save frontmost app via daemon before subprocess execution
+  const frontApp = await _helperGetFrontApp();
   try {
     const { stdout } = await execFileAsync("osascript", [tmpFile], {
       timeout,
@@ -662,6 +702,10 @@ async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
     return stdout.trim();
   } finally {
     unlink(tmpFile).catch(() => {});
+    // Restore focus via daemon after subprocess (~1ms)
+    if (frontApp?.bundleId && frontApp.bundleId !== 'com.apple.Safari') {
+      _helperActivateApp(frontApp.bundleId).catch(() => {});
+    }
   }
 }
 
