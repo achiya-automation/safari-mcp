@@ -31,6 +31,8 @@
 
 </div>
 
+> **If Safari MCP saves you from running Chrome, consider giving it a star!** It helps others discover this project.
+
 ---
 
 > **TL;DR:** Use your real Safari with all your logins, cookies, and sessions. No headless browsers, no Chrome, no Puppeteer. Just pure AppleScript + JavaScript running natively on macOS — 60% less CPU/heat on Apple Silicon.
@@ -545,9 +547,26 @@ Your support funds:
 
 ---
 
+## Community
+
+Safari MCP is used by developers building AI agents on macOS. [Share your use case in Discussions](https://github.com/achiya-automation/safari-mcp/discussions)
+
+---
+
+## Spread the Word
+
+If you find Safari MCP useful, help others discover it:
+
+- [Star this repo](https://github.com/achiya-automation/safari-mcp)
+- [Share on Twitter/X](https://twitter.com/intent/tweet?text=Safari%20MCP%20%E2%80%94%20Stop%20running%20Chrome%20just%20so%20your%20AI%20agent%20can%20browse.%2080%20tools%2C%20native%20Safari%2C%2060%25%20less%20CPU.&url=https%3A%2F%2Fgithub.com%2Fachiya-automation%2Fsafari-mcp)
+- [Share on LinkedIn](https://www.linkedin.com/sharing/share-offsite/?url=https%3A%2F%2Fgithub.com%2Fachiya-automation%2Fsafari-mcp)
+- Write about it on dev.to or your blog
+
+---
+
 ## Star History
 
-If Safari MCP saved you from Chrome overhead, consider giving it a ⭐
+If Safari MCP saved you from Chrome overhead, consider giving it a star!
 
 [![Star History Chart](https://api.star-history.com/svg?repos=achiya-automation/safari-mcp&type=Date)](https://star-history.com/#achiya-automation/safari-mcp&Date)
 
