@@ -89,6 +89,21 @@ function cleanupHelper() {
 process.on("exit", cleanupHelper);
 process.on("uncaughtException", (err) => { console.error("Uncaught:", err); cleanupHelper(); process.exit(1); });
 
+// ========== SAFARI RUNNING CHECK ==========
+// Prevent AppleScript from auto-launching Safari when it's closed
+async function isSafariRunning() {
+  try {
+    const { stdout } = await execFileAsync("pgrep", ["-x", "Safari"], { timeout: 2000 });
+    return stdout.trim().length > 0;
+  } catch {
+    return false; // pgrep exits 1 when no match
+  }
+}
+
+function safariNotRunningError() {
+  return new Error("Safari is not running. Open Safari manually before using Safari MCP tools.");
+}
+
 // ========== CLIPBOARD LOCK ==========
 // Prevents concurrent clipboard operations from clobbering the user's clipboard.
 // While locked, any new clipboard operation waits until the current one completes.
@@ -326,6 +341,7 @@ async function resolveActiveTab() {
 
 // Run AppleScript — uses execFile (safe, isolated, for complex scripts)
 async function osascript(script, { timeout = 10000 } = {}) {
+  if (!(await isSafariRunning())) throw safariNotRunningError();
   try {
     const { stdout } = await execFileAsync("osascript", ["-e", script], {
       timeout,
@@ -349,6 +365,7 @@ async function osascript(script, { timeout = 10000 } = {}) {
 
 // osascriptFast: uses persistent Swift daemon (~5ms) — 18x faster than subprocess (~90ms)
 async function osascriptFast(script, { timeout = 10000 } = {}) {
+  if (!(await isSafariRunning())) throw safariNotRunningError();
   if (!_helperProc) startHelper();
   if (_helperProc) {
     try {

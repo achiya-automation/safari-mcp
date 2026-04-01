@@ -393,6 +393,14 @@ try {
           const { execFile: execFileCb } = await import("node:child_process");
           const { promisify: pfy } = await import("node:util");
           const execFileAsync = pfy(execFileCb);
+          // Don't launch Safari if it's not running
+          try {
+            await execFileAsync("pgrep", ["-x", "Safari"], { timeout: 2000 });
+          } catch {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ match: false, error: "Safari is not running" }));
+            return;
+          }
           const script = `tell application "Safari"
             repeat with w in every window
               repeat with t in every tab of w
