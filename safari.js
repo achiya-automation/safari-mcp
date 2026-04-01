@@ -285,7 +285,7 @@ export async function restoreFocusIfStolen(savedBundleId) {
   if (!savedBundleId || savedBundleId === "com.apple.Safari") return;
   const current = await _helperGetFrontApp();
   if (current?.bundleId === "com.apple.Safari") {
-    await _helperHideSafari();
+    await _helperActivateApp(savedBundleId);
   }
 }
 
@@ -302,6 +302,23 @@ function _helperHideSafari(timeout = 2000) {
     }
     _helperQueue.push(cb);
     try { _helperProc.stdin.write('{"hideSafari":true}\n'); }
+    catch { clearTimeout(timer); resolve(); }
+  });
+}
+
+function _helperActivateApp(bundleId, timeout = 2000) {
+  return new Promise((resolve) => {
+    if (!_helperProc || !_helperProc.stdin?.writable) { resolve(); return; }
+    let resolved = false;
+    const timer = setTimeout(() => { if (!resolved) { resolved = true; resolve(); } }, timeout);
+    function cb() {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      resolve();
+    }
+    _helperQueue.push(cb);
+    try { _helperProc.stdin.write(JSON.stringify({ activateApp: bundleId }) + '\n'); }
     catch { clearTimeout(timer); resolve(); }
   });
 }
@@ -399,11 +416,11 @@ async function osascript(script, { timeout = 10000 } = {}) {
     }
     throw new Error(`AppleScript error: ${err.stderr || err.message}`);
   } finally {
-    // Hide Safari via daemon if it stole focus (~1ms)
+    // Re-activate previous app if Safari stole focus (~1ms)
     if (shouldGuardFocus && frontApp?.bundleId && frontApp.bundleId !== 'com.apple.Safari') {
       const current = await _helperGetFrontApp();
       if (current?.bundleId === 'com.apple.Safari') {
-        _helperHideSafari().catch(() => {});
+        _helperActivateApp(frontApp.bundleId).catch(() => {});
       }
     }
   }
@@ -710,11 +727,11 @@ async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
     return stdout.trim();
   } finally {
     unlink(tmpFile).catch(() => {});
-    // Hide Safari via daemon if it stole focus (~1ms)
+    // Re-activate previous app if Safari stole focus (~1ms)
     if (shouldGuard && frontApp?.bundleId && frontApp.bundleId !== 'com.apple.Safari') {
       const current = await _helperGetFrontApp();
       if (current?.bundleId === 'com.apple.Safari') {
-        _helperHideSafari().catch(() => {});
+        _helperActivateApp(frontApp.bundleId).catch(() => {});
       }
     }
   }
@@ -1626,11 +1643,11 @@ export async function screenshot({ fullPage = false } = {}) {
             );
           }
         }
-        // Hide Safari if screencapture stole focus (common on macOS Tahoe)
+        // Re-activate previous app if screencapture stole focus (common on macOS Tahoe)
         if (previousBundleId && previousBundleId !== "com.apple.Safari") {
           const cur = await _helperGetFrontApp();
           if (cur?.bundleId === "com.apple.Safari") {
-            await _helperHideSafari().catch(() => {});
+            await _helperActivateApp(previousBundleId).catch(() => {});
           }
         }
         // Compress: convert PNG to JPEG (50% quality) + resize to max 1200px width

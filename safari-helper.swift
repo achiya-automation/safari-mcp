@@ -285,6 +285,18 @@ while let line = readLine(strippingNewline: true) {
     continue
   }
 
+  // Handle activateApp — activate a specific app by bundle ID (native, ~1ms)
+  // Used to restore focus to previous app instead of hiding Safari (less jarring)
+  if let bundleId = json["activateApp"] as? String {
+    if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).first {
+      app.activate()
+      respond(["result": "activated"])
+    } else {
+      respond(["error": "app not found: \(bundleId)"])
+    }
+    continue
+  }
+
   // Handle hideSafari — hide Safari to prevent focus stealing (native, ~1ms)
   if json["hideSafari"] != nil {
     if let safariApp = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Safari").first {
@@ -304,12 +316,13 @@ while let line = readLine(strippingNewline: true) {
 
   // ========== FOCUS PRESERVATION ==========
   // Save the frontmost app BEFORE executing AppleScript.
-  // Safari AppleScript can steal focus — we hide Safari immediately after.
-  // Hiding is better than activating the previous app because:
-  // 1. It hides ALL Safari windows (both personal and automation profiles)
-  // 2. No wrong window flashes to the user
-  // 3. Works regardless of which app was previously active
-  let wasSafari = NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.Safari"
+  // Safari AppleScript can steal focus — we re-activate the previous app immediately after.
+  // Re-activating is better than hiding Safari because:
+  // 1. No jarring hide animation on Safari windows
+  // 2. User's Safari windows stay visible (just not in front)
+  // 3. Almost instantaneous — previous app just comes back to foreground
+  let savedBundleId = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+  let wasSafari = savedBundleId == "com.apple.Safari"
 
   guard let nsScript = NSAppleScript(source: script) else {
     respond(["error": "failed to compile AppleScript"])
@@ -319,11 +332,12 @@ while let line = readLine(strippingNewline: true) {
   var errorDict: NSDictionary?
   let result = nsScript.executeAndReturnError(&errorDict)
 
-  // Hide Safari if it stole focus (only if caller wasn't already in Safari)
+  // Restore focus to previous app if Safari stole it (only if caller wasn't already in Safari)
   if !wasSafari,
      NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.Safari" {
-    if let safariApp = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Safari").first {
-      safariApp.hide()
+    if let savedId = savedBundleId,
+       let previousApp = NSRunningApplication.runningApplications(withBundleIdentifier: savedId).first {
+      previousApp.activate()
     }
   }
 

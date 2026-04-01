@@ -526,11 +526,11 @@ async function _proxyToExtension(type, payload, timeoutMs = 30000) {
 }
 
 let _extensionLastPollTime = 0;
-// Detect stale HTTP connection (no poll in 10s = disconnected)
+// Detect stale HTTP connection (no poll in 30s = disconnected)
 // Only applies to primary instance (extension host) — not proxy mode
 setInterval(() => {
   if (_isExtensionHost && _extensionConnected && !_extensionWs && _extensionLastPollTime > 0) {
-    if (Date.now() - _extensionLastPollTime > 10000) {
+    if (Date.now() - _extensionLastPollTime > 30000) {
       _extensionConnected = false;
       _drainOnDisconnect("HTTP poll timeout");
       console.error("[Safari MCP] Extension disconnected (HTTP poll timeout)");
@@ -1114,7 +1114,10 @@ server.tool(
   "Take a screenshot of a specific element (by CSS selector). Returns base64 PNG image.",
   { selector: z.string().describe("CSS selector of the element to capture") },
   async ({ selector }) => {
-    const base64 = await safari.screenshotElement({ selector });
+    const base64 = await extensionOrFallback(
+      "screenshot_element", { selector },
+      () => safari.screenshotElement({ selector })
+    );
     return {
       content: [{ type: "image", data: base64, mimeType: "image/jpeg" }],
     };
@@ -1602,7 +1605,7 @@ server.tool(
 
 server.tool(
   "safari_save_pdf",
-  "Save the current page as a PDF file. Uses Safari's native Export as PDF. WARNING: This STEALS FOCUS — Safari comes to foreground briefly for the Export menu.",
+  "Save the current page as a PDF file. Uses screencapture + PDF rendering (no Safari UI interaction needed).",
   { path: z.string().describe("Absolute file path to save the PDF (e.g. /Users/am/Downloads/page.pdf)") },
   async (args) => {
     const result = await safari.savePDF(args);
