@@ -1,16 +1,14 @@
 /**
  * Safari MCP — TypeScript type declarations
- * Covers all ~80 registered tools and the MCP server export.
+ * Covers all ~83 registered tools and the MCP server export.
  */
 
 // ========== CORE TYPES ==========
 
-export interface MCPContent {
-  type: "text" | "image";
-  text?: string;
-  data?: string;
-  mimeType?: string;
-}
+// Fix 3: MCPContent as a discriminated union for proper TypeScript narrowing
+export type MCPContent =
+  | { type: "text"; text: string }
+  | { type: "image"; data: string; mimeType: string };
 
 export interface MCPToolResult {
   content: MCPContent[];
@@ -30,17 +28,6 @@ export interface MCPTool<TInput extends Record<string, unknown> = Record<string,
   handler: (input: TInput) => Promise<MCPToolResult>;
 }
 
-export interface MCPServer {
-  name: string;
-  version: string;
-  description: string;
-  tool: <TInput extends Record<string, unknown>>(
-    name: string,
-    description: string,
-    schema: Record<string, unknown>,
-    handler: (input: TInput) => Promise<MCPToolResult>
-  ) => void;
-}
 
 // ========== TOOL INPUT TYPES ==========
 
@@ -222,8 +209,12 @@ export interface SafariTab {
 }
 
 // ========== MODULE DECLARATION ==========
-// safari-mcp runs as a stdio MCP server process. It does not export values at
-// runtime, but consumers can import these types for type-safe MCP client code.
+// ========== MODULE DECLARATION ==========
+export interface McpServer {
+  connect(transport: unknown): Promise<void>;
+  tool(name: string, description: string, schema: unknown, handler: (input: unknown) => Promise<MCPToolResult>): unknown;
+  close(): Promise<void>;
+}
 
-declare const server: MCPServer;
+declare const server: McpServer;
 export default server;
