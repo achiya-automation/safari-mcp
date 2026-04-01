@@ -5,7 +5,6 @@
 
 // ========== CORE TYPES ==========
 
-// Fix 3: MCPContent as a discriminated union for proper TypeScript narrowing
 export type MCPContent =
   | { type: "text"; text: string }
   | { type: "image"; data: string; mimeType: string };
