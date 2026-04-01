@@ -275,7 +275,7 @@ export async function runJSQuick(js) { return runJS(js); }
 
 // ========== FOCUS PRESERVATION ==========
 // Safari AppleScript can steal focus (bring Safari window to front).
-// These helpers use the native Swift daemon (~0.1ms) instead of AppleScript (~90ms).
+// We hide Safari instead of activating the previous app — prevents ANY Safari window from flashing.
 export async function saveFrontmostApp() {
   const app = await _helperGetFrontApp();
   return app?.bundleId || null;
@@ -284,8 +284,25 @@ export async function restoreFocusIfStolen(savedBundleId) {
   if (!savedBundleId || savedBundleId === "com.apple.Safari") return;
   const current = await _helperGetFrontApp();
   if (current?.bundleId === "com.apple.Safari") {
-    await _helperActivateApp(savedBundleId);
+    await _helperHideSafari();
   }
+}
+
+function _helperHideSafari(timeout = 2000) {
+  return new Promise((resolve) => {
+    if (!_helperProc || !_helperProc.stdin?.writable) { resolve(); return; }
+    let resolved = false;
+    const timer = setTimeout(() => { if (!resolved) { resolved = true; resolve(); } }, timeout);
+    function cb() {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      resolve();
+    }
+    _helperQueue.push(cb);
+    try { _helperProc.stdin.write('{"hideSafari":true}\n'); }
+    catch { clearTimeout(timer); resolve(); }
+  });
 }
 
 export function getActiveTabIndex() { return _activeTabIndex; }
@@ -379,9 +396,12 @@ async function osascript(script, { timeout = 10000 } = {}) {
     }
     throw new Error(`AppleScript error: ${err.stderr || err.message}`);
   } finally {
-    // Restore focus via daemon AFTER subprocess (~1ms)
+    // Hide Safari via daemon if it stole focus (~1ms)
     if (frontApp?.bundleId && frontApp.bundleId !== 'com.apple.Safari') {
-      _helperActivateApp(frontApp.bundleId).catch(() => {});
+      const current = await _helperGetFrontApp();
+      if (current?.bundleId === 'com.apple.Safari') {
+        _helperHideSafari().catch(() => {});
+      }
     }
   }
 }
@@ -702,9 +722,12 @@ async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
     return stdout.trim();
   } finally {
     unlink(tmpFile).catch(() => {});
-    // Restore focus via daemon after subprocess (~1ms)
+    // Hide Safari via daemon if it stole focus (~1ms)
     if (frontApp?.bundleId && frontApp.bundleId !== 'com.apple.Safari') {
-      _helperActivateApp(frontApp.bundleId).catch(() => {});
+      const current = await _helperGetFrontApp();
+      if (current?.bundleId === 'com.apple.Safari') {
+        _helperHideSafari().catch(() => {});
+      }
     }
   }
 }

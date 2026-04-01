@@ -296,6 +296,17 @@ while let line = readLine(strippingNewline: true) {
     continue
   }
 
+  // Handle hideSafari — hide Safari to prevent focus stealing (native, ~1ms)
+  if json["hideSafari"] != nil {
+    if let safariApp = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Safari").first {
+      safariApp.hide()
+      respond(["result": "hidden"])
+    } else {
+      respond(["error": "Safari not running"])
+    }
+    continue
+  }
+
   // Handle AppleScript command
   guard let script = json["script"] as? String else {
     respond(["error": "invalid input — expected 'script', 'click', 'keyboard', 'getFrontApp', or 'activateApp'"])
@@ -304,9 +315,12 @@ while let line = readLine(strippingNewline: true) {
 
   // ========== FOCUS PRESERVATION ==========
   // Save the frontmost app BEFORE executing AppleScript.
-  // Safari AppleScript can steal focus — we restore it immediately after (~1ms).
-  let savedFrontApp = NSWorkspace.shared.frontmostApplication
-  let wasSafari = savedFrontApp?.bundleIdentifier == "com.apple.Safari"
+  // Safari AppleScript can steal focus — we hide Safari immediately after.
+  // Hiding is better than activating the previous app because:
+  // 1. It hides ALL Safari windows (both personal and automation profiles)
+  // 2. No wrong window flashes to the user
+  // 3. Works regardless of which app was previously active
+  let wasSafari = NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.Safari"
 
   guard let nsScript = NSAppleScript(source: script) else {
     respond(["error": "failed to compile AppleScript"])
@@ -316,11 +330,12 @@ while let line = readLine(strippingNewline: true) {
   var errorDict: NSDictionary?
   let result = nsScript.executeAndReturnError(&errorDict)
 
-  // Restore focus if Safari stole it (only if caller wasn't already in Safari)
+  // Hide Safari if it stole focus (only if caller wasn't already in Safari)
   if !wasSafari,
-     let saved = savedFrontApp,
      NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.Safari" {
-    saved.activate()
+    if let safariApp = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Safari").first {
+      safariApp.hide()
+    }
   }
 
   if let error = errorDict {
