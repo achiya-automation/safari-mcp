@@ -1,0 +1,16 @@
+# Exclude Xcode project — only needed for building the Safari extension from source.
+# Install the pre-built extension from the App Store or build from the GitHub repo.
+xcode/
+
+# Development and CI files
+.github/
+assets/
+examples/
+social-preview.png
+CHANGELOG.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+SECURITY.md
+server.json
+mcp.json
+package-lock.json

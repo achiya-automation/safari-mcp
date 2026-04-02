@@ -453,13 +453,20 @@ The Safari MCP Extension is **optional but recommended**. Without it, ~80% of fu
 
 ### Installing the Extension
 
-The extension requires a one-time build with Xcode (free, included with macOS):
+The extension requires a one-time build with Xcode (free, included with macOS).
+
+> **Note for npm users:** The `xcode/` directory is not included in the npm package to keep
+> the install size small. Clone the [GitHub repository](https://github.com/achiya-automation/safari-mcp)
+> to get the Xcode project if you want to build from source.
 
 **Prerequisites:** Xcode (install from App Store — free)
 
 ```bash
-# 1. Build the extension app
+# 1. Clone the repo (the npm package does not include the Xcode project)
+git clone https://github.com/achiya-automation/safari-mcp.git
 cd safari-mcp
+
+# 2. Build the extension app
 xcodebuild -project "xcode/Safari MCP/Safari MCP.xcodeproj" \
   -scheme "Safari MCP (macOS)" -configuration Release build
 
