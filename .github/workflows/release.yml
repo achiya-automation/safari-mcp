@@ -4,6 +4,10 @@ on:
   release:
     types: [published]
 
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
 jobs:
   publish-npm:
     runs-on: macos-latest
@@ -26,8 +30,10 @@ jobs:
           PACKAGE_VERSION=$(node -p "require('./package.json').version")
           if npm view safari-mcp@$PACKAGE_VERSION version 2>/dev/null; then
             echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Version $PACKAGE_VERSION already published — skipping"
           else
             echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Version $PACKAGE_VERSION not found — will publish"
           fi
 
       - name: Publish to npm
