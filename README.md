@@ -8,22 +8,17 @@
 
 **The only MCP server for Safari — native browser automation for AI agents.**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![GitHub release](https://img.shields.io/github/v/release/achiya-automation/safari-mcp)](https://github.com/achiya-automation/safari-mcp/releases)
 [![npm version](https://img.shields.io/npm/v/safari-mcp)](https://www.npmjs.com/package/safari-mcp)
 [![npm downloads](https://img.shields.io/npm/dm/safari-mcp)](https://www.npmjs.com/package/safari-mcp)
-[![CI](https://github.com/achiya-automation/safari-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/achiya-automation/safari-mcp/actions/workflows/ci.yml)
-[![Node.js](https://img.shields.io/badge/Node.js-18%2B-green)](https://nodejs.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![macOS](https://img.shields.io/badge/macOS-only-blue)](https://www.apple.com/macos/)
-[![MCP](https://img.shields.io/badge/MCP-compatible-purple)](https://modelcontextprotocol.io)
 [![GitHub stars](https://img.shields.io/github/stars/achiya-automation/safari-mcp?style=social)](https://github.com/achiya-automation/safari-mcp/stargazers)
-[![achiya-automation/safari-mcp MCP server](https://glama.ai/mcp/servers/achiya-automation/safari-mcp/badges/score.svg)](https://glama.ai/mcp/servers/achiya-automation/safari-mcp)
 
-<a href="vscode:mcp/install?%7B%22safari-mcp%22%3A%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D%7D"><img src="https://img.shields.io/badge/VS_Code-Install_MCP_Server-0078d4?logo=visual-studio-code&logoColor=white" alt="Install in VS Code"></a>
-<a href="https://insiders.vscode.dev/redirect?url=vscode-insiders:mcp/install?%7B%22safari-mcp%22%3A%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D%7D"><img src="https://img.shields.io/badge/VS_Code_Insiders-Install_MCP_Server-24bfa5?logo=visual-studio-code&logoColor=white" alt="Install in VS Code Insiders"></a>
-<a href="https://paypal.me/achiyaC123"><img src="https://img.shields.io/badge/Sponsor-PayPal-blue?logo=paypal" alt="Sponsor"></a>
+<a href="vscode:mcp/install?%7B%22safari-mcp%22%3A%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D%7D"><img src="https://img.shields.io/badge/VS_Code-Install_Server-0078d4?logo=visual-studio-code&logoColor=white" alt="Install in VS Code"></a>
+<a href="https://insiders.vscode.dev/redirect?url=vscode-insiders:mcp/install?%7B%22safari-mcp%22%3A%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D%7D"><img src="https://img.shields.io/badge/VS_Code_Insiders-Install_Server-24bfa5?logo=visual-studio-code&logoColor=white" alt="Install in VS Code Insiders"></a>
+<a href="cursor://anysphere.cursor-deeplink/mcp/install?name=safari-mcp&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D"><img src="https://img.shields.io/badge/Cursor-Install_Server-f97316?logo=cursor&logoColor=white" alt="Install in Cursor"></a>
 
-**80 tools** · **Zero dependencies** · **~5ms per command** · **60% less CPU than Chrome**
+**80 tools** · **No Chrome/Puppeteer/Playwright needed** · **~5ms per command** · **60% less CPU than Chrome**
 
 [Quick Start](#quick-start) · [All 80 Tools](#tools-80) · [Examples](examples/) · [Why Safari MCP?](#safari-mcp-vs-alternatives) · [Architecture](#architecture) · [Changelog](CHANGELOG.md)
 
@@ -31,24 +26,17 @@
 
 </div>
 
-> **If Safari MCP saves you from running Chrome, consider giving it a star!** It helps others discover this project.
+> **TL;DR:** Use your real Safari with all your logins, cookies, and sessions. No headless browsers, no Chrome, no Puppeteer. Just native AppleScript + JavaScript on macOS — 60% less CPU/heat on Apple Silicon.
 
----
-
-> **TL;DR:** Use your real Safari with all your logins, cookies, and sessions. No headless browsers, no Chrome, no Puppeteer. Just pure AppleScript + JavaScript running natively on macOS — 60% less CPU/heat on Apple Silicon.
-
-<details>
-<summary><b>🤔 Why not just use Playwright or Chrome DevTools MCP?</b></summary>
+### 🤔 Why not just use Playwright or Chrome DevTools MCP?
 
 | Problem | Safari MCP Solution |
 |---------|-------------------|
 | Chrome DevTools MCP heats up your Mac | Native WebKit — ~60% less CPU |
 | Playwright launches a new browser without your logins | Uses your **real Safari** with all sessions |
-| Puppeteer requires Chrome + debug port | Zero dependencies — just AppleScript |
+| Puppeteer requires Chrome + debug port | Just AppleScript — no extra browser |
 | Headless browsers can't access your authenticated sessions | Gmail, GitHub, Slack — already logged in |
 | Browser automation steals window focus | Safari stays in background, never interrupts |
-
-</details>
 
 ---
 
@@ -58,7 +46,7 @@
 - **Zero heat** — native WebKit on Apple Silicon, ~60% less CPU than Chrome
 - **Your real browser** — keeps all logins, cookies, sessions (Gmail, GitHub, Ahrefs, etc.)
 - **Background operation** — Safari stays in the background, no window stealing
-- **No dependencies** — no Puppeteer, no Playwright, no WebDriver, no Chrome
+- **No browser dependencies** — no Puppeteer, no Playwright, no WebDriver, no Chrome
 - **Persistent process** — reuses a single osascript process (~5ms per command vs ~80ms)
 - **Framework-compatible** — React, Vue, Angular, Svelte form filling via native setters
 
@@ -73,86 +61,60 @@
 - Safari → Settings → Advanced → **Show features for web developers** ✓
 - Safari → Develop → **Allow JavaScript from Apple Events** ✓
 
-### Install
+### Install (one command)
 
-**Option A — npm (recommended):**
+```bash
+npx safari-mcp
+```
+
+That's it — no global install needed. Or install permanently:
+
 ```bash
 npm install -g safari-mcp
 ```
 
-**Option B — Homebrew:**
+### Configure your MCP client
+
+Add to your client's config file — all clients use the same JSON:
+
+```json
+{
+  "mcpServers": {
+    "safari": {
+      "command": "npx",
+      "args": ["safari-mcp"]
+    }
+  }
+}
+```
+
+<details>
+<summary><b>Where does each client store this?</b></summary>
+
+| Client | Config file |
+|--------|------------|
+| **Claude Code** | `~/.mcp.json` |
+| **Claude Desktop** | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| **Cursor** | `.cursor/mcp.json` in your project |
+| **Windsurf** | `.windsurf/mcp.json` in your project |
+| **VS Code + Continue** | `.vscode/mcp.json` in your project |
+
+</details>
+
+<details>
+<summary><b>Alternative: Homebrew</b></summary>
+
 ```bash
 brew install achiya-automation/tap/safari-mcp
 ```
+</details>
 
-**Option C — from source:**
+<details>
+<summary><b>Alternative: from source</b></summary>
+
 ```bash
 git clone https://github.com/achiya-automation/safari-mcp.git
-cd safari-mcp
-npm install
-```
-
-### Configure
-
-Add to your MCP client config:
-
-<details>
-<summary><b>Claude Code</b> (~/.mcp.json)</summary>
-
-```json
-{
-  "mcpServers": {
-    "safari": {
-      "command": "node",
-      "args": ["/path/to/safari-mcp/index.js"]
-    }
-  }
-}
-```
-</details>
-
-<details>
-<summary><b>Claude Desktop</b> (claude_desktop_config.json)</summary>
-
-```json
-{
-  "mcpServers": {
-    "safari": {
-      "command": "node",
-      "args": ["/path/to/safari-mcp/index.js"]
-    }
-  }
-}
-```
-</details>
-
-<details>
-<summary><b>Cursor</b> (.cursor/mcp.json)</summary>
-
-```json
-{
-  "mcpServers": {
-    "safari": {
-      "command": "node",
-      "args": ["/path/to/safari-mcp/index.js"]
-    }
-  }
-}
-```
-</details>
-
-<details>
-<summary><b>Windsurf / VS Code + Continue</b></summary>
-
-```json
-{
-  "mcpServers": {
-    "safari": {
-      "command": "node",
-      "args": ["/path/to/safari-mcp/index.js"]
-    }
-  }
-}
+cd safari-mcp && npm install
 ```
 </details>
 
@@ -377,7 +339,7 @@ Safari MCP runs locally on your Mac with minimal attack surface:
 | CPU/Heat | 🟢 Minimal | 🔴 High | 🟡 Medium |
 | Your logins | ✅ Yes | ✅ Yes | ❌ No |
 | macOS native | ✅ WebKit | ❌ Chromium | ❌ Chromium/WebKit |
-| Dependencies | None | Chrome + debug port | Playwright runtime |
+| Browser dependencies | None | Chrome + debug port | Playwright runtime |
 | Tools | 80 | ~30 | ~25 |
 | File upload | JS (no dialog) | CDP | Playwright API |
 | Image paste | JS (no clipboard) | CDP | Playwright API |
@@ -553,26 +515,29 @@ Your support funds:
 
 ## Community
 
-Safari MCP is used by developers building AI agents on macOS. [Share your use case in Discussions](https://github.com/achiya-automation/safari-mcp/discussions)
+**2,000+ weekly npm downloads** — developers are using Safari MCP to build AI agents on macOS.
+
+- [GitHub Discussions](https://github.com/achiya-automation/safari-mcp/discussions) — ask questions, share use cases
+- [Issues](https://github.com/achiya-automation/safari-mcp/issues) — bug reports and feature requests
+- [![Good First Issues](https://img.shields.io/github/issues/achiya-automation/safari-mcp/good%20first%20issue?color=7057ff&label=good%20first%20issues)](https://github.com/achiya-automation/safari-mcp/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) — start contributing
 
 ---
 
-## Spread the Word
+## Like it? Give it a ⭐
 
-If you find Safari MCP useful, help others discover it:
+If Safari MCP saves you from Chrome overhead, **a star helps others discover it:**
 
-- [Star this repo](https://github.com/achiya-automation/safari-mcp)
-- [Share on Twitter/X](https://twitter.com/intent/tweet?text=Safari%20MCP%20%E2%80%94%20Stop%20running%20Chrome%20just%20so%20your%20AI%20agent%20can%20browse.%2080%20tools%2C%20native%20Safari%2C%2060%25%20less%20CPU.&url=https%3A%2F%2Fgithub.com%2Fachiya-automation%2Fsafari-mcp)
-- [Share on LinkedIn](https://www.linkedin.com/sharing/share-offsite/?url=https%3A%2F%2Fgithub.com%2Fachiya-automation%2Fsafari-mcp)
-- Write about it on dev.to or your blog
+[![Star this repo](https://img.shields.io/github/stars/achiya-automation/safari-mcp?style=social)](https://github.com/achiya-automation/safari-mcp)
 
----
-
-## Star History
-
-If Safari MCP saved you from Chrome overhead, consider giving it a star!
+[Share on Twitter/X](https://twitter.com/intent/tweet?text=Safari%20MCP%20%E2%80%94%20Stop%20running%20Chrome%20just%20so%20your%20AI%20agent%20can%20browse.%2080%20tools%2C%20native%20Safari%2C%2060%25%20less%20CPU.&url=https%3A%2F%2Fgithub.com%2Fachiya-automation%2Fsafari-mcp) · [Share on LinkedIn](https://www.linkedin.com/sharing/share-offsite/?url=https%3A%2F%2Fgithub.com%2Fachiya-automation%2Fsafari-mcp) · [Write about it](https://dev.to/)
 
 [![Star History Chart](https://api.star-history.com/svg?repos=achiya-automation/safari-mcp&type=Date)](https://star-history.com/#achiya-automation/safari-mcp&Date)
+
+---
+
+## Listed On
+
+[![Glama](https://glama.ai/mcp/servers/achiya-automation/safari-mcp/badges/score.svg)](https://glama.ai/mcp/servers/achiya-automation/safari-mcp) [![MCP Registry](https://img.shields.io/badge/MCP-Registry-purple)](https://registry.modelcontextprotocol.io/) [![CI](https://github.com/achiya-automation/safari-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/achiya-automation/safari-mcp/actions/workflows/ci.yml)
 
 ---
 
