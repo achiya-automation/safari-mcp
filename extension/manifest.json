@@ -20,6 +20,16 @@
   "host_permissions": ["<all_urls>"],
   "content_scripts": [{
     "matches": ["<all_urls>"],
+    "exclude_matches": [
+      "*://*.linkedin.com/*",
+      "*://*.x.com/*",
+      "*://*.twitter.com/*",
+      "*://*.producthunt.com/*",
+      "*://mail.google.com/*",
+      "*://calendar.google.com/*",
+      "*://chat.google.com/*",
+      "*://meet.google.com/*"
+    ],
     "js": ["content.js"],
     "run_at": "document_start",
     "world": "MAIN"

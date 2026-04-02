@@ -314,15 +314,10 @@ while let line = readLine(strippingNewline: true) {
     continue
   }
 
-  // ========== FOCUS PRESERVATION ==========
-  // Save the frontmost app BEFORE executing AppleScript.
-  // Safari AppleScript can steal focus — we re-activate the previous app immediately after.
-  // Re-activating is better than hiding Safari because:
-  // 1. No jarring hide animation on Safari windows
-  // 2. User's Safari windows stay visible (just not in front)
-  // 3. Almost instantaneous — previous app just comes back to foreground
-  let savedBundleId = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-  let wasSafari = savedBundleId == "com.apple.Safari"
+  // Focus preservation is handled by the Node.js layer (osascript() function
+  // and extensionOrFallback). The daemon must NOT manage focus — it runs every
+  // 3 seconds for background checks, and restoring focus here steals Safari
+  // from the user whenever they switch to it.
 
   guard let nsScript = NSAppleScript(source: script) else {
     respond(["error": "failed to compile AppleScript"])
@@ -331,15 +326,6 @@ while let line = readLine(strippingNewline: true) {
 
   var errorDict: NSDictionary?
   let result = nsScript.executeAndReturnError(&errorDict)
-
-  // Restore focus to previous app if Safari stole it (only if caller wasn't already in Safari)
-  if !wasSafari,
-     NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.Safari" {
-    if let savedId = savedBundleId,
-       let previousApp = NSRunningApplication.runningApplications(withBundleIdentifier: savedId).first {
-      previousApp.activate()
-    }
-  }
 
   if let error = errorDict {
     let msg = (error["NSAppleScriptErrorMessage"] as? String) ?? "AppleScript error"
