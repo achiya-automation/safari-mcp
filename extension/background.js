@@ -612,13 +612,14 @@ async function handleCommand(type, payload) {
             if (props.onMouseDown) { props.onMouseDown({ ...synth, type: "mousedown" }); reactFired = true; break; }
           }
           // Try __reactFiber$ / __reactInternalInstance$ (React 16/17)
+          // Traverse up to 20 levels — React portals (modals, dialogs) can have deeply nested fiber trees
           if (!reactFired) {
             const fk = keys.find(k => k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$"));
             if (fk && node[fk]) {
               let fiber = node[fk];
-              for (let f = 0; f < 10 && fiber; f++) {
+              for (let f = 0; f < 20 && fiber; f++) {
                 if (fiber.memoizedProps) {
-                  if (fiber.memoizedProps.onClick) { fiber.memoizedProps.onClick({ type: "click", target: el, currentTarget: node, clientX: cx, clientY: cy, preventDefault() {}, stopPropagation() {}, persist() {}, bubbles: true }); reactFired = true; break; }
+                  if (fiber.memoizedProps.onClick) { fiber.memoizedProps.onClick({ type: "click", target: el, currentTarget: node, clientX: cx, clientY: cy, preventDefault() {}, stopPropagation() {}, persist() {}, bubbles: true, nativeEvent: new MouseEvent("click"), isDefaultPrevented() { return false; }, isPropagationStopped() { return false; } }); reactFired = true; break; }
                 }
                 fiber = fiber.return;
               }
