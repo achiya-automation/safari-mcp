@@ -724,6 +724,11 @@ async function handleCommand(type, payload) {
             try {
               let view = pmEl.pmViewDesc && pmEl.pmViewDesc.view;
               if (!view) { const keys = Object.keys(pmEl); for (let i=0;i<keys.length;i++) { const o=pmEl[keys[i]]; if(o&&o.state&&o.dispatch){view=o;break;} } }
+              // Walk React Fiber tree to find EditorView (LinkedIn, Tiptap-React, etc.)
+              if (!view) {
+                const fk = Object.keys(pmEl).find(function(k){return k.startsWith("__reactFiber$")||k.startsWith("__reactInternalInstance$");});
+                if (fk) { let fiber = pmEl[fk]; for (let d=0;d<20&&fiber;d++) { const props = fiber.memoizedProps||(fiber.stateNode&&fiber.stateNode.props); if(props) { const v = props.editorView||props.view; if(v&&v.state&&v.dispatch){view=v;break;} } fiber=fiber.return; } }
+              }
               if (view && view.state && view.dispatch) {
                 const { state } = view;
                 const doc = state.doc;
@@ -741,6 +746,14 @@ async function handleCommand(type, payload) {
                   ceResult = "Filled contenteditable (ProseMirror replace)";
                 }
               }
+            } catch (e) { /* fall through */ }
+          }
+          // ProseMirror detected but no view found — use char-by-char with beforeinput
+          if (!ceResult && pmEl) {
+            try {
+              el.focus();
+              (window.__mcpClosureType || function(){})(value, el);
+              ceResult = "Filled contenteditable (ProseMirror char-by-char, " + value.length + " chars)";
             } catch (e) { /* fall through */ }
           }
 
@@ -822,6 +835,7 @@ async function handleCommand(type, payload) {
           if (!ceResult) {
             document.execCommand("selectAll", false, null);
             document.execCommand("delete", false, null);
+            el.dispatchEvent(new InputEvent("beforeinput", { inputType: "insertText", data: value, bubbles: true, cancelable: true }));
             document.execCommand("insertText", false, value);
             ceResult = "Filled contenteditable";
           }

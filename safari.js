@@ -1131,7 +1131,12 @@ export async function fill({ selector, value, ref }) {
   const result = await runJS(
     `(function(){try{var el=document.querySelector('${sel}');if(!el){var q=function(r){var a=r.querySelectorAll('*');for(var i=0;i<a.length;i++){if(a[i].shadowRoot){el=a[i].shadowRoot.querySelector('${sel}');if(el)return el;el=q(a[i].shadowRoot);if(el)return el;}}return null;};el=q(document);}if(!el)return 'Element not found: ${sel}';el.focus();if(el.isContentEditable||el.getAttribute('contenteditable')==='true'){` +
     // ProseMirror detection
-    `var pm=el.closest('.ProseMirror')||el.querySelector('.ProseMirror');if(pm){try{var v=null;if(pm.pmViewDesc&&pm.pmViewDesc.view)v=pm.pmViewDesc.view;else if(pm.cmView&&pm.cmView.view)v=pm.cmView.view;else{var keys=Object.keys(pm);for(var ki=0;ki<keys.length;ki++){var o=pm[keys[ki]];if(o&&o.state&&o.dispatch){v=o;break;}}}if(v&&v.state&&v.dispatch){var doc=v.state.doc;var hasContent=doc.textContent&&doc.textContent.trim().length>0;if(hasContent){var endPos=doc.content.size>1?doc.content.size-1:doc.content.size;v.dispatch(v.state.tr.insertText(' ${val}',endPos));v.focus();return 'Filled CE (ProseMirror append)';}else{var tr=v.state.tr;tr.replaceWith(0,doc.content.size,v.state.schema.text('${val}'));v.dispatch(tr);v.focus();return 'Filled CE (ProseMirror replace)';}}}catch(e){}}` +
+    `var pm=el.closest('.ProseMirror')||el.querySelector('.ProseMirror');if(pm){try{var v=null;if(pm.pmViewDesc&&pm.pmViewDesc.view)v=pm.pmViewDesc.view;else if(pm.cmView&&pm.cmView.view)v=pm.cmView.view;else{var keys=Object.keys(pm);for(var ki=0;ki<keys.length;ki++){var o=pm[keys[ki]];if(o&&o.state&&o.dispatch){v=o;break;}}}` +
+    // React Fiber walk for ProseMirror view (LinkedIn, Tiptap-React)
+    `if(!v){var fk=Object.keys(pm).find(function(k){return k.startsWith('__reactFiber$')||k.startsWith('__reactInternalInstance$');});if(fk){var fiber=pm[fk];for(var d=0;d<20&&fiber;d++){var props=fiber.memoizedProps||(fiber.stateNode&&fiber.stateNode.props);if(props){var pv=props.editorView||props.view;if(pv&&pv.state&&pv.dispatch){v=pv;break;}}fiber=fiber.return;}}}` +
+    `if(v&&v.state&&v.dispatch){var doc=v.state.doc;var hasContent=doc.textContent&&doc.textContent.trim().length>0;if(hasContent){var endPos=doc.content.size>1?doc.content.size-1:doc.content.size;v.dispatch(v.state.tr.insertText(' ${val}',endPos));v.focus();return 'Filled CE (ProseMirror append)';}else{var tr=v.state.tr;tr.replaceWith(0,doc.content.size,v.state.schema.text('${val}'));v.dispatch(tr);v.focus();return 'Filled CE (ProseMirror replace)';}}}catch(e){}}` +
+    // ProseMirror detected but no view — use char-by-char with beforeinput
+    `if(pm&&!v){return '__PM_CHARBYCHAR__';}` +
     // Closure/Medium detection — signal for native paste
     `var isClosure=Object.keys(el).some(function(k){return k.startsWith('closure_uid_');})||location.hostname.includes('medium.com');if(isClosure){return '__CLOSURE_NATIVE_PASTE__';}` +
     // Synthetic ClipboardEvent paste — works on ProseMirror, TipTap, Slate, and most modern editors
@@ -1142,6 +1147,42 @@ export async function fill({ selector, value, ref }) {
     // Standard input/textarea with _valueTracker
     `var t=el._valueTracker;if(t)t.setValue('');var proto=el.tagName==='TEXTAREA'?window.HTMLTextAreaElement.prototype:window.HTMLInputElement.prototype;var s=Object.getOwnPropertyDescriptor(proto,'value');if(s&&s.set){s.set.call(el,'${val}');}else{el.value='${val}';}el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));el.dispatchEvent(new Event('blur',{bubbles:true}));el.dispatchEvent(new Event('focusout',{bubbles:true}));el.focus();return 'Filled: '+el.value.substring(0,50);}catch(e){return 'ERR: '+e.message;}})()`
   );
+
+  // ProseMirror editor with no view access: use char-by-char with beforeinput events
+  if (result === "__PM_CHARBYCHAR__") {
+    const rawValue = value;
+    const lines = rawValue.split('\n');
+    const charInserts = lines.map((line, i) => {
+      const escaped = line.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+      let cmds = '';
+      if (i > 0) {
+        cmds += `t.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',keyCode:13,code:'Enter',bubbles:true,cancelable:true}));`;
+        cmds += `t.dispatchEvent(new InputEvent('beforeinput',{inputType:'insertParagraph',bubbles:true,cancelable:true}));`;
+        cmds += `document.execCommand('insertParagraph');`;
+        cmds += `t.dispatchEvent(new InputEvent('input',{inputType:'insertParagraph',bubbles:true}));`;
+        cmds += `t.dispatchEvent(new KeyboardEvent('keyup',{key:'Enter',keyCode:13,code:'Enter',bubbles:true}));`;
+      }
+      if (escaped.length > 0) {
+        // Insert text in one beforeinput + execCommand, then fire input
+        cmds += `t.dispatchEvent(new InputEvent('beforeinput',{data:'${escaped}',inputType:'insertText',bubbles:true,cancelable:true}));`;
+        cmds += `document.execCommand('insertText',false,'${escaped}');`;
+        cmds += `t.dispatchEvent(new InputEvent('input',{data:'${escaped}',inputType:'insertText',bubbles:true}));`;
+      }
+      return cmds;
+    }).join('');
+
+    const fillResult = await runJS(
+      `(function(){` +
+      `var el=document.querySelector('${selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}');` +
+      `if(!el)return 'Element not found';` +
+      `el.focus();el.click();` +
+      `var t=document.activeElement||el;` +
+      charInserts +
+      `return 'Filled CE (ProseMirror char-by-char)';` +
+      `})()`
+    );
+    return fillResult;
+  }
 
   // Closure/Medium editor: insert line-by-line via execCommand in small batches
   // No focus stealing, no System Events, no clipboard manipulation.
