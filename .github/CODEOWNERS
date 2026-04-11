@@ -1,0 +1,13 @@
+# Auto-assign @achiya-automation as reviewer for sensitive paths.
+# Enforced review is not required by branch protection, but any PR touching
+# these files will automatically request a review from the code owner.
+
+# Workflow and CI config
+.github/** @achiya-automation
+
+# Package manifest and lockfile
+/package.json @achiya-automation
+/package-lock.json @achiya-automation
+
+# Native helper (security-sensitive)
+/safari-helper.swift @achiya-automation
