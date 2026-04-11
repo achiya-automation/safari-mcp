@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Security
+
+- Pin `hono` to `^4.12.12` and `@hono/node-server` to `^1.19.13` via `package.json` overrides, silencing 6 transitive dependabot advisories (not exploitable at runtime — safari-mcp only loads `StdioServerTransport`)
+- Add `.github/CODEOWNERS` and expand Dependabot to cover `github-actions` ecosystem
+- Publishing to npm now uses OIDC Trusted Publisher instead of long-lived `NPM_TOKEN`; releases gate on a manual-approval `npm-publish` environment
+
 ## [2.7.3] - 2026-04-01
 
 ### Fixed
