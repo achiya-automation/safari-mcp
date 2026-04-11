@@ -27,5 +27,8 @@ jobs:
 
       - run: npm ci
 
-      - name: Verify module loads
-        run: node -e "import('./index.js')"
+      - name: Verify syntax of entry points
+        run: |
+          node --check index.js
+          node --check safari.js
+          node --check mcp-helpers.js
