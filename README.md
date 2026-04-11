@@ -13,6 +13,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![macOS](https://img.shields.io/badge/macOS-only-blue)](https://www.apple.com/macos/)
 [![GitHub stars](https://img.shields.io/github/stars/achiya-automation/safari-mcp?style=social)](https://github.com/achiya-automation/safari-mcp/stargazers)
+[![Featured in CLI-Anything](https://img.shields.io/badge/Featured%20in-CLI--Anything-blueviolet)](https://github.com/HKUDS/CLI-Anything/pull/212)
 
 <a href="vscode:mcp/install?%7B%22safari-mcp%22%3A%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D%7D"><img src="https://img.shields.io/badge/VS_Code-Install_Server-0078d4?logo=visual-studio-code&logoColor=white" alt="Install in VS Code"></a>
 <a href="https://insiders.vscode.dev/redirect?url=vscode-insiders:mcp/install?%7B%22safari-mcp%22%3A%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D%7D"><img src="https://img.shields.io/badge/VS_Code_Insiders-Install_Server-24bfa5?logo=visual-studio-code&logoColor=white" alt="Install in VS Code Insiders"></a>
