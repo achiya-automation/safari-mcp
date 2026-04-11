@@ -147,7 +147,7 @@ let _lastMemoryWarningTime = 0;
 
 function _getWebKitMemoryMB() {
   try {
-    const pids = execFileSync("pgrep", ["-Ef", "WebKit|WebContent"], { encoding: "utf8" }).trim();
+    const pids = execFileSync("pgrep", ["-f", "WebKit|WebContent"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
     if (!pids) return 0;
     const pidList = pids.split("\n").join(",");
     const psOut = execFileSync("ps", ["-p", pidList, "-o", "rss="], { encoding: "utf8" }).trim();
