@@ -538,7 +538,7 @@ Your support funds:
 
 ## Community
 
-**2,000+ weekly npm downloads** — developers are using Safari MCP to build AI agents on macOS.
+**2,000+ monthly npm downloads** — developers are using Safari MCP to build AI agents on macOS.
 
 - [GitHub Discussions](https://github.com/achiya-automation/safari-mcp/discussions) — ask questions, share use cases
 - [Issues](https://github.com/achiya-automation/safari-mcp/issues) — bug reports and feature requests
