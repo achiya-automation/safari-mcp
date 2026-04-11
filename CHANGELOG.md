@@ -5,7 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## [2.7.9] - 2026-04-11
+
+### Fixed
+
+- Remove `pgrep -E` flag that doesn't exist on macOS — memory monitor was emitting `pgrep: illegal option -- E` on stderr on every check (#15)
+- Move Safari extension popup inline `<script>` into `popup/popup.js` so MV3 `script-src 'self'` CSP stops blocking it; popup was stuck on "Checking..." indefinitely (#18, thanks @mikhailkogan17)
+- Re-sign `safari-helper` daemon with an explicit ad-hoc signature (replaces the linker-signed fallback) so macOS TCC has a stable cdhash to anchor Automation permissions
+
+### Documentation
+
+- README: add **Automation → Safari** to the macOS Permissions table, plus instructions for granting it to the parent IDE and the `osascript` one-shot workaround (#16)
+- README: add `codesign --sign - --force --deep` step to the extension build instructions so Safari will actually load the bundle produced by `xcodebuild` (#17)
 
 ### Security
 

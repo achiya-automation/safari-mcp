@@ -426,12 +426,21 @@ The extension requires a one-time build with Xcode (free, included with macOS).
 # 1. Clone the repo (the npm package does not include the Xcode project)
 git clone https://github.com/achiya-automation/safari-mcp.git
 cd safari-mcp
+
+# 2. Build the extension
 xcodebuild -project "xcode/Safari MCP/Safari MCP.xcodeproj" \
   -scheme "Safari MCP (macOS)" -configuration Release build
 
-# 2. Find and open the built app
-open ~/Library/Developer/Xcode/DerivedData/Safari_MCP-*/Build/Products/Release/Safari\ MCP.app
+# 3. Ad-hoc sign the built app so Safari will load it
+# (xcodebuild without a signing identity produces a bundle Safari silently rejects)
+APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData/Safari_MCP-*/Build/Products/Release -name "Safari MCP.app" -maxdepth 2 | head -1)
+codesign --sign - --force --deep "$APP_PATH"
+
+# 4. Open the app (needed once so Safari registers the extension)
+open "$APP_PATH"
 ```
+
+Alternatively, open `xcode/Safari MCP/Safari MCP.xcodeproj` directly in Xcode, select your Apple ID under Signing & Capabilities, and click Run. A free personal Apple Developer account is sufficient for local use.
 
 Then in Safari:
 1. Safari → Settings → Advanced → enable **Show features for web developers**
@@ -456,8 +465,21 @@ Safari MCP needs these one-time permissions:
 | Permission | Where | Why |
 |-----------|-------|-----|
 | JavaScript from Apple Events | Safari → Develop menu | Required for `do JavaScript` |
-| Screen Recording | System Settings → Privacy | Required for `safari_screenshot` |
-| Accessibility | System Settings → Privacy | Required for `safari_save_pdf` only |
+| Automation → Safari | System Settings → Privacy & Security → Automation | Required for all AppleScript-backed tools |
+| Screen Recording | System Settings → Privacy & Security → Screen Recording | Required for `safari_screenshot` |
+| Accessibility | System Settings → Privacy & Security → Accessibility | Required for `safari_save_pdf` only |
+
+### Granting Automation → Safari (important for IDE users)
+
+macOS TCC grants Automation permission to the **parent process** that spawns the MCP server, not to `safari-mcp` itself. So you need to grant **Automation → Safari** to the app that runs Claude Code / Cursor / Windsurf — typically **Visual Studio Code** or **Terminal**.
+
+If the permission dialog never appears automatically, run this command once from a Terminal that already has Automation permission:
+
+```bash
+osascript -e 'tell application "Safari" to get URL of current tab of window 1'
+```
+
+That call registers the Terminal app in the Automation database and then triggers the prompt for Safari. After you approve it, subsequent MCP calls from any child process chain will work.
 
 ---
 
@@ -466,6 +488,7 @@ Safari MCP needs these one-time permissions:
 | Issue | Fix |
 |-------|-----|
 | "AppleScript error" | Enable "Allow JavaScript from Apple Events" in Safari → Develop |
+| "Not authorized to send Apple events to Safari" | Grant Automation → Safari to your IDE (see above) |
 | Screenshots empty | Grant Screen Recording permission to Terminal/VS Code |
 | Tab not found | Call `safari_list_tabs` to refresh tab indices |
 | Hebrew keyboard issues | All typing uses JS events — immune to keyboard layout |
