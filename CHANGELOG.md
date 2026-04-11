@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.10] - 2026-04-12
+
+### Added
+
+- `safari_native_hover` tool — OS-level mouse move via macOS CGEvent. Triggers real `:hover` and `mouseenter` handlers on obfuscated UIs (Discord sidebars, portal-rendered tooltips) where JS-dispatched events aren't enough. Dwells for a configurable duration then restores the cursor position. Complements `safari_native_click`.
+
+### Fixed
+
+- **Tab ownership now survives MCP process restarts.** Previously, every time Claude Code (or any other MCP client) recycled the Safari MCP server, the in-memory `_ownedTabURLs` set was wiped, causing `⚠️ Tab safety: no tabs opened yet` errors on the next tool call. Ownership is now persisted to `~/.safari-mcp/owned-tabs.json` with a 30-minute TTL.
+- **`safari-helper` now targets macOS 12.0+ instead of macOS 26.** The daemon was shipped in v2.7.9 compiled with `minos 26.0`, which silently failed to launch on macOS 15 and earlier (#15 root cause). Rebuilt with `swiftc -target arm64-apple-macos12.0` so it runs on Monterey through Tahoe.
+
 ## [2.7.9] - 2026-04-11
 
 ### Fixed

@@ -545,6 +545,44 @@ function _helperNativeClick(x, y, doubleClick = false, windowId = 0, timeout = 5
   });
 }
 
+// Sends a CGEvent hover command to the Swift helper daemon.
+// Moves the cursor to (x, y), dwells to let tooltips render, optionally restores cursor.
+function _helperNativeHover(x, y, windowId = 0, dwellMs = 500, restoreMouse = true, timeout = 10000) {
+  return new Promise((resolve, reject) => {
+    if (!_helperProc) startHelper();
+    if (!_helperProc || !_helperProc.stdin || !_helperProc.stdin.writable) {
+      reject(new Error("safari-helper not available for native hover"));
+      return;
+    }
+    let resolved = false;
+    const timer = setTimeout(() => {
+      if (resolved) return;
+      resolved = true;
+      const idx = _helperQueue.indexOf(cb);
+      if (idx >= 0) _helperQueue[idx] = () => {};
+      reject(new Error("native hover timeout"));
+    }, timeout);
+
+    function cb(line) {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed.error) reject(new Error(parsed.error));
+        else resolve(parsed.result ?? "");
+      } catch {
+        resolve(line);
+      }
+    }
+
+    _helperQueue.push(cb);
+    const cmd = { hover: { x, y, dwellMs, restoreMouse } };
+    if (windowId) cmd.hover.windowId = windowId;
+    _helperProc.stdin.write(JSON.stringify(cmd) + "\n");
+  });
+}
+
 // Sends a CGEvent keyboard command to the Swift helper daemon.
 // No focus stealing — sends key events directly to the target window via PID.
 function _helperNativeKeyboard(keyCode, flags = [], windowId = 0, timeout = 5000) {
@@ -1118,6 +1156,88 @@ export async function nativeClick({ selector, text, x, y, ref, doubleClick = fal
   const clickType = doubleClick ? 'Native double-clicked' : 'Native clicked';
   const label = viewportCoords.tag + (viewportCoords.text ? ` "${viewportCoords.text}"` : '');
   return `${clickType}: ${label} at screen (${screenX},${screenY})`;
+}
+
+// ========== NATIVE HOVER (OS-level CGEvent mouse move — triggers real :hover and mouseenter) ==========
+// JS-dispatched mouseenter events work for most React components, but some UIs
+// (Discord sidebar, virtualized CSS :hover tooltips, custom portal-rendered
+// tooltips) only respond to a real OS-level cursor position. This function
+// moves the physical cursor to the target, dwells for tooltips to render,
+// then optionally restores the cursor to its original position.
+export async function nativeHover({ selector, text, x, y, ref, dwellMs = 500, restoreMouse = true }) {
+  await ensureHelpers();
+
+  // Step 1: Get element's viewport coordinates via JavaScript
+  let viewportCoords;
+  if (ref || selector || text) {
+    let jsExpr;
+    if (ref) {
+      jsExpr = `(function(){
+        var el = mcpFindRef('${ref}');
+        if (!el) return JSON.stringify({error: 'Element not found: ref=${ref}'});
+        el.scrollIntoView({block:'center', behavior:'instant'});
+        var rect = el.getBoundingClientRect();
+        return JSON.stringify({
+          x: Math.round(rect.left + rect.width / 2),
+          y: Math.round(rect.top + rect.height / 2),
+          tag: el.tagName,
+          text: (el.innerText || el.textContent || '').trim().substring(0, 50)
+        });
+      })()`;
+    } else if (selector) {
+      const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      jsExpr = `(function(){
+        var el = document.querySelector('${sel}');
+        if (!el) return JSON.stringify({error: 'Element not found: ${sel}'});
+        el.scrollIntoView({block:'center', behavior:'instant'});
+        var rect = el.getBoundingClientRect();
+        return JSON.stringify({
+          x: Math.round(rect.left + rect.width / 2),
+          y: Math.round(rect.top + rect.height / 2),
+          tag: el.tagName,
+          text: (el.innerText || el.textContent || '').trim().substring(0, 50)
+        });
+      })()`;
+    } else {
+      const safeText = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      jsExpr = `(function(){
+        var el = mcpFindText('${safeText}', true) || mcpFindText('${safeText}', false);
+        if (!el) return JSON.stringify({error: 'Element not found with text: ${safeText}'});
+        el.scrollIntoView({block:'center', behavior:'instant'});
+        var rect = el.getBoundingClientRect();
+        return JSON.stringify({
+          x: Math.round(rect.left + rect.width / 2),
+          y: Math.round(rect.top + rect.height / 2),
+          tag: el.tagName,
+          text: (el.innerText || el.textContent || '').trim().substring(0, 50)
+        });
+      })()`;
+    }
+
+    const result = await runJS(jsExpr);
+    try {
+      viewportCoords = JSON.parse(result);
+    } catch {
+      throw new Error("Failed to get element coordinates: " + result);
+    }
+    if (viewportCoords.error) {
+      throw new Error(viewportCoords.error);
+    }
+  } else if (x !== undefined && y !== undefined) {
+    viewportCoords = { x: Number(x), y: Number(y), tag: 'point', text: '' };
+  } else {
+    throw new Error("nativeHover requires selector, text, ref, or x/y coordinates");
+  }
+
+  const geo = await _getSafariWindowGeometry();
+  const screenX = geo.windowX + viewportCoords.x;
+  const screenY = geo.windowY + geo.toolbarHeight + viewportCoords.y;
+
+  if (!geo.windowId) throw new Error("Cannot native-hover without Safari window ID — would move mouse and steal focus");
+  await _helperNativeHover(screenX, screenY, geo.windowId, dwellMs, restoreMouse);
+
+  const label = viewportCoords.tag + (viewportCoords.text ? ` "${viewportCoords.text}"` : '');
+  return `Native hovered: ${label} at screen (${screenX},${screenY}) for ${dwellMs}ms${restoreMouse ? ' (mouse restored)' : ''}`;
 }
 
 // ========== FORM INPUT ==========

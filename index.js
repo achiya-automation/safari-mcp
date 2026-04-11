@@ -13,9 +13,10 @@ import { WebSocketServer } from "ws";
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
 
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 MB cap on POST body — prevents DoS
 
@@ -51,6 +52,36 @@ try {
 // ========== SESSION ID (unique per MCP process — enables per-session tab tracking) ==========
 const SESSION_ID = randomUUID().slice(0, 8);
 
+// ========== PERSISTENT TAB OWNERSHIP ==========
+// The in-memory _ownedTabURLs set is wiped when the MCP process restarts
+// (Claude Code periodically recycles MCP servers). Without persistence, every
+// restart re-triggers "Tab safety: no tabs opened yet" errors forcing a
+// re-open of every tab. Persist the set to a JSON file with a TTL so tabs
+// remain "owned" across process restarts for up to OWNERSHIP_TTL_MS.
+const OWNERSHIP_DIR = join(homedir(), ".safari-mcp");
+const OWNERSHIP_FILE = join(OWNERSHIP_DIR, "owned-tabs.json");
+const OWNERSHIP_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+function _loadOwnershipFile() {
+  try {
+    if (!existsSync(OWNERSHIP_FILE)) return [];
+    const raw = readFileSync(OWNERSHIP_FILE, "utf8");
+    const data = JSON.parse(raw);
+    if (!Array.isArray(data)) return [];
+    const cutoff = Date.now() - OWNERSHIP_TTL_MS;
+    return data.filter(e => e && typeof e.url === "string" && typeof e.ts === "number" && e.ts > cutoff);
+  } catch { return []; }
+}
+
+function _saveOwnershipFile(urls) {
+  try {
+    if (!existsSync(OWNERSHIP_DIR)) mkdirSync(OWNERSHIP_DIR, { recursive: true });
+    const now = Date.now();
+    const entries = Array.from(urls).map(url => ({ url, ts: now }));
+    writeFileSync(OWNERSHIP_FILE, JSON.stringify(entries), { mode: 0o600 });
+  } catch { /* best-effort */ }
+}
+
 // ========== MEMORY GUARD: track & auto-close MCP-opened tabs ==========
 const MAX_TABS = parseInt(process.env.MCP_MAX_TABS || "6", 10);
 const MEMORY_CHECK_INTERVAL_MS = parseInt(process.env.MCP_MEMORY_CHECK_MS || "60000", 10);
@@ -63,7 +94,8 @@ const _openedTabs = new Map();
 // Tracks URLs of tabs opened by this MCP session.
 // Any tool that modifies a tab (navigate, click, fill, etc.) is blocked
 // unless the current tab was opened via safari_new_tab.
-const _ownedTabURLs = new Set();
+// Hydrated from ~/.safari-mcp/owned-tabs.json so ownership survives MCP restarts.
+const _ownedTabURLs = new Set(_loadOwnershipFile().map(e => e.url));
 
 function _isURLOwned(url) {
   if (!url) return false;
@@ -96,11 +128,17 @@ function _isURLOwned(url) {
 }
 
 function _addOwnedURL(url) {
-  if (url && url !== 'about:blank' && url !== 'favorites://') _ownedTabURLs.add(url);
+  if (url && url !== 'about:blank' && url !== 'favorites://') {
+    _ownedTabURLs.add(url);
+    _saveOwnershipFile(_ownedTabURLs);
+  }
 }
 
 function _removeOwnedURL(url) {
-  if (url) _ownedTabURLs.delete(url);
+  if (url) {
+    _ownedTabURLs.delete(url);
+    _saveOwnershipFile(_ownedTabURLs);
+  }
 }
 
 function _updateOwnedURL(oldUrl, newUrl) {
@@ -949,6 +987,24 @@ server.tool(
   async (args) => {
     // Native click always uses AppleScript path (no extension) — it needs OS-level access
     const result = await safari.nativeClick(args);
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+  }
+);
+
+server.tool(
+  "safari_native_hover",
+  "OS-level mouse hover via macOS CGEvent — moves the real cursor to an element to trigger native :hover / mouseenter handlers. Use for obfuscated UIs where JS-dispatched mouseenter isn't enough, like Discord server sidebars (tooltips only appear on real hover) or portal-rendered tooltips. After hover, call safari_wait_for or safari_evaluate to read the tooltip. Dwells for dwellMs to let tooltips render, then restores the original cursor position by default. Requires Safari window to be visible.",
+  {
+    ref: z.string().optional().describe("Ref ID from safari_snapshot"),
+    selector: z.string().optional().describe("CSS selector"),
+    text: z.string().optional().describe("Visible text to find and hover"),
+    x: z.coerce.number().optional().describe("Viewport X coordinate"),
+    y: z.coerce.number().optional().describe("Viewport Y coordinate"),
+    dwellMs: z.coerce.number().optional().default(500).describe("Milliseconds to dwell over the element so tooltips render (clamped 0-5000)"),
+    restoreMouse: z.boolean().optional().default(true).describe("Restore cursor to original position after dwell"),
+  },
+  async (args) => {
+    const result = await safari.nativeHover(args);
     return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );

@@ -14,6 +14,53 @@ import Darwin
 import CoreGraphics
 import AppKit
 
+// ========== CGEvent Native Hover ==========
+// Moves the mouse cursor to a target position to trigger native :hover / mouseenter
+// without clicking. Used for revealing tooltips on obfuscated UIs (Discord sidebar,
+// virtualized server lists, custom React tooltips) where JS-dispatched mouseenter
+// events aren't enough because the rendering depends on CSS :hover or real pointer
+// position. Optionally restores the original cursor position after dwell.
+func performNativeHover(x: Double, y: Double, windowId: Int64 = 0, dwellMs: Int = 500, restoreMouse: Bool = true) -> [String: Any] {
+  let point = CGPoint(x: x, y: y)
+  let savedPosition = CGEvent(source: nil)?.location ?? CGPoint.zero
+
+  // Get Safari PID for process-targeted event posting (background hover, no focus steal)
+  var safariPID: pid_t = 0
+  if windowId > 0 {
+    let ws = NSWorkspace.shared
+    for app in ws.runningApplications {
+      if app.bundleIdentifier == "com.apple.Safari" {
+        safariPID = app.processIdentifier
+        break
+      }
+    }
+  }
+
+  let kWindowField = CGEventField(rawValue: 91)! // windowUnderMousePointer
+  let kWindowHandlerField = CGEventField(rawValue: 92)! // windowThatCanHandleThisEvent
+
+  func postMove(_ position: CGPoint) {
+    guard let ev = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: position, mouseButton: .left) else { return }
+    if windowId > 0 && safariPID > 0 {
+      ev.setIntegerValueField(kWindowField, value: windowId)
+      ev.setIntegerValueField(kWindowHandlerField, value: windowId)
+      ev.postToPid(safariPID)
+    } else {
+      ev.post(tap: .cghidEventTap)
+    }
+  }
+
+  postMove(point)
+  let ms = max(0, min(dwellMs, 5000)) // clamp 0-5000ms to prevent runaway blocking
+  usleep(UInt32(ms * 1000))
+  if restoreMouse {
+    postMove(savedPosition)
+  }
+
+  let targetInfo = windowId > 0 ? " (window \(windowId), background)" : ""
+  return ["result": "hovered at (\(Int(x)),\(Int(y))) for \(ms)ms\(targetInfo)\(restoreMouse ? " (mouse restored)" : "")"]
+}
+
 // ========== CGEvent Native Click ==========
 // Performs a REAL OS-level mouse click that produces isTrusted: true in the browser.
 // Requires Accessibility permissions (same as AppleScript automation).
@@ -256,6 +303,18 @@ while let line = readLine(strippingNewline: true) {
     continue
   }
 
+  // Handle CGEvent hover command — native mouse move to trigger real :hover / mouseenter
+  // {"hover": {"x": 500, "y": 300, "windowId": 4127, "dwellMs": 500, "restoreMouse": true}}
+  if let hoverData = json["hover"] as? [String: Any],
+     let x = hoverData["x"] as? Double,
+     let y = hoverData["y"] as? Double {
+    let windowId = Int64((hoverData["windowId"] as? Int) ?? 0)
+    let dwellMs = (hoverData["dwellMs"] as? Int) ?? 500
+    let restoreMouse = (hoverData["restoreMouse"] as? Bool) ?? true
+    respond(performNativeHover(x: x, y: y, windowId: windowId, dwellMs: dwellMs, restoreMouse: restoreMouse))
+    continue
+  }
+
   // Handle CGEvent keyboard command
   // {"keyboard": {"keyCode": 9, "flags": ["cmd"], "windowId": 4127}}
   // keyCode 9 = V, flags: cmd/shift/alt/ctrl
@@ -324,13 +383,30 @@ while let line = readLine(strippingNewline: true) {
     continue
   }
 
-  var errorDict: NSDictionary?
-  let result = nsScript.executeAndReturnError(&errorDict)
+  // Execute on a background thread to avoid blocking stdin reading.
+  // Heavy pages (SourceForge, etc.) can cause executeAndReturnError() to block
+  // for 10-30+ seconds, preventing ALL subsequent commands from being read.
+  let semaphore = DispatchSemaphore(value: 0)
+  var scriptResult: NSAppleEventDescriptor?
+  var scriptError: NSDictionary?
 
-  if let error = errorDict {
+  DispatchQueue.global(qos: .userInitiated).async {
+    var errorDict: NSDictionary?
+    scriptResult = nsScript.executeAndReturnError(&errorDict)
+    scriptError = errorDict
+    semaphore.signal()
+  }
+
+  // Wait up to 30 seconds for the script to complete.
+  // If it times out, respond with error but don't block the loop forever.
+  let waitResult = semaphore.wait(timeout: .now() + 30.0)
+
+  if waitResult == .timedOut {
+    respond(["error": "AppleScript execution timed out (30s)"])
+  } else if let error = scriptError {
     let msg = (error["NSAppleScriptErrorMessage"] as? String) ?? "AppleScript error"
     respond(["error": msg])
   } else {
-    respond(["result": result.stringValue ?? ""])
+    respond(["result": scriptResult?.stringValue ?? ""])
   }
 }
