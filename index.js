@@ -1009,6 +1009,19 @@ server.tool(
   }
 );
 
+server.tool(
+  "safari_native_keyboard",
+  "OS-level keyboard event via macOS CGEvent — sends a real keypress (with optional modifiers) to the Safari window WITHOUT activating Safari or stealing focus. Use when safari_press_key's JS path doesn't reach React trust-gated handlers (Discord ProseMirror Enter, Slack send, virtualized editors). Keys: enter, return, tab, escape, space, delete, backspace, up/down/left/right, home, end, pageup, pagedown, f1-f6, a-z, 0-9 and common punctuation. Modifiers: cmd, shift, alt, ctrl. Produces isTrusted:true events. Never activates Safari — runs entirely in the background.",
+  {
+    key: z.string().describe("Key name: enter, escape, tab, space, arrow keys, letters, digits, etc."),
+    modifiers: z.array(z.string()).optional().default([]).describe("Modifier keys: cmd, shift, alt, ctrl"),
+  },
+  async (args) => {
+    const result = await safari.nativeKeyboard(args);
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+  }
+);
+
 // ========== FORM INPUT ==========
 
 server.tool(

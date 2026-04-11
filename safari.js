@@ -1397,6 +1397,44 @@ const jsKeyMap = {
   f1: "F1", f2: "F2", f3: "F3", f4: "F4", f5: "F5", f6: "F6",
 };
 
+// macOS virtual key codes for CGEvent keyboard (used by _helperNativeKeyboard).
+// These are the HID-level codes that postToPid uses, NOT JS keyCode values.
+const macKeyCodeMap = {
+  enter: 36, return: 36, "numpad-enter": 76,
+  tab: 48, space: 49, delete: 51, backspace: 51, escape: 53,
+  up: 126, "arrowup": 126, down: 125, "arrowdown": 125,
+  left: 123, "arrowleft": 123, right: 124, "arrowright": 124,
+  home: 115, end: 119, pageup: 116, pagedown: 121,
+  f1: 122, f2: 120, f3: 99, f4: 118, f5: 96, f6: 97,
+  a: 0, s: 1, d: 2, f: 3, h: 4, g: 5, z: 6, x: 7, c: 8, v: 9,
+  b: 11, q: 12, w: 13, e: 14, r: 15, y: 16, t: 17,
+  "1": 18, "2": 19, "3": 20, "4": 21, "6": 22, "5": 23,
+  "=": 24, "9": 25, "7": 26, "-": 27, "8": 28, "0": 29,
+  "]": 30, o: 31, u: 32, "[": 33, i: 34, p: 35,
+  l: 37, j: 38, "'": 39, k: 40, ";": 41, "\\": 42,
+  ",": 43, "/": 44, n: 45, m: 46, ".": 47, "`": 50,
+};
+
+// Native keyboard via CGEvent — sends a single key (with optional modifiers)
+// to the Safari window WITHOUT activating Safari or moving the mouse.
+// This produces isTrusted:true events that bypass React trust checks (Discord ProseMirror,
+// Slack virtualized editors, etc.) without any focus stealing. Requires Safari window ID.
+export async function nativeKeyboard({ key, modifiers = [] }) {
+  await ensureHelpers();
+  if (!key) throw new Error("nativeKeyboard requires 'key'");
+  const k = String(key).toLowerCase();
+  const keyCode = macKeyCodeMap[k];
+  if (keyCode === undefined) {
+    throw new Error(`nativeKeyboard: unsupported key "${key}". Supported: ${Object.keys(macKeyCodeMap).join(", ")}`);
+  }
+  const geo = await _getSafariWindowGeometry();
+  if (!geo.windowId) throw new Error("Cannot native-key without Safari window ID — would steal focus");
+  const normalized = (modifiers || []).map(m => String(m).toLowerCase());
+  await _helperNativeKeyboard(keyCode, normalized, geo.windowId);
+  const modsLabel = normalized.length ? normalized.join("+") + "+" : "";
+  return `Native key: ${modsLabel}${k} (CGEvent to window ${geo.windowId}, no focus steal)`;
+}
+
 // System Events key codes — only used for paste_image, upload_file, save_pdf
 // (functions that truly require OS-level UI interaction)
 

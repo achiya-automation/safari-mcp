@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.11] - 2026-04-12
+
+### Added
+
+- `safari_native_keyboard` tool — OS-level keyboard event via macOS CGEvent, targeted to the Safari window ID without activating Safari. Produces `isTrusted: true` events that bypass React trust checks in Discord ProseMirror, Slack virtualized editors, and similar trust-gated UIs. Supports all common keys (enter, tab, escape, arrows, letters, digits, punctuation) and modifiers (cmd, shift, alt, ctrl). **No focus stealing** — runs entirely in the background.
+
+### Fixed
+
+- Operations that required a real keypress previously had no zero-focus-steal path; users (and automation agents) had to fall back to `osascript "tell application \"Safari\" to activate"` which brings Safari to the foreground and interrupts whatever the user is doing. `safari_native_keyboard` closes this gap so pressing Enter in Discord, Slack, or any ProseMirror-backed editor no longer pops Safari in front of the user.
+
 ## [2.7.10] - 2026-04-12
 
 ### Added
