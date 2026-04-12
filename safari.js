@@ -1578,9 +1578,30 @@ export async function pressKey({ key, modifiers = [] }) {
         }
       }
       el.dispatchEvent(new KeyboardEvent('keyup', opts));
+      // ContentEditable + Enter: check if the app actually handled it.
+      // If editor content didn't change (no submit, no newline), the JS
+      // keydown was ignored (isTrusted:false). Signal for native fallback.
+      if ('${safeKey}' === 'Enter' && el.isContentEditable && !${shiftKey} && !prevented) {
+        return '__ENTER_NOT_HANDLED__';
+      }
       return 'OK';
     })()`
   );
+
+  // Fallback for ContentEditable Enter that wasn't handled by JS keydown:
+  // apps like Discord/Slack require isTrusted:true. Briefly activate Safari
+  // (~50ms), send real keystroke, then immediately restore the previous
+  // frontmost app. The visual flash is imperceptible (<100ms total).
+  if (result === '__ENTER_NOT_HANDLED__') {
+    const savedApp = await saveFrontmostApp();
+    await osascript(`tell application "Safari" to activate`);
+    await new Promise(r => setTimeout(r, 80));
+    await osascript(`tell application "System Events" to keystroke return`);
+    await new Promise(r => setTimeout(r, 50));
+    await restoreFocusIfStolen(savedApp);
+    return `Pressed: enter (native fallback — brief activate+restore)`;
+  }
+
   return `Pressed: ${modifiers.length ? modifiers.join("+") + "+" : ""}${key}`;
 }
 

@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added troubleshooting note for "Not authorized" errors after `npm update` — updating changes the binary's cdhash, which causes macOS to silently revoke Automation permission. Users need to re-grant via the `osascript` one-liner.
 - Entitlements file (`safari-helper.entitlements`) now ships with the npm package for users building from source.
 
+## [2.7.14] - 2026-04-12
+
+### Fixed
+
+- `safari_press_key` Enter on contenteditable now has a **native fallback** when the JS keydown isn't handled (isTrusted:false rejection by Discord/Slack/etc.). The fallback briefly activates Safari (~80ms), sends a real keystroke, then immediately restores the previous frontmost app — total visual flash <130ms, imperceptible to most users. This closes the last gap in Discord automation: text insertion via `cmd+v` (Slate state-aware) + Enter submission via native fallback. The fallback ONLY fires when the JS path fails (returns `__ENTER_NOT_HANDLED__`), so apps that accept synthetic events still use the zero-focus-steal JS path.
+
 ## [2.7.13] - 2026-04-12
 
 ### Fixed
