@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.14] - 2026-04-12
+
+### Fixed
+
+- **`safari-helper` now includes `com.apple.security.automation.apple-events` entitlement.** This helps macOS correctly identify the binary's intent and surface the TCC Automation prompt more reliably on first launch from an IDE. Previously, the ad-hoc signature had no entitlements, causing some setups to silently deny Apple Events without ever prompting.
+- Added troubleshooting note for "Not authorized" errors after `npm update` — updating changes the binary's cdhash, which causes macOS to silently revoke Automation permission. Users need to re-grant via the `osascript` one-liner.
+- Entitlements file (`safari-helper.entitlements`) now ships with the npm package for users building from source.
+
 ## [2.7.13] - 2026-04-12
 
 ### Fixed

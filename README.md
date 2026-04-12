@@ -437,6 +437,10 @@ xcodebuild -project "xcode/Safari MCP/Safari MCP.xcodeproj" \
 APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData/Safari_MCP-*/Build/Products/Release -name "Safari MCP.app" -maxdepth 2 | head -1)
 codesign --sign - --force --deep "$APP_PATH"
 
+# 4. Re-sign safari-helper with the Apple Events entitlement
+# (helps macOS surface the TCC Automation prompt reliably)
+codesign --sign - --force --entitlements safari-helper.entitlements safari-helper
+
 # 4. Open the app (needed once so Safari registers the extension)
 open "$APP_PATH"
 ```
@@ -490,6 +494,7 @@ That call registers the Terminal app in the Automation database and then trigger
 |-------|-----|
 | "AppleScript error" | Enable "Allow JavaScript from Apple Events" in Safari → Develop |
 | "Not authorized to send Apple events to Safari" | Grant Automation → Safari to your IDE (see above) |
+| "Not authorized" after `npm update` | Updating changes the binary's cdhash — macOS silently revokes Automation permission. Re-run the `osascript` one-liner above to re-grant it |
 | Screenshots empty | Grant Screen Recording permission to Terminal/VS Code |
 | Tab not found | Call `safari_list_tabs` to refresh tab indices |
 | Hebrew keyboard issues | All typing uses JS events — immune to keyboard layout |
