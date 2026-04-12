@@ -1593,19 +1593,7 @@ export async function pressKey({ key, modifiers = [] }) {
   // (~50ms), send real keystroke, then immediately restore the previous
   // frontmost app. The visual flash is imperceptible (<100ms total).
   if (result === '__ENTER_NOT_HANDLED__') {
-    const savedApp = await saveFrontmostApp();
-    // Visually switch to the MCP-tracked tab — safari_switch_tab only tracks
-    // internally but doesn't change which tab Safari shows. The keystroke must
-    // land on the VISIBLE tab, so we force-switch here.
-    if (_activeTabIndex) {
-      await osascript(`tell application "Safari" to tell ${getTargetWindowRef()} to set current tab to tab ${_activeTabIndex}`);
-    }
-    await osascript(`tell application "Safari" to activate`);
-    await new Promise(r => setTimeout(r, 80));
-    await osascript(`tell application "System Events" to keystroke return`);
-    await new Promise(r => setTimeout(r, 50));
-    await restoreFocusIfStolen(savedApp);
-    return `Pressed: enter (native fallback — brief activate+restore)`;
+    return `Pressed: enter (JS keydown dispatched but not handled — the app likely requires isTrusted:true. Editor content is ready; the user needs to press Enter in Safari to submit.)`;
   }
 
   return `Pressed: ${modifiers.length ? modifiers.join("+") + "+" : ""}${key}`;
