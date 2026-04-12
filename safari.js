@@ -1551,7 +1551,7 @@ export async function pressKey({ key, modifiers = [] }) {
   const shiftKey = hasShift;
   const altKey = modifiers.some((m) => m.toLowerCase() === "alt");
 
-  await runJS(
+  const result = await runJS(
     `(function(){
       var el = document.activeElement || document.body;
       var opts = {key:'${safeKey}',code:'Key${safeKey.length === 1 ? safeKey.toUpperCase() : safeKey}',bubbles:true,cancelable:true,shiftKey:${shiftKey},altKey:${altKey}};
