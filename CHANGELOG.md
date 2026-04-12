@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.13] - 2026-04-12
+
+### Fixed
+
+- `safari_press_key` Enter on contenteditable no longer inserts a line break. Modern editors (Discord Slate, Slack, Notion, Medium) handle Enter in their own keydown handler to trigger submit/send. The old fallback `execCommand('insertLineBreak')` was double-acting — the app tries to submit AND MCP adds a newline, corrupting the editor state and preventing actual submission. Now:
+  - **INPUT** → form submit (unchanged)
+  - **TEXTAREA** → insertLineBreak (unchanged)
+  - **ContentEditable + Enter** → keydown event only, let the app decide (fixed)
+  - **ContentEditable + Shift+Enter** → insertLineBreak (newline, as expected)
+
 ## [2.7.12] - 2026-04-12
 
 ### Added

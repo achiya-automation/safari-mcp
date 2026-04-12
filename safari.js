@@ -1560,7 +1560,12 @@ export async function pressKey({ key, modifiers = [] }) {
       if (!prevented) {
         if ('${safeKey}' === 'Enter') {
           if (el.tagName === 'INPUT') { el.form && el.form.dispatchEvent(new Event('submit',{bubbles:true})); }
-          else { document.execCommand('insertLineBreak'); }
+          else if (el.tagName === 'TEXTAREA') { document.execCommand('insertLineBreak'); }
+          else if (el.isContentEditable && ${shiftKey}) { document.execCommand('insertLineBreak'); }
+          // ContentEditable + Enter (no Shift): do NOT insertLineBreak.
+          // Modern editors (Discord Slate, Slack, Notion, Medium) handle Enter
+          // in their own keydown listener to trigger submit/send/newBlock.
+          // insertLineBreak would double-act: the app submits AND we add a newline.
         } else if ('${safeKey}' === 'Tab') {
           var focusable = [...document.querySelectorAll('input,textarea,select,button,a,[tabindex]')].filter(function(e){return e.tabIndex>=0;});
           var idx = focusable.indexOf(el);
