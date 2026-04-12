@@ -552,6 +552,19 @@ Your support funds:
 
 ---
 
+## Ecosystem
+
+Other macOS MCP servers that complement Safari MCP:
+
+| Project | What it does | When to use |
+|---------|-------------|-------------|
+| [mcp-server-macos-use](https://github.com/mediar-ai/mcp-server-macos-use) | OS-level macOS automation (accessibility, screen control) | System-wide interactions beyond Safari |
+| [chrome-devtools-mcp](https://github.com/anthropics/chrome-devtools-mcp) | Chrome DevTools Protocol | Lighthouse audits, Chrome-specific performance traces |
+
+> Using Safari MCP alongside Chrome DevTools MCP? Safari handles 95% of daily browsing (zero overhead), Chrome handles the 5% that needs Lighthouse or Chrome-specific traces.
+
+---
+
 ## Like it? Give it a ⭐
 
 If Safari MCP saves you from Chrome overhead, **a star helps others discover it:**
