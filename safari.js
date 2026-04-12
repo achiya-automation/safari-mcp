@@ -1419,6 +1419,24 @@ const macKeyCodeMap = {
 // to the Safari window WITHOUT activating Safari or moving the mouse.
 // This produces isTrusted:true events that bypass React trust checks (Discord ProseMirror,
 // Slack virtualized editors, etc.) without any focus stealing. Requires Safari window ID.
+// Native type via clipboard paste (CGEvent Cmd+V targeted to Safari window).
+// Inserts text into ANY editor (ProseMirror, Slate, Draft.js, regular inputs,
+// contenteditable, cross-origin iframes) by going through the real paste pipeline.
+// Unlike safari_fill's synthetic paste, this updates the framework's internal
+// model state, so subsequent operations (like pressing Enter to submit in Discord)
+// see the text as "really there".
+export async function nativeType({ value, selector, ref }) {
+  await ensureHelpers();
+  if (!value) throw new Error("nativeType requires 'value'");
+  // Focus the target element if selector/ref provided
+  if (ref || selector) {
+    const sel = ref ? refSelector(ref) : selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    await runJS(`(function(){ var el=document.querySelector('${sel}'); if(el){el.focus();el.click();} return el?'focused':'not found'; })()`);
+    await new Promise(r => setTimeout(r, 50));
+  }
+  return await _nativeTypeViaClipboard(value);
+}
+
 export async function nativeKeyboard({ key, modifiers = [] }) {
   await ensureHelpers();
   if (!key) throw new Error("nativeKeyboard requires 'key'");
@@ -1561,13 +1579,16 @@ export async function pressKey({ key, modifiers = [] }) {
   return `Pressed: ${modifiers.length ? modifiers.join("+") + "+" : ""}${key}`;
 }
 
-// Native typing via clipboard paste — for cross-origin iframes (Intercom, Zendesk, etc.)
-// JS can't access content inside cross-origin iframes, so we use OS-level CGEvent:
-// 1. Save current clipboard
-// 2. Set clipboard to our text
-// 3. Cmd+V via CGEvent keyboard (targeted to window — NO focus steal, NO activate)
-// 4. Restore clipboard
-// Requires nativeClick to have focused the input inside the iframe first.
+// ========== NATIVE TYPE VIA CLIPBOARD PASTE ==========
+// Uses OS-level clipboard + CGEvent Cmd+V to insert text. Produces a REAL paste event
+// that ProseMirror/Slate/Draft.js process through their native paste handlers, updating
+// internal model state (not just the DOM). Also works for cross-origin iframes.
+// NO focus steal — sends CGEvent Cmd+V targeted to Safari window ID.
+//
+// Why this matters: synthetic DOM manipulation (safari_fill's "synthetic paste") writes
+// to the DOM but doesn't update React/ProseMirror state. Discord's onSubmit reads from
+// state, not DOM, so Enter submits empty. This function fixes that by going through the
+// real paste pipeline.
 async function _nativeTypeViaClipboard(text) {
   await _acquireClipboardLock();
   try {

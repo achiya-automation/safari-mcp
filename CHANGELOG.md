@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.12] - 2026-04-12
+
+### Added
+
+- `safari_native_type` tool — inserts text into any editor via OS-level clipboard paste (CGEvent Cmd+V targeted to Safari window). Unlike `safari_fill` which writes to the DOM directly (breaking ProseMirror/Slate/Draft.js internal state), `safari_native_type` goes through the browser's real paste pipeline. The framework processes the paste event natively, so its model stays in sync with the DOM. After calling `safari_native_type`, pressing Enter via `safari_native_keyboard` will actually submit the form — because the framework state matches the visible content. Saves and restores the user's clipboard. No focus stealing.
+
+### Why this matters
+
+This closes the last gap in the Discord/Slack automation chain:
+1. `safari_hover` → find server by tooltip name
+2. `safari_click` → enter channel
+3. `safari_native_type` → paste message into ProseMirror editor (state-aware)
+4. `safari_native_keyboard {key: "enter"}` → submit (no focus steal)
+
+Previously step 3 used `safari_fill` which worked visually but the text wasn't "really there" from Discord's perspective — leading to empty submissions on Enter.
+
 ## [2.7.11] - 2026-04-12
 
 ### Added

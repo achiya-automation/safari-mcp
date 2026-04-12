@@ -1022,6 +1022,20 @@ server.tool(
   }
 );
 
+server.tool(
+  "safari_native_type",
+  "Insert text into ANY editor via OS-level clipboard paste (CGEvent Cmd+V targeted to Safari window). Unlike safari_fill which manipulates DOM directly (breaking React/ProseMirror state), this goes through the real paste pipeline — ProseMirror/Slate/Draft.js process the paste event natively and update their internal model. After native_type, pressing Enter (via safari_native_keyboard) will actually submit the form because the framework state matches the DOM. Saves and restores the user's clipboard. No focus stealing. Use for Discord, Slack, and any editor where safari_fill works visually but the content isn't 'really there' when you try to submit.",
+  {
+    value: z.string().describe("Text to insert via clipboard paste"),
+    selector: z.string().optional().describe("CSS selector of the editor element to focus first"),
+    ref: z.string().optional().describe("Ref ID from safari_snapshot to focus first"),
+  },
+  async (args) => {
+    const result = await safari.nativeType(args);
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+  }
+);
+
 // ========== FORM INPUT ==========
 
 server.tool(
