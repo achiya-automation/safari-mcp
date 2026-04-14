@@ -1,6 +1,6 @@
 {
   "name": "safari-mcp",
-  "version": "2.7.16",
+  "version": "2.8.0",
   "mcpName": "io.github.achiya-automation/safari-mcp",
   "description": "Safari browser automation for AI agents — native macOS, zero Chrome overhead. 80 tools via AppleScript + JavaScript.",
   "type": "module",
@@ -10,7 +10,8 @@
     "safari-mcp": "index.js"
   },
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "postinstall": "node scripts/postinstall.cjs || true"
   },
   "keywords": [
     "safari",
@@ -67,7 +68,8 @@
     "glama.json",
     "LICENSE",
     "README.md",
-    "index.d.ts"
+    "index.d.ts",
+    "scripts/postinstall.cjs"
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",

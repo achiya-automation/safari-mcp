@@ -1,0 +1,14 @@
+runtime: "container"
+build:
+  dockerfile: "Dockerfile"
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    properties: {}
+    required: []
+  commandFunction: |
+    () => ({
+      command: "node",
+      args: ["smithery-entry.js"]
+    })

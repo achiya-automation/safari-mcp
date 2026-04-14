@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.0] - 2026-04-14
+
+### Added
+
+- **Postinstall welcome banner** (`scripts/postinstall.cjs`) — printed once after `npm install`, shows next-step setup and a discoverable star CTA. Skipped silently in CI and when `SAFARI_MCP_SILENT_INSTALL=1` is set.
+- **Once-per-day startup banner** in `index.js` — written to stderr (never stdout, so MCP protocol is untouched) on the first server start of the day. Includes version, capability summary, and a one-line star link. Suppressed by `SAFARI_MCP_QUIET=1`.
+- **`smithery.yaml`** — Smithery deployment config, points at the existing `smithery-entry.js` (no top-level `await`).
+
+### Changed
+
+- **README revamp for discoverability:**
+  - New social-proof badge row: MCP Registry, Glama, Awesome MCP, CLI-Anything.
+  - Prominent star CTA block right after Quick Start (was buried at line 568).
+  - New "Why Safari MCP and Not the Other Safari MCP Projects?" comparison table — clarifies how this project differs from `lxman/safari-mcp-server`, `Epistates/MCPSafari`, and `HayoDev/safari-devtools-mcp`.
+  - Removed duplicate "vs. Chrome DevTools MCP / Playwright MCP" section.
+- **GitHub topics** updated for better organic discovery — added `claude-code`, `safari-mcp`, `mcp` to the topic set.
+
 ## [2.7.14] - 2026-04-12
 
 ### Fixed

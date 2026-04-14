@@ -2159,6 +2159,28 @@ server.tool(
 
 // ========== START SERVER ==========
 
+// One-time-per-day startup banner — visible CTA without spamming MCP logs.
+// Stderr only (stdout is reserved for MCP protocol). Skipped if SAFARI_MCP_QUIET=1.
+try {
+  if (process.env.SAFARI_MCP_QUIET !== "1") {
+    const bannerStateFile = join(homedir(), ".safari-mcp", "last-banner");
+    if (!existsSync(OWNERSHIP_DIR)) mkdirSync(OWNERSHIP_DIR, { recursive: true });
+    let lastShown = 0;
+    try { lastShown = parseInt(readFileSync(bannerStateFile, "utf8"), 10) || 0; } catch {}
+    const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+    if (Date.now() - lastShown > ONE_DAY_MS) {
+      const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "package.json");
+      let version = "?";
+      try { version = JSON.parse(readFileSync(pkgPath, "utf8")).version; } catch {}
+      console.error("");
+      console.error(`[Safari MCP] 🦁 v${version} ready — 80 tools, native WebKit, zero Chrome.`);
+      console.error(`[Safari MCP] ⭐ Like it? Star: https://github.com/achiya-automation/safari-mcp`);
+      console.error("");
+      try { writeFileSync(bannerStateFile, String(Date.now()), { mode: 0o600 }); } catch {}
+    }
+  }
+} catch { /* banner is best-effort, never block startup */ }
+
 _startMemoryMonitor();
 const transport = new StdioServerTransport();
 await server.connect(transport);

@@ -5,3 +5,9 @@ node_modules/
 
 .mcpregistry_*
 .launch-day/
+
+# MCP Registry publisher binary (downloaded locally, not for commit)
+mcp-publisher
+
+# Smithery build artifacts
+.smithery/

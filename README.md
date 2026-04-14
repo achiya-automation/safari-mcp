@@ -13,6 +13,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![macOS](https://img.shields.io/badge/macOS-only-blue)](https://www.apple.com/macos/)
 [![GitHub stars](https://img.shields.io/github/stars/achiya-automation/safari-mcp?style=social)](https://github.com/achiya-automation/safari-mcp/stargazers)
+
+[![MCP Registry](https://img.shields.io/badge/MCP-Registry-purple?logo=anthropic)](https://registry.modelcontextprotocol.io/)
+[![Glama](https://img.shields.io/badge/Glama-Listed-7c3aed)](https://glama.ai/mcp/servers/g0upg7gyex)
+[![Awesome MCP](https://img.shields.io/badge/Awesome%20MCP-Featured-ff69b4)](https://github.com/punkpeye/awesome-mcp-servers)
 [![Featured in CLI-Anything](https://img.shields.io/badge/Featured%20in-CLI--Anything-blueviolet)](https://github.com/HKUDS/CLI-Anything/pull/212)
 
 <a href="vscode:mcp/install?%7B%22safari-mcp%22%3A%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D%7D"><img src="https://img.shields.io/badge/VS_Code-Install_Server-0078d4?logo=visual-studio-code&logoColor=white" alt="Install in VS Code"></a>
@@ -118,6 +122,21 @@ git clone https://github.com/achiya-automation/safari-mcp.git
 cd safari-mcp && npm install
 ```
 </details>
+
+---
+
+<div align="center">
+
+### ⭐ Found Safari MCP useful?
+
+**A star takes 2 seconds and helps other macOS developers discover this.**
+
+[![Star on GitHub](https://img.shields.io/github/stars/achiya-automation/safari-mcp?style=for-the-badge&logo=github&color=yellow&label=Star%20this%20repo)](https://github.com/achiya-automation/safari-mcp)
+
+*4,000+ developers install Safari MCP every month. Less than 1% star it.*
+*If it saves you Chrome heat, give it back a click.*
+
+</div>
 
 ---
 
@@ -351,22 +370,32 @@ Safari MCP runs locally on your Mac with minimal attack surface:
 
 > **Tip:** Use Safari MCP for daily browsing tasks (95% of work) and Chrome DevTools MCP only for Lighthouse/Performance audits.
 
-### Safari MCP Servers Comparison
+### Why Safari MCP and Not the Other Safari MCP Projects?
 
-| Feature | **safari-mcp** | MCPSafari | safari-mcp-server |
-|---------|:--------------:|:---------:|:-----------------:|
-| Tools | **80** | 23 | ~10 |
-| License | **MIT** | None | MIT |
-| Install | npm / Homebrew | Binary | npm |
-| Storage (cookies, localStorage) | **10 tools** | None | None |
-| Data extraction (tables, links) | **5 tools** | None | None |
-| Network mocking | **Yes** | No | No |
-| Device emulation | **Yes** | No | No |
-| File upload (no dialog) | **Yes** | No | No |
-| PDF export | **Yes** | No | No |
-| Console capture | **4 tools** | 1 | No |
-| Performance metrics | **Yes** | No | No |
-| Fallback engine | **Dual (Extension + AppleScript)** | Extension only | WebDriver |
+There are several "safari-mcp" projects floating around. Here's how they compare:
+
+| Feature | **🦁 safari-mcp** *(this repo)* | [lxman/safari-mcp-server](https://github.com/lxman/safari-mcp-server) | [Epistates/MCPSafari](https://github.com/Epistates/MCPSafari) | [HayoDev/safari-devtools-mcp](https://github.com/HayoDev/safari-devtools-mcp) |
+|---------|:------------------------------:|:----------------------:|:------------:|:----------------------:|
+| **Tools** | **80** | ~10 | 23 | ~15 |
+| **Install** | `npx safari-mcp` | Manual | Binary | `npx` |
+| **Engine** | **Dual** (Extension + AppleScript) | WebDriver | Extension only | DevTools Protocol |
+| **Keeps your real Safari logins** | ✅ Yes | ⚠️ Limited | ✅ Yes | ❌ Debug session |
+| **Background (no focus steal)** | ✅ Yes | ❌ No | ⚠️ Sometimes | ✅ Yes |
+| **Storage tools** (cookies, localStorage, IndexedDB) | **10** | 0 | 0 | 2 |
+| **Data extraction** (tables, meta, images, links) | **4** | 0 | 0 | 0 |
+| **Network mocking** | ✅ Yes | ❌ No | ❌ No | ❌ No |
+| **Device emulation** (iPhone, iPad, Pixel) | ✅ Yes | ❌ No | ❌ No | ❌ No |
+| **File upload** (no dialog) | ✅ JS DataTransfer | ❌ No | ❌ No | ❌ No |
+| **Image paste** (no clipboard touch) | ✅ Yes | ❌ No | ❌ No | ❌ No |
+| **PDF export** | ✅ Yes | ❌ No | ❌ No | ❌ No |
+| **Console capture** | **4 tools** | 0 | 1 | 1 |
+| **Performance metrics + Web Vitals** | ✅ Yes | ❌ No | ❌ No | ⚠️ Partial |
+| **Active maintenance** | ✅ Multiple releases/week | 🟡 Sporadic | 🟡 Slow | 🟡 Slow |
+| **License** | **MIT** | MIT | None specified | MIT |
+| **In MCP Registry** | ✅ | ❌ | ❌ | ✅ |
+| **In Awesome MCP** | ✅ | ❌ | ❌ | ❌ |
+
+> **TL;DR** — if you want the most complete Safari MCP with the smoothest install, the most tools, and active maintenance, **this is the one**.
 
 ---
 
