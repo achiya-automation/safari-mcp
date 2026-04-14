@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.2] - 2026-04-14
+
+### Added
+
+- **README: Featured on HackerNoon** — added prominent badge and quote linking to the new technical deep-dive [I Had to Reverse-Engineer React, Shadow DOM, and CSP to Automate Safari Without Chrome](https://hackernoon.com/i-had-to-reverse-engineer-react-shadow-dom-and-csp-to-automate-safari-without-chrome) (published 2026-04-14). The article walks through the three hardest problems behind safari-mcp: React's `_valueTracker` workaround, recursive Shadow DOM traversal with MutationObserver caching, and the 4-strategy CSP fallback chain.
+
 ## [2.8.1] - 2026-04-14
 
 ### Added

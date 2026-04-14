@@ -6,12 +6,12 @@
     "url": "https://github.com/achiya-automation/safari-mcp",
     "source": "github"
   },
-  "version": "2.8.1",
+  "version": "2.8.2",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "safari-mcp",
-      "version": "2.8.1",
+      "version": "2.8.2",
       "transport": {
         "type": "stdio"
       },

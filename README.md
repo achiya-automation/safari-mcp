@@ -17,6 +17,7 @@
 [![MCP Registry](https://img.shields.io/badge/MCP-Registry-purple?logo=anthropic)](https://registry.modelcontextprotocol.io/)
 [![Glama](https://img.shields.io/badge/Glama-Listed-7c3aed)](https://glama.ai/mcp/servers/g0upg7gyex)
 [![Awesome MCP](https://img.shields.io/badge/Awesome%20MCP-Featured-ff69b4)](https://github.com/punkpeye/awesome-mcp-servers)
+[![Featured on HackerNoon](https://img.shields.io/badge/Featured%20on-HackerNoon-00FE9A?logo=hackernoon&logoColor=black)](https://hackernoon.com/i-had-to-reverse-engineer-react-shadow-dom-and-csp-to-automate-safari-without-chrome)
 [![Featured in CLI-Anything](https://img.shields.io/badge/Featured%20in-CLI--Anything-blueviolet)](https://github.com/HKUDS/CLI-Anything/pull/212)
 
 <a href="vscode:mcp/install?%7B%22safari-mcp%22%3A%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D%7D"><img src="https://img.shields.io/badge/VS_Code-Install_Server-0078d4?logo=visual-studio-code&logoColor=white" alt="Install in VS Code"></a>
@@ -32,6 +33,8 @@
 </div>
 
 > **TL;DR:** Use your real Safari with all your logins, cookies, and sessions. No headless browsers, no Chrome, no Puppeteer. Just native AppleScript + JavaScript on macOS — 60% less CPU/heat on Apple Silicon.
+
+> 📰 **Featured on HackerNoon:** [I Had to Reverse-Engineer React, Shadow DOM, and CSP to Automate Safari Without Chrome](https://hackernoon.com/i-had-to-reverse-engineer-react-shadow-dom-and-csp-to-automate-safari-without-chrome) — the three hardest technical problems behind Safari MCP and the code that solved them.
 
 ### 🤔 Why not just use Playwright or Chrome DevTools MCP?
 
@@ -135,6 +138,8 @@ cd safari-mcp && npm install
 
 *4,000+ developers install Safari MCP every month. Less than 1% star it.*
 *If it saves you Chrome heat, give it back a click.*
+
+📰 **[Read the deep-dive on HackerNoon →](https://hackernoon.com/i-had-to-reverse-engineer-react-shadow-dom-and-csp-to-automate-safari-without-chrome)**
 
 </div>
 
