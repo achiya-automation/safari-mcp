@@ -51,3 +51,31 @@ jobs:
       - name: Publish to npm
         if: steps.check.outputs.exists == 'false'
         run: npm publish --provenance --access public
+
+      - name: Sync server.json version to match package.json
+        run: |
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            const s = JSON.parse(fs.readFileSync('server.json', 'utf8'));
+            s.version = pkg.version;
+            if (Array.isArray(s.packages)) {
+              for (const p of s.packages) p.version = pkg.version;
+            }
+            fs.writeFileSync('server.json', JSON.stringify(s, null, 2) + '\n');
+          "
+          cat server.json
+
+      - name: Download mcp-publisher
+        run: |
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "x86_64" ]; then ARCH=amd64; fi
+          curl -sL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_darwin_${ARCH}.tar.gz" -o mcp-publisher.tar.gz
+          tar -xzf mcp-publisher.tar.gz mcp-publisher
+          chmod +x mcp-publisher
+          ./mcp-publisher --help | head -3
+
+      - name: Publish to MCP Registry
+        run: |
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish
