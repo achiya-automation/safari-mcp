@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.3] - 2026-04-14
+
+### Fixed
+
+- **Tab tracking: bulletproof identity via `window.__mcpTabMarker`** — discovered during the v2.8.2 launch campaign that `safari_evaluate` could occasionally land on the wrong tab when `safari_new_tab` and `safari_evaluate` were called more than ~500 ms apart and a popup/redirect added a new tab in the meantime. Root cause: `resolveActiveTab` relied on URL prefix matching, which fails when the page redirects (e.g. LinkedIn `/feed/` → `/feed/?shareActive=true`) or when query strings change. Fix: every `safari_new_tab` now writes a unique marker into `window.__mcpTabMarker`, and `resolveActiveTab` uses that marker as the primary identification strategy. The URL/domain matching remains as a fallback for tabs created before the marker was set. Marker survives same-tab navigation, query changes, and history pushState.
+- **Resolve cache reduced from 500 ms to 100 ms** — was masking the multi-tab race when calls were spaced more than 100 ms apart but less than 500 ms. The marker check above is cheap (~5 ms), so the tighter cache adds negligible latency.
+
 ## [2.8.2] - 2026-04-14
 
 ### Added

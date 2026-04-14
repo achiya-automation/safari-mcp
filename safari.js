@@ -156,7 +156,8 @@ let _activeTabIndex = null; // null = use front document (default)
 let _activeTabURL = null;   // URL-based tracking (stable even when tabs shift)
 let _lastResolveTime = 0;   // Cache: skip resolve if verified recently
 let _lastTabCount = null;   // Track tab count for smart cache invalidation
-const RESOLVE_CACHE_MS = 500; // Brief cache — invalidated on tab count change
+let _activeTabMarker = null; // window.__mcpTabMarker — survives same-tab navigation, bulletproof tab identity
+const RESOLVE_CACHE_MS = 100; // Brief cache — was 500, reduced to catch tabs added by user/popups (v2.8.3 fix)
 
 // ========== DIAGNOSTIC LOG ==========
 // File-based log for profile/focus issues — survives MCP restart, visible to user
@@ -331,7 +332,41 @@ export function setActiveTabURL(url) { _activeTabURL = url; _lastResolveTime = D
 
 // Resolve our tracked URL to current tab index — single combined osascript call
 async function resolveActiveTab() {
+  if (!_activeTabURL && !_activeTabMarker) return _activeTabIndex;
+
+  // Strategy 1: window.__mcpTabMarker (bulletproof — survives navigation, redirects, query changes)
+  // Only attempted if we have a marker AND a cached index hint
+  if (_activeTabMarker && _activeTabIndex) {
+    try {
+      const safeMarker = _activeTabMarker.replace(/'/g, "\\'");
+      // Single JS call: check cached index first, then walk all tabs to find marker
+      const checkScript = `(function(){return window.__mcpTabMarker==='${safeMarker}'?'1':'0'})()`;
+      const matchAtCached = await osascriptFast(
+        `tell application "Safari" to do JavaScript "${checkScript}" in tab ${_activeTabIndex} of ${getTargetWindowRef()}`
+      ).catch(() => '0');
+      if (String(matchAtCached).trim() === '1') return _activeTabIndex;
+      // Cached index doesn't match — scan all tabs for marker
+      const tabCountStr = await osascriptFast(
+        `tell application "Safari" to return count of tabs of ${getTargetWindowRef()}`
+      ).catch(() => '0');
+      const tabCount = Number(tabCountStr) || 0;
+      for (let i = tabCount; i >= 1; i--) {
+        const m = await osascriptFast(
+          `tell application "Safari" to do JavaScript "${checkScript}" in tab ${i} of ${getTargetWindowRef()}`
+        ).catch(() => '0');
+        if (String(m).trim() === '1') {
+          _activeTabIndex = i;
+          _lastTabCount = tabCount;
+          return i;
+        }
+      }
+      // Marker not found anywhere — page reloaded or tab closed
+      _activeTabMarker = null;
+    } catch { /* fall through to URL strategy */ }
+  }
+
   if (!_activeTabURL) return _activeTabIndex;
+
   try {
     const safeUrl = _activeTabURL.replace(/"/g, '\\"');
     const domain = _activeTabURL.replace(/^https?:\/\//, '').split('/')[0].replace(/"/g, '\\"');
@@ -2112,6 +2147,11 @@ export async function newTab(url = "") {
   _activeTabURL = url || null;
   _lastResolveTime = Date.now();
   _lastTabCount = Number(tabCount);  // Update tab count cache
+  // Set bulletproof tab marker — survives same-tab navigation, redirects, query changes (v2.8.3)
+  _activeTabMarker = `MCP_${SESSION_ID}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  await osascriptFast(
+    `tell application "Safari" to do JavaScript "window.__mcpTabMarker='${_activeTabMarker}'" in tab ${_activeTabIndex} of ${getTargetWindowRef()}`
+  ).catch(() => {});
   // Wait for page load if URL given
   if (url) {
     try {
