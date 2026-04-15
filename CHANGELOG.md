@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.4] - 2026-04-16
+
+### Fixed
+
+- **`SESSION_ID is not defined` runtime error on `safari_new_tab`** — introduced by v2.8.3's bulletproof tab marker. The marker code at `safari.js:2151` references `SESSION_ID`, but that const was only declared in `index.js` (not exported), so the separate `safari.js` ES module threw `ReferenceError: SESSION_ID is not defined` whenever a new tab went through the marker path. Symptom: `safari_new_tab` returned `SESSION_ID is not defined` but the tab still opened in Safari — subsequent calls then failed the tab-ownership safety check, making the MCP unusable for form-driven workflows (HubSpot AEO, Semrush AI Visibility, GTmetrix, etc.). Fix: declare a local `const SESSION_ID = randomUUID().slice(0, 8)` in `safari.js` (each ES module gets its own, which is fine — the marker only needs per-process uniqueness).
+
 ## [2.8.3] - 2026-04-14
 
 ### Fixed

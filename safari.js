@@ -10,10 +10,14 @@ import { join, dirname, resolve as resolvePath } from "node:path";
 import { readFile, writeFile, unlink, appendFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
 // Extension bridge is handled by index.js (WebSocket server on port 9223)
 
 const execFileAsync = promisify(execFile);
 const __dirname = dirname(fileURLToPath(import.meta.url));
+// Local session ID — kept in sync with index.js SESSION_ID for tab marker generation
+// Both files need their own const because they're separate ES modules; the marker only needs to be unique per process
+const SESSION_ID = randomUUID().slice(0, 8);
 
 // ========== SWIFT HELPER DAEMON ==========
 // Persistent process — no subprocess spawn overhead (~5ms vs ~90ms)
