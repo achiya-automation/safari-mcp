@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.5] - 2026-04-19
+
+### Changed
+
+- **README: above-the-fold rewrite applied** — research-backed overhaul of the hero section based on patterns from the top non-corporate MCP projects (Context7 49K⭐, Serena 23K⭐, Desktop Commander 5.9K⭐, BrowserMCP 6K⭐):
+  - **Tagline:** shortened from 11 words ("The only MCP server for Safari — native browser automation for AI agents") to a Serena-style category claim: **"The browser for your coding agent."** A second italic line (*"Your real Safari, logged in — no Chrome, no heat, no headless."*) carries the three wedges.
+  - **Badges:** reduced from ~10 above the fold to 4 core badges (npm version, downloads, MIT, macOS). Registry/Glama/Awesome/HackerNoon/CLI-Anything moved to the "Listed On" section at the bottom where they belong.
+  - **"❌ Without / ✅ With Safari MCP" block** added immediately after the hero — Context7's killer pattern. Framed against the three real alternatives (Playwright, Chrome DevTools MCP, headless scrapers) instead of the defensive "Why not just use X" question.
+  - **80-tool list collapsed into `<details>`** — the full tool table is still there for depth, but no longer dominates the scroll experience. Top-level content is now skimmable in under 30 seconds.
+  - **Star-scolding block removed** — the "Less than 1% star it" block was an anti-pattern per every top README analyzed. Kept the silent star-history chart at the bottom, which is what Context7/Desktop Commander/Serena all do.
+  - **"What agents unlock with Safari MCP" section** added — Serena-style framing of the capabilities an LLM actually benefits from (authenticated sessions, framework-aware form setters, background operation, batched workflow calls).
+  - **Community count corrected** — "2,000+ monthly" → "6,000+ monthly" to match current npm downloads (~1,500/week × 4).
+
+No API, tool, or code changes — documentation/positioning only.
+
 ## [2.8.4] - 2026-04-16
 
 ### Fixed

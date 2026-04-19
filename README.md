@@ -6,19 +6,14 @@
 
 # 🦁 Safari MCP
 
-**The only MCP server for Safari — native browser automation for AI agents.**
+**The browser for your coding agent.**
+
+*Your real Safari, logged in — no Chrome, no heat, no headless.*
 
 [![npm version](https://img.shields.io/npm/v/safari-mcp)](https://www.npmjs.com/package/safari-mcp)
 [![npm downloads](https://img.shields.io/npm/dm/safari-mcp)](https://www.npmjs.com/package/safari-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![macOS](https://img.shields.io/badge/macOS-only-blue)](https://www.apple.com/macos/)
-[![GitHub stars](https://img.shields.io/github/stars/achiya-automation/safari-mcp?style=social)](https://github.com/achiya-automation/safari-mcp/stargazers)
-
-[![MCP Registry](https://img.shields.io/badge/MCP-Registry-purple?logo=anthropic)](https://registry.modelcontextprotocol.io/)
-[![Glama](https://img.shields.io/badge/Glama-Listed-7c3aed)](https://glama.ai/mcp/servers/g0upg7gyex)
-[![Awesome MCP](https://img.shields.io/badge/Awesome%20MCP-Featured-ff69b4)](https://github.com/punkpeye/awesome-mcp-servers)
-[![Featured on HackerNoon](https://img.shields.io/badge/Featured%20on-HackerNoon-00FE9A?logo=hackernoon&logoColor=black)](https://hackernoon.com/i-had-to-reverse-engineer-react-shadow-dom-and-csp-to-automate-safari-without-chrome)
-[![Featured in CLI-Anything](https://img.shields.io/badge/Featured%20in-CLI--Anything-blueviolet)](https://github.com/HKUDS/CLI-Anything/pull/212)
 
 <a href="vscode:mcp/install?%7B%22safari-mcp%22%3A%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D%7D"><img src="https://img.shields.io/badge/VS_Code-Install_Server-0078d4?logo=visual-studio-code&logoColor=white" alt="Install in VS Code"></a>
 <a href="https://insiders.vscode.dev/redirect?url=vscode-insiders:mcp/install?%7B%22safari-mcp%22%3A%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D%7D"><img src="https://img.shields.io/badge/VS_Code_Insiders-Install_Server-24bfa5?logo=visual-studio-code&logoColor=white" alt="Install in VS Code Insiders"></a>
@@ -32,19 +27,21 @@
 
 </div>
 
-> **TL;DR:** Use your real Safari with all your logins, cookies, and sessions. No headless browsers, no Chrome, no Puppeteer. Just native AppleScript + JavaScript on macOS — 60% less CPU/heat on Apple Silicon.
+## ❌ Without Safari MCP
 
-> 📰 **Featured on HackerNoon:** [I Had to Reverse-Engineer React, Shadow DOM, and CSP to Automate Safari Without Chrome](https://hackernoon.com/i-had-to-reverse-engineer-react-shadow-dom-and-csp-to-automate-safari-without-chrome) — the three hardest technical problems behind Safari MCP and the code that solved them.
+Your AI agent needs to browse. So it either:
 
-### 🤔 Why not just use Playwright or Chrome DevTools MCP?
+- **Spins up Chromium via Playwright** — with no logins, no cookies, no sessions
+- **Uses Chrome DevTools MCP** — and melts your fan running a second browser
+- **Relies on headless scrapers** — blocked by Cloudflare, reCAPTCHA, and bot detection
 
-| Problem | Safari MCP Solution |
-|---------|-------------------|
-| Chrome DevTools MCP heats up your Mac | Native WebKit — ~60% less CPU |
-| Playwright launches a new browser without your logins | Uses your **real Safari** with all sessions |
-| Puppeteer requires Chrome + debug port | Just AppleScript — no extra browser |
-| Headless browsers can't access your authenticated sessions | Gmail, GitHub, Slack — already logged in |
-| Browser automation steals window focus | Safari stays in background, never interrupts |
+## ✅ With Safari MCP
+
+Your AI drives the **Safari you're already logged into** — Gmail, GitHub, Ahrefs, Slack, banking.
+
+Native WebKit. ~60% less CPU. Background operation. 80 tools. One `npx` command. macOS only.
+
+> 📰 **Featured on HackerNoon:** [I Had to Reverse-Engineer React, Shadow DOM, and CSP to Automate Safari Without Chrome](https://hackernoon.com/i-had-to-reverse-engineer-react-shadow-dom-and-csp-to-automate-safari-without-chrome)
 
 ---
 
@@ -128,23 +125,6 @@ cd safari-mcp && npm install
 
 ---
 
-<div align="center">
-
-### ⭐ Found Safari MCP useful?
-
-**A star takes 2 seconds and helps other macOS developers discover this.**
-
-[![Star on GitHub](https://img.shields.io/github/stars/achiya-automation/safari-mcp?style=for-the-badge&logo=github&color=yellow&label=Star%20this%20repo)](https://github.com/achiya-automation/safari-mcp)
-
-*4,000+ developers install Safari MCP every month. Less than 1% star it.*
-*If it saves you Chrome heat, give it back a click.*
-
-📰 **[Read the deep-dive on HackerNoon →](https://hackernoon.com/i-had-to-reverse-engineer-react-shadow-dom-and-csp-to-automate-safari-without-chrome)**
-
-</div>
-
----
-
 ## Usage Workflow
 
 The recommended pattern for AI agents using Safari MCP:
@@ -169,6 +149,9 @@ The recommended pattern for AI agents using Safari MCP:
 ---
 
 ## Tools (80)
+
+<details>
+<summary><b>Click to expand the full tool list — organized by category</b></summary>
 
 ### Navigation (4)
 | Tool | Description |
@@ -340,6 +323,8 @@ The recommended pattern for AI agents using Safari MCP:
 | Tool | Description |
 |------|-------------|
 | `safari_run_script` | Run multiple actions in a single call (batch) |
+
+</details>
 
 ---
 
@@ -576,9 +561,22 @@ Your support funds:
 
 ---
 
+## What agents unlock with Safari MCP
+
+When an AI agent drives Safari MCP, it gets things a headless browser can't:
+
+- **Real authenticated sessions** — Gmail, GitHub, Ahrefs, Slack, banking dashboards are all already logged in
+- **Framework-aware form filling** — `safari_fill_and_submit` calls React/Vue/Angular setters natively, no guessing whether `input` events fired
+- **Background operation** — the agent works in parallel while you keep using your Mac
+- **One MCP call per workflow** — `safari_run_script` batches navigation + clicks + extraction into a single roundtrip
+
+The pattern holds across models: **drive the browser the human already trusts** — you inherit logins, cookies, extensions, and the user's exact environment in one step.
+
+---
+
 ## Community
 
-**2,000+ monthly npm downloads** — developers are using Safari MCP to build AI agents on macOS.
+**6,000+ monthly npm downloads** — developers are building AI agents on macOS with Safari MCP.
 
 - [GitHub Discussions](https://github.com/achiya-automation/safari-mcp/discussions) — ask questions, share use cases
 - [Issues](https://github.com/achiya-automation/safari-mcp/issues) — bug reports and feature requests
