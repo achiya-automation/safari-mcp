@@ -1287,7 +1287,53 @@ async function handleCommand(type, payload) {
           }
         }
         if (!root) return "Element not found: " + rootSelector;
-        let tree = walk(root, 0);
+
+        // TOP-LAYER MODAL DETECTION: when a modal/dialog is open, user intent is almost always
+        // to interact with it, not the page behind. Pages like Google Business Profile, Drive,
+        // Airtable rich dialogs open top-layer content that standard DOM walks miss or bury.
+        // Detect visible modals and, if found, walk them FIRST so their refs appear at the top.
+        let topLayerTree = "";
+        if (!rootSelector) {
+          const seenModals = new Set();
+          const modalSelectors = [
+            'dialog[open]',
+            '[role="dialog"]:not([aria-hidden="true"])',
+            '[role="alertdialog"]:not([aria-hidden="true"])',
+            '[aria-modal="true"]',
+            '[data-radix-dialog-content]',
+            '[data-headlessui-state*="open"][role="dialog"]',
+            '.MuiDialog-container',
+            // Google overlays: Search/GBP/Drive editors use these markers
+            '[jscontroller][aria-modal]',
+            '[jscontroller][role="dialog"]',
+            'c-wiz[role="dialog"]',
+            'c-wiz[aria-modal]'
+          ];
+          for (const sel of modalSelectors) {
+            let nodes;
+            try { nodes = document.querySelectorAll(sel); } catch (_) { continue; }
+            for (const m of nodes) {
+              if (seenModals.has(m)) continue;
+              seenModals.add(m);
+              const cs = window.getComputedStyle(m);
+              if (cs.display === "none" || cs.visibility === "hidden" || cs.opacity === "0") continue;
+              const r = m.getBoundingClientRect();
+              // A real modal covers a meaningful area
+              if (r.width < 150 || r.height < 100) continue;
+              // Tombstones: modals at 0,0 with 0 size are placeholders
+              if (r.width === 0 || r.height === 0) continue;
+              // Nested modals: skip if we already included a parent
+              let isNested = false;
+              for (const other of seenModals) {
+                if (other !== m && other.contains(m)) { isNested = true; break; }
+              }
+              if (isNested) continue;
+              topLayerTree += walk(m, 0);
+            }
+          }
+        }
+
+        let tree = topLayerTree + walk(root, 0);
         // Shadow roots are now walked INLINE inside walk() — no separate walkShadows needed.
         // Walk same-origin iframes
         const iframes = document.querySelectorAll("iframe");

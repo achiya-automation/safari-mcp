@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.0] - 2026-04-20
+
+### Added
+
+- **`safari_snapshot` — auto-detect open top-layer modals/dialogs.** When a dialog is visible
+  (dialog[open], [role="dialog"], [aria-modal="true"], Radix/Headless/MUI containers, or
+  Google's `c-wiz[role="dialog"]` / `[jscontroller][aria-modal]` overlays), the snapshot
+  now walks the modal FIRST so its refs appear at the top of the tree. Solves the pattern
+  where clicking a button opens a dialog but `snapshot` returns only the page behind it
+  (common with Google Business Profile, Google Drive editors, Airtable rich dialogs).
+  Deduplicates nested modals — the outermost visible modal wins.
+
 ## [2.8.9] - 2026-04-20
 
 ### Security
