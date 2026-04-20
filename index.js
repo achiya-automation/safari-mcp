@@ -666,6 +666,8 @@ const _nullMeansFailure = new Set([
 const _noOwnershipCheck = new Set([
   // Tab management
   "new_tab", "list_tabs", "close_tab", "switch_tab",
+  // Extension self-management (doesn't touch tabs)
+  "reload_extension",
   // Read-only — don't modify the page
   "read_page", "get_source", "snapshot", "accessibility_snapshot",
   "get_element", "query_all", "screenshot", "screenshot_element",
@@ -1253,6 +1255,19 @@ server.tool(
       () => safari.listTabs()
     );
     return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.tool(
+  "safari_reload_extension",
+  "Hot-reload the Safari MCP Bridge extension — forces it to reload its own code from disk without requiring manual Safari Preferences → Extensions → toggle. Use after editing extension/background.js or extension/content.js in the safari-mcp repo. The extension briefly disconnects during reload and auto-reconnects within ~2 seconds. NOTE: this tool itself requires the extension version already installed to support the `reload_extension` command (added in v2.9.1+). If your extension is older, trigger a manual reload once to pick up this feature.",
+  {},
+  async () => {
+    const result = await extensionOrFallback(
+      "reload_extension", {},
+      async () => "Extension fallback not available — this command requires the Safari MCP Bridge extension."
+    );
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
 

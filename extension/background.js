@@ -285,6 +285,19 @@ async function handleCommand(type, payload) {
       return targetTab.title;
     }
 
+    // --- Reload Extension (hot-reload after code changes) ---
+    // Allows the MCP server to trigger the extension to reload its own code from disk,
+    // bypassing the need for manual Safari → Preferences → Extensions → toggle.
+    // The WebSocket will disconnect as a side effect; the extension auto-reconnects.
+    case "reload_extension": {
+      // Respond BEFORE reload so the MCP server sees a success result.
+      // Delay the actual reload by a tick so the response can flush over the wire.
+      setTimeout(() => {
+        try { browser.runtime.reload(); } catch (_) { chrome.runtime.reload(); }
+      }, 50);
+      return { reloaded: true, version: browser.runtime.getManifest().version };
+    }
+
     case "read_page": {
       return await execInTab((sel, maxLen) => {
         if (sel) {

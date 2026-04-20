@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.1] - 2026-04-20
+
+### Added
+
+- **`safari_reload_extension` — hot-reload the Safari extension from disk.** After editing
+  `extension/background.js` or `extension/content.js`, call this tool to trigger
+  `browser.runtime.reload()` inside the extension. Safari re-reads the files from disk and
+  the WebSocket auto-reconnects within ~2 seconds. Eliminates the manual toggle dance in
+  Safari → Preferences → Extensions after every code change. This is the final piece that
+  makes safari-mcp self-updating — once v2.9.1+ is loaded once, all future extension code
+  changes deploy with a single MCP call.
+
 ## [2.9.0] - 2026-04-20
 
 ### Added
