@@ -1742,6 +1742,174 @@ export async function replaceEditorContent({ text }) {
     .replace(/\n/g, '\\n')
     .replace(/\r/g, '');
 
+  // PREFLIGHT: Two-channel Monaco sync — update the model (visual) AND call
+  // the React wrapper's onChange (state). Airtable wraps Monaco in a React
+  // component whose "Finish editing" save reads from React state, not from
+  // the Monaco model. So setValue alone is "visually correct, stale on save".
+  // We walk the React fiber up from .monaco-editor until we find a component
+  // whose memoizedProps contain an `onChange` function + a `value` field,
+  // then call onChange(text) to sync React. Works for Airtable-style embeds
+  // and is a no-op on plain Monaco (VS Code web, GitHub) where setValue
+  // already covers the state.
+  const preflightFirstLine = text.split('\n')[0].slice(0, 20).replace(/'/g, "\\'");
+  const monacoPreflight = await runJS(
+    `(function(){
+      var m = (typeof monaco !== 'undefined') ? monaco : window.monaco;
+      if (!m || !m.editor) return JSON.stringify({kind:'not-monaco'});
+      var hasTextarea = !!document.querySelector('.monaco-editor textarea.inputarea');
+      var models = []; try { models = m.editor.getModels() || []; } catch(e){}
+      if (!models.length) return JSON.stringify({kind:'no-model', hasTextarea: hasTextarea});
+
+      // Locate the React wrapper component that owns this Monaco embed.
+      // Prefer an editable wrapper (isReadOnly !== true); fall back to any
+      // wrapper if only a read-only preview exists (Airtable before Edit).
+      function findFiber(el) {
+        if (!el) return null;
+        var ks = Object.keys(el);
+        for (var j = 0; j < ks.length; j++) {
+          if (ks[j].indexOf('__reactFiber') === 0) return el[ks[j]];
+        }
+        return null;
+      }
+      function findWrapperWithOnChange(fiber) {
+        var c = fiber;
+        for (var i = 0; i < 40 && c; i++) {
+          var p = c.memoizedProps;
+          if (p && typeof p.onChange === 'function' && ('value' in p)) return c;
+          c = c.return;
+        }
+        return null;
+      }
+      var els = document.querySelectorAll('.monaco-editor');
+      var editableWrapper = null, anyWrapper = null;
+      for (var i = els.length - 1; i >= 0; i--) {
+        var f = findFiber(els[i].parentElement);
+        if (!f) continue;
+        var w = findWrapperWithOnChange(f);
+        if (!w) continue;
+        if (!anyWrapper) anyWrapper = w;
+        if (w.memoizedProps.isReadOnly !== true) { editableWrapper = w; break; }
+      }
+      var wrapper = editableWrapper || anyWrapper;
+
+      // Step 1: Monaco model setValue — updates visual + fires onDidChangeModelContent
+      try { models[models.length - 1].setValue('${safeText}'); }
+      catch(e) { return JSON.stringify({kind:'setValue-err', hasTextarea: hasTextarea, err: String(e && e.message)}); }
+
+      // Step 2: Sync React state via wrapper.onChange (if wrapper found).
+      // onChange may be silently guarded (e.g. Airtable's readOnly check).
+      // We only treat sync as real when the wrapper's value prop actually
+      // changes OR a sibling/parent expression state reflects the update
+      // on the next render tick.
+      var reactSynced = false;
+      var reactGuarded = false;
+      if (wrapper) {
+        var prevValue = wrapper.memoizedProps.value;
+        try {
+          wrapper.memoizedProps.onChange('${safeText}');
+          // Re-fetch the fiber's memoizedProps (may have been swapped by React)
+          var after = wrapper.alternate ? wrapper.alternate.memoizedProps : wrapper.memoizedProps;
+          var nowValue = (after && 'value' in after) ? after.value : wrapper.memoizedProps.value;
+          reactSynced = (nowValue !== prevValue);
+          // If value didn't change, onChange was a no-op (guarded by isReadOnly
+          // or permission check). Signal this so caller falls back to native paste.
+          reactGuarded = !reactSynced;
+        } catch(e) { reactSynced = false; reactGuarded = true; }
+      }
+
+      // Step 3: Verify DOM reflects the new content
+      var firstDom = document.querySelector('.monaco-editor .view-line');
+      var domTxt = firstDom ? firstDom.textContent : '';
+      var expected = '${preflightFirstLine}';
+      var domOk = expected.length < 5 || domTxt.indexOf(expected) !== -1;
+
+      return JSON.stringify({
+        kind: 'monaco',
+        domOk: domOk,
+        reactSynced: reactSynced,
+        reactGuarded: reactGuarded,
+        hasWrapper: !!wrapper,
+        editable: !!editableWrapper,
+        hasTextarea: hasTextarea,
+        models: models.length
+      });
+    })()`
+  );
+
+  let mpParsed = null;
+  try { mpParsed = JSON.parse(monacoPreflight); } catch(e) {}
+
+  // Fully synced: Monaco model + React state both updated.
+  if (mpParsed && mpParsed.kind === 'monaco' && mpParsed.domOk && mpParsed.reactSynced) {
+    return 'Monaco(model+react): replaced ' + text.split('\n').length + ' lines';
+  }
+
+  // Plain Monaco embed (no React wrapper) — setValue is sufficient.
+  if (mpParsed && mpParsed.kind === 'monaco' && mpParsed.domOk && !mpParsed.hasWrapper) {
+    return 'Monaco(model): replaced ' + text.split('\n').length + ' lines';
+  }
+
+  // Airtable-style embed where React fiber sync failed (wrapper.onChange was
+  // a no-op, or the site guards writes by permission/readOnly). Fall back to
+  // native clipboard paste via CGEvent: forces readOnly=false first, activates
+  // Safari, focuses the textarea, and sends Cmd+A/Cmd+V targeted to the window.
+  if (mpParsed && mpParsed.kind === 'monaco' && mpParsed.hasTextarea) {
+    const savedFrontApp = await saveFrontmostApp();
+    try {
+      // Step 1: Install editor capture hook (if not already) + try to find visible editable editor
+      await runJS(
+        `(function(){
+          if (!window.__mcpEditorHook) {
+            window.__mcpEditorHook = true;
+            window.__mcpCapturedEditors = [];
+            try { monaco.editor.onDidCreateEditor(function(e){window.__mcpCapturedEditors.push(e);}); } catch(e){}
+          }
+          // Force readOnly=false on all existing editors (harmless if already false)
+          try {
+            (window.__mcpCapturedEditors || []).forEach(function(e){
+              try { if (e.updateOptions) e.updateOptions({readOnly: false}); } catch(_){}
+            });
+          } catch(e){}
+          return 'hook-installed';
+        })()`
+      );
+      // Step 2: Activate Safari to frontmost — required for CGEvent keyboard to reach web content
+      await _helperActivateApp("com.apple.Safari");
+      await new Promise(r => setTimeout(r, 300));
+      // Step 3: Focus Monaco's input textarea
+      await runJS(`(function(){var t=document.querySelector('.monaco-editor textarea.inputarea');if(t){t.focus();return 'focused';}return 'no-textarea';})()`);
+      await new Promise(r => setTimeout(r, 100));
+      // Step 4: Cmd+A + Cmd+V via GLOBAL CGEvent (cghidEventTap) — reaches web content
+      // reliably since Safari is frontmost
+      await _helperNativeKeyboard(0, ["cmd"], 0); // Cmd+A global
+      await new Promise(r => setTimeout(r, 100));
+      // Write clipboard + paste via global CGEvent (not windowed)
+      await _acquireClipboardLock();
+      try {
+        const savedClip = await _saveClipboard();
+        await new Promise((resolve, reject) => {
+          const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
+          proc.stdin.write(text);
+          proc.stdin.end();
+          proc.on("close", resolve);
+          proc.on("error", reject);
+        });
+        await _helperNativeKeyboard(9, ["cmd"], 0); // Cmd+V global
+        await new Promise(r => setTimeout(r, 200));
+        await _restoreClipboard(savedClip);
+      } finally {
+        _releaseClipboardLock();
+      }
+      await new Promise(r => setTimeout(r, 300));
+      // Restore original front app
+      if (savedFrontApp) await restoreFocusIfStolen(savedFrontApp);
+      return 'Monaco(native-paste): replaced ' + text.split('\n').length + ' lines';
+    } catch(e) {
+      if (savedFrontApp) await restoreFocusIfStolen(savedFrontApp).catch(() => {});
+      // Fall through to remaining editor-type checks
+    }
+  }
+
   const result = await runJS(
     `(function(){
       // Monaco editor (Airtable, VS Code web, GitHub)

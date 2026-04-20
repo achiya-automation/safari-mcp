@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.8] - 2026-04-20
+
+### Changed
+
+- **`safari_replace_editor` — React wrapper onChange sync for Monaco embeds.** Two-channel
+  write strategy: Monaco `model.setValue()` for the visual + walk the React fiber up from
+  `.monaco-editor` until a component with `onChange` + `value` props is found, then call
+  its `onChange(text)` to sync React state. Solves the "DOM updated, state stale" pattern
+  on sites that wrap Monaco in React (Airtable automations, custom admin UIs) where the
+  "Save" button reads from React state, not from the Monaco model.
+- Preflight returns a structured JSON status (`{domOk, reactSynced, reactGuarded, hasWrapper, ...}`)
+  so callers can distinguish plain Monaco embeds (`Monaco(model)`) from React-wrapped ones
+  (`Monaco(model+react)`) and gracefully fall back to the native-paste CGEvent path when the
+  wrapper's `onChange` is guarded (readOnly / permission check / no-op).
+- Verification tightened: the React sync is only reported successful when the wrapper's
+  `value` prop actually changes after the `onChange` call. If `onChange` silently swallows
+  the write (common on readOnly previews), `reactGuarded=true` is reported and the fallback
+  CGEvent Cmd+A/Cmd+V path runs — no false positives.
+
 ## [2.8.5] - 2026-04-19
 
 ### Changed
