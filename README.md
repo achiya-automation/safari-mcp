@@ -561,6 +561,19 @@ Your support funds:
 
 ---
 
+## Commercial Support
+
+**Need Safari MCP integrated into your product or agent stack?** [Achiya Automation](https://achiya-automation.com/en/blog/safari-mcp-browser-automation/) offers:
+
+- **Priority bug fixes** and custom tool development for your use case
+- **Integration consulting** — wiring Safari MCP into production agent systems (Claude, Cursor, n8n, custom)
+- **Private deployment support** — multi-user Safari MCP, non-standard macOS environments, CI/CD
+- **Training workshops** for engineering teams adopting MCP-based automation
+
+Built by the author of Safari MCP. [Start a conversation →](https://achiya-automation.com/en/contact/)
+
+---
+
 ## What agents unlock with Safari MCP
 
 When an AI agent drives Safari MCP, it gets things a headless browser can't:
