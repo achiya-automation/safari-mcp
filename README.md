@@ -80,7 +80,33 @@ npm install -g safari-mcp
 
 ### Configure your MCP client
 
-Add to your client's config file — all clients use the same JSON:
+All clients run Safari MCP the same way — `npx safari-mcp`. Pick your editor:
+
+<details>
+<summary><b>Claude Code</b></summary>
+
+```bash
+claude mcp add safari -- npx safari-mcp
+```
+
+Or edit `~/.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "safari": {
+      "command": "npx",
+      "args": ["safari-mcp"]
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Claude Desktop</b></summary>
+
+Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ```json
 {
@@ -93,17 +119,140 @@ Add to your client's config file — all clients use the same JSON:
 }
 ```
 
+Restart Claude Desktop after saving.
+</details>
+
 <details>
-<summary><b>Where does each client store this?</b></summary>
+<summary><b>Cursor</b></summary>
 
-| Client | Config file |
-|--------|------------|
-| **Claude Code** | `~/.mcp.json` |
-| **Claude Desktop** | `~/Library/Application Support/Claude/claude_desktop_config.json` |
-| **Cursor** | `.cursor/mcp.json` in your project |
-| **Windsurf** | `.windsurf/mcp.json` in your project |
-| **VS Code + Continue** | `.vscode/mcp.json` in your project |
+One-click: [**Install in Cursor**](cursor://anysphere.cursor-deeplink/mcp/install?name=safari-mcp&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D)
 
+Or edit `.cursor/mcp.json` in your project:
+
+```json
+{
+  "mcpServers": {
+    "safari": {
+      "command": "npx",
+      "args": ["safari-mcp"]
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>VS Code / VS Code Insiders</b></summary>
+
+One-click: [**Install in VS Code**](vscode:mcp/install?%7B%22safari-mcp%22%3A%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D%7D)
+
+Or edit `.vscode/mcp.json`:
+
+```json
+{
+  "servers": {
+    "safari": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["safari-mcp"]
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Windsurf</b></summary>
+
+Edit `.windsurf/mcp.json` in your project (or `~/.codeium/windsurf/mcp_config.json` globally):
+
+```json
+{
+  "mcpServers": {
+    "safari": {
+      "command": "npx",
+      "args": ["safari-mcp"]
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Cline</b></summary>
+
+Open Cline in VS Code → click the MCP icon → **Edit MCP Settings** → add:
+
+```json
+{
+  "mcpServers": {
+    "safari": {
+      "command": "npx",
+      "args": ["safari-mcp"]
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Continue</b></summary>
+
+Edit `~/.continue/config.yaml` (or `.continue/config.yaml` in workspace):
+
+```yaml
+mcpServers:
+  - name: safari
+    command: npx
+    args:
+      - safari-mcp
+```
+</details>
+
+<details>
+<summary><b>Goose</b></summary>
+
+Edit `~/.config/goose/config.yaml`:
+
+```yaml
+extensions:
+  safari:
+    name: safari
+    type: stdio
+    cmd: npx
+    args:
+      - safari-mcp
+    enabled: true
+```
+</details>
+
+<details>
+<summary><b>LM Studio</b></summary>
+
+Open LM Studio → **Settings** → **MCP Servers** → **Add Server**:
+
+- **Name:** `safari`
+- **Command:** `npx`
+- **Args:** `safari-mcp`
+</details>
+
+<details>
+<summary><b>Zed</b></summary>
+
+Open Zed → **Settings** → search for "Context Servers" and add:
+
+```json
+{
+  "context_servers": {
+    "safari": {
+      "command": {
+        "path": "npx",
+        "args": ["safari-mcp"]
+      }
+    }
+  }
+}
+```
 </details>
 
 <details>
