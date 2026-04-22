@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.3] - 2026-04-22
+
+### Fixed
+
+- **`safari_fill` now works inside dialog-hosted rich editors (LinkedIn share composer).**
+  Three issues previously made LinkedIn posting impossible:
+  1. The contenteditable fallback dispatched a `blur` event at the end — LinkedIn's
+     composer listens for `focusout` and dismisses the dialog, so every fill closed
+     the post box.
+  2. When ProseMirror was detected but its `EditorView` could not be reached via
+     `pmViewDesc` or the React Fiber walk, fill fell back to `beforeinput`+`execCommand`
+     char-by-char. Those events are `isTrusted:false` and ProseMirror's paste handler
+     rejects them, so the text never landed in editor state.
+  3. The synthetic `ClipboardEvent('paste')` returned "Filled CE (synthetic paste)" even
+     when ProseMirror called `preventDefault` without accepting the payload.
+
+  Fix: when the contenteditable sits inside a `[role="dialog"]`, route through the
+  existing CGEvent Cmd+V pipeline (`_nativeTypeViaClipboard`). Real paste, `isTrusted:true`,
+  window-targeted so no focus steal. The `blur` dispatch is removed — React detects the
+  change from `input` alone.
+
+### Changed
+
+- Default contenteditable fill no longer dispatches `blur`. This also fixes silent
+  dismissal of other popover editors (Twitter/X composer, Medium inline-reply) that
+  treated the blur as "user clicked away".
+
 ## [2.9.2] - 2026-04-21
 
 ### Documentation

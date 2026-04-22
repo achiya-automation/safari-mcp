@@ -1294,15 +1294,22 @@ export async function fill({ selector, value, ref }) {
     // React Fiber walk for ProseMirror view (LinkedIn, Tiptap-React)
     `if(!v){var fk=Object.keys(pm).find(function(k){return k.startsWith('__reactFiber$')||k.startsWith('__reactInternalInstance$');});if(fk){var fiber=pm[fk];for(var d=0;d<20&&fiber;d++){var props=fiber.memoizedProps||(fiber.stateNode&&fiber.stateNode.props);if(props){var pv=props.editorView||props.view;if(pv&&pv.state&&pv.dispatch){v=pv;break;}}fiber=fiber.return;}}}` +
     `if(v&&v.state&&v.dispatch){var doc=v.state.doc;var hasContent=doc.textContent&&doc.textContent.trim().length>0;if(hasContent){var endPos=doc.content.size>1?doc.content.size-1:doc.content.size;v.dispatch(v.state.tr.insertText(' ${val}',endPos));v.focus();return 'Filled CE (ProseMirror append)';}else{var tr=v.state.tr;tr.replaceWith(0,doc.content.size,v.state.schema.text('${val}'));v.dispatch(tr);v.focus();return 'Filled CE (ProseMirror replace)';}}}catch(e){}}` +
-    // ProseMirror detected but no view — use char-by-char with beforeinput
-    `if(pm&&!v){return '__PM_CHARBYCHAR__';}` +
+    // ProseMirror detected but no view — in a dialog (LinkedIn share composer), go to
+    // native paste (real CGEvent Cmd+V) so ProseMirror's isTrusted-gated paste handler
+    // accepts the insertion and the dialog doesn't dismiss. Outside a dialog fall back
+    // to char-by-char beforeinput (works on Discord-style PM without dismissal risk).
+    `if(pm&&!v){var inDlg=!!el.closest('[role="dialog"]');if(inDlg){return '__NATIVE_PASTE_DIALOG__';}return '__PM_CHARBYCHAR__';}` +
     // Closure/Medium detection — signal for native paste
     `var isClosure=Object.keys(el).some(function(k){return k.startsWith('closure_uid_');})||location.hostname.includes('medium.com');if(isClosure){return '__CLOSURE_NATIVE_PASTE__';}` +
     // Synthetic ClipboardEvent paste — works on ProseMirror, TipTap, Slate, and most modern editors
     // that don't respond to execCommand but DO handle paste events
     `try{el.focus();var sel2=window.getSelection();if(sel2.rangeCount){var rng=document.createRange();rng.selectNodeContents(el);sel2.removeAllRanges();sel2.addRange(rng);}var dt=new DataTransfer();dt.setData('text/plain','${val}');var pe=new ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData:dt});var handled=!el.dispatchEvent(pe);if(handled||el.textContent.indexOf('${val.substring(0, 20)}')>=0){return 'Filled CE (synthetic paste)';}}catch(ep){}` +
-    // Default contenteditable: selectAll+delete+insert (safer than textContent='')
-    `document.execCommand('selectAll');document.execCommand('delete');document.execCommand('insertText',false,'${val}');el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('blur',{bubbles:true}));return 'Filled contenteditable';}` +
+    // Synthetic paste did not verify — in a dialog, route to native paste (CGEvent Cmd+V)
+    // to produce real isTrusted:true events. Avoids LinkedIn-style dialog dismissal too.
+    `if(!!el.closest('[role="dialog"]')){return '__NATIVE_PASTE_DIALOG__';}` +
+    // Default contenteditable: selectAll+delete+insert. No blur — blur dismisses dialogs
+    // and nearby popovers; React only needs 'input' to see the change.
+    `document.execCommand('selectAll');document.execCommand('delete');document.execCommand('insertText',false,'${val}');el.dispatchEvent(new Event('input',{bubbles:true}));return 'Filled contenteditable';}` +
     // Standard input/textarea with _valueTracker
     `var t=el._valueTracker;if(t)t.setValue('');var proto=el.tagName==='TEXTAREA'?window.HTMLTextAreaElement.prototype:window.HTMLInputElement.prototype;var s=Object.getOwnPropertyDescriptor(proto,'value');if(s&&s.set){s.set.call(el,'${val}');}else{el.value='${val}';}el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));el.dispatchEvent(new Event('blur',{bubbles:true}));el.dispatchEvent(new Event('focusout',{bubbles:true}));el.focus();return 'Filled: '+el.value.substring(0,50);}catch(e){return 'ERR: '+e.message;}})()`
   );
@@ -1373,6 +1380,28 @@ export async function fill({ selector, value, ref }) {
       `})()`
     );
     return fillResult;
+  }
+
+  // ProseMirror/contenteditable inside a dialog (LinkedIn share composer is the canonical
+  // case). Synthetic events get rejected by isTrusted-gated paste handlers, and stray blur
+  // events dismiss the dialog. Use CGEvent Cmd+V — real paste, isTrusted:true, windowed so
+  // no focus steal. Requires the element to be focused + have a collapsed selection at end.
+  if (result === "__NATIVE_PASTE_DIALOG__") {
+    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    await runJS(
+      `(function(){var el=document.querySelector('${sel}');if(!el)return 'not-found';` +
+      `el.focus();` +
+      // Select all existing content so Cmd+V replaces (not appends)
+      `var s=window.getSelection();if(s){var r=document.createRange();r.selectNodeContents(el);s.removeAllRanges();s.addRange(r);}` +
+      `return 'focused';})()`
+    );
+    await new Promise(r => setTimeout(r, 50));
+    try {
+      await _nativeTypeViaClipboard(value);
+      return `Filled CE (native paste in dialog, ${value.length} chars)`;
+    } catch (e) {
+      return `ERR native paste in dialog: ${e.message}`;
+    }
   }
 
   return result;
