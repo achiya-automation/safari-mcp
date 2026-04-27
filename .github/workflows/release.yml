@@ -3,6 +3,12 @@ name: Publish
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v2.9.3)"
+        required: true
+        type: string
 
 concurrency:
   group: publish
@@ -10,13 +16,15 @@ concurrency:
 
 jobs:
   publish-npm:
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     environment: npm-publish
     permissions:
       contents: read
       id-token: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.0.0
         with:
@@ -27,12 +35,12 @@ jobs:
 
       - name: Verify release tag matches package version
         env:
-          TAG_REF: ${{ github.ref_name }}
+          TAG_REF: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           PKG_VERSION=$(node -p "require('./package.json').version")
           TAG_VERSION="${TAG_REF#v}"
           if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
-            echo "::error::package.json version ($PKG_VERSION) does not match release tag ($TAG_VERSION)"
+            echo "::error::package.json version ($PKG_VERSION) does not match tag ($TAG_VERSION)"
             exit 1
           fi
 
@@ -68,9 +76,11 @@ jobs:
 
       - name: Download mcp-publisher
         run: |
+          OS=$(uname -s | tr '[:upper:]' '[:lower:]')
           ARCH=$(uname -m)
           if [ "$ARCH" = "x86_64" ]; then ARCH=amd64; fi
-          curl -sL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_darwin_${ARCH}.tar.gz" -o mcp-publisher.tar.gz
+          if [ "$ARCH" = "aarch64" ]; then ARCH=arm64; fi
+          curl -sL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_${OS}_${ARCH}.tar.gz" -o mcp-publisher.tar.gz
           tar -xzf mcp-publisher.tar.gz mcp-publisher
           chmod +x mcp-publisher
           ./mcp-publisher --help | head -3
