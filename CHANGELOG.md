@@ -5,32 +5,136 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.9.3] - 2026-04-22
+## [2.10.0] - 2026-05-01
+
+### Added
+
+- **`safari_verify_state` tool — verify framework state before Submit.** Modern editors
+  (ProseMirror, Lexical, Closure, React-controlled inputs) keep state separately from the
+  DOM. `el.value` or `el.textContent` can show new text while the framework store still
+  holds the old value, so a Submit click sends stale data. Call `safari_verify_state`
+  AFTER `safari_fill` and BEFORE clicking Submit; it returns
+  `{match, mode, actual, expected, hint?}`. Modes: input, prosemirror, lexical, closure,
+  contenteditable. The `hint` field surfaces `_valueTracker` desync — the most common
+  Featured.com / Next.js RSC failure mode.
+
+- **Auto-conversion of webp/heic/tiff uploads when the target rejects them.** `safari_upload_file`
+  now reads the input's `accept` attribute. If the format isn't accepted (Quora's classic
+  `accept="image/png,image/jpeg"` rejects webp), the file is converted to PNG via macOS
+  `sips` (no extra deps) before encoding. No-op when `accept` is empty, `image/*`, or
+  already includes the source format.
+
+- **Native `<select>` guard in `safari_click`.** LinkedIn-style "select your industry"
+  dropdowns look custom but are real `<select>` elements. Calling `.click()` on them
+  hands off to the OS option list, which blocks AppleScript until dismissed → tool
+  timeout. The click pipeline now detects `SELECT` early and throws a directive error
+  pointing at `safari_select_option` plus the first 8 option labels.
 
 ### Fixed
 
-- **`safari_fill` now works inside dialog-hosted rich editors (LinkedIn share composer).**
-  Three issues previously made LinkedIn posting impossible:
-  1. The contenteditable fallback dispatched a `blur` event at the end — LinkedIn's
-     composer listens for `focusout` and dismisses the dialog, so every fill closed
-     the post box.
-  2. When ProseMirror was detected but its `EditorView` could not be reached via
-     `pmViewDesc` or the React Fiber walk, fill fell back to `beforeinput`+`execCommand`
-     char-by-char. Those events are `isTrusted:false` and ProseMirror's paste handler
-     rejects them, so the text never landed in editor state.
-  3. The synthetic `ClipboardEvent('paste')` returned "Filled CE (synthetic paste)" even
-     when ProseMirror called `preventDefault` without accepting the payload.
+- **`safari_fill` standard input/textarea path — Featured.com / HubSpot Formik / React 18.**
+  Three coupled bugs caused silent value-mismatch on Next.js RSC and Formik forms:
+  1. **`focus` was dispatched LAST** (after `blur` + `focusout`). Formik's onBlur
+     validation runs on focused-state transition; firing focus after blur left the field
+     in a stale state and validation never re-ran.
+  2. **Plain `Event('input')` instead of `InputEvent`.** React 18's reconciler checks
+     `inputType` and `data` on input events; without them, the controlled component's
+     internal store rejects the change as "not a real edit."
+  3. **No `composed: true`.** Events stayed inside Shadow DOM and never reached the
+     framework's listeners on the host.
 
-  Fix: when the contenteditable sits inside a `[role="dialog"]`, route through the
-  existing CGEvent Cmd+V pipeline (`_nativeTypeViaClipboard`). Real paste, `isTrusted:true`,
-  window-targeted so no focus steal. The `blur` dispatch is removed — React detects the
-  change from `input` alone.
+  All three fixed: focus first, real `InputEvent` with `inputType:"insertReplacementText"`
+  + `data`, `composed: true` on every dispatched event, and post-fill verification that
+  routes to native CGEvent Cmd+V paste if `el.value` doesn't match expected.
+
+- **`safari_fill` ProseMirror dispatch verification.** LinkedIn's PM occasionally accepts
+  the `tr.insertText` dispatch but rolls it back on the next tick (its readOnly plugin
+  reasserts state). The dispatcher now reads back `view.state.doc.textContent` after
+  `dispatch()`; if the value isn't present, fill falls through to `__NATIVE_PASTE_DIALOG__`
+  → CGEvent Cmd+V (real isTrusted events).
+
+- **`safari_fill` Reddit nested Shadow DOM events propagate.** All input/change/blur events
+  ship with `composed: true`, so nested closed-shadow textareas (Reddit appeals reaches
+  4 levels deep) actually notify host listeners.
+
+- **`safari_fill_form` batch — was missing `_valueTracker` and InputEvent.** The single-call
+  variant of `fill_form` skipped React state-sync entirely (only the contenteditable branch
+  had treatment). Fixed: same setter + InputEvent + composed dispatch + dialog-aware blur
+  as the per-field `safari_fill`. Also: prototype-correct setter for textarea and select,
+  deep-query through Shadow DOM, and reports `PARTIAL` when post-fill `el.value` doesn't
+  match expected.
+
+- **Closure / Medium detection broader.** Used to only match `closure_uid_` keys on the
+  element itself or `medium.com` hostname. Now also matches `closure_lm_` keys, walks 10
+  levels of ancestors for closure markers, and falls back on `window.goog.events` /
+  `window.goog.editor` globals — covers Closure-built editors outside Medium.
+
+- **`mcpReactClick` Fiber walk — React 18 portals (HackerNoon Submit, Radix dropdowns).**
+  The synthetic event used to omit `isDefaultPrevented()` / `isPropagationStopped()` methods
+  React 18 internally checks. Some portal-rendered components silently no-op when those are
+  missing. Now produces a fully-React-18-compatible SyntheticEvent (real
+  `MouseEvent`/`PointerEvent` as `nativeEvent`, working flag accessors, `composed: true`,
+  pageX/Y, screenX/Y, modifier keys). The walk also tries `onPointerDown` → `onMouseDown`
+  → `onMouseUp` → `onPointerUp` → `onClick` in sequence — covers components that open the
+  modal on pointerDown and commit on click. Fiber walk depth doubled (15 → 30) and now
+  also reads `stateNode.props` for forwardRef components.
+
+### Documented hard limits (still need manual fallback)
+
+- **XPC Web Inspector Protocol.** Apple gates access with a private entitlement; no
+  legitimate workaround exists. `safari_evaluate` continues to use AppleScript `do JavaScript`.
+- **Trusted Types pages (Google Search Console, modern Google admin consoles).** Pages
+  with `require-trusted-types-for 'script'` reject both `do JavaScript` and extension-issued
+  evals when the policy is enforced page-wide. Recommended fallback is `safari_snapshot` +
+  `ref`-based interactions which don't require JS execution.
+
+## [2.9.3] - 2026-04-22
+
+### Added
+
+- **Lexical editor support (LinkedIn share composer, Meta/Shopify apps).** `safari_fill`
+  locates the Lexical editor instance via three cascading strategies: (A) `[data-lexical-editor="true"]`
+  ancestor with a `__lexicalEditor` property, (B) DOM-ancestor walk for the same property on
+  nested wrappers, (C) React Fiber walk — duck-types any object on props/state/stateNode that
+  exposes both `parseEditorState` and `setEditorState`. Once found, it drives the editor via
+  its own API — entirely in-page, no CGEvent, no focus shift. Two fill strategies, both pure
+  DOM events (the dialog stays open):
+    1. Dispatch `beforeinput` with `inputType:"insertFromPaste"` + a synthetic `DataTransfer`.
+       Lexical's `handleBeforeInput` reads `dataTransfer.getData('text/plain')` and commits
+       through `editor.update()` internally, so state + DOM stay in sync.
+    2. Fallback: `editor.parseEditorState()` + `editor.setEditorState()` with a minimal
+       `root → paragraph → text` doc. Used when Lexical's paste path ignores the synthetic
+       event (some wrapper configurations).
+
+  Why this matters: LinkedIn's composer is a `[role="dialog"]` with a `focusout` listener
+  that dismisses the modal. Our previous CGEvent Cmd+V path pasted the text correctly but
+  caused the dialog to close mid-paste (the Safari window-activation side-effect briefly
+  fired `focusout` on the editor). Lexical's own API never touches focus, so the dialog
+  stays open and the Post button becomes enabled.
+
+### Fixed
+
+- **`safari_fill` now survives inside dialog-hosted rich editors.** Three issues previously
+  made LinkedIn posting impossible:
+  1. The contenteditable fallback dispatched a `blur` event at the end — LinkedIn's composer
+     listens for `focusout` and dismissed the dialog, so every fill closed the post box.
+  2. When ProseMirror was detected but its `EditorView` could not be reached via `pmViewDesc`
+     or the React Fiber walk, fill fell back to `beforeinput`+`execCommand` char-by-char.
+     Those events are `isTrusted:false` and ProseMirror's paste handler rejects them — text
+     never landed in editor state.
+  3. The synthetic `ClipboardEvent('paste')` returned "Filled CE (synthetic paste)" even when
+     ProseMirror called `preventDefault` without accepting the payload.
+
+  Primary fix is the Lexical path above. For ProseMirror editors whose view is not reachable,
+  contenteditables inside `[role="dialog"]` now route to `_nativeTypeViaClipboard` (CGEvent
+  Cmd+V, `isTrusted:true`) as a last resort. The `blur` dispatch is removed — React detects
+  the change from `input` alone.
 
 ### Changed
 
-- Default contenteditable fill no longer dispatches `blur`. This also fixes silent
-  dismissal of other popover editors (Twitter/X composer, Medium inline-reply) that
-  treated the blur as "user clicked away".
+- Default contenteditable fill no longer dispatches `blur`. This also fixes silent dismissal
+  of other popover editors (Twitter/X composer, Medium inline-reply) that treated the blur
+  as "user clicked away".
 
 ## [2.9.2] - 2026-04-21
 

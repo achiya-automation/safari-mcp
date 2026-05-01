@@ -1072,6 +1072,19 @@ server.tool(
 );
 
 server.tool(
+  "safari_verify_state",
+  "Verify the framework-level state of an editor/input matches the expected value. Returns JSON {match, mode, actual, expected, hint?}. Modern editors (ProseMirror, Lexical, Closure, React-controlled inputs) maintain state separately from the DOM — `.value` or `.textContent` may show new text while the internal store still holds old data, so a Submit click sends stale data. Call this AFTER safari_fill and BEFORE clicking Submit on critical forms (Featured.com, LinkedIn share, Medium, Reddit).",
+  {
+    selector: z.string().describe("CSS selector of the editor/input to verify"),
+    expected: z.string().describe("Expected value or text fragment that should appear in framework state"),
+  },
+  async (args) => {
+    const result = await safari.verifyState(args);
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+  }
+);
+
+server.tool(
   "safari_select_option",
   "Select an option in a native <select> dropdown. Sets .value and dispatches change event. For custom dropdowns (React/LinkedIn), use safari_click on the dropdown trigger, then safari_click on the option instead.",
   {

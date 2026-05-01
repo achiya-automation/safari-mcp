@@ -178,42 +178,72 @@ if (window.__mcpVersion !== 5) {
   window.mcpReactClick = function(el) {
     var startNode = window.mcpResolveTarget(el) || el;
     if (!startNode) return false;
+    // React 18-compatible SyntheticEvent — includes isDefaultPrevented/isPropagationStopped
+    // methods that React internally checks. Without them, some portal-rendered components
+    // (HackerNoon modal Submit, Radix dropdowns) silently no-op.
     function makeSynth(targetNode, type) {
       var r = targetNode.getBoundingClientRect();
-      return { type: type || 'click', target: targetNode, currentTarget: targetNode,
-        clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, pageX: r.left + r.width / 2 + window.scrollX, pageY: r.top + r.height / 2 + window.scrollY,
-        preventDefault: function() {}, stopPropagation: function() {}, nativeEvent: new MouseEvent(type || 'click'), persist: function() {}, bubbles: true, cancelable: true };
+      var native = type === 'click' || type === 'mousedown' || type === 'mouseup' || type === 'mousemove'
+        ? new MouseEvent(type, { bubbles: true, cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 })
+        : type === 'pointerdown' || type === 'pointerup'
+        ? new PointerEvent(type, { bubbles: true, cancelable: true, pointerId: 1, pointerType: 'mouse' })
+        : new Event(type || 'click', { bubbles: true, cancelable: true });
+      var defaultPrevented = false, propagationStopped = false;
+      return {
+        type: type || 'click', target: targetNode, currentTarget: targetNode,
+        clientX: r.left + r.width / 2, clientY: r.top + r.height / 2,
+        pageX: r.left + r.width / 2 + window.scrollX, pageY: r.top + r.height / 2 + window.scrollY,
+        screenX: r.left + r.width / 2, screenY: r.top + r.height / 2,
+        button: 0, buttons: 0, detail: 1,
+        altKey: false, ctrlKey: false, metaKey: false, shiftKey: false,
+        preventDefault: function() { defaultPrevented = true; if (native.preventDefault) native.preventDefault(); },
+        stopPropagation: function() { propagationStopped = true; if (native.stopPropagation) native.stopPropagation(); },
+        stopImmediatePropagation: function() { propagationStopped = true; },
+        isDefaultPrevented: function() { return defaultPrevented; },
+        isPropagationStopped: function() { return propagationStopped; },
+        defaultPrevented: false, cancelBubble: false,
+        nativeEvent: native, persist: function() {},
+        bubbles: true, cancelable: true, eventPhase: 2, isTrusted: false,
+        timeStamp: Date.now(), composed: true, view: window
+      };
     }
     // For React radio/checkbox inputs, onChange is the primary handler (not onClick)
     var isToggle = startNode.tagName === 'INPUT' && (startNode.type === 'radio' || startNode.type === 'checkbox');
     function tryOnChange(propsObj, targetNode) {
       if (!isToggle || !propsObj.onChange) return false;
       var newChecked = startNode.type === 'radio' ? true : !startNode.checked;
-      propsObj.onChange({ target: { value: startNode.value, checked: newChecked, type: startNode.type, name: startNode.name, id: startNode.id, tagName: 'INPUT' },
-        currentTarget: targetNode, preventDefault: function() {}, stopPropagation: function() {}, nativeEvent: new Event('change'), persist: function() {}, bubbles: true, cancelable: true, type: 'change' });
+      var ev = makeSynth(targetNode, 'change');
+      ev.target = { value: startNode.value, checked: newChecked, type: startNode.type, name: startNode.name, id: startNode.id, tagName: 'INPUT' };
+      propsObj.onClick && propsObj.onClick(ev);
+      propsObj.onChange(ev);
       return true;
+    }
+    // Try a single React props bag: returns true if ANY handler fired.
+    // Order matters — onPointerDown/onMouseDown sometimes opens modals, then onClick commits.
+    function tryProps(propsObj, targetNode) {
+      if (!propsObj) return false;
+      if (tryOnChange(propsObj, targetNode)) return true;
+      var fired = false;
+      if (typeof propsObj.onPointerDown === 'function') { try { propsObj.onPointerDown(makeSynth(targetNode, 'pointerdown')); fired = true; } catch (_e) {} }
+      if (typeof propsObj.onMouseDown === 'function') { try { propsObj.onMouseDown(makeSynth(targetNode, 'mousedown')); fired = true; } catch (_e) {} }
+      if (typeof propsObj.onMouseUp === 'function') { try { propsObj.onMouseUp(makeSynth(targetNode, 'mouseup')); fired = true; } catch (_e) {} }
+      if (typeof propsObj.onPointerUp === 'function') { try { propsObj.onPointerUp(makeSynth(targetNode, 'pointerup')); fired = true; } catch (_e) {} }
+      if (typeof propsObj.onClick === 'function') { try { propsObj.onClick(makeSynth(targetNode, 'click')); fired = true; } catch (_e) {} }
+      return fired;
     }
     var node = startNode;
     for (var depth = 0; depth < 15 && node; depth++) {
       var pk = Object.keys(node).find(function(k) { return k.startsWith('__reactProps$'); });
-      if (pk && node[pk]) {
-        var props = node[pk];
-        if (tryOnChange(props, node)) return true;
-        if (props.onClick) { props.onClick(makeSynth(node, 'click')); return true; }
-        if (props.onMouseDown) { props.onMouseDown(makeSynth(node, 'mousedown')); return true; }
-        if (props.onPointerDown) { props.onPointerDown(makeSynth(node, 'pointerdown')); return true; }
-      }
+      if (pk && node[pk] && tryProps(node[pk], node)) return true;
       var fk = Object.keys(node).find(function(k) { return k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'); });
       if (fk) {
-        var f = node[fk];
-        while (f) {
-          if (f.memoizedProps) {
-            if (tryOnChange(f.memoizedProps, node)) return true;
-            if (f.memoizedProps.onClick) { f.memoizedProps.onClick(makeSynth(node, 'click')); return true; }
-            if (f.memoizedProps.onMouseDown) { f.memoizedProps.onMouseDown(makeSynth(node, 'mousedown')); return true; }
-            if (f.memoizedProps.onPointerDown) { f.memoizedProps.onPointerDown(makeSynth(node, 'pointerdown')); return true; }
-          }
-          f = f.return;
+        // Walk fiber chain UP via .return (covers portals — Fiber tree is logical, not DOM-shaped).
+        var f = node[fk], hops = 0;
+        while (f && hops < 30) {
+          if (tryProps(f.memoizedProps, node)) return true;
+          // Components written as forwardRef put the click handler on stateNode.props
+          if (f.stateNode && f.stateNode.props && tryProps(f.stateNode.props, node)) return true;
+          f = f.return; hops++;
         }
       }
       node = node.parentElement;

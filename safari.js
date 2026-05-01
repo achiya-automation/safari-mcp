@@ -1042,32 +1042,39 @@ async function clickWithRetry(js) {
 
 export async function click({ selector, text, x, y, ref }) {
   await ensureHelpers();
+  // Native <select> elements look like custom dropdowns on LinkedIn etc., but they
+  // hand off to the OS-level option list. .click() on them blocks AppleScript until
+  // the native popup is dismissed → the JSC eval times out and the tool returns an
+  // error after seconds of hang. Detect early and return a clear directive instead.
+  const selectGuard = `if(el&&el.tagName==='SELECT'){var opts=[];for(var oi=0;oi<el.options.length&&opts.length<8;oi++){opts.push(el.options[oi].text||el.options[oi].value);}return '__SELECT_GUARD__:'+(el.id||el.name||'select')+': '+opts.join('|');}`;
+  let result;
   if (ref) {
-    return clickWithRetry(
-      `(function(){var el=mcpFindRef('${ref}');if(!el)return 'Element not found: ref=${ref}';var target=mcpClickWithReact(el);return 'Clicked: '+target.tagName+((target.innerText||target.textContent)?(' "'+(target.innerText||target.textContent).trim().substring(0,50)+'"'):'');})()`
+    result = await clickWithRetry(
+      `(function(){var el=mcpFindRef('${ref}');if(!el)return 'Element not found: ref=${ref}';${selectGuard}var target=mcpClickWithReact(el);return 'Clicked: '+target.tagName+((target.innerText||target.textContent)?(' "'+(target.innerText||target.textContent).trim().substring(0,50)+'"'):'');})()`
     );
-  }
-
-  if (selector) {
+  } else if (selector) {
     const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-    return clickWithRetry(
-      `(function(){var el=mcpQuerySelectorDeep('${sel}');if(!el)return 'Element not found: ${sel}';var target=mcpClickWithReact(el);return 'Clicked: '+target.tagName+((target.innerText||target.textContent)?(' "'+(target.innerText||target.textContent).trim().substring(0,50)+'"'):'');})()`
+    result = await clickWithRetry(
+      `(function(){var el=mcpQuerySelectorDeep('${sel}');if(!el)return 'Element not found: ${sel}';${selectGuard}var target=mcpClickWithReact(el);return 'Clicked: '+target.tagName+((target.innerText||target.textContent)?(' "'+(target.innerText||target.textContent).trim().substring(0,50)+'"'):'');})()`
     );
-  }
-
-  if (text) {
+  } else if (text) {
     const safeText = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-    return clickWithRetry(
-      `(function(){var el=mcpFindText('${safeText}',true)||mcpFindText('${safeText}',false);if(!el)return 'Element not found with text: ${safeText}';var target=mcpClickWithReact(el);return 'Clicked: '+target.tagName+' "'+((target.innerText||target.textContent)||'').trim().substring(0,50)+'"';})()`
+    result = await clickWithRetry(
+      `(function(){var el=mcpFindText('${safeText}',true)||mcpFindText('${safeText}',false);if(!el)return 'Element not found with text: ${safeText}';${selectGuard}var target=mcpClickWithReact(el);return 'Clicked: '+target.tagName+' "'+((target.innerText||target.textContent)||'').trim().substring(0,50)+'"';})()`
     );
+  } else if (x !== undefined && y !== undefined) {
+    result = await clickWithRetry(
+      `(function(){var el=mcpElementFromPoint(${Number(x)},${Number(y)});if(!el)return 'No element at (${Number(x)},${Number(y)})';${selectGuard}var target=mcpClickWithReact(el);return 'Clicked: '+target.tagName+' at (${Number(x)},${Number(y)})';})()`
+    );
+  } else {
+    throw new Error("click requires selector, text, or x/y coordinates");
   }
 
-  if (x !== undefined && y !== undefined) {
-    return clickWithRetry(
-      `(function(){var el=mcpElementFromPoint(${Number(x)},${Number(y)});if(!el)return 'No element at (${Number(x)},${Number(y)})';var target=mcpClickWithReact(el);return 'Clicked: '+target.tagName+' at (${Number(x)},${Number(y)})';})()`
-    );
+  if (typeof result === 'string' && result.startsWith('__SELECT_GUARD__:')) {
+    const detail = result.substring('__SELECT_GUARD__:'.length);
+    throw new Error(`Target is a native <select> (${detail}). Use safari_select_option with a value matching one of the options instead — clicking it would open the OS picker and block.`);
   }
-  throw new Error("click requires selector, text, or x/y coordinates");
+  return result;
 }
 
 export async function doubleClick({ selector, x, y, ref }) {
@@ -1289,18 +1296,60 @@ export async function fill({ selector, value, ref }) {
   const val = value.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, "");
   const result = await runJS(
     `(function(){try{var el=document.querySelector('${sel}');if(!el){var q=function(r){var a=r.querySelectorAll('*');for(var i=0;i<a.length;i++){if(a[i].shadowRoot){el=a[i].shadowRoot.querySelector('${sel}');if(el)return el;el=q(a[i].shadowRoot);if(el)return el;}}return null;};el=q(document);}if(!el)return 'Element not found: ${sel}';el.focus();if(el.isContentEditable||el.getAttribute('contenteditable')==='true'){` +
+    // Lexical editor detection (LinkedIn share composer, modern Meta/Shopify apps).
+    // Three lookup strategies, cheapest first:
+    //   A) [data-lexical-editor="true"] on ancestor with __lexicalEditor property.
+    //   B) Walk DOM ancestors for __lexicalEditor (nested-config wrappers).
+    //   C) React Fiber walk — LinkedIn sometimes obfuscates __lexicalEditor, so we
+    //      locate the editor by duck-typing: any object on props/state/stateNode
+    //      that exposes both parseEditorState AND setEditorState is the editor.
+    // Once found, two fill strategies, both pure DOM (no CGEvent, no focus shift):
+    //   1) InputEvent('beforeinput', insertFromPaste + DataTransfer) — Lexical's
+    //      handleBeforeInput reads dataTransfer and commits via editor.update().
+    //   2) parseEditorState() + setEditorState() with a minimal paragraph doc —
+    //      used when Lexical ignores synthetic paste events.
+    `var lexEl=el.closest('[data-lexical-editor="true"]');var lex=(lexEl&&lexEl.__lexicalEditor)||null;` +
+    `if(!lex){var lexCur=el;for(var lexI=0;lexI<15&&lexCur;lexI++){if(lexCur.__lexicalEditor){lexEl=lexCur;lex=lexCur.__lexicalEditor;break;}lexCur=lexCur.parentElement;}}` +
+    `if(!lex){var lexHost=lexEl||el;var lexFk=null;for(var lfk in lexHost){if(lfk.indexOf('__reactFiber')===0||lfk.indexOf('__reactInternalInstance')===0){lexFk=lfk;break;}}` +
+      `if(lexFk){var lexF=lexHost[lexFk];var lexIsEd=function(o){return o&&typeof o.parseEditorState==='function'&&typeof o.setEditorState==='function';};` +
+        `for(var lexD=0;lexD<30&&lexF;lexD++){var lp=lexF.memoizedProps;if(lp){for(var lpk in lp){if(lexIsEd(lp[lpk])){lex=lp[lpk];break;}}}` +
+        `if(!lex){var ls=lexF.memoizedState;while(ls){if(lexIsEd(ls.memoizedState)){lex=ls.memoizedState;break;}ls=ls.next;}}` +
+        `if(!lex){var lsn=lexF.stateNode;if(lsn){if(lexIsEd(lsn))lex=lsn;else if(lsn.editor&&lexIsEd(lsn.editor))lex=lsn.editor;}}` +
+        `if(lex)break;lexF=lexF.return;}}}` +
+    `if(lex){if(!lexEl){lexEl=lex._rootElement||el;}` +
+      // Strategy 1: beforeinput with insertFromPaste + DataTransfer
+      `try{lexEl.focus();var lexSel=window.getSelection();if(lexSel){var lexRng=document.createRange();lexRng.selectNodeContents(lexEl);lexSel.removeAllRanges();lexSel.addRange(lexRng);}var lexDt=new DataTransfer();lexDt.setData('text/plain','${val}');var lexBi=new InputEvent('beforeinput',{inputType:'insertFromPaste',dataTransfer:lexDt,bubbles:true,cancelable:true});var lexCancelled=!lexEl.dispatchEvent(lexBi);if(lexCancelled||lexEl.textContent.indexOf('${val.substring(0, 20)}')>=0){return 'Filled CE (Lexical beforeinput paste)';}}catch(lexE1){}` +
+      // Strategy 2: parseEditorState + setEditorState (direct state replacement)
+      `try{var lexJson='{"root":{"children":[{"children":[{"detail":0,"format":0,"mode":"normal","style":"","text":"${val}","type":"text","version":1}],"direction":"ltr","format":"","indent":0,"textFormat":0,"type":"paragraph","version":1}],"direction":"ltr","format":"","indent":0,"type":"root","version":1}}';var lexNs=lex.parseEditorState(lexJson);lex.setEditorState(lexNs);if(typeof lex.focus==='function')lex.focus();return 'Filled CE (Lexical setEditorState)';}catch(lexE2){}` +
+    `}` +
     // ProseMirror detection
     `var pm=el.closest('.ProseMirror')||el.querySelector('.ProseMirror');if(pm){try{var v=null;if(pm.pmViewDesc&&pm.pmViewDesc.view)v=pm.pmViewDesc.view;else if(pm.cmView&&pm.cmView.view)v=pm.cmView.view;else{var keys=Object.keys(pm);for(var ki=0;ki<keys.length;ki++){var o=pm[keys[ki]];if(o&&o.state&&o.dispatch){v=o;break;}}}` +
     // React Fiber walk for ProseMirror view (LinkedIn, Tiptap-React)
     `if(!v){var fk=Object.keys(pm).find(function(k){return k.startsWith('__reactFiber$')||k.startsWith('__reactInternalInstance$');});if(fk){var fiber=pm[fk];for(var d=0;d<20&&fiber;d++){var props=fiber.memoizedProps||(fiber.stateNode&&fiber.stateNode.props);if(props){var pv=props.editorView||props.view;if(pv&&pv.state&&pv.dispatch){v=pv;break;}}fiber=fiber.return;}}}` +
-    `if(v&&v.state&&v.dispatch){var doc=v.state.doc;var hasContent=doc.textContent&&doc.textContent.trim().length>0;if(hasContent){var endPos=doc.content.size>1?doc.content.size-1:doc.content.size;v.dispatch(v.state.tr.insertText(' ${val}',endPos));v.focus();return 'Filled CE (ProseMirror append)';}else{var tr=v.state.tr;tr.replaceWith(0,doc.content.size,v.state.schema.text('${val}'));v.dispatch(tr);v.focus();return 'Filled CE (ProseMirror replace)';}}}catch(e){}}` +
+    `if(v&&v.state&&v.dispatch){try{var doc=v.state.doc;var hasContent=doc.textContent&&doc.textContent.trim().length>0;if(hasContent){var endPos=doc.content.size>1?doc.content.size-1:doc.content.size;v.dispatch(v.state.tr.insertText(' ${val}',endPos));}else{var tr=v.state.tr;tr.replaceWith(0,doc.content.size,v.state.schema.text('${val}'));v.dispatch(tr);}v.focus();` +
+      // Verify the dispatch actually committed — LinkedIn's PM sometimes accepts the
+      // tr but rolls it back on the next tick (its readOnly plugin reasserts state).
+      // If the doc text doesn't contain our value within 50ms, route to native paste.
+      `var pmCheck=(v.state.doc.textContent||'')+' '+(pm.textContent||'');` +
+      `if(pmCheck.indexOf('${val.substring(0, Math.min(20, val.length))}')>=0){return 'Filled CE (ProseMirror)';}` +
+      `}catch(_pmE){}}}catch(e){}}` +
     // ProseMirror detected but no view — in a dialog (LinkedIn share composer), go to
     // native paste (real CGEvent Cmd+V) so ProseMirror's isTrusted-gated paste handler
     // accepts the insertion and the dialog doesn't dismiss. Outside a dialog fall back
     // to char-by-char beforeinput (works on Discord-style PM without dismissal risk).
     `if(pm&&!v){var inDlg=!!el.closest('[role="dialog"]');if(inDlg){return '__NATIVE_PASTE_DIALOG__';}return '__PM_CHARBYCHAR__';}` +
-    // Closure/Medium detection — signal for native paste
-    `var isClosure=Object.keys(el).some(function(k){return k.startsWith('closure_uid_');})||location.hostname.includes('medium.com');if(isClosure){return '__CLOSURE_NATIVE_PASTE__';}` +
+    // Closure/Medium detection — signal for native paste.
+    // Match any of: closure_uid_ key on element, medium.com hostname, ancestor with
+    // closure markers, or window.goog.events/goog.editor.Plugin globals (broader catch
+    // for Closure-built editors outside Medium).
+    `var isClosure=false;` +
+    `try{` +
+    `if(Object.keys(el).some(function(k){return k.indexOf('closure_uid_')===0||k.indexOf('closure_lm_')===0;}))isClosure=true;` +
+    `else if(location.hostname.indexOf('medium.com')>=0)isClosure=true;` +
+    `else if(typeof goog!=='undefined'&&goog&&(goog.events||goog.editor))isClosure=true;` +
+    `else{var clCur=el.parentElement,clHop=0;while(clCur&&clHop<10){if(Object.keys(clCur).some(function(k){return k.indexOf('closure_uid_')===0;})){isClosure=true;break;}clCur=clCur.parentElement;clHop++;}}` +
+    `}catch(_clE){}` +
+    `if(isClosure){return '__CLOSURE_NATIVE_PASTE__';}` +
     // Synthetic ClipboardEvent paste — works on ProseMirror, TipTap, Slate, and most modern editors
     // that don't respond to execCommand but DO handle paste events
     `try{el.focus();var sel2=window.getSelection();if(sel2.rangeCount){var rng=document.createRange();rng.selectNodeContents(el);sel2.removeAllRanges();sel2.addRange(rng);}var dt=new DataTransfer();dt.setData('text/plain','${val}');var pe=new ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData:dt});var handled=!el.dispatchEvent(pe);if(handled||el.textContent.indexOf('${val.substring(0, 20)}')>=0){return 'Filled CE (synthetic paste)';}}catch(ep){}` +
@@ -1310,8 +1359,26 @@ export async function fill({ selector, value, ref }) {
     // Default contenteditable: selectAll+delete+insert. No blur — blur dismisses dialogs
     // and nearby popovers; React only needs 'input' to see the change.
     `document.execCommand('selectAll');document.execCommand('delete');document.execCommand('insertText',false,'${val}');el.dispatchEvent(new Event('input',{bubbles:true}));return 'Filled contenteditable';}` +
-    // Standard input/textarea with _valueTracker
-    `var t=el._valueTracker;if(t)t.setValue('');var proto=el.tagName==='TEXTAREA'?window.HTMLTextAreaElement.prototype:window.HTMLInputElement.prototype;var s=Object.getOwnPropertyDescriptor(proto,'value');if(s&&s.set){s.set.call(el,'${val}');}else{el.value='${val}';}el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));el.dispatchEvent(new Event('blur',{bubbles:true}));el.dispatchEvent(new Event('focusout',{bubbles:true}));el.focus();return 'Filled: '+el.value.substring(0,50);}catch(e){return 'ERR: '+e.message;}})()`
+    // Standard input/textarea with _valueTracker.
+    //   • focus() FIRST — Formik/HubSpot read focused state during onChange validation.
+    //   • InputEvent with inputType:'insertReplacementText' + data — React 18 RSC, Next.js,
+    //     and Featured.com require a real InputEvent (not plain Event) to update store state.
+    //   • composed:true on every event — pierces Shadow DOM (Reddit, web components).
+    //   • blur/focusout SUPPRESSED inside dialogs — blur dismisses LinkedIn share composer
+    //     and many MUI/Radix dialogs. React only needs 'input' to see the change anyway.
+    //   • Post-fill verification — if el.value !== expected after dispatch, signal the wrapper
+    //     to try native CGEvent paste fallback (real isTrusted events).
+    `var inDlg=!!(el.closest&&el.closest('[role="dialog"]'));` +
+    `var t=el._valueTracker;if(t)t.setValue('');` +
+    `var proto=el.tagName==='TEXTAREA'?window.HTMLTextAreaElement.prototype:window.HTMLInputElement.prototype;` +
+    `var s=Object.getOwnPropertyDescriptor(proto,'value');` +
+    `if(s&&s.set){s.set.call(el,'${val}');}else{el.value='${val}';}` +
+    `try{el.dispatchEvent(new InputEvent('input',{inputType:'insertReplacementText',data:'${val}',bubbles:true,composed:true,cancelable:true}));}catch(_iE){el.dispatchEvent(new Event('input',{bubbles:true,composed:true}));}` +
+    `el.dispatchEvent(new Event('change',{bubbles:true,composed:true}));` +
+    `if(!inDlg){el.dispatchEvent(new Event('blur',{bubbles:true,composed:true}));el.dispatchEvent(new Event('focusout',{bubbles:true,composed:true}));el.focus();}` +
+    `var actual=(el.value!==undefined?el.value:'');` +
+    `if(actual!=='${val}'){return '__FILL_VALUE_MISMATCH__:'+actual.substring(0,80);}` +
+    `return 'Filled: '+actual.substring(0,50);}catch(e){return 'ERR: '+e.message;}})()`
   );
 
   // ProseMirror editor with no view access: use char-by-char with beforeinput events
@@ -1382,6 +1449,26 @@ export async function fill({ selector, value, ref }) {
     return fillResult;
   }
 
+  // Standard input/textarea path returned with el.value mismatched against expected —
+  // typically Next.js RSC (Featured.com) or HubSpot Formik silently ignored the property
+  // descriptor setter. Fall back to native CGEvent Cmd+V paste — real keyboard events
+  // route through the framework's normal input pipeline.
+  if (typeof result === 'string' && result.startsWith('__FILL_VALUE_MISMATCH__')) {
+    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    await runJS(
+      `(function(){var el=document.querySelector('${sel}');if(!el)return 'not-found';` +
+      `el.focus();if('select' in el){el.select();}else if(el.setSelectionRange){el.setSelectionRange(0,(el.value||'').length);}` +
+      `return 'focused';})()`
+    );
+    await new Promise(r => setTimeout(r, 30));
+    try {
+      await _nativeTypeViaClipboard(value);
+      return `Filled (native paste fallback after value-mismatch, ${value.length} chars)`;
+    } catch (e) {
+      return `${result} (native paste fallback failed: ${e.message})`;
+    }
+  }
+
   // ProseMirror/contenteditable inside a dialog (LinkedIn share composer is the canonical
   // case). Synthetic events get rejected by isTrusted-gated paste handlers, and stray blur
   // events dismiss the dialog. Use CGEvent Cmd+V — real paste, isTrusted:true, windowed so
@@ -1407,6 +1494,90 @@ export async function fill({ selector, value, ref }) {
   return result;
 }
 
+// Verify the framework-level state of an editor or input matches `expected`.
+// Modern editors (ProseMirror, Lexical, Closure, React-controlled inputs) maintain
+// state separately from the DOM — `.value` or `.textContent` can show the new text
+// while the framework's internal store still holds the old value, so a Submit click
+// sends the stale data. Call this after `fill` and BEFORE `click`-Submit.
+//
+// Returns JSON: { match: boolean, mode: 'input'|'prosemirror'|'lexical'|'closure'|'contenteditable',
+//                 actual: string, expected: string, hint?: string }
+export async function verifyState({ selector, expected, ref }) {
+  if (ref) selector = refSelector(ref);
+  if (!selector) throw new Error("verifyState requires selector or ref");
+  const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const exp = String(expected || '').replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, "");
+  const expSnippet = String(expected || '').substring(0, 30).replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, "");
+  return runJS(
+    `(function(){
+      var el = document.querySelector('${sel}');
+      if (!el && window.mcpQuerySelectorDeep) el = window.mcpQuerySelectorDeep('${sel}');
+      if (!el) return JSON.stringify({ match: false, mode: 'not-found', actual: '', expected: '${exp}' });
+
+      var expected = '${exp}';
+      var snippet = '${expSnippet}';
+
+      // ProseMirror — check view state, not DOM
+      var pm = el.closest && el.closest('.ProseMirror') || el.querySelector && el.querySelector('.ProseMirror');
+      if (pm) {
+        var v = (pm.pmViewDesc && pm.pmViewDesc.view) || (pm.cmView && pm.cmView.view) || null;
+        if (!v) {
+          var keys = Object.keys(pm);
+          for (var ki = 0; ki < keys.length; ki++) { var o = pm[keys[ki]]; if (o && o.state && o.dispatch) { v = o; break; } }
+        }
+        if (!v) {
+          var fk = Object.keys(pm).find(function(k){return k.indexOf('__reactFiber')===0||k.indexOf('__reactInternalInstance')===0;});
+          if (fk) { var fb = pm[fk]; for (var d=0; d<20 && fb; d++){ var pp=fb.memoizedProps||(fb.stateNode&&fb.stateNode.props); if (pp){ var pv=pp.editorView||pp.view; if (pv&&pv.state){ v=pv; break; }} fb=fb.return; }}
+        }
+        var pmText = v && v.state && v.state.doc ? (v.state.doc.textContent || '') : (pm.textContent || '');
+        return JSON.stringify({ match: pmText.indexOf(snippet) >= 0, mode: 'prosemirror', actual: pmText.substring(0, 200), expected: expected.substring(0, 200) });
+      }
+
+      // Lexical — read editor state
+      var lexEl = el.closest && el.closest('[data-lexical-editor="true"]');
+      var lex = lexEl && lexEl.__lexicalEditor;
+      if (!lex) {
+        var lc = el; for (var li = 0; li < 15 && lc; li++) { if (lc.__lexicalEditor) { lex = lc.__lexicalEditor; break; } lc = lc.parentElement; }
+      }
+      if (lex && typeof lex.getEditorState === 'function') {
+        try {
+          var lexText = '';
+          lex.getEditorState().read(function(){
+            var root = lex._editorState && lex._editorState._nodeMap ? lex._editorState._nodeMap.get('root') : null;
+            // Fallback: read DOM text since direct API requires Lexical's $getRoot
+            lexText = (lexEl || el).textContent || '';
+          });
+          return JSON.stringify({ match: lexText.indexOf(snippet) >= 0, mode: 'lexical', actual: lexText.substring(0, 200), expected: expected.substring(0, 200) });
+        } catch (_lE) {}
+      }
+
+      // Closure (Medium and similar) — check element textContent (Closure mutates DOM directly)
+      var isClosure = Object.keys(el).some(function(k){return k.indexOf('closure_uid_')===0;}) || location.hostname.indexOf('medium.com') >= 0;
+      if (isClosure) {
+        var clText = el.textContent || '';
+        return JSON.stringify({ match: clText.indexOf(snippet) >= 0, mode: 'closure', actual: clText.substring(0, 200), expected: expected.substring(0, 200) });
+      }
+
+      // Generic contenteditable
+      if (el.isContentEditable) {
+        var ceText = el.textContent || '';
+        return JSON.stringify({ match: ceText.indexOf(snippet) >= 0, mode: 'contenteditable', actual: ceText.substring(0, 200), expected: expected.substring(0, 200) });
+      }
+
+      // Standard input/textarea/select
+      var actualVal = el.value !== undefined ? String(el.value) : '';
+      var match = actualVal === expected;
+      var hint = '';
+      // Detect React store/_valueTracker mismatch — common Featured.com / Next.js RSC bug
+      if (!match && el._valueTracker && typeof el._valueTracker.getValue === 'function') {
+        var tracked = el._valueTracker.getValue();
+        if (tracked !== actualVal) hint = 'React _valueTracker out of sync (tracked=' + JSON.stringify(tracked.substring(0, 60)) + ')';
+      }
+      return JSON.stringify({ match: match, mode: 'input', actual: actualVal.substring(0, 200), expected: expected.substring(0, 200), hint: hint });
+    })()`
+  );
+}
+
 export async function clearField({ selector }) {
   const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
   return runJS(
@@ -1423,7 +1594,9 @@ export async function selectOption({ selector, value }) {
 }
 
 export async function fillForm({ fields }) {
-  // Single JS call for ALL fields (instead of N separate osascript calls)
+  // Single JS call for ALL fields (instead of N separate osascript calls).
+  // Same React-state-sync logic as `fill`: _valueTracker reset, prototype-correct setter,
+  // InputEvent with inputType, composed events for shadow DOM, dialog-aware blur.
   const fieldsJSON = JSON.stringify(fields.map(f => ({
     s: f.selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'"),
     v: f.value.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n"),
@@ -1434,20 +1607,42 @@ export async function fillForm({ fields }) {
       var results = [];
       fields.forEach(function(f) {
         var el = document.querySelector(f.s);
+        if (!el) {
+          var roots = window.mcpCollectRoots ? window.mcpCollectRoots() : [document];
+          for (var ri = 0; ri < roots.length && !el; ri++) {
+            try { el = roots[ri].querySelector(f.s); } catch (_e) {}
+          }
+        }
         if (!el) { results.push('Not found: ' + f.s); return; }
         el.focus();
+        var inDlg = !!(el.closest && el.closest('[role="dialog"]'));
         if (el.isContentEditable) {
-          el.textContent = '';
+          try {
+            var sel = window.getSelection();
+            if (sel) { var rng = document.createRange(); rng.selectNodeContents(el); sel.removeAllRanges(); sel.addRange(rng); }
+            document.execCommand('delete');
+          } catch (_seE) {}
           document.execCommand('insertText', false, f.v);
+          el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
         } else {
-          var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value') ||
-                       Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value');
+          var t = el._valueTracker; if (t) t.setValue('');
+          var proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype :
+                      el.tagName === 'SELECT' ? window.HTMLSelectElement.prototype :
+                      window.HTMLInputElement.prototype;
+          var setter = Object.getOwnPropertyDescriptor(proto, 'value');
           if (setter && setter.set) setter.set.call(el, f.v);
           else el.value = f.v;
-          el.dispatchEvent(new Event('input', {bubbles: true}));
-          el.dispatchEvent(new Event('change', {bubbles: true}));
+          try { el.dispatchEvent(new InputEvent('input', { inputType: 'insertReplacementText', data: f.v, bubbles: true, composed: true, cancelable: true })); }
+          catch (_iE) { el.dispatchEvent(new Event('input', { bubbles: true, composed: true })); }
+          el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+          if (!inDlg) {
+            el.dispatchEvent(new Event('blur', { bubbles: true, composed: true }));
+            el.dispatchEvent(new Event('focusout', { bubbles: true, composed: true }));
+          }
         }
-        results.push('Filled: ' + el.tagName + ' with "' + f.v.substring(0, 30) + '"');
+        var actual = el.value !== undefined ? String(el.value) : (el.textContent || '');
+        var match = actual === f.v || actual.indexOf(f.v.substring(0, 20)) >= 0;
+        results.push((match ? 'Filled' : 'PARTIAL') + ': ' + el.tagName + ' with "' + f.v.substring(0, 30) + '"');
       });
       return results.join('\\n');
     })()`
@@ -2672,11 +2867,38 @@ export async function uploadFile({ selector, filePath }) {
 
   const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
   const { basename, extname } = await import("node:path");
-  const fileName = basename(filePath);
-  const ext = extname(filePath).toLowerCase().replace(".", "");
+  let fileName = basename(filePath);
+  let ext = extname(filePath).toLowerCase().replace(".", "");
+  let resolvedPath = filePath;
+
+  // Auto-convert images that the target input rejects.
+  // Quora is the canonical case — declares accept="image/png,image/jpeg" and silently
+  // ignores webp drops. Convert webp/heic to PNG via macOS sips (no extra deps).
+  const imageFormats = new Set(['webp', 'heic', 'heif', 'tiff', 'tif']);
+  if (imageFormats.has(ext)) {
+    const accept = await runJS(
+      `(function(){var el=document.querySelector('${sel}');if(!el){var roots=window.mcpCollectRoots?window.mcpCollectRoots():[document];for(var i=0;i<roots.length;i++){el=roots[i].querySelector('${sel}');if(el)break;}}return el?(el.getAttribute('accept')||''):'';})()`
+    ).catch(() => '');
+    const acceptStr = String(accept || '').toLowerCase();
+    const accepted = !acceptStr ||
+      acceptStr.includes('image/*') ||
+      acceptStr.includes(`image/${ext}`) ||
+      acceptStr.includes(`.${ext}`);
+    if (!accepted) {
+      const tmpPng = join(tmpdir(), `safari-mcp-upload-${Date.now()}.png`);
+      try {
+        await execFileAsync('sips', ['-s', 'format', 'png', resolvedPath, '--out', tmpPng], { timeout: 15000 });
+        resolvedPath = tmpPng;
+        fileName = basename(tmpPng);
+        ext = 'png';
+      } catch (sipsErr) {
+        console.error(`[Safari MCP] sips conversion failed (${ext}→png): ${sipsErr.message}. Continuing with original.`);
+      }
+    }
+  }
 
   // Read file as base64
-  const fileData = await readFile(filePath);
+  const fileData = await readFile(resolvedPath);
   const base64 = fileData.toString("base64");
 
   // Determine MIME type
