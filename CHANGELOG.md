@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.1] - 2026-05-01
+
+### Fixed
+
+- **Tab tracking bug — new_tab + navigate could overwrite the user's active tab.** When
+  `safari_new_tab(url)` was called with a URL that didn't load (file:// blocked by Safari,
+  network error, etc.), the new tab stayed at about:blank, the marker injection ran in a
+  context that was wiped by the next navigation, and the very next `safari_navigate` lost
+  track of which tab was ours and silently fell back to "current tab of window" — i.e. the
+  user's active tab. Real-world impact: testing v2.10.0 on the developer's own machine
+  overwrote two of his open tabs (Chatwoot Meta Dashboard, n8n executions).
+
+  Fixes:
+  - New `_lastNewTabAt` grace window (30s) — within this window, ANY mutating operation
+    that would otherwise fall back to the user's tab now throws a clear error pointing
+    back to safari_new_tab. No more silent retargeting.
+  - `safari_navigate` re-injects `window.__mcpTabMarker` after every successful navigation,
+    so subsequent `resolveActiveTab` marker checks find the tab even after JS context
+    was wiped by the navigation.
+
+- **Trusted Types pages (Google Search Console, modern Google admin, banks).** Strategy 2
+  of the extension's `evaluate` flow used to call `trustedTypes.createPolicy("mcpEval", …)`
+  AFTER the page loaded, which fails on pages that reject new policy creation post-load.
+  Now the content script (MAIN world, document_start) pre-registers `__mcpTrustedPolicy`
+  BEFORE the page sets `require-trusted-types-for`, and Strategy 2 reuses it. Pages that
+  used to silently fail under CSP-strict rules now have a working evaluation path. Take
+  effect: reload the Safari extension after upgrading.
+
 ## [2.10.0] - 2026-05-01
 
 ### Added

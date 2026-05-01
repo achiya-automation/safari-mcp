@@ -158,6 +158,14 @@ async function _restoreClipboard(savedContent) {
 // to the current index.
 let _activeTabIndex = null; // null = use front document (default)
 let _activeTabURL = null;   // URL-based tracking (stable even when tabs shift)
+// Timestamp of most recent new_tab — within this grace window we MUST NOT fall
+// back to "current tab of window" (which is the USER'S active tab). New tabs
+// often start at about:blank if their URL fails to load (file://, blocked, etc.),
+// and the URL-based marker resolution can fail until the page actually loads.
+// During the grace window, navigate/click/fill operations either use the cached
+// _activeTabIndex or fail loudly — never silently target the user's tab.
+let _lastNewTabAt = 0;
+const NEW_TAB_GRACE_MS = 30000;
 let _lastResolveTime = 0;   // Cache: skip resolve if verified recently
 let _lastTabCount = null;   // Track tab count for smart cache invalidation
 let _activeTabMarker = null; // window.__mcpTabMarker — survives same-tab navigation, bulletproof tab identity
@@ -272,6 +280,20 @@ function isStaleWindowError(err) {
 
 // Safe fallback target: when no tab index is known, use the profile window's current tab
 // instead of "front document" which can target the user's personal profile window
+// Throw if a write operation is about to fall back to the user's active tab
+// during the new-tab grace window. Without this, navigate/fill/click silently
+// target whatever tab the user is looking at when our cached index is lost.
+function _assertNotFallingBackToUserTab(opName) {
+  if (_activeTabIndex) return; // we have a tracked index — fine
+  const sinceNew = Date.now() - _lastNewTabAt;
+  if (sinceNew < NEW_TAB_GRACE_MS) {
+    throw new Error(
+      `Tab tracking lost within ${Math.round(sinceNew/1000)}s of safari_new_tab — refusing to ${opName} via fallback (would target the user's active tab). ` +
+      `Re-run safari_new_tab and retry.`
+    );
+  }
+}
+
 function getFallbackTarget() {
   return SAFARI_PROFILE ? `current tab of ${getTargetWindowRef()}` : "front document";
 }
@@ -826,6 +848,7 @@ export async function navigate(url) {
   const safeUrl = targetUrl.replace(/"/g, '\\"');
     // Resolve tab by URL first (in case indices shifted)
     if (_activeTabURL) await resolveActiveTab();
+    _assertNotFallingBackToUserTab('navigate');
     const navTarget = _activeTabIndex
       ? `tab ${_activeTabIndex} of ${getTargetWindowRef()}`
       : getFallbackTarget();
@@ -903,6 +926,17 @@ export async function navigate(url) {
       _activeTabURL = targetUrl;
     }
     _lastResolveTime = Date.now();
+
+    // Re-inject the tab marker — navigation creates a new JS context which wipes the
+    // window.__mcpTabMarker we set in newTab. Without re-injection, resolveActiveTab's
+    // marker-based search fails on the very next call and falls back to URL search,
+    // which can mis-target if the tab is still loading or shows an error page.
+    if (_activeTabIndex && _activeTabMarker) {
+      const safeMarker = _activeTabMarker.replace(/'/g, "\\'");
+      await osascriptFast(
+        `tell application "Safari" to do JavaScript "window.__mcpTabMarker='${safeMarker}'" in tab ${_activeTabIndex} of ${getTargetWindowRef()}`
+      ).catch(() => {});
+    }
 
     return result;
 }
@@ -2543,6 +2577,7 @@ export async function newTab(url = "") {
   _activeTabURL = url || null;
   _lastResolveTime = Date.now();
   _lastTabCount = Number(tabCount);  // Update tab count cache
+  _lastNewTabAt = Date.now();        // Start grace window — block fallback to user's tab
   // Set bulletproof tab marker — survives same-tab navigation, redirects, query changes (v2.8.3)
   _activeTabMarker = `MCP_${SESSION_ID}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
   await osascriptFast(

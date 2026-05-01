@@ -342,9 +342,15 @@ async function handleCommand(type, payload) {
           window[id] = { done: false };
           const s = document.createElement("script");
           const code = "try{var __r=(function(){" + script + "})();if(__r&&typeof __r.then==='function'){__r.then(function(v){window['" + id + "']={done:true,v:v};}).catch(function(e){window['" + id + "']={done:true,e:e.message};});}else{window['" + id + "']={done:true,v:__r};}}catch(e){window['" + id + "']={done:true,e:e.message};}";
-          if (window.trustedTypes && window.trustedTypes.createPolicy) {
+          // Prefer the policy pre-registered by content.js at document_start —
+          // pages that block new policy creation post-load (GSC, modern Google admin)
+          // still accept ours because it was grandfathered in before their CSP applied.
+          if (window.__mcpTrustedPolicy && typeof window.__mcpTrustedPolicy.createScript === "function") {
+            try { s.textContent = window.__mcpTrustedPolicy.createScript(code); }
+            catch (_) { s.textContent = code; }
+          } else if (window.trustedTypes && window.trustedTypes.createPolicy) {
             try {
-              const policy = window.trustedTypes.createPolicy("mcpEval", { createScript: (s) => s });
+              const policy = window.trustedTypes.createPolicy("mcpEval_" + Date.now(), { createScript: (s) => s });
               s.textContent = policy.createScript(code);
             } catch (_) { s.textContent = code; }
           } else {

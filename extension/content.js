@@ -1,7 +1,11 @@
-// Content script — runs at document_start in MAIN world (before page scripts)
-// Purpose: Monkey-patch attachShadow to capture CLOSED shadow roots.
-// Without this, Reddit and other sites using closed shadow DOM
-// are invisible to snapshot/click/fill.
+// Content script — runs at document_start in MAIN world (before page scripts).
+// Two responsibilities:
+//   1. Monkey-patch attachShadow to capture CLOSED shadow roots (Reddit, etc.).
+//   2. Pre-register a Trusted Types policy named "mcpBridge" BEFORE the page sets
+//      its own require-trusted-types-for directive. Our policy is then grandfathered
+//      and survives even on pages (Google Search Console, Google admin, modern banks)
+//      that block new policy creation after page load. MCP evaluate strategies
+//      consult `window.__mcpTrustedPolicy` first.
 // Runs in MAIN world via manifest "world": "MAIN" — no script injection needed,
 // so CSP cannot block it.
 
@@ -20,4 +24,17 @@ if (!window.__mcpShadowPatched) {
   window.__mcpGetShadowRoot = function(el) {
     return el.shadowRoot || _closedRoots.get(el) || null;
   };
+}
+
+if (!window.__mcpTrustedPolicy && window.trustedTypes && typeof window.trustedTypes.createPolicy === "function") {
+  try {
+    window.__mcpTrustedPolicy = window.trustedTypes.createPolicy("mcpBridge", {
+      createScript: function (s) { return s; },
+      createScriptURL: function (s) { return s; },
+      createHTML: function (s) { return s; }
+    });
+  } catch (_e) {
+    // Page already restricts policies — rare since content script runs at document_start
+    // before page scripts. Leave undefined; evaluate fallbacks will probe other paths.
+  }
 }
