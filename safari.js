@@ -1330,6 +1330,35 @@ export async function fill({ selector, value, ref }) {
   const val = value.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, "");
   const result = await runJS(
     `(function(){try{var el=document.querySelector('${sel}');if(!el){var q=function(r){var a=r.querySelectorAll('*');for(var i=0;i<a.length;i++){if(a[i].shadowRoot){el=a[i].shadowRoot.querySelector('${sel}');if(el)return el;el=q(a[i].shadowRoot);if(el)return el;}}return null;};el=q(document);}if(!el)return 'Element not found: ${sel}';el.focus();if(el.isContentEditable||el.getAttribute('contenteditable')==='true'){` +
+    // Quill editor detection (LinkedIn share composer in 2026 — they migrated from
+    // ProseMirror, Slack message editor, many enterprise apps). The Quill instance is
+    // attached to `.ql-container.__quill` (v2) or accessible via React Fiber's
+    // memoizedProps/stateNode. Without proper API access, fill-by-DOM crashes Quill's
+    // internal Delta state and dismisses the dialog (the v2.10.0 LinkedIn bug repro).
+    `var qlEditor=el.classList&&el.classList.contains('ql-editor')?el:el.closest('.ql-editor');` +
+    `if(qlEditor){` +
+      `var qlContainer=qlEditor.closest('.ql-container')||qlEditor.parentElement;` +
+      `var quill=(qlContainer&&qlContainer.__quill)||null;` +
+      // Fallback: walk React Fiber to find the Quill instance attached as a prop or stateNode
+      `if(!quill&&qlContainer){var qfk=Object.keys(qlContainer).find(function(k){return k.indexOf('__reactFiber')===0||k.indexOf('__reactInternalInstance')===0;});if(qfk){var qf=qlContainer[qfk];for(var qd=0;qd<25&&qf;qd++){var qp=qf.memoizedProps;if(qp&&qp.quill&&typeof qp.quill.setContents==='function'){quill=qp.quill;break;}var qsn=qf.stateNode;if(qsn&&qsn.quill&&typeof qsn.quill.setContents==='function'){quill=qsn.quill;break;}qf=qf.return;}}}` +
+      `if(quill&&typeof quill.setContents==='function'){` +
+        `try{` +
+          // Convert escaped string back to real string for Quill API.
+          // The val template var has \\n / \\\\ / \\' applied, so we need to unescape for setText.
+          `var qlText='${val}'.replace(/\\\\n/g,'\\n').replace(/\\\\'/g,"'").replace(/\\\\\\\\/g,'\\\\');` +
+          // setContents with a plain text Delta — bypasses clipboard, no synthetic events,
+          // doesn't trigger LinkedIn's focusout-dismiss handler.
+          `quill.setContents([{insert: qlText + '\\n'}], 'api');` +
+          `quill.setSelection(qlText.length, 0, 'api');` +
+          // Verify the text actually committed
+          `var qlActual=quill.getText().replace(/\\n+$/,'');` +
+          `if(qlActual.indexOf(qlText.substring(0, Math.min(20, qlText.length)))>=0){return 'Filled CE (Quill setContents)';}` +
+        `}catch(_qE){}` +
+      `}` +
+      // Quill instance not found via direct or Fiber — route to native paste fallback.
+      // Quill respects real isTrusted clipboard events, so CGEvent Cmd+V works.
+      `return '__NATIVE_PASTE_DIALOG__';` +
+    `}` +
     // Lexical editor detection (LinkedIn share composer, modern Meta/Shopify apps).
     // Three lookup strategies, cheapest first:
     //   A) [data-lexical-editor="true"] on ancestor with __lexicalEditor property.

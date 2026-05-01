@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.2] - 2026-05-01
+
+### Fixed
+
+- **`safari_fill` now handles Quill editors (the LinkedIn share composer 2026 reality).**
+  LinkedIn migrated their post composer from ProseMirror to Quill in 2026, which made
+  the v2.10.0 ProseMirror-targeted fix inapplicable to LinkedIn. Worse, fill attempts
+  on Quill's contenteditable surface crashed the Swift helper daemon and dismissed the
+  composer dialog. The fix detects `.ql-editor` ancestors first, locates the Quill
+  instance via `.ql-container.__quill` (Quill 2.x) or by walking React Fiber
+  (`memoizedProps.quill` / `stateNode.quill`), then commits the value through
+  `quill.setContents(delta, 'api')` — bypassing the clipboard, generating no synthetic
+  events, and respecting Quill's internal Delta state. If the Quill instance can't be
+  located via direct or Fiber access, fill routes to `__NATIVE_PASTE_DIALOG__` (CGEvent
+  Cmd+V) — Quill respects real isTrusted clipboard events. Verified post-fill that the
+  Quill text actually committed; on mismatch the function returns the same fallback
+  signal the wrapper uses for ProseMirror dialog-paste fallback.
+
 ## [2.10.1] - 2026-05-01
 
 ### Fixed
