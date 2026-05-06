@@ -166,6 +166,13 @@ let _activeTabURL = null;   // URL-based tracking (stable even when tabs shift)
 // _activeTabIndex or fail loudly — never silently target the user's tab.
 let _lastNewTabAt = 0;
 const NEW_TAB_GRACE_MS = 30000;
+// Becomes true once safari_new_tab is called for the first time in this session.
+// Once true, write operations (navigate/click/fill) MUST NOT fall back to
+// "current tab of window" — that targets the USER'S active tab. The 30s grace
+// window was insufficient: tab tracking can be lost much later in a session
+// (e.g. tab ghost recovery in runJS), and silently falling back to the user's
+// tab caused incidents where the user's working tab was overwritten.
+let _hasOwnedTab = false;
 let _lastResolveTime = 0;   // Cache: skip resolve if verified recently
 let _lastTabCount = null;   // Track tab count for smart cache invalidation
 let _activeTabMarker = null; // window.__mcpTabMarker — survives same-tab navigation, bulletproof tab identity
@@ -285,13 +292,18 @@ function isStaleWindowError(err) {
 // target whatever tab the user is looking at when our cached index is lost.
 function _assertNotFallingBackToUserTab(opName) {
   if (_activeTabIndex) return; // we have a tracked index — fine
-  const sinceNew = Date.now() - _lastNewTabAt;
-  if (sinceNew < NEW_TAB_GRACE_MS) {
+  // If we ever opened our own tab in this session, we MUST NOT fall back to
+  // "current tab of window" — that's the USER'S active tab. Always throw,
+  // regardless of how long ago the tab was opened. The previous 30-second
+  // grace window was insufficient: long-running sessions (Reddit warmup,
+  // multi-step workflows) routinely exceed it, and the danger persists.
+  if (_hasOwnedTab) {
     throw new Error(
-      `Tab tracking lost within ${Math.round(sinceNew/1000)}s of safari_new_tab — refusing to ${opName} via fallback (would target the user's active tab). ` +
-      `Re-run safari_new_tab and retry.`
+      `Tab tracking lost — refusing to ${opName} via fallback to "current tab of window" (would target the user's active tab). ` +
+      `This session previously opened its own tab via safari_new_tab; re-run safari_new_tab to recover, or call safari_list_tabs and safari_switch_tab to re-anchor to a known tab.`
     );
   }
+  // No tab ever owned by this session — fallback to front document is intentional.
 }
 
 function getFallbackTarget() {
@@ -779,7 +791,18 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
           return osascript(retryScript, { timeout });
         }
       }
-      // If still can't resolve, try current tab of the window
+      // If still can't resolve and we previously owned a tab — refuse to
+      // fall back to "current tab of window" (which is the USER'S active tab).
+      // Falling back would silently run our JS (potentially writes:
+      // document.title=, location.href=) on the user's working page.
+      if (_hasOwnedTab) {
+        throw new Error(
+          `Tab tracking lost during runJS — original tab ${idx} no longer exists, and URL-based resolution failed. ` +
+          `Refusing to fall back to "current tab of window" (would target user's active tab). ` +
+          `Call safari_new_tab to open a fresh tab and retry.`
+        );
+      }
+      // No owned tab in this session — front-document fallback is intentional.
       const fallbackScript = `tell application "Safari" to do JavaScript "${escaped}" in current tab of ${getTargetWindowRef()}`;
       console.error(`[Safari MCP] Falling back to current tab`);
       if (fallbackScript.length < 50000) return osascriptFast(fallbackScript, { timeout });
@@ -800,6 +823,14 @@ async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
     if (resolved) { idx = resolved; _lastResolveTime = Date.now(); }
   }
   if (!idx) idx = _activeTabIndex;
+  // If we previously owned a tab but lost tracking, refuse to target current tab
+  // (which is the USER'S active tab). Same protection as navigate/runJS fallback.
+  if (!idx && _hasOwnedTab) {
+    throw new Error(
+      `Tab tracking lost during runJSLarge — refusing to fall back to "current tab of window" (would target user's active tab). ` +
+      `Call safari_new_tab to open a fresh tab and retry.`
+    );
+  }
   const target = idx
     ? `tab ${idx} of ${getTargetWindowRef()}`
     : getFallbackTarget();
@@ -2606,7 +2637,9 @@ export async function newTab(url = "") {
   _activeTabURL = url || null;
   _lastResolveTime = Date.now();
   _lastTabCount = Number(tabCount);  // Update tab count cache
-  _lastNewTabAt = Date.now();        // Start grace window — block fallback to user's tab
+  _lastNewTabAt = Date.now();        // (legacy — grace window superseded by _hasOwnedTab)
+  _hasOwnedTab = true;               // Permanently true: this session has opened its own tab,
+                                     // so write ops must NEVER fall back to the user's current tab.
   // Set bulletproof tab marker — survives same-tab navigation, redirects, query changes (v2.8.3)
   _activeTabMarker = `MCP_${SESSION_ID}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
   await osascriptFast(
@@ -4214,6 +4247,8 @@ export async function navigateAndRead(url, { maxLength = 50000 } = {}) {
   let targetUrl = url;
   if (!/^https?:\/\//i.test(targetUrl)) targetUrl = "https://" + targetUrl;
   const safeUrl = targetUrl.replace(/"/g, '\\"');
+  if (_activeTabURL) await resolveActiveTab();
+  _assertNotFallingBackToUserTab('navigateAndRead');
   const navTarget = _activeTabIndex ? `tab ${_activeTabIndex} of ${getTargetWindowRef()}` : getFallbackTarget();
   await osascriptFast(`tell application "Safari" to set URL of ${navTarget} to "${safeUrl}"`);
   _activeTabURL = targetUrl;

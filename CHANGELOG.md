@@ -5,7 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.10.2] - 2026-05-01
+## [2.10.3] - 2026-05-06
+
+### Fixed
+
+- **Permanent tab-safety guard: `safari_navigate` (and friends) can no longer overwrite the user's active tab when MCP tab tracking is lost mid-session.**
+  Previously, a 30-second `NEW_TAB_GRACE_MS` window guarded against fallback to "current tab of window" only briefly after `safari_new_tab`. After the grace expired, if `_activeTabIndex` was lost (e.g. the tab-ghost recovery path in `runJS` nullified it), `navigate` silently fell back to the user's current tab via `getFallbackTarget()` — and clobbered whatever page the user was working on.
+  The fix introduces a session-scoped `_hasOwnedTab` flag set permanently the first time `safari_new_tab` succeeds. Once true, the four entry points that can target a tab — `_assertNotFallingBackToUserTab` (used by `navigate` and `navigateAndRead`), `runJS`'s tab-ghost fallback path, and `runJSLarge` — refuse to fall back to the user's current tab. They throw a descriptive error instead, prompting the caller to re-open a tab via `safari_new_tab`.
+  Sessions that never call `safari_new_tab` (e.g. tools that operate on the user's current tab intentionally) are unaffected — the front-document fallback still works for them.
+  Originally surfaced by an incident where `safari_navigate('https://old.reddit.com/...')` called ~30 minutes into a session navigated the user's localhost dev tab (which they had clicked back to between commands) instead of the MCP-owned tab.
+
+
 
 ### Fixed
 
