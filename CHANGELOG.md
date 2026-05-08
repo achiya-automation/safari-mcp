@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.4] - 2026-05-08
+
+### Fixed
+
+- **`safari_fill` no longer loses middle paragraphs in ProseMirror/Tiptap editors with no view access (Hashnode-style).**
+  When a ProseMirror-based editor doesn't expose its `view` via `pmViewDesc` or React Fiber walk (Hashnode's contenteditable has neither), `safari_fill` previously fell through to char-by-char `beforeinput` + `execCommand('insertText')` per line. On multi-paragraph content with markdown-like first characters (`>`, `**`, `[`), the editor dropped middle paragraphs silently — the result was the first paragraph + a chain of empty paragraphs + the last paragraph. The fix verifies actual content length after the char-by-char pass; if the rendered text is less than 60% of the expected value length, it clears the editor and re-fills via `execCommand('insertHTML')` with paragraph-wrapped HTML. The new return marker `Filled CE (ProseMirror insertHTML fallback, <actual>/<expected>)` makes the path observable.
+  Originally surfaced cross-posting a dev.to article body to a Hashnode draft — char-by-char filled 446 chars out of an expected 6800+, retaining only the first and last paragraphs.
+
+- **`safari_fill` synthetic-paste path now explicitly clears pre-existing content before paste.**
+  X's `tweetTextarea_0` at `/intent/post?text=...` pre-fills the textarea with the URL's `text` parameter before the page settles. Previous fill logic positioned cursor at the end of the existing content (via `selectNodeContents` + collapse) but didn't delete the selection before dispatching the synthetic `paste` event — most editors replace selection on paste, but X's React handler appended, resulting in duplicated text (`<URL prefill> <safari_fill value>`). The fix adds an explicit `document.execCommand('delete', false, null)` after the selection is set and before the `ClipboardEvent('paste')` dispatch. Affects any contenteditable whose initial content needs to be replaced via the synthetic-paste path (Quill in some configurations, X composer with URL-prefilled text, similar React-driven editors).
+
 ## [2.10.3] - 2026-05-06
 
 ### Fixed

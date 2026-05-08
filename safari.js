@@ -1446,7 +1446,11 @@ export async function fill({ selector, value, ref }) {
     `if(isClosure){return '__CLOSURE_NATIVE_PASTE__';}` +
     // Synthetic ClipboardEvent paste — works on ProseMirror, TipTap, Slate, and most modern editors
     // that don't respond to execCommand but DO handle paste events
-    `try{el.focus();var sel2=window.getSelection();if(sel2.rangeCount){var rng=document.createRange();rng.selectNodeContents(el);sel2.removeAllRanges();sel2.addRange(rng);}var dt=new DataTransfer();dt.setData('text/plain','${val}');var pe=new ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData:dt});var handled=!el.dispatchEvent(pe);if(handled||el.textContent.indexOf('${val.substring(0, 20)}')>=0){return 'Filled CE (synthetic paste)';}}catch(ep){}` +
+    // Pre-clear: select all + delete BEFORE paste. Some editors (X's tweetTextarea_0
+    // when it has URL-prefilled content from /intent/post?text=, Quill in some configs)
+    // append paste content to selection instead of replacing — explicit delete avoids
+    // the duplication seen when the textarea was pre-populated by URL parameters.
+    `try{el.focus();var sel2=window.getSelection();if(sel2.rangeCount){var rng=document.createRange();rng.selectNodeContents(el);sel2.removeAllRanges();sel2.addRange(rng);document.execCommand('delete',false,null);}var dt=new DataTransfer();dt.setData('text/plain','${val}');var pe=new ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData:dt});var handled=!el.dispatchEvent(pe);if(handled||el.textContent.indexOf('${val.substring(0, 20)}')>=0){return 'Filled CE (synthetic paste)';}}catch(ep){}` +
     // Synthetic paste did not verify — in a dialog, route to native paste (CGEvent Cmd+V)
     // to produce real isTrusted:true events. Avoids LinkedIn-style dialog dismissal too.
     `if(!!el.closest('[role="dialog"]')){return '__NATIVE_PASTE_DIALOG__';}` +
@@ -1505,6 +1509,23 @@ export async function fill({ selector, value, ref }) {
       `el.focus();el.click();` +
       `var t=document.activeElement||el;` +
       charInserts +
+      // Verification: count actual text length vs expected. If char-by-char dropped
+      // intermediate paragraphs (Hashnode-style Tiptap with markdown-like chars at
+      // line starts: `>`, `**`, `[`), fall back to execCommand('insertHTML') with
+      // paragraph-wrapped HTML.
+      `var actualLen=(el.innerText||'').length;` +
+      `var expectedLen=${value.length};` +
+      `if(actualLen<expectedLen*0.6){` +
+        // Clear and re-fill via insertHTML
+        `var sel=window.getSelection();var r=document.createRange();r.selectNodeContents(el);sel.removeAllRanges();sel.addRange(r);` +
+        `document.execCommand('delete',false,null);` +
+        // Build paragraph HTML from the original value
+        `var paras=${JSON.stringify(value)}.split(/\\n\\n+/).filter(function(p){return p.trim().length>0;});` +
+        `var html=paras.map(function(p){var safe=p.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\\n/g,'<br>');return '<p>'+safe+'</p>';}).join('');` +
+        `el.focus();var sel2=window.getSelection();var r2=document.createRange();r2.selectNodeContents(el);r2.collapse(true);sel2.removeAllRanges();sel2.addRange(r2);` +
+        `document.execCommand('insertHTML',false,html);` +
+        `return 'Filled CE (ProseMirror insertHTML fallback, '+(el.innerText||'').length+'/'+expectedLen+')';` +
+      `}` +
       `return 'Filled CE (ProseMirror char-by-char)';` +
       `})()`
     );
