@@ -27,6 +27,9 @@ jobs:
 
       - run: npm ci
 
+      - name: Audit production dependencies (fail on high+)
+        run: npm audit --audit-level=high --omit=dev
+
       - name: Verify syntax of entry points
         run: |
           node --check index.js
