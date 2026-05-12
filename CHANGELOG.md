@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.5] - 2026-05-12
+
+### Security
+
+- **Upgrade `fast-uri` 3.1.0 → 3.1.2 (CVE-2026-6321 / GHSA-q3j6-qgpj-74h6).** Resolves host-confusion via percent-encoded authority delimiters and path-traversal via percent-encoded dot segments. fast-uri is transitively pulled through `hono`'s URL parsing on the extension's lightweight HTTP surface.
+- **Upgrade `hono` 4.12.14 → 4.12.18.** Rolls up multiple advisories — CSS declaration injection via JSX SSR style object values, JWT NumericDate claim validation in `verify()`, cache middleware ignoring `Vary: Authorization` / `Vary: Cookie`, JSX tag/attribute name HTML injection, non-breaking-space cookie-name bypass, `setCookie` cookie-name validation, IPv4-mapped IPv6 matching in `ipRestriction()`, repeated-slash bypass in `serveStatic`, path traversal in `toSSG()`, and `bodyLimit()` bypass for chunked / unknown-length requests.
+- **Upgrade `ip-address` 10.1.0 → 10.2.0.** XSS in `Address6` HTML-emitting methods.
+
+### CI
+
+- **`npm audit` gate now fails the build on `high` or `critical` advisories in production dependencies.** Previously the gate logged but did not fail. Catches future Dependabot misses earlier.
+
+No user-facing behavior changes. Recommended reinstall for transitive-dependency hardening.
+
 ## [2.10.4] - 2026-05-08
 
 ### Fixed
