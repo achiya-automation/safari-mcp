@@ -31,7 +31,8 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
 
-      - run: npm ci
+      - name: Install dependencies
+        run: npm ci --force
 
       - name: Verify release tag matches package version
         env:
