@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.7] - 2026-05-14
+
+### Fixed
+
+- **Vue 3 v-model checkbox/radio sync.** `mcpClick` was calling `target.click()` and dispatching a synthetic click event for checkboxes and radios, but in some production-stripped Vue 3 apps (PartnerStack network application drawer is the canonical case) the v-model reactive binding silently dropped the state update — the DOM `.checked` flipped, but Vue's internal proxy state never updated, so the next form submission saw the OLD selection. Belt-and-suspenders: after the click, explicitly redispatch `input` and `change` events with `composed: true` (crosses Shadow DOM and Vue Teleport portals) and reset React's `_valueTracker` for the shared React-checkbox case. Restores reliable Next/Submit progression on multi-step Vue forms that gate validation on checkbox state.
+
 ## [2.10.6] - 2026-05-14
 
 ### Added

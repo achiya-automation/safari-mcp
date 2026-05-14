@@ -166,6 +166,18 @@ if (window.__mcpVersion !== 6) {
       }
     } catch (e) {}
     target.dispatchEvent(new MouseEvent('click', { ...s, buttons: 0 }));
+    // Vue v-model / Lit @change / framework-agnostic toggle sync — for checkbox/radio,
+    // Vue 3 listens for `change` via v-model; some Vue components subscribe to `input` instead.
+    // Native target.click() fires both, but in production-stripped Vue apps (no fiber/proxy
+    // visible), the reactivity sometimes misses the events when fired in the same microtask
+    // as a synthetic click. Belt-and-suspenders: re-dispatch input+change with composed:true
+    // and reset React's _valueTracker so subsequent submits see the new value.
+    if (target.tagName === 'INPUT' && (target.type === 'checkbox' || target.type === 'radio')) {
+      try { if (target._valueTracker && typeof target._valueTracker.setValue === 'function') target._valueTracker.setValue(''); } catch (_e) {}
+      var toggleOpts = { bubbles: true, cancelable: true, composed: true };
+      target.dispatchEvent(new Event('input', toggleOpts));
+      target.dispatchEvent(new Event('change', toggleOpts));
+    }
     if (href && href !== beforeUrl) {
       location.href = href;
     }
