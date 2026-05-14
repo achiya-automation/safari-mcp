@@ -3,8 +3,8 @@
 // It is also used by the extension's execInTab for the AppleScript fallback path.
 // IMPORTANT: Keep compatible with all browsers — no ES6+ modules, use var where possible.
 
-if (window.__mcpVersion !== 5) {
-  window.__mcpVersion = 5;
+if (window.__mcpVersion !== 6) {
+  window.__mcpVersion = 6;
   window.__mcpRefs = window.__mcpRefs || {};
   window.__mcpCachedRoots = null;
   window.__mcpRootsDirty = true;
@@ -327,5 +327,91 @@ if (window.__mcpVersion !== 5) {
       }
     }
     return best;
+  };
+  // React-Select v5 / Radix-style controlled-select bypass: walks fiber up from the
+  // target element to find a Select component (props.options + props.onChange), then
+  // invokes onChange directly with the matching option. Avoids menu UI entirely —
+  // critical for Cloudflare custom-token forms where the dropdown indicator stops
+  // responding to dispatched clicks after a few rows.
+  window.mcpReactSelectFindInstance = function(el) {
+    if (!el) return null;
+    var node = el;
+    for (var d = 0; d < 25 && node; d++) {
+      var keys = Object.keys(node);
+      var fk;
+      for (var ki = 0; ki < keys.length; ki++) {
+        if (keys[ki].indexOf('__reactFiber$') === 0 || keys[ki].indexOf('__reactInternalInstance$') === 0) { fk = keys[ki]; break; }
+      }
+      if (fk) {
+        var fiber = node[fk], hops = 0;
+        while (fiber && hops < 60) {
+          var p = fiber.memoizedProps || fiber.pendingProps || (fiber.stateNode && fiber.stateNode.props);
+          if (p && Array.isArray(p.options) && typeof p.onChange === 'function') {
+            return { props: p, fiber: fiber };
+          }
+          fiber = fiber.return;
+          hops++;
+        }
+      }
+      node = node.parentElement;
+    }
+    return null;
+  };
+  window.mcpReactSelectFlatten = function(options) {
+    var flat = [];
+    for (var i = 0; i < options.length; i++) {
+      var o = options[i];
+      if (o && Array.isArray(o.options)) {
+        for (var j = 0; j < o.options.length; j++) flat.push(o.options[j]);
+      } else if (o) {
+        flat.push(o);
+      }
+    }
+    return flat;
+  };
+  window.mcpReactSelectSet = function(el, optionLabel) {
+    var found = window.mcpReactSelectFindInstance(el);
+    if (!found) return JSON.stringify({ ok: false, error: 'no react-select Select component found in fiber tree' });
+    var p = found.props;
+    var flat = window.mcpReactSelectFlatten(p.options);
+    if (!flat.length) return JSON.stringify({ ok: false, error: 'Select component has no options (try opening the menu first to populate)' });
+    var needle = String(optionLabel);
+    var target = null;
+    for (var i = 0; i < flat.length; i++) {
+      if (flat[i] && (flat[i].label === needle || flat[i].value === needle)) { target = flat[i]; break; }
+    }
+    if (!target) {
+      var lcNeedle = needle.toLowerCase();
+      for (var k = 0; k < flat.length; k++) {
+        var lab = String(flat[k] && (flat[k].label !== undefined ? flat[k].label : flat[k].value) || '').toLowerCase();
+        if (lab === lcNeedle) { target = flat[k]; break; }
+      }
+    }
+    if (!target) {
+      return JSON.stringify({
+        ok: false,
+        error: 'option not found',
+        searched: needle,
+        total: flat.length,
+        available: flat.slice(0, 30).map(function(o) { return o && (o.label !== undefined ? o.label : o.value); })
+      });
+    }
+    var action = { action: 'select-option', option: target, name: p.name };
+    try {
+      p.onChange(target, action);
+      return JSON.stringify({ ok: true, selected: target.label !== undefined ? target.label : target.value });
+    } catch (e) {
+      return JSON.stringify({ ok: false, error: 'onChange threw: ' + e.message });
+    }
+  };
+  window.mcpReactSelectListOptions = function(el) {
+    var found = window.mcpReactSelectFindInstance(el);
+    if (!found) return JSON.stringify({ ok: false, error: 'no react-select Select component found' });
+    var flat = window.mcpReactSelectFlatten(found.props.options);
+    return JSON.stringify({
+      ok: true,
+      total: flat.length,
+      options: flat.map(function(o) { return { label: o && o.label, value: o && o.value }; })
+    });
   };
 }

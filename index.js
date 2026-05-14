@@ -1107,6 +1107,33 @@ server.tool(
 );
 
 server.tool(
+  "safari_react_select_set",
+  "Set a value in a react-select v5 dropdown by walking React fiber to find the Select component and invoking onChange directly — bypasses the menu UI entirely. Use when safari_click on the chevron or option keeps failing (Cloudflare custom token forms after a few rows, portal-rendered selects that intercept synthetic events). Returns JSON {ok, selected} on success, or {ok:false, error, available:[…]} listing up to 30 option labels on miss. Match is by label, value, or case-insensitive label. Either ref or selector required. NOTE: For Permissions-levels combos that are disabled until a Permission is selected, set the Permissions value first — the level combo becomes enabled and its props.options populate.",
+  {
+    selector: z.string().optional().describe("CSS selector — typically input[name=...] or the .react-select__control container"),
+    ref: z.string().optional().describe("Ref ID from safari_snapshot"),
+    value: z.string().describe("Option label (or value) to select — case-insensitive fallback"),
+  },
+  async (args) => {
+    const result = await safari.reactSelectSet(args);
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+  }
+);
+
+server.tool(
+  "safari_react_select_list_options",
+  "List available options of a react-select v5 dropdown without opening the menu. Returns JSON {ok, total, options:[{label,value}…]}. Useful when safari_react_select_set returns 'option not found' and you need to see exact labels (e.g. 'Email Routing Rules' vs 'Email Routing'). Either ref or selector required.",
+  {
+    selector: z.string().optional().describe("CSS selector"),
+    ref: z.string().optional().describe("Ref ID from safari_snapshot"),
+  },
+  async (args) => {
+    const result = await safari.reactSelectListOptions(args);
+    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+  }
+);
+
+server.tool(
   "safari_fill_form",
   "Fill multiple form fields at once",
   {

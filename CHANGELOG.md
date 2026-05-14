@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.6] - 2026-05-14
+
+### Added
+
+- **`safari_react_select_set`** — set a value in a react-select v5 dropdown by walking React fiber up from the target element to find the Select component, then invoking `onChange` directly with the matching option. Bypasses the menu UI entirely. Critical for forms where `safari_click` on the dropdown chevron stops responding after a few rows (Cloudflare custom token form is the canonical case — the indicator's pointer/click handlers silently no-op past row 4 even though the elements still have valid React fibers). Match priority: exact label → exact value → case-insensitive label. Returns `{ok, selected}` on success, or `{ok:false, error:'option not found', available:[…]}` listing up to 30 labels on miss. Either `ref` or `selector` required.
+- **`safari_react_select_list_options`** — companion read-only tool. Returns `{ok, total, options:[{label,value}…]}` without opening the menu. Useful when `set` returns "option not found" and you need to see the exact labels (e.g. `Email Routing Rules` vs `Email Routing`).
+- **`mcpReactSelectFindInstance` / `mcpReactSelectFlatten` / `mcpReactSelectSet` / `mcpReactSelectListOptions`** — underlying page-injected helpers. Bumps `__mcpVersion` to 6 so existing pages re-inject on next `ensureHelpers`.
+
+### Implementation notes
+
+The fiber walk has two passes: outer DOM-parent traversal (up to 25 levels) and inner fiber `.return` traversal (up to 60 hops) at each DOM level. This covers portal-rendered Select components where the React tree and DOM tree diverge. Grouped options (`{label, options:[…]}`) are flattened before matching. The synthetic action object passed to `onChange(target, action)` mirrors react-select's own `{action:'select-option', option, name}` shape so consumers that branch on `action.action` behave correctly.
+
+### Fixed
+
+- `ensureHelpers` check now requires `mcpReactSelectSet` in addition to `mcpClickWithReact` and `mcpFindText`, forcing re-injection on pages still holding the v5 helpers.
+
 ## [2.10.5] - 2026-05-12
 
 ### Security

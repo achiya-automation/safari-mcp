@@ -1070,7 +1070,7 @@ async function ensureHelpers() {
   if (_activeTabURL && _helpersInjectedForUrl === _activeTabURL && (now - _helpersInjectedAt) < HELPERS_CACHE_MS) return;
 
   // Check if helpers are actually present (not just version flag)
-  const check = await runJS("(typeof mcpClickWithReact==='function'&&typeof mcpFindText==='function')?'ok':'missing'").catch(() => 'missing');
+  const check = await runJS("(typeof mcpClickWithReact==='function'&&typeof mcpFindText==='function'&&typeof mcpReactSelectSet==='function')?'ok':'missing'").catch(() => 'missing');
   if (check === 'ok') {
     _helpersInjectedForUrl = _activeTabURL;
     _helpersInjectedAt = now;
@@ -1706,6 +1706,45 @@ export async function selectOption({ selector, value }) {
   return runJS(
     `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found';el.focus();var t=el._valueTracker;if(t)t.setValue('');var d=Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value');if(d&&d.set){d.set.call(el,'${val}');}else{el.value='${val}';}var m=false;for(var i=0;i<el.options.length;i++){if(el.options[i].value==='${val}'){el.selectedIndex=i;m=true;break;}}if(!m||el.value!=='${val}'){var norm=function(s){return s.replace(/[\\u200B-\\u200F\\u202A-\\u202E\\u2066-\\u2069\\uFEFF]/g,'').replace(/[\\u2010-\\u2015\\u2212\\uFE58\\uFE63\\uFF0D]/g,'-').replace(/\\s*-\\s*/g,'-').replace(/\\s+/g,' ').trim();};var cv=norm('${val}');for(var i=0;i<el.options.length;i++){if(norm(el.options[i].value)===cv||norm(el.options[i].text)===cv){el.selectedIndex=i;if(d&&d.set){d.set.call(el,el.options[i].value);}else{el.value=el.options[i].value;}m=true;break;}}if(!m){for(var i=0;i<el.options.length;i++){var nv=norm(el.options[i].value),nt=norm(el.options[i].text);if(nv.indexOf(cv)>=0||nt.indexOf(cv)>=0||cv.indexOf(nv)>=0||cv.indexOf(nt)>=0){if(i===0&&el.options.length>1)continue;el.selectedIndex=i;if(d&&d.set){d.set.call(el,el.options[i].value);}else{el.value=el.options[i].value;}m=true;break;}}}}el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));el.dispatchEvent(new Event('blur',{bubbles:true}));return 'Selected: '+el.value+' (index '+el.selectedIndex+')';})()`
   );
+}
+
+// React-Select v5 / Radix-style controlled-select bypass.
+// Walks React fiber up from the target element to find a Select component
+// (props.options + props.onChange) and calls onChange directly — no menu UI.
+// Use when safari_click on the chevron/option fails (Cloudflare token form,
+// portal-rendered selects that intercept synthetic events).
+export async function reactSelectSet({ selector, ref, value }) {
+  await ensureHelpers();
+  if (value === undefined || value === null) throw new Error("reactSelectSet requires 'value' (option label)");
+  let finder;
+  if (ref) {
+    const safeRef = String(ref).replace(/'/g, "\\'");
+    finder = `mcpFindRef('${safeRef}')`;
+  } else if (selector) {
+    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    finder = `mcpQuerySelectorDeep('${sel}')`;
+  } else {
+    throw new Error("reactSelectSet requires 'ref' or 'selector'");
+  }
+  const safeValue = String(value).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const js = `(function(){var el=${finder};if(!el)return JSON.stringify({ok:false,error:'element not found'});return window.mcpReactSelectSet(el,'${safeValue}');})()`;
+  return runJS(js);
+}
+
+export async function reactSelectListOptions({ selector, ref }) {
+  await ensureHelpers();
+  let finder;
+  if (ref) {
+    const safeRef = String(ref).replace(/'/g, "\\'");
+    finder = `mcpFindRef('${safeRef}')`;
+  } else if (selector) {
+    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    finder = `mcpQuerySelectorDeep('${sel}')`;
+  } else {
+    throw new Error("reactSelectListOptions requires 'ref' or 'selector'");
+  }
+  const js = `(function(){var el=${finder};if(!el)return JSON.stringify({ok:false,error:'element not found'});return window.mcpReactSelectListOptions(el);})()`;
+  return runJS(js);
 }
 
 export async function fillForm({ fields }) {
