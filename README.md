@@ -645,7 +645,23 @@ Safari MCP needs these one-time permissions:
 | JavaScript from Apple Events | Safari → Develop menu | Required for `do JavaScript` |
 | Automation → Safari | System Settings → Privacy & Security → Automation | Required for all AppleScript-backed tools |
 | Screen Recording | System Settings → Privacy & Security → Screen Recording | Required for `safari_screenshot` |
-| Accessibility | System Settings → Privacy & Security → Accessibility | Required for `safari_save_pdf` only |
+| Accessibility (safari-helper) | System Settings → Privacy & Security → Accessibility | Required for `safari_native_click`, `safari_native_keyboard`, `safari_native_hover` and `safari_save_pdf` |
+
+### Granting Accessibility to safari-helper (required for `safari_native_*`)
+
+The `safari_native_click`, `safari_native_keyboard` and `safari_native_hover` tools inject OS-level `CGEvent` events into Safari without stealing focus. macOS requires the underlying helper binary to be approved in **Accessibility** before those events can reach a non-frontmost window.
+
+1. Open **System Settings → Privacy & Security → Accessibility**.
+2. Click `+` (unlock with your password if needed).
+3. Navigate to the helper binary and add it:
+   - npm global install: `$(npm root -g)/safari-mcp/safari-helper`
+   - npx / project install: `./node_modules/safari-mcp/safari-helper`
+   - From source clone: `/path/to/safari-mcp/safari-helper`
+4. Make sure the toggle next to it is **ON**.
+
+The postinstall script re-signs the helper with a stable identifier (`com.achiya-automation.safari-mcp`) so this permission survives future upgrades — without that step, every `npm update` would silently revoke approval because the binary's adhoc-signed identifier changes per build.
+
+If `safari_native_click` reports success but the page doesn't react (no `isTrusted: true` click events fire), the helper is most likely missing this approval. The `safari_*` (non-`native_`) tools don't need it.
 
 ### Granting Automation → Safari (important for IDE users)
 
@@ -668,6 +684,7 @@ That call registers the Terminal app in the Automation database and then trigger
 | "AppleScript error" | Enable "Allow JavaScript from Apple Events" in Safari → Develop |
 | "Not authorized to send Apple events to Safari" | Grant Automation → Safari to your IDE (see above) |
 | "Not authorized" after `npm update` | Updating changes the binary's cdhash — macOS silently revokes Automation permission. Re-run the `osascript` one-liner above to re-grant it |
+| `safari_native_click` reports success but page doesn't react | Add `safari-helper` to **System Settings → Privacy & Security → Accessibility** (see [Granting Accessibility](#granting-accessibility-to-safari-helper-required-for-safari_native_) above). Confirm by attaching a `click` listener with `{capture:true}` in the page console — without the grant, no `isTrusted: true` event fires |
 | Screenshots empty | Grant Screen Recording permission to Terminal/VS Code |
 | Tab not found | Call `safari_list_tabs` to refresh tab indices |
 | Hebrew keyboard issues | All typing uses JS events — immune to keyboard layout |

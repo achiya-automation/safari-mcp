@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.9] - 2026-05-14
+
+### Fixed
+
+- **Stable codesign identifier for Accessibility-permission persistence.** The shipped `safari-helper` binary is adhoc-signed with a hash-based identifier (e.g. `safari-helper-555549441c166aa237e130ddbe3d95629266ecaf`). macOS TCC keys Accessibility grants by that identifier, so every `npm install` / rebuild silently invalidated any previously-granted approval — the helper kept reporting success but CGEvent injections never reached non-frontmost Safari content (no `isTrusted` events fired on the page). The PartnerStack network application drawer was the canonical reproducer. `scripts/postinstall.cjs` now re-signs the helper with the fixed identifier `com.achiya-automation.safari-mcp` (preserving entitlements) so the Accessibility grant persists across upgrades. README now documents the one-time `Accessibility → +` step explicitly under "Granting Accessibility to safari-helper".
+
 ## [2.10.8] - 2026-05-14
 
 ### Fixed
