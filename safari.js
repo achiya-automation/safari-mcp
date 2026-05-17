@@ -216,9 +216,14 @@ async function refreshTargetWindow(force = false) {
   if (!force && _targetWindowRef && (now - _targetWindowCacheTime) < TARGET_WINDOW_CACHE_MS) return;
   const safeProfile = SAFARI_PROFILE.replace(/"/g, '\\"');
   // Find profile window by name AND verify the window ID still matches
-  const result = await osascriptFast(
-    `tell application "Safari"\n  repeat with w in every window\n    if name of w starts with "${safeProfile} \u2014" then return (id of w as text) & "|" & name of w\n  end repeat\n  return "0|"\nend tell`
-  ).catch(() => '0|');
+  const detectScript = `tell application "Safari"\n  repeat with w in every window\n    if name of w starts with "${safeProfile} \u2014" then return (id of w as text) & "|" & name of w\n  end repeat\n  return "0|"\nend tell`;
+  let result = await osascriptFast(detectScript).catch(() => '0|');
+  // The persistent helper occasionally returns '0|' for a window that genuinely
+  // exists (daemon timeout / restart race). Before concluding the window is
+  // missing, retry once with a plain osascript subprocess \u2014 slower but reliable.
+  if (String(result).split('|')[0] === '0') {
+    result = await osascript(detectScript).catch(() => '0|');
+  }
   const [idStr, windowName] = String(result).split('|');
   const id = Number(idStr);
   if (id > 0) {
@@ -243,7 +248,12 @@ async function refreshTargetWindow(force = false) {
 // Background verification: periodically check that cached window ID still belongs to profile
 if (SAFARI_PROFILE) {
   setInterval(async () => {
-    if (!_targetWindowRef || !_targetWindowId) return;
+    // No cached window (e.g. flaky detection at startup) — keep trying to
+    // rediscover it so the server self-heals instead of staying stuck.
+    if (!_targetWindowRef || !_targetWindowId) {
+      await refreshTargetWindow(true).catch(() => {});
+      return;
+    }
     try {
       const name = await osascriptFast(
         `tell application "Safari" to return name of ${_targetWindowRef}`
@@ -374,15 +384,17 @@ async function resolveActiveTab() {
 
   // Strategy 1: window.__mcpTabMarker (bulletproof — survives navigation, redirects, query changes)
   // Only attempted if we have a marker AND a cached index hint
-  if (_activeTabMarker && _activeTabIndex) {
+  if (_activeTabMarker) {
     try {
       const safeMarker = _activeTabMarker.replace(/'/g, "\\'");
       // Single JS call: check cached index first, then walk all tabs to find marker
       const checkScript = `(function(){return window.__mcpTabMarker==='${safeMarker}'?'1':'0'})()`;
-      const matchAtCached = await osascriptFast(
-        `tell application "Safari" to do JavaScript "${checkScript}" in tab ${_activeTabIndex} of ${getTargetWindowRef()}`
-      ).catch(() => '0');
-      if (String(matchAtCached).trim() === '1') return _activeTabIndex;
+      if (_activeTabIndex) {
+        const matchAtCached = await osascriptFast(
+          `tell application "Safari" to do JavaScript "${checkScript}" in tab ${_activeTabIndex} of ${getTargetWindowRef()}`
+        ).catch(() => '0');
+        if (String(matchAtCached).trim() === '1') return _activeTabIndex;
+      }
       // Cached index doesn't match — scan all tabs for marker
       const tabCountStr = await osascriptFast(
         `tell application "Safari" to return count of tabs of ${getTargetWindowRef()}`
@@ -764,13 +776,18 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
   if (!idx && _activeTabIndex && _activeTabURL && (Date.now() - _lastResolveTime < RESOLVE_CACHE_MS)) {
     // Recently verified and tab count unchanged — use cached index
     idx = _activeTabIndex;
-  } else if (!idx && _activeTabURL && _activeTabURL !== '') {
-    // Resolve by URL — verify index is still correct
+  } else if (!idx && (_activeTabURL || _activeTabMarker)) {
+    // Resolve by URL or marker — the marker scan still finds an owned tab
+    // even after _activeTabURL has been cleared by a failed URL lookup.
     const resolved = await resolveActiveTab();
     if (resolved) { idx = resolved; _lastResolveTime = Date.now(); }
   }
   // ALWAYS fall back to _activeTabIndex — never clear it from resolve failures
   if (!idx) idx = _activeTabIndex;
+  // Once this session owns a tab, never silently run on the user's current tab.
+  if (!idx && _hasOwnedTab && SAFARI_PROFILE) {
+    throw new Error('Tab tracking lost during runJS — refusing to target the user\'s current tab. Call safari_new_tab to reopen.');
+  }
   const target = idx
     ? `tab ${idx} of ${getTargetWindowRef()}`
     : getFallbackTarget();
