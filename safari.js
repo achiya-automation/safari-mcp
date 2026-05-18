@@ -3005,6 +3005,26 @@ export async function waitFor({ selector, text, timeout = 10000 }) {
 
 // ========== EVALUATE ==========
 
+// Index of the last `;` that ends a top-level statement — skips `;` inside strings,
+// template literals and parens/brackets/braces (e.g. a `for (;;)` header). Returns
+// -1 when there is no top-level statement separator.
+function _lastTopLevelSemicolon(s) {
+  let depth = 0, inStr = false, quote = '', last = -1;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (c === '\\') { i++; continue; }
+      if (c === quote) inStr = false;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') { inStr = true; quote = c; }
+    else if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') depth--;
+    else if (c === ';' && depth === 0) last = i;
+  }
+  return last;
+}
+
 // Build the expression to evaluate from a user script. Pure (no Safari calls) so
 // it can be unit-tested directly — see scripts/test-evaluate-wrapping.js.
 export function _buildEvalExpr(js) {
@@ -3045,8 +3065,16 @@ export function _buildEvalExpr(js) {
     if (addedReturn) {
       expr = `(${isAsync ? 'async function' : 'function'}(){${lines.join('\n')}})()`;
     } else if (isAsync) {
-      // No safe return slot — run the body in an async IIFE (value may be undefined).
-      expr = `(async function(){${js}})()`;
+      // No newline gave a return slot — typically a single-line `const x = await …; expr`.
+      // Split at the last top-level `;`: if a bare expression follows it, that becomes the
+      // awaited result. Otherwise run the body as-is (value may be undefined).
+      const semi = _lastTopLevelSemicolon(js);
+      const tail = semi >= 0 ? js.slice(semi + 1).trim() : '';
+      if (tail && !tail.startsWith('}') && !NON_EXPR.test(tail)) {
+        expr = `(async function(){${js.slice(0, semi + 1)} return (${tail}); })()`;
+      } else {
+        expr = `(async function(){${js}})()`;
+      }
     } else {
       // Indirect eval yields the completion value of an arbitrary statement list;
       // the catch re-runs the body plainly when a strict CSP blocks eval.

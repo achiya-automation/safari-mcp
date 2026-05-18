@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.11.2] - 2026-05-18
+
+### Fixed
+
+- **Concurrent MCP instances no longer kill each other on startup.** Each `safari-mcp` process used to `SIGTERM` every other instance running more than 10 seconds, to clear "stale" processes from previous sessions. But concurrent instances are supported by design — the first to bind the HTTP port becomes the extension host and the rest proxy commands through it — so this kill was wrong: with multiple Claude Code sessions open, or a restart racing the previous instance, each new process disconnected the others mid-task and the MCP server showed up as "not connected". The cross-instance kill is removed entirely; every instance is already cleaned up by its own MCP client on shutdown.
+- **`safari_evaluate` now resolves single-line async scripts that end in a bare expression.** A script such as `const r = await fetch(url); r.status` — multiple statements separated by `;` on one line — returned `(no return value)`: the return-injection only scanned newline-separated lines, so a single line beginning with `const`/`let` was left without a return slot and the async IIFE discarded the trailing expression. `evaluate` now also splits at the last top-level `;` — skipping `;` inside strings, template literals and `for (;;)` headers — so the final expression becomes the awaited result.
+
 ## [2.11.1] - 2026-05-18
 
 ### Fixed

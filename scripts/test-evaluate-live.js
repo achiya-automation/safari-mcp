@@ -46,6 +46,9 @@ async function main() {
   check('async: multi-statement await', await safari.evaluate({
       script: 'const a = await Promise.resolve(8);\nconst b = await Promise.resolve(9);\na + b' }),
     v => String(v) === '17');
+  check('async: single-line multi-statement', await safari.evaluate({
+      script: 'const r = await fetch(location.href); r.status' }),
+    v => String(v) === '200');
   check('async: fetch same-origin', await safari.evaluate({ script: 'fetch(location.href).then(r => r.status)' }),
     v => String(v) === '200');
   check('async: error surfaces', await safari.evaluate({ script: 'await Promise.reject(new Error("boom"))' }),

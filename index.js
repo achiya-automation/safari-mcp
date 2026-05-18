@@ -20,34 +20,14 @@ import { homedir } from "node:os";
 
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 MB cap on POST body — prevents DoS
 
-// ========== SINGLETON: kill stale instances from previous sessions ==========
-// NOTE: Claude Code VSCode may start 2 instances simultaneously (~40ms apart).
-// Only kill instances running >10 seconds (truly stale), not fresh siblings.
-try {
-  const myPid = process.pid;
-  const lines = execFileSync("pgrep", ["-af", "node.*/safari-mcp/index\\.js"], { encoding: "utf8" }).trim().split("\n");
-  for (const line of lines) {
-    const pid = parseInt(line.split(/\s+/)[0], 10);
-    if (pid && pid !== myPid) {
-      // Check how long the process has been running (elapsed time in seconds)
-      let elapsedSec = 0;
-      try {
-        const etime = execFileSync("ps", ["-o", "etime=", "-p", String(pid)], { encoding: "utf8" }).trim();
-        // etime format: [[DD-]HH:]MM:SS — parse to seconds
-        const parts = etime.replace(/-/g, ":").split(":").map(Number);
-        if (parts.length === 2) elapsedSec = parts[0] * 60 + parts[1];
-        else if (parts.length === 3) elapsedSec = parts[0] * 3600 + parts[1] * 60 + parts[2];
-        else if (parts.length === 4) elapsedSec = parts[0] * 86400 + parts[1] * 3600 + parts[2] * 60 + parts[3];
-      } catch {}
-      if (elapsedSec > 10) {
-        try { process.kill(pid, "SIGTERM"); } catch {}
-        console.error(`[Safari MCP] Killed stale instance PID ${pid} (running ${elapsedSec}s)`);
-      } else {
-        console.error(`[Safari MCP] Skipping fresh instance PID ${pid} (running ${elapsedSec}s)`);
-      }
-    }
-  }
-} catch {}
+// ========== MULTI-INSTANCE: concurrent instances coexist (never kill siblings) ==========
+// This block previously SIGTERM'd every other safari-mcp instance running >10s to
+// clear "stale" processes from previous sessions. That broke multi-session use:
+// each new Claude Code session's instance killed every older session's instance,
+// disconnecting them mid-task. Concurrent instances are fully supported by design —
+// the first to bind HTTP_PORT becomes the extension host, the rest proxy commands
+// through it (see PROXY MODE below). Instances from closed sessions are SIGTERM'd
+// by their own MCP client on shutdown, so no cross-instance cleanup is needed here.
 
 // ========== SESSION ID (unique per MCP process — enables per-session tab tracking) ==========
 const SESSION_ID = randomUUID().slice(0, 8);

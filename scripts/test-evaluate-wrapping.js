@@ -94,6 +94,10 @@ function noThrow(fn) {
   check('async arrow IIFE', await runAsync('(async () => { return await Promise.resolve(8) * 2; })()'), 16);
   check('.then() chain', await runAsync('Promise.resolve(5).then(x => x + 100)'), 105);
   check('async multi-statement', await runAsync('const a = await Promise.resolve(3);\nconst b = await Promise.resolve(4);\na * b'), 12);
+  check('async single-line multi-statement', await runAsync('const a = await Promise.resolve(3); a * 4'), 12);
+  check('async single-line, two declarations', await runAsync('let x = await Promise.resolve(5); const y = await Promise.resolve(6); x + y'), 11);
+  check('async single-line ending in member expr', await runAsync('const o = await Promise.resolve({ n: 8 }); o.n'), 8);
+  check('async single-line with for-loop (semicolon-aware)', await runAsync('let s = 0; for (let i = 0; i < 3; i++) { s += await Promise.resolve(i); }; s'), 3);
   check('leading async statement', await runAsync('async function f(){ return 11; }\nawait f()'), 11);
   check('delayed promise (real wait)', await runAsync('await new Promise(r => setTimeout(() => r("late"), 80))'), 'late');
   check('async returning object', await runAsync('await Promise.resolve({ n: 9 })'), '{"n":9}');
