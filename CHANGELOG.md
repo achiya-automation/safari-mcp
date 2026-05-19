@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.11.3] - 2026-05-19
+
+### Fixed
+
+- **`safari_select_option` now reaches native `<select>` elements inside iframes and shadow DOM.** The tool resolved its target with a plain top-frame `document.querySelector(selector)`, so a `<select>` rendered inside an iframe (for example an embedded Salesforce/Lightning support form) or a shadow root was unreachable — every call returned `Element not found`, even though `safari_snapshot` had captured the element and `safari_click` could resolve it. `safari_select_option` now accepts a `ref` (from `safari_snapshot`): the ref path resolves the element through `mcpFindRef` — the same deep finder `click` uses, which traverses shadow roots and same-origin frames — and the selector path falls back to `mcpQuerySelectorDeep`. Pass `ref` for any select a top-document selector cannot reach.
+
 ## [2.11.2] - 2026-05-18
 
 ### Fixed

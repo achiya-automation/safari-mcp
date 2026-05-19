@@ -1080,12 +1080,19 @@ server.tool(
 
 server.tool(
   "safari_select_option",
-  "Select an option in a native <select> dropdown. Sets .value and dispatches change event. For custom dropdowns (React/LinkedIn), use safari_click on the dropdown trigger, then safari_click on the option instead.",
+  "Select an option in a native <select> dropdown. Sets .value and dispatches change event. Pass `ref` (from safari_snapshot) for a select inside an iframe or shadow DOM — a plain `selector` only reaches the top document. For custom dropdowns (React/LinkedIn), use safari_click on the dropdown trigger, then safari_click on the option instead.",
   {
-    selector: z.string().describe("CSS selector of the select"),
-    value: z.string().describe("Option value to select"),
+    selector: z.string().optional().describe("CSS selector of the select (top document only)"),
+    ref: z.string().optional().describe("Ref ID from safari_snapshot — required for selects inside iframes/shadow DOM"),
+    value: z.string().describe("Option value or visible label to select"),
   },
   async (args) => {
+    // ref path: resolve via mcpFindRef (reaches iframes/shadow DOM) on the AppleScript
+    // engine — the extension's select_option handler is selector-only.
+    if (args.ref) {
+      const refResult = await safari.selectOption({ ref: args.ref, value: args.value });
+      return { content: [{ type: "text", text: typeof refResult === 'string' ? refResult : JSON.stringify(refResult) }] };
+    }
     let result = await extensionOrFallback(
       "select_option", { selector: args.selector, value: args.value },
       () => safari.selectOption(args)
