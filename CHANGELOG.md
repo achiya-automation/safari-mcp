@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.11.4] - 2026-05-25
+
+### Fixed
+
+- **`/proxy-command` no longer leaks commands to the wrong Safari profile.** Secondary MCP instances and external HTTP clients can call this endpoint to route a command through the primary instance's extension WebSocket. The endpoint sent every command straight to `sendToExtension()` without checking `SAFARI_PROFILE`, so when the host instance was configured to target a specific profile but the connected extension belonged to a different profile window (e.g. the user's "personal" profile happened to be the one that won the extension-connect race), the command executed in the wrong profile — silently. A real example: a skill ran 8 parallel safari-mcp instances, the MCP tools failed to register, the skill fell back to direct `POST /proxy-command` calls, and every Reddit action ran against the personal profile's Reddit session instead of the dedicated automation profile. `/proxy-command` now returns HTTP 503 with a clear message when `SAFARI_PROFILE` is set on the host, pointing callers at the `safari_*` MCP tools — those route through AppleScript when a profile is configured and stay inside the configured profile window. Secondary instances running under the same `SAFARI_PROFILE` already skipped `/proxy-command` (because `_preferAppleScript` forced the AppleScript path), so they're unaffected; the gate only blocks callers that would have crossed the profile boundary.
+
 ## [2.11.3] - 2026-05-19
 
 ### Fixed

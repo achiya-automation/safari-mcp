@@ -473,6 +473,14 @@ try {
 
     // POST /proxy-command — secondary instances send commands through primary
     if (req.method === "POST" && req.url === "/proxy-command") {
+      // חוסם כש-SAFARI_PROFILE מוגדר — אחרת ה-extension עלול לפעול בפרופיל הלא נכון
+      if (process.env.SAFARI_PROFILE) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          error: `Refusing /proxy-command: SAFARI_PROFILE="${process.env.SAFARI_PROFILE}" is set on the host instance. The Safari extension may be connected to a different profile window, which would execute commands in the wrong profile. Use the safari_* MCP tools instead — they route through AppleScript when SAFARI_PROFILE is set and stay within the configured profile window.`
+        }));
+        return;
+      }
       let body = "";
       req.on("data", (chunk) => { body += chunk; if (body.length > MAX_BODY_SIZE) { res.writeHead(413); res.end("Payload too large"); req.destroy(); } });
       req.on("end", async () => {
