@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.11.5] - 2026-05-26
+
+### Security
+
+- **Bumped `ws` 8.20.1 → 8.21.0** to pick up the upstream fix for a remote memory-exhaustion DoS (CVE-class issue, responsibly disclosed by Nadav Magier). A peer streaming a high volume of tiny fragments or data chunks over modest network traffic could OOM a `ws` server or client. `safari-mcp` uses `ws` for the Safari extension WebSocket bridge, so the receiving side now caps retained fragments and chunks. No API changes.
+
 ## [2.11.4] - 2026-05-25
 
 ### Fixed
