@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.11.6] - 2026-05-26
+
+### Security
+
+- **Bumped transitive `qs` 6.15.0 → 6.15.2** via `npm audit fix` to close [Dependabot alert #18](https://github.com/achiya-automation/safari-mcp/security/dependabot/18). `qs` ships with Express (pulled in by `@modelcontextprotocol/sdk` for the HTTP control surface); `qs.stringify` would crash with a `TypeError` on null/undefined entries inside comma-format arrays when `encodeValuesOnly: true`. `safari-mcp` does not set that option, so this was not exploitable in our code path, but the upgrade clears the alert and any downstream user that does set it. No API changes.
+
 ## [2.11.5] - 2026-05-26
 
 ### Security
