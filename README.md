@@ -46,7 +46,7 @@ Your AI drives the **Safari you're already logged into** — Gmail, GitHub, Ahre
 
 Native WebKit. ~60% less CPU. Background operation. 80 tools. One `npx` command. macOS only.
 
-> 📰 **Featured on HackerNoon:** [I Had to Reverse-Engineer React, Shadow DOM, and CSP to Automate Safari Without Chrome](https://hackernoon.com/i-had-to-reverse-engineer-react-shadow-dom-and-csp-to-automate-safari-without-chrome)
+> 📰 **Featured on freeCodeCamp:** [How to Connect Your AI Coding Agent to a Browser on macOS](https://www.freecodecamp.org/news/how-to-connect-your-ai-coding-agent-to-a-browser-on-macos/) · [HackerNoon: Reverse-Engineering React, Shadow DOM, and CSP](https://hackernoon.com/i-had-to-reverse-engineer-react-shadow-dom-and-csp-to-automate-safari-without-chrome)
 
 ---
 
