@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.11.9] - 2026-05-28
+
+### Fixed
+
+- **MCP `initialize` handshake no longer blocks on profile-window detection at startup.** When launched with `SAFARI_PROFILE=<name>`, the server used to run `await refreshTargetWindow(true)` on the module's top-level await before the stdio loop began responding to the MCP `initialize` request. That call shells out to AppleScript to enumerate Safari windows and match the profile — typically ~50–200ms, but it could exceed 30s if Safari was busy (Spotlight indexing, heavy tab churn, AppleScript daemon stalled). When it did, Claude Code's 30-second MCP handshake timeout fired, the server was killed, and `safari-*` tools silently disappeared from the conversation's tool catalog until the user started a new Claude Code session. The detection now runs in a fire-and-forget async IIFE so module init completes immediately; tool calls that arrive before it finishes already trigger lazy refresh inside `getTargetWindowRef()`, so the targeting behaviour is unchanged.
+
 ## [2.11.7] - 2026-05-26
 
 ### Fixed

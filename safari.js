@@ -307,13 +307,23 @@ if (SAFARI_PROFILE) {
 
 // Initialize profile window at startup (ES module top-level await)
 if (SAFARI_PROFILE) {
-  await new Promise(r => setTimeout(r, 50)); // Let helper process initialize
-  await refreshTargetWindow(true);
-  if (_targetWindowRef) {
-    _logProfile(`Startup: Profile "${SAFARI_PROFILE}" → targeting ${_targetWindowRef}`);
-  } else {
-    _logProfile(`WARNING: Profile "${SAFARI_PROFILE}" window NOT found at startup`);
-  }
+  // Run profile-window detection off the critical path so module init — and
+  // therefore the MCP initialize handshake — completes immediately. Tool calls
+  // that arrive before this finishes already trigger lazy refresh via
+  // getTargetWindowRef(), so correctness is preserved.
+  // Why this matters: a blocking `await refreshTargetWindow(true)` here could
+  // run >30s when Safari was busy or AppleScript was stalled, tripping Claude
+  // Code's 30s MCP timeout and leaving the conversation's tool catalog without
+  // safari tools until a new conversation is started.
+  (async () => {
+    await new Promise(r => setTimeout(r, 50)); // Let helper process initialize
+    await refreshTargetWindow(true);
+    if (_targetWindowRef) {
+      _logProfile(`Startup: Profile "${SAFARI_PROFILE}" → targeting ${_targetWindowRef}`);
+    } else {
+      _logProfile(`WARNING: Profile "${SAFARI_PROFILE}" window NOT found at startup`);
+    }
+  })();
 }
 
 // Detect stale window ID errors and invalidate cache
