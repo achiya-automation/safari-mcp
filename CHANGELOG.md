@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.12.0] - 2026-06-02
+
+A correctness + security pass across the engine, server, and extension.
+
+### Fixed
+
+#### Async tools that never actually waited (`do JavaScript` can't await a Promise)
+Several tools passed an `async` IIFE straight to AppleScript `do JavaScript`, which returns the moment the synchronous portion finishes — handing back an unsettled Promise (`[object Promise]`) instead of the result. This is the same constraint already handled for `safari_evaluate`/`safari_wait_for`; these tools now poll page state from the Node side:
+- **`safari_navigate_and_read`** was fully broken — it returned `[object Promise]` instead of the page content. Now polls `readyState`, then reads.
+- **`safari_go_back` / `safari_go_forward`** navigated but never updated the tracked URL, so the next operation could target the wrong tab.
+- **`safari_reload`** reloaded but never waited for load or refreshed the URL.
+- **`safari_click_and_wait`** clicked but never waited; **`safari_fill_and_submit`** submitted but didn't wait for the result page; **`safari_scroll_to`** (text mode) scrolled once instead of looping; **`safari_emulate` / `safari_reset_emulation`** didn't wait for the reload.
+- **`safari_get_indexed_db` / `safari_list_indexed_dbs`** returned `[object Promise]` — now routed through the async poller.
+- **`safari_screenshot_element`** (canvas path) returned a Promise and never fell through to the reliable screencapture+crop fallback; the `safari_screenshot` canvas fallback and `safari_upload_file` drop-fallback had the same flaw.
+
+#### Injection / escaping correctness
+- **`safari_mock_route`**: escape order was reversed (`'`→`\'` before `\`→`\\`), double-escaping quotes and breaking the injected JS. Backslash is now escaped first.
+- **`safari_set_cookie` / `safari_set_local_storage` / `safari_set_session_storage` / `safari_delete_cookies`**: keys/values containing a backslash produced invalid JS (only `'` was escaped). Backslash is now escaped first.
+- **`safari_get_computed_style`**: CSS property names were interpolated into injected JS unsanitized — now escaped.
+- **`safari_navigate` / `safari_new_tab` / `safari_navigate_and_read`**: URLs were only quote-escaped — a backslash or newline could break out of the AppleScript string literal (potential AppleScript injection). Now backslash-escaped and CR/LF stripped.
+- **Extension snapshot**: page-controlled attribute values (`aria-label`, `title`, `value`, `href`, …) are now HTML-escaped, so a crafted attribute can't inject a fake `ref=`/`role=` into the snapshot and steer the agent to the wrong element.
+- **Extension ref lookup**: attribute values are escaped and the query is guarded, so a page-controlled `aria-label`/`name`/`placeholder` containing `"` no longer throws a DOMException that surfaced as a misleading "element not found".
+
+#### Filesystem safety
+- **`safari_save_pdf`**: now validates the output path (allowlist + sensitive-path block) — it could previously overwrite any file. The Python conversion receives paths via `argv` instead of interpolating them into source (the old shell-style escaping was wrong for a Python `-c` string and broke on any path containing a quote).
+- **`_validateFilePath`**: the `..` check was dead (`path.resolve()` already strips `..`); it now rejects traversal in the raw input and resolves symlinks, so a symlink under `/Users/` pointing outside the allowlist is caught.
+- **Temp-file leaks**: `safari_screenshot_element` (crop) reconstructed the wrong filename and leaked it on error; `safari_upload_file` never deleted the PNG produced by image conversion. Both now clean up.
+
+#### Tab safety & focus
+- **Tab-ownership same-origin hole**: once the session opened a single tab on an origin (github.com, google.com, …), *every* tab on that origin — including the user's own — counted as owned, so a click/fill could land in the user's tab. The over-broad rule was removed; same-origin redirects remain covered by the path-prefix check.
+- **`safari_wait_for_new_tab`** never registered the found tab as owned, so the next interaction (e.g. after an OAuth popup) was blocked by the tab-safety guard. It now tracks ownership.
+- **Focus restore** runs in `finally` inside `extensionOrFallback`, so a failed operation that brought Safari to the front still hands focus back.
+- **Clipboard restore** for native paste runs in `finally` — if the helper daemon dies mid-paste, the user's clipboard is restored instead of being left with the tool's text.
+
+#### Robustness
+- **HTTP body-size guard** could call `res.writeHead(413)` twice on one oversized request (`ERR_HTTP_HEADERS_SENT`); guarded with `res.headersSent`.
+- **Extension poll loop**: a single malformed `/poll` body used to tear down the loop and trigger a multi-second reconnect — it's now skipped. The safety-timeout path uses `continue` instead of re-entering `pollForCommands()` (no overlapping loops).
+- **Extension navigate**: sparse pages that are OAuth/redirect callbacks (`code=`/`token=`/`state=` in the URL) are no longer hard-reloaded — the reload dropped POST data and could re-submit forms.
+- **`safari_get_local_storage` / `safari_get_session_storage`** no longer throw on a key whose value is `null`.
+- Window IDs are validated numeric before reaching `do shell script "screencapture -l<id>"`.
+- Stale-detection and proxy-recheck timers are `unref()`'d, so they never keep the Node process alive on their own.
+- **Extension Trusted-Types policy** registers only `createScript` now (dropped the unused, world-accessible `createHTML`/`createScriptURL` pass-throughs).
+
+### Deferred (tracked, intentionally not changed here)
+- The local HTTP/WebSocket bridge has no auth token — any local process can drive it. The CORS guard already blocks web pages (browsers always send an `Origin`), but a no-`Origin` local request passes. A proper fix needs a native-messaging handshake or a Unix-domain socket and is tracked separately, to avoid breaking the extension transport.
+- `manifest.json` `host_permissions: ["<all_urls>"]` is broader than the `http(s)` the bridge needs; narrowing it may force a permission re-grant on installed extensions, so it's deferred.
+
 ## [2.11.9] - 2026-05-28
 
 ### Fixed

@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve as resolvePath } from "node:path";
 import { readFile, writeFile, unlink, appendFile } from "node:fs/promises";
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 // Extension bridge is handled by index.js (WebSocket server on port 9223)
@@ -1031,7 +1031,9 @@ export async function navigate(url) {
     targetUrl = "https://" + targetUrl;
   }
 
-  const safeUrl = targetUrl.replace(/"/g, '\\"');
+  // Escape backslash first, then quotes; strip CR/LF — a newline would break out of
+  // the AppleScript string literal and allow AppleScript injection.
+  const safeUrl = targetUrl.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/[\r\n]/g, '');
     // Resolve tab by URL first (in case indices shifted)
     if (_activeTabURL) await resolveActiveTab();
     _assertNotFallingBackToUserTab('navigate');
@@ -1112,7 +1114,7 @@ export async function navigate(url) {
     try {
       const parsed = JSON.parse(result);
       if (parsed.blocked && url.startsWith("http://")) {
-        const httpUrl = url.replace(/"/g, '\\"');
+        const httpUrl = url.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/[\r\n]/g, '');
         await osascriptFast(
           `tell application "Safari" to set URL of ${navTarget} to "${httpUrl}"`
         );
@@ -1161,37 +1163,58 @@ export async function navigate(url) {
     return result;
 }
 
+// Poll document.readyState from the Node side and return {title,url[,text]} once the
+// page settles. `do JavaScript` returns immediately and never awaits an async IIFE
+// (see _evaluateAsync), so any in-page `await` loop is fire-and-forget — page-load
+// waits MUST be driven from Node. Shared by goBack/goForward/reload/navigateAndRead.
+async function _pollReadyAndRead(navIndex, { maxLength } = {}) {
+  const readExpr = maxLength != null
+    ? `JSON.stringify({title:document.title,url:location.href,text:document.body?document.body.innerText.substring(0,${Number(maxLength)}):''})`
+    : `JSON.stringify({title:document.title,url:location.href})`;
+  let result = '{}';
+  for (let poll = 0; poll < 60; poll++) {
+    await new Promise(r => setTimeout(r, poll < 10 ? 200 : 500));
+    try {
+      const state = await runJS('document.readyState', { tabIndex: navIndex, timeout: 5000 });
+      if (state === 'complete' || state === 'interactive') {
+        result = await runJS(readExpr, { tabIndex: navIndex, timeout: 5000 });
+        if (state === 'complete') break;
+        if (poll > 10) break; // interactive after ~2s is good enough
+      }
+    } catch { /* page still loading, retry */ }
+  }
+  return result;
+}
+
 export async function goBack() {
-  // Navigate back + smart wait: check immediately, then poll only if loading
-  const result = await runJS(
-    `(async function(){history.back();await new Promise(function(r){setTimeout(r,50)});if(document.readyState!=='complete'){for(var i=0;i<30;i++){await new Promise(function(r){setTimeout(r,150)});if(document.readyState==='complete')break;}}return JSON.stringify({title:document.title,url:location.href});})()`,
-    { timeout: 10000 }
-  );
+  await refreshTargetWindow();
+  const navIndex = _activeTabIndex;
+  // history.back() is synchronous; the page-load wait is polled from Node (see _pollReadyAndRead).
+  await runJS("history.back()", { tabIndex: navIndex, timeout: 5000 });
+  const result = await _pollReadyAndRead(navIndex);
   try { const p = JSON.parse(result); if (p.url) _activeTabURL = p.url; } catch {}
   return result;
 }
 
 export async function goForward() {
-  const result = await runJS(
-    `(async function(){history.forward();await new Promise(function(r){setTimeout(r,50)});if(document.readyState!=='complete'){for(var i=0;i<30;i++){await new Promise(function(r){setTimeout(r,150)});if(document.readyState==='complete')break;}}return JSON.stringify({title:document.title,url:location.href});})()`,
-    { timeout: 10000 }
-  );
+  await refreshTargetWindow();
+  const navIndex = _activeTabIndex;
+  await runJS("history.forward()", { tabIndex: navIndex, timeout: 5000 });
+  const result = await _pollReadyAndRead(navIndex);
   try { const p = JSON.parse(result); if (p.url) _activeTabURL = p.url; } catch {}
   return result;
 }
 
 export async function reload(hardReload = false) {
-  // Reload destroys JS context — must wait separately then re-query
-  await runJS(hardReload ? "location.reload(true)" : "location.reload()");
-  await new Promise((r) => setTimeout(r, 100)); // Brief wait for reload to start (was 500ms)
-  // Poll readyState in a single call
-  const result = await runJS(
-    `(async function(){for(var i=0;i<30;i++){if(document.readyState==='complete')break;await new Promise(function(r){setTimeout(r,200)});}return JSON.stringify({title:document.title,url:location.href});})()`,
-    { timeout: 10000 }
-  );
+  await refreshTargetWindow();
+  const navIndex = _activeTabIndex;
+  // Reload destroys JS context — fire it, then poll readyState from Node.
+  await runJS(hardReload ? "location.reload(true)" : "location.reload()", { tabIndex: navIndex });
+  await new Promise((r) => setTimeout(r, 100)); // Brief wait for reload to start
+  const result = await _pollReadyAndRead(navIndex);
   try { const p = JSON.parse(result); if (p.url) _activeTabURL = p.url; } catch {}
   // A reload destroys the JS context — re-stamp marker + visibility spoof.
-  await _stampTab(_activeTabIndex);
+  await _stampTab(navIndex);
   return result;
 }
 
@@ -2285,9 +2308,10 @@ export async function pressKey({ key, modifiers = [] }) {
 // real paste pipeline.
 async function _nativeTypeViaClipboard(text) {
   await _acquireClipboardLock();
+  let savedClipboard;
   try {
     // Save current clipboard
-    const savedClipboard = await _saveClipboard();
+    savedClipboard = await _saveClipboard();
 
     // Set clipboard to our text via pipe (safe from shell injection)
     await new Promise((resolve, reject) => {
@@ -2302,23 +2326,19 @@ async function _nativeTypeViaClipboard(text) {
     // MUST have windowId — global CGEvent (windowId=0) would steal focus and move mouse
     const geo = await _getSafariWindowGeometry();
     if (!geo.windowId) {
-      // Can't get window ID — restore clipboard and let catch block release lock
-      await _restoreClipboard(savedClipboard);
       throw new Error("Cannot native-paste without Safari window ID — would steal focus");
     }
     // keyCode 9 = V key, flags: ["cmd"]
     await _helperNativeKeyboard(9, ["cmd"], geo.windowId);
 
-    // Wait for paste to settle, then restore clipboard immediately
+    // Wait for paste to settle
     await new Promise(r => setTimeout(r, 100)); // 100ms is enough for Cmd+V to process
-    await _restoreClipboard(savedClipboard);
-    _releaseClipboardLock();
-
     return `Typed ${text.length} chars (native paste into iframe)`;
-  } catch (err) {
-    // Ensure lock is released on ANY error (including the windowId check above)
+  } finally {
+    // ALWAYS restore the user's clipboard + release the lock — even if the daemon died
+    // mid-paste — so the user never silently inherits the tool's pasted text.
+    if (savedClipboard !== undefined) await _restoreClipboard(savedClipboard).catch(() => {});
     if (_clipboardLocked) _releaseClipboardLock();
-    throw err;
   }
 }
 
@@ -2675,9 +2695,12 @@ export async function screenshot({ fullPage = false } = {}) {
     const skipScreencapture = isBackgroundTab;
 
     // Try screencapture — use osascript's do shell script to bypass VS Code permission issue
-    const windowId = !skipScreencapture ? await osascript(
+    const windowIdRaw = !skipScreencapture ? await osascript(
       `tell application "Safari" to return id of ${getTargetWindowRef()}`
     ).catch(() => null) : null;
+    // Window IDs are OS-assigned integers — reject anything non-numeric before it reaches
+    // `do shell script "screencapture -l<id>"` (defense-in-depth against odd AppleScript stdout).
+    const windowId = windowIdRaw != null && /^\d+$/.test(String(windowIdRaw).trim()) ? String(windowIdRaw).trim() : null;
 
     // On macOS Tahoe, screencapture -l may briefly steal focus.
     // Save frontmost app via daemon so we can hide Safari if it stole focus.
@@ -2775,7 +2798,10 @@ export async function screenshot({ fullPage = false } = {}) {
       { timeout: 30000 }
     );
 
-    if (dataUrl && dataUrl !== "FALLBACK_TEXT") {
+    // canvas/SVG returns a Promise `do JavaScript` can't await → guard against the
+    // unsettled "[object Promise]"/empty value and only return a real base64 PNG.
+    const looksBase64 = typeof dataUrl === 'string' && dataUrl.length > 100 && /^[A-Za-z0-9+/]+={0,2}$/.test(dataUrl.slice(0, 120));
+    if (looksBase64) {
       return dataUrl;
     }
 
@@ -2839,25 +2865,32 @@ export async function screenshotElement({ selector }) {
     { timeout: 15000 }
   );
 
-  if (result === "SVG_RENDER_FAILED" || result.startsWith("Element")) {
+  // The canvas/SVG path returns a Promise that `do JavaScript` can't await (so it yields
+  // "[object Promise]"/empty), and foreignObject can't render cross-origin images/fonts.
+  // Treat anything that isn't a valid base64 PNG as a render failure and fall through to
+  // the reliable screencapture+crop path.
+  const looksBase64 = typeof result === 'string' && result.length > 100 && /^[A-Za-z0-9+/]+={0,2}$/.test(result.slice(0, 120));
+  if (!looksBase64) {
     // Fallback: use screencapture + crop
     const tmpFile = join(tmpdir(), `safari-el-${Date.now()}.png`);
+    let cropFile = null;
     try {
-      const windowId = await osascript(`tell application "Safari" to return id of ${getTargetWindowRef()}`).catch(() => null);
+      const windowIdRaw = await osascript(`tell application "Safari" to return id of ${getTargetWindowRef()}`).catch(() => null);
+      const windowId = windowIdRaw != null && /^\d+$/.test(String(windowIdRaw).trim()) ? String(windowIdRaw).trim() : null;
       if (!windowId) throw new Error("Cannot get Safari window ID");
 
       // Get element bounds relative to screen
       const bounds = await runJS(
         `(function(){var el=document.querySelector('${sel}');if(!el)return '';var r=el.getBoundingClientRect();return JSON.stringify({x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)});})()`
       );
-      if (!bounds) throw new Error(result);
+      if (!bounds) throw new Error(typeof result === 'string' && result.startsWith('Element') ? result : 'Element not found for screenshot');
 
       // Full window screenshot then crop with sips
       await execFileAsync("screencapture", ["-l" + windowId, "-o", "-x", tmpFile]);
       const { x, y, w, h } = JSON.parse(bounds);
       // Use sips to crop (macOS built-in)
       const toolbarHeight = 74; // Safari toolbar approximate height (matches _getSafariWindowGeometry)
-      const cropFile = join(tmpdir(), `safari-el-crop-${Date.now()}.png`);
+      cropFile = join(tmpdir(), `safari-el-crop-${Date.now()}.png`);
       await execFileAsync("sips", [
         "-c", String(h), String(w),
         "--cropOffset", String(y + toolbarHeight), String(x),
@@ -2869,8 +2902,7 @@ export async function screenshotElement({ selector }) {
       if (data.length > 100) return data.toString("base64");
     } catch (e) {
       await unlink(tmpFile).catch(() => {});
-      // Also clean cropFile if it was created before the error
-      await unlink(tmpFile.replace('safari-el-', 'safari-el-crop-')).catch(() => {});
+      if (cropFile) await unlink(cropFile).catch(() => {});  // captured path — old code rebuilt it with the wrong timestamp and leaked it
       throw new Error(`Element screenshot failed: ${e.message}`);
     }
   }
@@ -2926,7 +2958,7 @@ export async function listTabs() {
 
 export async function newTab(url = "") {
   await refreshTargetWindow();
-  const safeUrl = url ? url.replace(/"/g, '\\"') : "";
+  const safeUrl = url ? url.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/[\r\n]/g, '') : "";
   try {
     if (url) {
       await osascript(`tell application "Safari"\ntell ${getTargetWindowRef()}\nset userTab to current tab\nmake new tab with properties {URL:"${safeUrl}"}\nset current tab to userTab\nend tell\nend tell`);
@@ -3273,11 +3305,11 @@ export async function getCookies() {
 
 export async function getLocalStorage({ key }) {
   if (key) {
-    const safeKey = key.replace(/'/g, "\\'");
+    const safeKey = key.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
     return runJS(`localStorage.getItem('${safeKey}')`);
   }
   return runJS(
-    "JSON.stringify(Object.fromEntries(Object.keys(localStorage).map(function(k){return[k,localStorage.getItem(k).substring(0,200)]})))"
+    "JSON.stringify(Object.fromEntries(Object.keys(localStorage).map(function(k){var v=localStorage.getItem(k);return[k,v==null?null:v.substring(0,200)]})))"
   );
 }
 
@@ -3332,15 +3364,23 @@ export async function drag({ sourceSelector, targetSelector, sourceX, sourceY, t
 // Prevent reading sensitive system files via upload/paste tools
 function _validateFilePath(filePath) {
   const resolved = resolvePath(filePath);
-  if (resolved.includes('..')) throw new Error("Path traversal not allowed: " + filePath);
+  // resolve() already collapses "..", so checking the RESOLVED path for it is a dead no-op.
+  // Reject traversal sequences in the RAW input instead; the allowlist below is the real guard.
+  if (/(^|[/\\])\.\.([/\\]|$)/.test(filePath)) throw new Error("Path traversal not allowed: " + filePath);
   const blocked = ['.ssh', '.gnupg', '.aws', '.config/gcloud', 'credentials', '.env', '.npmrc', '.netrc', 'id_rsa', 'id_ed25519', '.keychain'];
-  const lower = resolved.toLowerCase();
-  for (const b of blocked) {
-    if (lower.includes(b)) throw new Error("Blocked: reading sensitive path " + filePath);
-  }
-  // Must be under /Users/ or /tmp/ or /var/folders/ (macOS temp)
-  if (!resolved.startsWith('/Users/') && !resolved.startsWith('/tmp/') && !resolved.startsWith('/var/folders/') && !resolved.startsWith('/private/tmp/')) {
-    throw new Error("File path must be under /Users/, /tmp/, or /var/folders/: " + filePath);
+  // Resolve symlinks when the target exists, so a symlink under /Users/ pointing at /etc
+  // can't slip past the allowlist. Falls back to the lexical path when the file doesn't
+  // exist yet (e.g. savePDF's output path).
+  let real = resolved;
+  try { real = realpathSync(resolved); } catch { /* not created yet — keep lexical path */ }
+  for (const checkPath of new Set([resolved, real])) {
+    const lower = checkPath.toLowerCase();
+    for (const b of blocked) {
+      if (lower.includes(b)) throw new Error("Blocked: sensitive path " + filePath);
+    }
+    if (!checkPath.startsWith('/Users/') && !checkPath.startsWith('/tmp/') && !checkPath.startsWith('/var/folders/') && !checkPath.startsWith('/private/tmp/')) {
+      throw new Error("File path must be under /Users/, /tmp/, or /var/folders/: " + filePath);
+    }
   }
 }
 
@@ -3422,9 +3462,11 @@ export async function uploadFile({ selector, filePath }) {
   const mime = mimeMap[ext] || "application/octet-stream";
   const safeName = fileName.replace(/'/g, "\\'");
 
-  // Send to Safari via runJSLarge (handles files >260KB via temp file)
+  // Send to Safari via runJSLarge (handles files >260KB via temp file).
+  // Fully synchronous IIFE — `do JavaScript` can't await a Promise, so an `async`
+  // wrapper would hand back "[object Promise]" before the body settled.
   const result = await runJSLarge(
-    `(async function(){
+    `(function(){
       // Deep query: main document → shadow DOM → iframes
       function deepQuery(sel) {
         var el = document.querySelector(sel);
@@ -3471,8 +3513,8 @@ export async function uploadFile({ selector, filePath }) {
       el.dispatchEvent(new Event('change', { bubbles: true }));
       el.dispatchEvent(new Event('input', { bubbles: true }));
 
-      // Wait briefly for framework to process drop events before checking
-      await new Promise(function(r) { setTimeout(r, 200); });
+      // No await here: do-JavaScript cannot await a Promise, and the drop events above
+      // already dispatched synchronously. A framework that needs a tick is surfaced by the hint below.
 
       // Re-check after drop
       if (el.files && el.files.length > 0) {
@@ -3486,6 +3528,8 @@ export async function uploadFile({ selector, filePath }) {
     { timeout: 30000 }
   );
 
+  // Clean up the temp PNG produced by any sips image conversion above (was leaked before).
+  if (resolvedPath !== filePath) await unlink(resolvedPath).catch(() => {});
   return result;
 }
 
@@ -3577,11 +3621,12 @@ export async function emulate({ device, width, height, userAgent, scale = 1 }) {
     `(function(){var m=document.querySelector('meta[name=viewport]');if(!m){m=document.createElement('meta');m.name='viewport';document.head.appendChild(m);}m.content='width=${w},initial-scale=${scale}';})()`
   );
 
-  // Reload to apply changes
-  // Reload and wait via inline JS polling (not fixed sleep)
-  await runJS(
-    `(async function(){location.reload();await new Promise(function(r){setTimeout(r,300)});for(var i=0;i<30;i++){if(document.readyState==='complete')break;await new Promise(function(r){setTimeout(r,200)});}return 'done';})()`
-  );
+  // Reload to apply changes, then wait for load — polled from Node (`do JavaScript`
+  // can't await an in-page loop).
+  const navIndex = _activeTabIndex;
+  await runJS("location.reload()", { tabIndex: navIndex });
+  await new Promise(r => setTimeout(r, 200));
+  await _pollReadyAndRead(navIndex);
 
   return JSON.stringify({
     device: device || "custom",
@@ -3601,9 +3646,11 @@ export async function resetEmulation() {
   await osascript(
     `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {0, 0, 1440, 900}`
   );
-  await runJS(
-    `(async function(){location.reload();await new Promise(function(r){setTimeout(r,300)});for(var i=0;i<30;i++){if(document.readyState==='complete')break;await new Promise(function(r){setTimeout(r,200)});}return 'done';})()`
-  );
+  // Reload + wait for load — polled from Node (`do JavaScript` can't await an in-page loop).
+  const navIndex = _activeTabIndex;
+  await runJS("location.reload()", { tabIndex: navIndex });
+  await new Promise(r => setTimeout(r, 200));
+  await _pollReadyAndRead(navIndex);
   return "Emulation reset to desktop";
 }
 
@@ -3628,6 +3675,7 @@ export async function clearConsoleCapture() {
 
 export async function savePDF({ path: pdfPath }) {
   await refreshTargetWindow();
+  _validateFilePath(pdfPath);  // allowlist (/Users//tmp//var-folders) + block sensitive paths — prevents arbitrary overwrite
   // NO focus stealing — uses screencapture + Python Quartz to generate PDF
 
   // Step 1: Get full page dimensions
@@ -3645,9 +3693,11 @@ export async function savePDF({ path: pdfPath }) {
   await new Promise(r => setTimeout(r, 500)); // Let page reflow
 
   // Step 3: Take screenshot via screencapture -l (window-targeted, NO focus steal)
-  const windowId = await osascript(
+  const windowIdRaw = await osascript(
     `tell application "Safari" to return id of ${getTargetWindowRef()}`
   );
+  const windowId = windowIdRaw != null && /^\d+$/.test(String(windowIdRaw).trim()) ? String(windowIdRaw).trim() : null;
+  if (!windowId) throw new Error("Cannot get Safari window ID for PDF capture");
   const tmpPng = join(tmpdir(), `safari-mcp-pdf-${Date.now()}.png`);
   try {
     // Use do shell script to inherit osascript's Screen Recording permission
@@ -3666,17 +3716,17 @@ export async function savePDF({ path: pdfPath }) {
     `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {${origBounds}}`
   ).catch(() => {});
 
-  // Step 5: Convert screenshot to PDF using Python3 + macOS Quartz (no external deps)
-  const safePdfPath = pdfPath.replace(/'/g, "'\\''");
-  const safePngPath = tmpPng.replace(/'/g, "'\\''");
+  // Step 5: Convert screenshot to PDF using Python3 + macOS Quartz (no external deps).
+  // Paths are passed as argv — NOT interpolated into the source — so there is no shell
+  // or Python string-escaping to get wrong, and no code-injection surface.
   try {
     await execFileAsync("python3", ["-c", `
 import sys
 from Quartz import CGImageSourceCreateWithURL, CGImageSourceCreateImageAtIndex, CGImageGetWidth, CGImageGetHeight, CGPDFContextCreateWithURL, CGRectMake, CGPDFContextBeginPage, CGPDFContextEndPage, CGContextDrawImage
 from CoreFoundation import CFURLCreateFromFileSystemRepresentation
 
-png_path = b'${safePngPath}'
-pdf_path = b'${safePdfPath}'
+png_path = sys.argv[1].encode('utf-8')
+pdf_path = sys.argv[2].encode('utf-8')
 
 src_url = CFURLCreateFromFileSystemRepresentation(None, png_path, len(png_path), False)
 img_src = CGImageSourceCreateWithURL(src_url, None)
@@ -3695,7 +3745,7 @@ CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), img)
 CGPDFContextEndPage(ctx)
 del ctx
 print(f"OK {w}x{h}")
-`.trim()], { timeout: 15000 });
+`.trim(), tmpPng, pdfPath], { timeout: 15000 });
   } catch (err) {
     throw new Error(`PDF conversion failed: ${err.message}`);
   } finally {
@@ -3987,8 +4037,8 @@ export async function getAccessibilityTree({ selector, maxDepth = 5 }) {
 // ========== COOKIE CRUD ==========
 
 export async function setCookie({ name, value, domain, path: cookiePath, expires, secure, sameSite, httpOnly }) {
-  const safeName = name.replace(/'/g, "\\'");
-  const safeValue = value.replace(/'/g, "\\'");
+  const safeName = name.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const safeValue = value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
   let cookie = `${safeName}=${safeValue}`;
   if (cookiePath) cookie += `; path=${cookiePath}`;
   if (domain) cookie += `; domain=${domain}`;
@@ -4005,7 +4055,7 @@ export async function deleteCookies({ name, all }) {
     );
   }
   if (name) {
-    const safeName = name.replace(/'/g, "\\'");
+    const safeName = name.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
     return runJS(
       `document.cookie='${safeName}=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/'; 'Deleted cookie: ${safeName}'`
     );
@@ -4017,29 +4067,29 @@ export async function deleteCookies({ name, all }) {
 
 export async function getSessionStorage({ key }) {
   if (key) {
-    const safeKey = key.replace(/'/g, "\\'");
+    const safeKey = key.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
     return runJS(`sessionStorage.getItem('${safeKey}')`);
   }
   return runJS(
-    "JSON.stringify(Object.fromEntries(Object.keys(sessionStorage).map(function(k){return[k,sessionStorage.getItem(k).substring(0,200)]})))"
+    "JSON.stringify(Object.fromEntries(Object.keys(sessionStorage).map(function(k){var v=sessionStorage.getItem(k);return[k,v==null?null:v.substring(0,200)]})))"
   );
 }
 
 export async function setSessionStorage({ key, value }) {
-  const safeKey = key.replace(/'/g, "\\'");
-  const safeValue = value.replace(/'/g, "\\'");
+  const safeKey = key.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const safeValue = value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
   return runJS(`sessionStorage.setItem('${safeKey}','${safeValue}'); 'Set sessionStorage: ${safeKey}'`);
 }
 
 export async function setLocalStorage({ key, value }) {
-  const safeKey = key.replace(/'/g, "\\'");
-  const safeValue = value.replace(/'/g, "\\'");
+  const safeKey = key.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const safeValue = value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
   return runJS(`localStorage.setItem('${safeKey}','${safeValue}'); 'Set localStorage: ${safeKey}'`);
 }
 
 export async function deleteLocalStorage({ key }) {
   if (key) {
-    const safeKey = key.replace(/'/g, "\\'");
+    const safeKey = key.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
     return runJS(`localStorage.removeItem('${safeKey}'); 'Deleted localStorage: ${safeKey}'`);
   }
   return runJS("var n=localStorage.length; localStorage.clear(); 'Cleared localStorage: '+n+' items'");
@@ -4047,7 +4097,7 @@ export async function deleteLocalStorage({ key }) {
 
 export async function deleteSessionStorage({ key }) {
   if (key) {
-    const safeKey = key.replace(/'/g, "\\'");
+    const safeKey = key.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
     return runJS(`sessionStorage.removeItem('${safeKey}'); 'Deleted sessionStorage: ${safeKey}'`);
   }
   return runJS("var n=sessionStorage.length; sessionStorage.clear(); 'Cleared sessionStorage: '+n+' items'");
@@ -4148,8 +4198,10 @@ export async function clipboardWrite({ text, restore = true }) {
 
 // Intercept fetch/XHR requests matching a URL pattern and return mock responses
 export async function mockNetworkRoute({ urlPattern, response }) {
-  const safePattern = urlPattern.replace(/'/g, "\\'").replace(/\\/g, "\\\\");
-  const safeBody = (response.body || "").replace(/'/g, "\\'").replace(/\\/g, "\\\\").replace(/\n/g, "\\n");
+  // Escape backslash FIRST, then quotes — the reverse order double-escapes the quote
+  // (\' → \\') and breaks out of the JS string literal.
+  const safePattern = urlPattern.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const safeBody = (response.body || "").replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n");
   const status = response.status || 200;
   const contentType = response.contentType || "application/json";
 
@@ -4473,7 +4525,7 @@ export async function overrideGeolocation({ latitude, longitude, accuracy = 100 
 export async function getComputedStyles({ selector, properties }) {
   const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
   const propsFilter = properties
-    ? `.filter(function(p){return [${properties.map((p) => `'${p}'`).join(",")}].includes(p)})`
+    ? `.filter(function(p){return [${properties.map((p) => `'${String(p).replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`).join(",")}].includes(p)})`
     : "";
   return runJS(
     `(function(){
@@ -4493,7 +4545,8 @@ export async function getComputedStyles({ selector, properties }) {
 export async function getIndexedDB({ dbName, storeName, limit = 20 }) {
   const safeDb = dbName.replace(/'/g, "\\'");
   const safeStore = storeName.replace(/'/g, "\\'");
-  return runJS(
+  // `do JavaScript` can't await a Promise — route async work through the Node-side poller.
+  return _evaluateAsync(
     `(async function(){
       return new Promise(function(resolve, reject) {
         var request = indexedDB.open('${safeDb}');
@@ -4516,13 +4569,12 @@ export async function getIndexedDB({ dbName, storeName, limit = 20 }) {
           cursor.onerror = function() { resolve(JSON.stringify({ error: 'Cursor error' })); db.close(); };
         };
       });
-    })()`,
-    { timeout: 15000 }
+    })()`
   );
 }
 
 export async function listIndexedDBs() {
-  return runJS(
+  return _evaluateAsync(
     `(async function(){
       try {
         var dbs = await indexedDB.databases();
@@ -4616,34 +4668,31 @@ export async function scrollToElement({ selector, text, block = "center", timeou
     );
   }
   if (text) {
-    // Virtual DOM scroll: scroll down repeatedly until text appears (for Airtable, etc.)
+    // Virtual DOM scroll: scroll down repeatedly until text appears (for Airtable, etc.).
+    // Each check+scroll is one synchronous step; the loop is driven from Node because
+    // `do JavaScript` can't await an in-page delay (see _evaluateAsync).
     const safeText = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-    return runJS(
-      `(async function(){
-        var deadline = Date.now() + ${Number(timeout)};
-        var scrollable = document.querySelector('[class*="grid"],[class*="virtual"],[class*="scroll"],[role="grid"],[role="table"]') || document.scrollingElement || document.documentElement;
-        var lastY = -1;
-        while (Date.now() < deadline) {
-          // Check if text exists in DOM
-          var tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
-          while(tw.nextNode()){
-            if(tw.currentNode.textContent.trim().includes('${safeText}')){
-              var el = tw.currentNode.parentElement;
-              el.scrollIntoView({behavior:'smooth',block:'${block}'});
-              return 'Found and scrolled to: "' + el.textContent.trim().substring(0,50) + '"';
-            }
-          }
-          // Scroll down
-          var curY = scrollable.scrollTop;
-          if (curY === lastY) return 'Text not found: ${safeText} (scrolled to bottom)';
-          lastY = curY;
-          scrollable.scrollBy(0, 500);
-          await new Promise(function(r){setTimeout(r,300)});
-        }
-        return 'Timeout: text not found within ${timeout}ms';
-      })()`,
-      { timeout: timeout + 5000 }
-    );
+    const safeBlock = String(block).replace(/[^a-z]/gi, '') || 'center';
+    const navIndex = _activeTabIndex;
+    const stepJs =
+      `(function(){` +
+      `var scrollable=document.querySelector('[class*="grid"],[class*="virtual"],[class*="scroll"],[role="grid"],[role="table"]')||document.scrollingElement||document.documentElement;` +
+      `var tw=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,null);` +
+      `while(tw.nextNode()){if(tw.currentNode.textContent.trim().includes('${safeText}')){var el=tw.currentNode.parentElement;el.scrollIntoView({behavior:'smooth',block:'${safeBlock}'});return 'Found and scrolled to: "'+el.textContent.trim().substring(0,50)+'"';}}` +
+      `var curY=scrollable.scrollTop;scrollable.scrollBy(0,500);return 'SCROLL:'+curY;})()`;
+    const deadline = Date.now() + Number(timeout);
+    let lastY = -1;
+    while (Date.now() < deadline) {
+      const r = await runJS(stepJs, { tabIndex: navIndex, timeout: 5000 }).catch(() => '');
+      if (typeof r === 'string' && r.startsWith('Found')) return r;
+      if (typeof r === 'string' && r.startsWith('SCROLL:')) {
+        const curY = parseInt(r.slice(7), 10);
+        if (curY === lastY) return `Text not found: ${text} (scrolled to bottom)`;
+        lastY = curY;
+      }
+      await new Promise(res => setTimeout(res, 300));
+    }
+    return `Timeout: text not found within ${timeout}ms`;
   }
   throw new Error("scrollToElement requires selector or text");
 }
@@ -4657,23 +4706,17 @@ export async function navigateAndRead(url, { maxLength = 50000 } = {}) {
   await runJS("window.onbeforeunload=null", { timeout: 2000 }).catch(() => {});
   let targetUrl = url;
   if (!/^https?:\/\//i.test(targetUrl)) targetUrl = "https://" + targetUrl;
-  const safeUrl = targetUrl.replace(/"/g, '\\"');
+  // Escape backslash first, then quotes; strip CR/LF — a newline would break out of
+  // the AppleScript string literal and allow AppleScript injection.
+  const safeUrl = targetUrl.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/[\r\n]/g, '');
   if (_activeTabURL) await resolveActiveTab();
   _assertNotFallingBackToUserTab('navigateAndRead');
-  const navTarget = _activeTabIndex ? `tab ${_activeTabIndex} of ${getTargetWindowRef()}` : getFallbackTarget();
+  const navIndex = _activeTabIndex;
+  const navTarget = navIndex ? `tab ${navIndex} of ${getTargetWindowRef()}` : getFallbackTarget();
   await osascriptFast(`tell application "Safari" to set URL of ${navTarget} to "${safeUrl}"`);
   _activeTabURL = targetUrl;
-  // Single JS call: poll readyState + return page data — 1 call instead of 30+
-  const navResult = await runJS(
-    `(async function(){
-      for(var i=0;i<60;i++){
-        if(document.readyState==='complete')break;
-        await new Promise(function(r){setTimeout(r,i<10?200:500)});
-      }
-      return JSON.stringify({title:document.title,url:location.href,text:document.body.innerText.substring(0,${Number(maxLength)})});
-    })()`,
-    { timeout: 30000 }
-  );
+  // Poll readyState from Node, then read — `do JavaScript` can't await an async IIFE.
+  const navResult = await _pollReadyAndRead(navIndex, { maxLength });
   // Update _activeTabURL with the actual URL after navigation
   try {
     const parsed = JSON.parse(navResult);
@@ -4684,13 +4727,14 @@ export async function navigateAndRead(url, { maxLength = 50000 } = {}) {
 
 // Click + wait for navigation or element — common after clicking a link/button
 export async function clickAndWait({ selector, text, waitFor: waitSelector, timeout = 10000 }) {
-  const safeSel = selector ? selector.replace(/'/g, "\\'") : "";
-  const safeText = text ? text.replace(/'/g, "\\'") : "";
-  const safeWait = waitSelector ? waitSelector.replace(/'/g, "\\'") : "";
-  // Single JS call: click + wait — 1 call instead of 20+
-  return runJS(
-    `(async function(){
-      // Find and click
+  const esc = (s) => s.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const safeSel = selector ? esc(selector) : "";
+  const safeText = text ? esc(text) : "";
+  const safeWait = waitSelector ? esc(waitSelector) : "";
+  const navIndex = _activeTabIndex;
+  // Step 1: find + click — fully synchronous, so it runs inside one `do JavaScript`.
+  const clickResult = await runJS(
+    `(function(){
       var el;
       ${safeSel ? `el = document.querySelector('${safeSel}');` : ""}
       ${safeText && !safeSel ? `
@@ -4700,31 +4744,35 @@ export async function clickAndWait({ selector, text, waitFor: waitSelector, time
       if(!el) return JSON.stringify({error:'Element not found'});
       el.scrollIntoView({block:'center'});
       el.click();
-      // Wait
-      var deadline = Date.now() + ${Number(timeout)};
-      ${safeWait ? `
-        while(Date.now()<deadline){
-          if(document.querySelector('${safeWait}'))break;
-          await new Promise(function(r){setTimeout(r,200)});
-        }
-      ` : `
-        await new Promise(function(r){setTimeout(r,300)});
-        while(Date.now()<deadline){
-          if(document.readyState==='complete')break;
-          await new Promise(function(r){setTimeout(r,200)});
-        }
-      `}
-      return JSON.stringify({title:document.title,url:location.href,clicked:el.tagName+' "'+el.textContent.trim().substring(0,50)+'"'});
+      return JSON.stringify({clicked:el.tagName+' "'+el.textContent.trim().substring(0,50)+'"'});
     })()`,
-    { timeout: timeout + 5000 }
+    { tabIndex: navIndex, timeout: 10000 }
   );
+  let clickedInfo = '';
+  try { const c = JSON.parse(clickResult); if (c.error) return clickResult; clickedInfo = c.clicked || ''; } catch {}
+  // Step 2: wait from Node — `do JavaScript` can't await an in-page loop.
+  const deadline = Date.now() + Number(timeout);
+  await new Promise(r => setTimeout(r, 300));
+  while (Date.now() < deadline) {
+    try {
+      if (safeWait) {
+        if (await runJS(`document.querySelector('${safeWait}')?'1':''`, { tabIndex: navIndex, timeout: 5000 }) === '1') break;
+      } else if (await runJS('document.readyState', { tabIndex: navIndex, timeout: 5000 }) === 'complete') {
+        break;
+      }
+    } catch { /* page navigating */ }
+    await new Promise(r => setTimeout(r, 200));
+  }
+  const final = await runJS(`JSON.stringify({title:document.title,url:location.href})`, { tabIndex: navIndex, timeout: 5000 });
+  try { const p = JSON.parse(final); p.clicked = clickedInfo; return JSON.stringify(p); } catch { return final; }
 }
 
 // Fill form + submit — common for login, search, etc.
 export async function fillAndSubmit({ fields, submitSelector }) {
   await fillForm({ fields });
+  const navIndex = _activeTabIndex;
   if (submitSelector) {
-    const sel = submitSelector.replace(/'/g, "\\'");
+    const sel = submitSelector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
     await runJS(
       `(function(){var el=document.querySelector('${sel}');if(el)el.click();})()`
     );
@@ -4734,15 +4782,9 @@ export async function fillAndSubmit({ fields, submitSelector }) {
       `(function(){var btn=document.querySelector('[type=submit],button:not([type])');if(btn)btn.click();})()`
     );
   }
-  // Wait for navigation/reload via inline JS (not fixed sleep)
-  return runJS(
-    `(async function(){
-      await new Promise(function(r){setTimeout(r,300)});
-      for(var i=0;i<30;i++){if(document.readyState==='complete')break;await new Promise(function(r){setTimeout(r,200)});}
-      return JSON.stringify({title:document.title,url:location.href});
-    })()`,
-    { timeout: 15000 }
-  );
+  // Wait for navigation/reload — polled from Node (`do JavaScript` can't await).
+  await new Promise(r => setTimeout(r, 300));
+  return _pollReadyAndRead(navIndex);
 }
 
 // Full page analysis — extracts everything in ONE call

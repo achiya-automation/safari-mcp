@@ -96,13 +96,13 @@ function _isURLOwned(url) {
         if (new URL(owned).origin === urlOrigin && urlBase.startsWith(normalize(owned))) return true;
       } catch {}
     }
-    // Broader same-origin check: if we own ANY URL on this origin, treat all same-origin URLs as owned.
-    // This handles redirects like /article/new → /article/edit/ID where path prefix doesn't match.
-    for (const owned of _ownedTabURLs) {
-      try {
-        if (new URL(owned).origin === urlOrigin) return true;
-      } catch {}
-    }
+    // NOTE: a broader "own ANY URL on this origin → treat ALL same-origin URLs as owned"
+    // check used to live here. It defeated tab-safety: once this session opened a single
+    // tab on github.com / google.com / etc., EVERY tab on that origin — including the
+    // user's own open tabs — counted as ours, so a click/fill could land in the user's tab.
+    // Same-origin redirects stay covered by the path-prefix check above plus final-URL
+    // tracking in safari_navigate (a redirect that changes the path entirely now needs an
+    // explicit safari_navigate, which is the safe default).
   } catch {}
   return false;
 }
@@ -373,7 +373,7 @@ try {
     // POST /result — extension sends command result
     if (req.method === "POST" && req.url === "/result") {
       let body = "";
-      req.on("data", (chunk) => { body += chunk; if (body.length > MAX_BODY_SIZE) { res.writeHead(413); res.end("Payload too large"); req.destroy(); } });
+      req.on("data", (chunk) => { if (res.headersSent) return; body += chunk; if (body.length > MAX_BODY_SIZE) { res.writeHead(413); res.end("Payload too large"); req.destroy(); } });
       req.on("end", () => {
         try {
           const msg = JSON.parse(body);
@@ -414,7 +414,7 @@ try {
     // POST /verify-profile — extension asks server to check which profile has a nonce tab
     if (req.method === "POST" && req.url === "/verify-profile") {
       let body = "";
-      req.on("data", (chunk) => { body += chunk; if (body.length > MAX_BODY_SIZE) { res.writeHead(413); res.end("Payload too large"); req.destroy(); } });
+      req.on("data", (chunk) => { if (res.headersSent) return; body += chunk; if (body.length > MAX_BODY_SIZE) { res.writeHead(413); res.end("Payload too large"); req.destroy(); } });
       req.on("end", async () => {
         try {
           const { nonce, expectedProfile } = JSON.parse(body);
@@ -482,7 +482,7 @@ try {
         return;
       }
       let body = "";
-      req.on("data", (chunk) => { body += chunk; if (body.length > MAX_BODY_SIZE) { res.writeHead(413); res.end("Payload too large"); req.destroy(); } });
+      req.on("data", (chunk) => { if (res.headersSent) return; body += chunk; if (body.length > MAX_BODY_SIZE) { res.writeHead(413); res.end("Payload too large"); req.destroy(); } });
       req.on("end", async () => {
         try {
           const { type, payload } = JSON.parse(body);
@@ -547,8 +547,8 @@ async function _checkPrimaryExtension() {
   } catch {
     _primaryHasExtension = false;
   }
-  // Re-check every 10s
-  setTimeout(_checkPrimaryExtension, 10000);
+  // Re-check every 10s (unref'd — must not keep the Node process alive on its own)
+  setTimeout(_checkPrimaryExtension, 10000).unref();
 }
 
 // Send command to primary instance's extension via proxy
@@ -568,7 +568,7 @@ async function _proxyToExtension(type, payload, timeoutMs = 30000) {
 let _extensionLastPollTime = 0;
 // Detect stale HTTP connection (no poll in 30s = disconnected)
 // Only applies to primary instance (extension host) — not proxy mode
-setInterval(() => {
+const _staleHttpTimer = setInterval(() => {
   if (_isExtensionHost && _extensionConnected && !_extensionWs && _extensionLastPollTime > 0) {
     if (Date.now() - _extensionLastPollTime > 30000) {
       _extensionConnected = false;
@@ -577,6 +577,7 @@ setInterval(() => {
     }
   }
 }, 5000);
+_staleHttpTimer.unref();  // stale-detection must not keep the Node process alive on its own
 
 // ========== SHARED EXTENSION LOGIC ==========
 
@@ -749,10 +750,11 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
     }
   } finally {
     safari.setFocusGuard(false);
+    // Restore focus in finally — even when the operation threw, Safari may have come to
+    // the front mid-op and must be sent back, or the user is left staring at the
+    // automation window with their keystrokes landing in it.
+    await safari.restoreFocusIfStolen(savedApp);
   }
-
-  // Restore focus if Safari stole it
-  await safari.restoreFocusIfStolen(savedApp);
 
   return result;
 }
@@ -1478,6 +1480,7 @@ server.tool(
                 await extensionOrFallback("switch_tab", { index: resolved.index }, () => safari.switchTab(resolved.index));
                 safari.setActiveTabIndex(resolved.index);
                 safari.setActiveTabURL(resolved.url);
+                _trackTab(resolved.index, resolved.url);  // own the popup, else the next interaction trips the tab-safety guard
                 return { content: [{ type: "text", text: `Found new tab: ${resolved.title} (${resolved.url})` }] };
               }
               continue;
@@ -1486,6 +1489,7 @@ server.tool(
             await extensionOrFallback("switch_tab", { index: tab.index }, () => safari.switchTab(tab.index));
             safari.setActiveTabIndex(tab.index);
             safari.setActiveTabURL(tab.url);
+            _trackTab(tab.index, tab.url);  // own the new tab, else the next interaction trips the tab-safety guard
             return { content: [{ type: "text", text: `Found new tab: ${tab.title} (${tab.url})` }] };
           }
         }

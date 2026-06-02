@@ -145,14 +145,18 @@ async function pollForCommands() {
       });
       clearTimeout(timeout);
       if (res.status === 200) {
-        const msg = await res.json();
-        await executeAndReply(msg);
+        // A single malformed/truncated body must NOT tear down the poll loop — a bad
+        // packet used to throw SyntaxError here, fall through to "server gone", and
+        // trigger a multi-second reconnect backoff. Skip the bad packet and keep polling.
+        const msg = await res.json().catch(() => null);
+        if (msg) await executeAndReply(msg);
       }
       // 204 = no command, loop immediately to keep connection active
     } catch (err) {
       if (err.name === "AbortError") {
-        // If still connected, this was a safety timeout — reconnect
-        if (isConnected && _enabled) { pollForCommands(); return; }
+        // 90s safety-timeout abort while still connected — continue the loop in place.
+        // (Re-calling pollForCommands() here risked two overlapping loops posting dup results.)
+        if (isConnected && _enabled) continue;
         return; // Intentional abort (disable/new connect)
       }
       // Server gone — reconnect via shared scheduler (prevents duplicate timers)
@@ -241,7 +245,12 @@ async function handleCommand(type, payload) {
         return true;
       }, [], tabId).catch(() => true);
 
-      if (!hasContent) {
+      // Don't hard-reload OAuth/redirect callback pages: a sparse-but-valid callback
+      // (code=/token=/state= in the URL) would be reloaded, dropping its POST data and
+      // breaking the auth flow. Only reload normal http(s) pages without auth params.
+      const reloadable = /^https?:/i.test(payload.url || "") &&
+        !/[?&#](code|token|access_token|id_token|state|session_state)=/i.test(payload.url || "");
+      if (!hasContent && reloadable) {
         // Try hard reload once
         await browser.tabs.reload(tabId, { bypassCache: true });
         await waitForTabLoad(tabId, 15000);
@@ -459,12 +468,17 @@ async function handleCommand(type, payload) {
             return null;
           }
           const m = refs[refId];
+          // Escape attribute values + guard the query — a page-controlled aria-label/name/
+          // placeholder containing a double-quote would otherwise build an invalid selector
+          // and throw a DOMException that surfaces as a misleading "element not found".
+          const dqAttr = (sel) => { try { return dq(sel); } catch (_e) { return null; } };
+          const aq = (v) => String(v).replace(/["\\]/g, "\\$&");
           if (m.id) { el = document.getElementById(m.id); if (el) return el; }
-          if (m.nameAttr) { el = dq('[name="' + m.nameAttr + '"]'); if (el) return el; }
-          if (m.al) { el = dq('[aria-label="' + m.al + '"]'); if (el) return el; }
-          if (m.ph) { el = dq('[placeholder="' + m.ph + '"]'); if (el) return el; }
+          if (m.nameAttr) { el = dqAttr('[name="' + aq(m.nameAttr) + '"]'); if (el) return el; }
+          if (m.al) { el = dqAttr('[aria-label="' + aq(m.al) + '"]'); if (el) return el; }
+          if (m.ph) { el = dqAttr('[placeholder="' + aq(m.ph) + '"]'); if (el) return el; }
           // Type attribute fallback (input type="email", type="url", etc.)
-          if (m.inputType) { el = dq(m.tag.toLowerCase() + '[type="' + m.inputType + '"]'); if (el) return el; }
+          if (m.inputType) { el = dqAttr(m.tag.toLowerCase() + '[type="' + aq(m.inputType) + '"]'); if (el) return el; }
           // Coordinate fallback — scroll into view then hit-test
           if (m.cx !== undefined && m.cy !== undefined) {
             window.scrollTo(window.scrollX, Math.max(0, m.cy - window.innerHeight / 2));
@@ -1233,27 +1247,31 @@ async function handleCommand(type, payload) {
             attrs = ` ref="${refId}"`;
           }
 
+          // Escape page-controlled attribute values: a crafted aria-label/title/value with
+          // a double-quote could otherwise break the pseudo-XML snapshot and inject a fake
+          // ref=""/role="" that steers the agent into clicking the wrong element.
+          const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
           const role = el.getAttribute("role");
-          if (role) attrs += ` role="${role}"`;
-          if (el.id) attrs += ` id="${el.id}"`;
+          if (role) attrs += ` role="${esc(role)}"`;
+          if (el.id) attrs += ` id="${esc(el.id)}"`;
           const al = el.getAttribute("aria-label");
-          if (al) attrs += ` aria-label="${al}"`;
+          if (al) attrs += ` aria-label="${esc(al)}"`;
           const title = el.getAttribute("title");
-          if (title) attrs += ` title="${title.substring(0, 80)}"`;
+          if (title) attrs += ` title="${esc(title.substring(0, 80))}"`;
           if (el.value && ["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName)) {
-            attrs += ` value="${String(el.value).substring(0, 50)}"`;
+            attrs += ` value="${esc(String(el.value).substring(0, 50))}"`;
           }
-          if (el.type && el.tagName === "INPUT") attrs += ` type="${el.type}"`;
-          if (el.href && el.tagName === "A") attrs += ` href="${el.href.substring(0, 100)}"`;
+          if (el.type && el.tagName === "INPUT") attrs += ` type="${esc(el.type)}"`;
+          if (el.href && el.tagName === "A") attrs += ` href="${esc(el.href.substring(0, 100))}"`;
           if (el.disabled) attrs += " disabled";
           const ph = el.getAttribute("placeholder");
-          if (ph) attrs += ` placeholder="${ph}"`;
+          if (ph) attrs += ` placeholder="${esc(ph)}"`;
           // For interactive elements with no visible text — show alt/aria-describedby hint
-          if (interactive && el.tagName === "IMG" && el.alt) attrs += ` alt="${el.alt.substring(0, 80)}"`;
+          if (interactive && el.tagName === "IMG" && el.alt) attrs += ` alt="${esc(el.alt.substring(0, 80))}"`;
           const ariaDesc = el.getAttribute("aria-describedby");
           if (ariaDesc) {
             const descEl = document.getElementById(ariaDesc);
-            if (descEl) attrs += ` described="${descEl.textContent.trim().substring(0, 80)}"`;
+            if (descEl) attrs += ` described="${esc(descEl.textContent.trim().substring(0, 80))}"`;
           }
 
           // Self-closing for some tags
