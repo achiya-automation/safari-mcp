@@ -11,6 +11,7 @@
   },
   "scripts": {
     "start": "node index.js",
+    "test": "node --test tests/smoke.test.js",
     "postinstall": "node scripts/postinstall.cjs || true"
   },
   "keywords": [
