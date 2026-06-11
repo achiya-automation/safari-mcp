@@ -11,7 +11,7 @@
   },
   "scripts": {
     "start": "node index.js",
-    "test": "node --test 'tests/*.test.js' 'test/*.test.mjs'",
+    "test": "node --test tests/*.test.js test/*.test.mjs",
     "postinstall": "node scripts/postinstall.cjs || true"
   },
   "keywords": [
