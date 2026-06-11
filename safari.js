@@ -3,7 +3,7 @@
 // 2. AppleScript + Swift daemon (~5ms) — keeps logins, always available
 // Extension is preferred. AppleScript is fallback when extension is not connected.
 
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve as resolvePath } from "node:path";
@@ -19,11 +19,28 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // Both files need their own const because they're separate ES modules; the marker only needs to be unique per process
 const SESSION_ID = randomUUID().slice(0, 8);
 
+// ========== STRING ESCAPING (single source of truth) ==========
+// Escaping ORDER is security-relevant: the backslash MUST be escaped before the quote, or the
+// backslash inserted in front of the quote gets doubled and the string breaks out. These helpers
+// replace ~70 hand-inlined copies of the same recipe — fix the escaping once here, not at every
+// call site. Verified equivalent to the inline pattern by test/escaping.test.mjs.
+
+// Value injected into a SINGLE-QUOTED JS string literal (selector, key, name, …).
+// Exported only so test/escaping.test.mjs can lock the recipe against the historical inline pattern.
+export function escJsSingleQuote(s) {
+  return String(s).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+// String injected into a DOUBLE-QUOTED AppleScript literal — also strips CR/LF, since a raw
+// newline would close the AppleScript string and allow AppleScript injection.
+export function escAppleScriptString(s) {
+  return String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/[\r\n]/g, "");
+}
+
 // ========== SWIFT HELPER DAEMON ==========
 // Persistent process — no subprocess spawn overhead (~5ms vs ~90ms)
 let _helperProc = null;
 const _helperQueue = []; // callbacks waiting for responses
-let _helperConsecutiveTimeouts = 0; // Track consecutive timeouts — only kill after 3
+let _helperConsecutiveTimeouts = 0; // Track consecutive timeouts — kill threshold lives where it's checked (currently 5)
 
 // ── Helper request serialization ──────────────────────────────────────────
 // The Swift helper runs each request on its own background thread, so it can
@@ -49,6 +66,7 @@ function _drainHelperQueue(reason) {
 }
 
 function startHelper() {
+  if (_helperProc) return; // idempotent — a respawn already won the race; don't orphan a daemon
   const helperPath = join(__dirname, "safari-helper");
   try {
     _helperProc = spawn(helperPath, [], { stdio: ["pipe", "pipe", "ignore"] });
@@ -137,6 +155,7 @@ function safariNotRunningError() {
 // While locked, any new clipboard operation waits until the current one completes.
 let _clipboardLocked = false;
 let _clipboardRestoreTimer = null;
+let _pendingClipboardRestore; // content stashed for a synchronous flush on shutdown (see flushClipboardRestore)
 
 async function _acquireClipboardLock(timeoutMs = 10000) {
   const start = Date.now();
@@ -161,17 +180,25 @@ async function _saveClipboard() {
   } catch { return null; }
 }
 
+// Write text to the macOS clipboard via pbcopy. Single place that handles EPIPE on the stdin
+// stream (pbcopy exiting before it reads) — an unhandled 'error' there would otherwise reach
+// uncaughtException and kill the whole server.
+function _pbcopy(text) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
+    proc.stdin.on("error", reject);
+    proc.on("error", reject);
+    proc.on("close", resolve);
+    proc.stdin.write(text);
+    proc.stdin.end();
+  });
+}
+
 // Restore clipboard immediately (no async setTimeout leak)
 async function _restoreClipboard(savedContent) {
   if (savedContent === null) return;
   try {
-    await new Promise((resolve, reject) => {
-      const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
-      proc.stdin.write(savedContent);
-      proc.stdin.end();
-      proc.on("close", resolve);
-      proc.on("error", reject);
-    });
+    await _pbcopy(savedContent);
   } catch {}
 }
 
@@ -188,8 +215,6 @@ let _activeTabURL = null;   // URL-based tracking (stable even when tabs shift)
 // and the URL-based marker resolution can fail until the page actually loads.
 // During the grace window, navigate/click/fill operations either use the cached
 // _activeTabIndex or fail loudly — never silently target the user's tab.
-let _lastNewTabAt = 0;
-const NEW_TAB_GRACE_MS = 30000;
 // Becomes true once safari_new_tab is called for the first time in this session.
 // Once true, write operations (navigate/click/fill) MUST NOT fall back to
 // "current tab of window" — that targets the USER'S active tab. The 30s grace
@@ -421,22 +446,73 @@ export async function restoreFocusIfStolen(savedBundleId) {
   let current = await _helperGetFrontApp();
   if (current?.bundleId !== "com.apple.Safari") return;
 
-  // Primary: bring previous app back. Await so the caller doesn't return
-  // control to user-space while Safari is still frontmost.
+  // GUARD FIRST — check the user BEFORE any activate. If they interacted within
+  // the last couple seconds, Safari is frontmost because THEY are working in it
+  // (or just switched to it while a background instance's op was mid-flight), and
+  // restoring the previous app rips Safari out from under them — the "VS Code
+  // keeps jumping in front every few seconds" bug. The OLD code ran this guard
+  // only AFTER the first activate below, so that activate already stole focus
+  // before the guard could veto. With ~5 safari-mcp instances sharing one Safari
+  // window, every background op fired this steal. Bias HARD toward not stealing:
+  // a stale Safari-frontmost (user clicks back once) beats repeatedly yanking
+  // focus away from an active user.
+  if (await _userIsActive()) { _traceRestore(savedBundleId, "skip-user-active"); return; }
+
+  _traceRestore(savedBundleId, "restore");
+  // Bring previous app back. Await so the caller doesn't hand control back to
+  // user-space while Safari is still frontmost.
   await _helperActivateApp(savedBundleId).catch(() => {});
 
-  // Tahoe settle window — NSRunningApplication.activate() is async at the OS
-  // level; without this brief wait the verify check below races and reports a
-  // false success.
-  await new Promise(r => setTimeout(r, 5));
+  // Settle window — NSRunningApplication.activate() is async at the OS level and
+  // reliably takes tens of ms to take effect. The old 5ms was far too short: the
+  // verify below almost always still saw Safari frontmost and wrongly fired the
+  // hide fallback, even though activate() was about to land. Give it a real
+  // chance before deciding activate "failed".
+  await new Promise(r => setTimeout(r, 120));
 
   current = await _helperGetFrontApp();
   if (current?.bundleId === "com.apple.Safari") {
-    // Activate did not take effect (Safari's window-server policy can block it
-    // under Tahoe). Hide Safari as a last-resort fallback — the OS auto-picks
-    // the next app, which is reliably the one we saved.
-    await _helperHideSafari().catch(() => {});
+    // Safari still frontmost after activate. The OLD code HID Safari here — but
+    // hiding is destructive: it pulls the WHOLE app off-screen. It fired whenever
+    // the user had switched into Safari themselves while a background agent's op
+    // was in flight, and recurred even with an idle-guard because a user passively
+    // VIEWING Safari exceeds the idle threshold. Several autonomous background
+    // instances (Daily-RC → codex computer-use) share this one profile window, so
+    // the race was constant. NEVER hide. Non-destructive only: if the user is
+    // interacting, they own the foreground — leave it. Otherwise one more activate
+    // attempt, then give up and leave Safari frontmost (the user clicks back —
+    // vastly better than Safari vanishing).
+    if (await _userIsActive()) { _traceRestore(savedBundleId, "skip-user-active-late"); return; }
+    await _helperActivateApp(savedBundleId).catch(() => {});
   }
+}
+
+// Seconds since the user's last HID input (keyboard or mouse), via IOKit.
+// `-r -d 1` roots the dump at IOHIDSystem and keeps it shallow (~13ms, ~4KB) —
+// note: a plain `-d 1` measures depth from the registry root and never reaches
+// IOHIDSystem, returning no HIDIdleTime. Returns Infinity on any failure so
+// callers fail toward "user is idle" (preserving the pre-existing hide behavior).
+async function _userIdleSeconds() {
+  try {
+    const { stdout } = await execFileAsync("ioreg", ["-c", "IOHIDSystem", "-r", "-d", "1"], { timeout: 1500 });
+    const m = stdout.match(/"HIDIdleTime"\s*=\s*(\d+)/);
+    if (!m) return Infinity;
+    return parseInt(m[1], 10) / 1e9; // nanoseconds → seconds
+  } catch { return Infinity; }
+}
+
+// True when the user interacted within the last ~2.5s — used to avoid hiding
+// Safari out from under a user who just brought it to the front themselves.
+async function _userIsActive() {
+  return (await _userIdleSeconds()) < 2.5;
+}
+
+// Lightweight trace of every restore decision — confirms WHICH instance (pid)
+// restored focus and whether the user-active guard vetoed it. Best-effort; never
+// throws into the hot path. Tail ~/safari-mcp/restore-trace.log to watch live.
+const _RESTORE_TRACE = join(__dirname, "restore-trace.log");
+function _traceRestore(savedBundleId, decision) {
+  appendFile(_RESTORE_TRACE, `${new Date().toISOString()} pid=${process.pid} saved=${savedBundleId} -> ${decision}\n`).catch(() => {});
 }
 
 function _helperHideSafari(timeout = 2000) {
@@ -675,17 +751,24 @@ function _osascriptFastHelper(script, timeout) {
     const timer = setTimeout(() => {
       if (resolved) return;
       resolved = true;
-      // DON'T remove from queue — replace with no-op consumer to maintain FIFO order.
-      // Without this, the late response would be consumed by the NEXT callback in the queue.
+      // DON'T remove from queue — replace with a proof-of-life consumer to maintain
+      // FIFO order. A heavy page (e.g. the Airtable SPA) makes `do JavaScript` legitimately
+      // slow: the call exceeds `timeout`ms, but the helper IS alive and emits its response a
+      // moment later. That late response proves liveness — so when it arrives we reset the
+      // consecutive-timeout counter instead of discarding the signal. Killing the daemon on a
+      // slow page is pointless (the fresh daemon hits the same slow page) and disruptive.
+      // Only a helper that NEVER replies (truly hung) accumulates timeouts with no late reply.
       const idx = _helperQueue.indexOf(cb);
-      if (idx >= 0) _helperQueue[idx] = () => {}; // Consume and discard late response
+      if (idx >= 0) _helperQueue[idx] = () => { _helperConsecutiveTimeouts = 0; }; // late reply ⇒ alive
       _helperConsecutiveTimeouts++;
-      if (_helperConsecutiveTimeouts >= 3) {
-        console.error(`[Safari MCP] safari-helper: ${_helperConsecutiveTimeouts} consecutive timeouts — killing daemon`);
+      if (_helperConsecutiveTimeouts >= 5) {
+        console.error(`[Safari MCP] safari-helper: ${_helperConsecutiveTimeouts} consecutive timeouts with no late replies — killing daemon`);
         _helperProc?.kill();
         _helperProc = null;
         _helperConsecutiveTimeouts = 0;
-        setTimeout(startHelper, 100);
+        // The killed proc's 'exit' handler also schedules a restart; guard the timer so only
+        // one respawn wins (startHelper is now idempotent too) — no second, orphaned daemon.
+        setTimeout(() => { if (!_shuttingDown && !_helperProc) startHelper(); }, 100);
       }
       reject(new Error("safari-helper timeout"));
     }, timeout);
@@ -758,7 +841,17 @@ function _helperNativeClick(x, y, doubleClick = false, windowId = 0, timeout = 5
     const cmd = { click: { x, y } };
     if (doubleClick) cmd.click.double = true;
     if (windowId) cmd.click.windowId = windowId;
-    _helperProc.stdin.write(JSON.stringify(cmd) + "\n");
+    try {
+      _helperProc.stdin.write(JSON.stringify(cmd) + "\n");
+    } catch (e) {
+      // EPIPE if the daemon died in the gap after the writable check — splice our callback
+      // out so it can't consume the NEXT command's response (FIFO desync), then reject.
+      const i = _helperQueue.indexOf(cb);
+      if (i >= 0) _helperQueue.splice(i, 1);
+      clearTimeout(timer);
+      resolved = true;
+      reject(e);
+    }
   }));
 }
 
@@ -796,7 +889,17 @@ function _helperNativeHover(x, y, windowId = 0, dwellMs = 500, restoreMouse = tr
     _helperQueue.push(cb);
     const cmd = { hover: { x, y, dwellMs, restoreMouse } };
     if (windowId) cmd.hover.windowId = windowId;
-    _helperProc.stdin.write(JSON.stringify(cmd) + "\n");
+    try {
+      _helperProc.stdin.write(JSON.stringify(cmd) + "\n");
+    } catch (e) {
+      // EPIPE if the daemon died in the gap after the writable check — splice our callback
+      // out so it can't consume the NEXT command's response (FIFO desync), then reject.
+      const i = _helperQueue.indexOf(cb);
+      if (i >= 0) _helperQueue.splice(i, 1);
+      clearTimeout(timer);
+      resolved = true;
+      reject(e);
+    }
   }));
 }
 
@@ -834,7 +937,17 @@ function _helperNativeKeyboard(keyCode, flags = [], windowId = 0, timeout = 5000
     _helperQueue.push(cb);
     const cmd = { keyboard: { keyCode, flags } };
     if (windowId) cmd.keyboard.windowId = windowId;
-    _helperProc.stdin.write(JSON.stringify(cmd) + "\n");
+    try {
+      _helperProc.stdin.write(JSON.stringify(cmd) + "\n");
+    } catch (e) {
+      // EPIPE if the daemon died in the gap after the writable check — splice our callback
+      // out so it can't consume the NEXT command's response (FIFO desync), then reject.
+      const i = _helperQueue.indexOf(cb);
+      if (i >= 0) _helperQueue.splice(i, 1);
+      clearTimeout(timer);
+      resolved = true;
+      reject(e);
+    }
   }));
 }
 
@@ -862,8 +975,13 @@ function _helperGetFrontApp(timeout = 2000) {
 async function _getSafariWindowGeometry() {
   await refreshTargetWindow();
   const windowRef = getTargetWindowRef();
-  // Get window bounds + window ID — always use direct osascript (daemon returns empty for this)
-  const boundsResult = await osascript(
+  // Get window bounds + window ID via the helper daemon. The daemon is TCC-granted
+  // under safari-helper's STABLE path, so this never falls back to osascript-under-claude
+  // — which re-prompts for Apple Events on every claude version bump (the binary lives in
+  // a version-numbered folder). The script returns a plain comma-joined string (not a list),
+  // which the daemon's stringValue handles fine. osascriptFast itself falls back to a fresh
+  // osascript subprocess only if the daemon is dead — a rare hiccup, not the steady state.
+  const boundsResult = await osascriptFast(
     `tell application "Safari"\n  set b to bounds of ${windowRef}\n  set wid to id of ${windowRef}\n  return (item 1 of b as text) & "," & (item 2 of b as text) & "," & (item 3 of b as text) & "," & (item 4 of b as text) & "," & (wid as text)\nend tell`
   );
   // boundsResult = "x1, y1, x2, y2, windowId"
@@ -916,8 +1034,11 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
   }
   // ALWAYS fall back to _activeTabIndex — never clear it from resolve failures
   if (!idx) idx = _activeTabIndex;
-  // Once this session owns a tab, never silently run on the user's current tab.
-  if (!idx && _hasOwnedTab && SAFARI_PROFILE) {
+  // Once this session owns a tab, never silently run on the user's current tab —
+  // regardless of SAFARI_PROFILE. Without a profile getFallbackTarget() returns
+  // "front document" (the user's active tab), so the guard matters MOST there.
+  // Mirrors runJSLarge and the ghost-recovery guard below, which key on _hasOwnedTab alone.
+  if (!idx && _hasOwnedTab) {
     throw new Error('Tab tracking lost during runJS — refusing to target the user\'s current tab. Call safari_new_tab to reopen.');
   }
   const target = idx
@@ -976,7 +1097,10 @@ async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
   await refreshTargetWindow();
   // Resolve tab the same way runJS does — verify cached index via URL
   let idx = tabIndex;
-  if (!idx && _activeTabURL && _activeTabURL !== 'about:blank' && _activeTabURL !== '') {
+  // Match runJS: resolve when EITHER the URL or the tab marker is tracked — after a
+  // redirect clears _activeTabURL the marker is still authoritative; skipping the
+  // scan meant large-payload ops (upload/paste) could target a stale index.
+  if (!idx && ((_activeTabURL && _activeTabURL !== 'about:blank' && _activeTabURL !== '') || _activeTabMarker)) {
     const resolved = await resolveActiveTab();
     if (resolved) { idx = resolved; _lastResolveTime = Date.now(); }
   }
@@ -1060,6 +1184,28 @@ export async function navigate(url) {
       { timeout: 10000 }
     );
 
+    // Optimistically track the destination NOW. The async load below can take seconds
+    // on a heavy SPA; if any step throws mid-load, resolveActiveTab() can still re-find
+    // this tab by URL instead of clearing the index and locking the session out of its
+    // own tab. Corrected to the real landed URL once the page settles (below).
+    _activeTabURL = targetUrl;
+    _activeTabIndex = navIndex;
+    _lastResolveTime = Date.now();
+
+    // about:blank and any already-loaded page report readyState 'complete' the instant
+    // we poll, BEFORE the async set-URL takes effect — so breaking on readyState alone
+    // mistakes the stale/blank page for a finished navigation (root cause of false
+    // "set URL had no effect" failures navigating a fresh tab to an SPA). Only settle
+    // once the URL has actually LEFT preNavUrl (a same-URL reload is exempt).
+    const _isReload = !!preNavUrl && preNavUrl === targetUrl;
+    const _settled = (state, landed) => {
+      if (state !== 'complete' && state !== 'interactive') return false;
+      if (_isReload) return true;
+      if (!landed || landed === 'about:blank') return false;
+      return landed !== preNavUrl;
+    };
+    const _probeUrl = (json) => { try { return JSON.parse(json).url || ''; } catch { return ''; } };
+
     // Step 2: Poll readyState synchronously from Node.js side
     // (AppleScript do JavaScript doesn't await async Promises — returns immediately)
     let result = '{}';
@@ -1072,9 +1218,12 @@ export async function navigate(url) {
             `JSON.stringify({title:document.title,url:location.href,blocked:document.title.includes('cannot open')||document.title.includes('\u05D0\u05D9\u05DF \u05D0\u05E4\u05E9\u05E8\u05D5\u05EA')})`,
             { tabIndex: navIndex, timeout: 5000 }
           );
-          if (state === 'complete') break;
-          // interactive = DOM ready but resources still loading — wait a bit more
-          if (poll > 10) break; // Don't wait forever for 'complete' if interactive after 2s
+          if (_settled(state, _probeUrl(result))) {
+            if (state === 'complete') break;
+            // interactive = DOM ready but resources still loading — wait a bit more
+            if (poll > 10) break; // Don't wait forever for 'complete' if interactive after 2s
+          }
+          // else: new URL not in effect yet (stale/blank page) — keep polling
         }
       } catch { /* page still loading, retry */ }
     }
@@ -1082,9 +1231,8 @@ export async function navigate(url) {
     // If the fast `set URL` above silently no-opped (cold/crashed daemon), the poll
     // just saw the OLD page already loaded. Detect that — the URL never left
     // preNavUrl — and retry once through the daemon-independent osascript path.
-    let landedUrl = '';
-    try { landedUrl = JSON.parse(result).url || ''; } catch { /* result not JSON */ }
-    if (preNavUrl && preNavUrl !== targetUrl && (!landedUrl || landedUrl === preNavUrl)) {
+    let landedUrl = _probeUrl(result);
+    if (preNavUrl && preNavUrl !== targetUrl && (!landedUrl || landedUrl === preNavUrl || landedUrl === 'about:blank')) {
       console.error('[Safari MCP] navigate: fast set-URL did not take effect — retrying via osascript subprocess');
       await osascript(`tell application "Safari" to set URL of ${navTarget} to "${safeUrl}"`, { timeout: 12000 });
       for (let rpoll = 0; rpoll < 80; rpoll++) {
@@ -1092,23 +1240,38 @@ export async function navigate(url) {
         try {
           const state = await runJS('document.readyState', { tabIndex: navIndex, timeout: 5000 });
           if (state === 'complete' || state === 'interactive') {
-            result = await runJS('JSON.stringify({title:document.title,url:location.href})', { tabIndex: navIndex, timeout: 5000 });
-            if (state === 'complete') break;
-            if (rpoll > 10) break;
+            const probe = await runJS('JSON.stringify({title:document.title,url:location.href})', { tabIndex: navIndex, timeout: 5000 });
+            if (_settled(state, _probeUrl(probe))) {
+              result = probe;
+              if (state === 'complete') break;
+              if (rpoll > 10) break;
+            }
           }
         } catch { /* page still loading, retry */ }
       }
+      // Last chance: the daemon may have applied the set URL only AFTER our polls ran.
+      // Re-read the live URL directly before declaring failure.
+      let retryUrl = _probeUrl(result);
+      if (!retryUrl || retryUrl === preNavUrl || retryUrl === 'about:blank') {
+        const liveUrl = await runJS('location.href', { tabIndex: navIndex, timeout: 5000 }).catch(() => '');
+        if (liveUrl && liveUrl !== preNavUrl && liveUrl !== 'about:blank') {
+          result = JSON.stringify({ title: '', url: liveUrl });
+          retryUrl = liveUrl;
+        }
+      }
       // Still stuck on the pre-navigation URL → the navigation genuinely failed.
-      // Throw rather than returning the stale page as a successful navigation.
-      let retryUrl = '';
-      try { retryUrl = JSON.parse(result).url || ''; } catch { /* result not JSON */ }
       if (retryUrl && retryUrl === preNavUrl) {
+        // Preserve tab tracking (index + the page actually showing) so the session can
+        // recover via switch_tab / re-navigate instead of being locked out of its tab.
+        _activeTabURL = preNavUrl;
+        _activeTabIndex = navIndex;
+        _lastResolveTime = Date.now();
         throw new Error(`navigate failed: page stayed on ${preNavUrl} — Safari "set URL" to ${targetUrl} had no effect (Safari automation/daemon issue, retry exhausted)`);
       }
     }
 
     // Inject click helpers in background (non-blocking, for subsequent clicks)
-    _injectHelpersfast().catch(() => {});
+    _injectHelpersfast().catch((err) => console.error(`[Safari MCP] background helper injection skipped: ${err.message}`));
 
     // If HTTPS failed and original was HTTP, try original HTTP URL
     try {
@@ -1222,7 +1385,7 @@ export async function reload(hardReload = false) {
 
 export async function readPage({ selector, maxLength = 50000 } = {}) {
   if (selector) {
-    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(selector);
     return runJS(
       `(function(){
         var el = document.querySelector('${sel}');
@@ -1286,6 +1449,12 @@ const _HELPERS_ESCAPED = INJECT_MCP_HELPERS
 async function _injectHelpersfast() {
   await refreshTargetWindow();
   let idx = _activeTabIndex;
+  // Same guard as runJS: once this session has owned a tab, NEVER fall back to
+  // "front document" — that's the user's active tab, and injecting the helpers
+  // there is script injection into a page the user is working in.
+  if (!idx && _hasOwnedTab) {
+    throw new Error("Tab tracking lost — refusing to inject helpers into the front (user) tab.");
+  }
   const target = idx
     ? `tab ${idx} of ${getTargetWindowRef()}`
     : getFallbackTarget();
@@ -1367,10 +1536,10 @@ export async function click({ selector, text, x, y, ref }) {
   if (ref) {
     result = await clickWithRetry(coreJS(`mcpFindRef('${ref}')`, `Element not found: ref=${ref}`));
   } else if (selector) {
-    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(selector);
     result = await clickWithRetry(coreJS(`mcpQuerySelectorDeep('${sel}')`, `Element not found: ${selector}`));
   } else if (text) {
-    const safeText = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const safeText = escJsSingleQuote(text);
     result = await clickWithRetry(coreJS(`mcpFindText('${safeText}',true)||mcpFindText('${safeText}',false)`, `Element not found with text: ${text}`));
   } else if (x !== undefined && y !== undefined) {
     result = await clickWithRetry(coreJS(`mcpElementFromPoint(${Number(x)},${Number(y)})`, `No element at (${Number(x)},${Number(y)})`));
@@ -1413,7 +1582,7 @@ export async function click({ selector, text, x, y, ref }) {
 export async function doubleClick({ selector, x, y, ref }) {
   if (ref) selector = refSelector(ref);
   if (selector) {
-    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(selector);
     return runJS(
       `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';el.scrollIntoView({block:'center'});el.dispatchEvent(new MouseEvent('dblclick',{bubbles:true,cancelable:true}));return 'Double-clicked: '+el.tagName;})()`
     );
@@ -1428,7 +1597,7 @@ export async function doubleClick({ selector, x, y, ref }) {
 
 export async function rightClick({ selector, x, y }) {
   if (selector) {
-    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(selector);
     return runJS(
       `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';el.scrollIntoView({block:'center'});el.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true,button:2}));return 'Right-clicked: '+el.tagName;})()`
     );
@@ -1467,7 +1636,7 @@ export async function nativeClick({ selector, text, x, y, ref, doubleClick = fal
         });
       })()`;
     } else if (selector) {
-      const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      const sel = escJsSingleQuote(selector);
       jsExpr = `(function(){
         var el = document.querySelector('${sel}');
         if (!el) return JSON.stringify({error: 'Element not found: ${sel}'});
@@ -1481,7 +1650,7 @@ export async function nativeClick({ selector, text, x, y, ref, doubleClick = fal
         });
       })()`;
     } else {
-      const safeText = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      const safeText = escJsSingleQuote(text);
       jsExpr = `(function(){
         var el = mcpFindText('${safeText}', true) || mcpFindText('${safeText}', false);
         if (!el) return JSON.stringify({error: 'Element not found with text: ${safeText}'});
@@ -1564,7 +1733,7 @@ export async function nativeHover({ selector, text, x, y, ref, dwellMs = 500, re
         });
       })()`;
     } else if (selector) {
-      const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      const sel = escJsSingleQuote(selector);
       jsExpr = `(function(){
         var el = document.querySelector('${sel}');
         if (!el) return JSON.stringify({error: 'Element not found: ${sel}'});
@@ -1578,7 +1747,7 @@ export async function nativeHover({ selector, text, x, y, ref, dwellMs = 500, re
         });
       })()`;
     } else {
-      const safeText = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      const safeText = escJsSingleQuote(text);
       jsExpr = `(function(){
         var el = mcpFindText('${safeText}', true) || mcpFindText('${safeText}', false);
         if (!el) return JSON.stringify({error: 'Element not found with text: ${safeText}'});
@@ -1624,9 +1793,14 @@ export async function nativeHover({ selector, text, x, y, ref, dwellMs = 500, re
 export async function fill({ selector, value, ref }) {
   if (ref) selector = refSelector(ref);
   if (!selector) throw new Error("fill requires selector or ref");
-  const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const sel = escJsSingleQuote(selector);
   // Proper escaping order: backslashes first, then quotes
   const val = value.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, "");
+  // Same value encoded for the Lexical JSON literal (Strategy 2): JSON-escape first
+  // (quotes/newlines/backslashes), then escape for the surrounding single-quoted JS
+  // string. `val` alone broke the JSON on any double-quote, and parseEditorState's
+  // silent catch made the whole strategy vanish without a trace.
+  const lexVal = JSON.stringify(String(value)).slice(1, -1).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
   const result = await runJS(
     `(function(){try{var el=document.querySelector('${sel}');if(!el){var q=function(r){var a=r.querySelectorAll('*');for(var i=0;i<a.length;i++){if(a[i].shadowRoot){el=a[i].shadowRoot.querySelector('${sel}');if(el)return el;el=q(a[i].shadowRoot);if(el)return el;}}return null;};el=q(document);}if(!el)return 'Element not found: ${sel}';el.focus();if(el.isContentEditable||el.getAttribute('contenteditable')==='true'){` +
     // Quill editor detection (LinkedIn share composer in 2026 — they migrated from
@@ -1682,7 +1856,7 @@ export async function fill({ selector, value, ref }) {
       // Strategy 1: beforeinput with insertFromPaste + DataTransfer
       `try{lexEl.focus();var lexSel=window.getSelection();if(lexSel){var lexRng=document.createRange();lexRng.selectNodeContents(lexEl);lexSel.removeAllRanges();lexSel.addRange(lexRng);}var lexDt=new DataTransfer();lexDt.setData('text/plain','${val}');var lexBi=new InputEvent('beforeinput',{inputType:'insertFromPaste',dataTransfer:lexDt,bubbles:true,cancelable:true});var lexCancelled=!lexEl.dispatchEvent(lexBi);if(lexCancelled||lexEl.textContent.indexOf('${val.substring(0, 20)}')>=0){return 'Filled CE (Lexical beforeinput paste)';}}catch(lexE1){}` +
       // Strategy 2: parseEditorState + setEditorState (direct state replacement)
-      `try{var lexJson='{"root":{"children":[{"children":[{"detail":0,"format":0,"mode":"normal","style":"","text":"${val}","type":"text","version":1}],"direction":"ltr","format":"","indent":0,"textFormat":0,"type":"paragraph","version":1}],"direction":"ltr","format":"","indent":0,"type":"root","version":1}}';var lexNs=lex.parseEditorState(lexJson);lex.setEditorState(lexNs);if(typeof lex.focus==='function')lex.focus();return 'Filled CE (Lexical setEditorState)';}catch(lexE2){}` +
+      `try{var lexJson='{"root":{"children":[{"children":[{"detail":0,"format":0,"mode":"normal","style":"","text":"${lexVal}","type":"text","version":1}],"direction":"ltr","format":"","indent":0,"textFormat":0,"type":"paragraph","version":1}],"direction":"ltr","format":"","indent":0,"type":"root","version":1}}';var lexNs=lex.parseEditorState(lexJson);lex.setEditorState(lexNs);if(typeof lex.focus==='function')lex.focus();return 'Filled CE (Lexical setEditorState)';}catch(lexE2){}` +
     `}` +
     // ProseMirror detection
     `var pm=el.closest('.ProseMirror')||el.querySelector('.ProseMirror');if(pm){try{var v=null;if(pm.pmViewDesc&&pm.pmViewDesc.view)v=pm.pmViewDesc.view;else if(pm.cmView&&pm.cmView.view)v=pm.cmView.view;else{var keys=Object.keys(pm);for(var ki=0;ki<keys.length;ki++){var o=pm[keys[ki]];if(o&&o.state&&o.dispatch){v=o;break;}}}` +
@@ -1772,7 +1946,7 @@ export async function fill({ selector, value, ref }) {
 
     const fillResult = await runJS(
       `(function(){` +
-      `var el=document.querySelector('${selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}');` +
+      `var el=document.querySelector('${escJsSingleQuote(selector)}');` +
       `if(!el)return 'Element not found';` +
       `el.focus();el.click();` +
       `var t=document.activeElement||el;` +
@@ -1821,7 +1995,7 @@ export async function fill({ selector, value, ref }) {
 
     const fillResult = await runJS(
       `(function(){` +
-      `var el=document.querySelector('${selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}');` +
+      `var el=document.querySelector('${escJsSingleQuote(selector)}');` +
       `if(!el)return 'Element not found';` +
       `el.focus();el.click();` +
       `var sel=window.getSelection();if(sel.rangeCount){var r=document.createRange();r.selectNodeContents(el);r.collapse(false);sel.removeAllRanges();sel.addRange(r);}` +
@@ -1837,7 +2011,7 @@ export async function fill({ selector, value, ref }) {
   // descriptor setter. Fall back to native CGEvent Cmd+V paste — real keyboard events
   // route through the framework's normal input pipeline.
   if (typeof result === 'string' && result.startsWith('__FILL_VALUE_MISMATCH__')) {
-    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(selector);
     await runJS(
       `(function(){var el=document.querySelector('${sel}');if(!el)return 'not-found';` +
       `el.focus();if('select' in el){el.select();}else if(el.setSelectionRange){el.setSelectionRange(0,(el.value||'').length);}` +
@@ -1857,7 +2031,7 @@ export async function fill({ selector, value, ref }) {
   // events dismiss the dialog. Use CGEvent Cmd+V — real paste, isTrusted:true, windowed so
   // no focus steal. Requires the element to be focused + have a collapsed selection at end.
   if (result === "__NATIVE_PASTE_DIALOG__") {
-    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(selector);
     await runJS(
       `(function(){var el=document.querySelector('${sel}');if(!el)return 'not-found';` +
       `el.focus();` +
@@ -1888,7 +2062,7 @@ export async function fill({ selector, value, ref }) {
 export async function verifyState({ selector, expected, ref }) {
   if (ref) selector = refSelector(ref);
   if (!selector) throw new Error("verifyState requires selector or ref");
-  const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const sel = escJsSingleQuote(selector);
   const exp = String(expected || '').replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, "");
   const expSnippet = String(expected || '').substring(0, 30).replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, "");
   return runJS(
@@ -1926,8 +2100,6 @@ export async function verifyState({ selector, expected, ref }) {
         try {
           var lexText = '';
           lex.getEditorState().read(function(){
-            var root = lex._editorState && lex._editorState._nodeMap ? lex._editorState._nodeMap.get('root') : null;
-            // Fallback: read DOM text since direct API requires Lexical's $getRoot
             lexText = (lexEl || el).textContent || '';
           });
           return JSON.stringify({ match: lexText.indexOf(snippet) >= 0, mode: 'lexical', actual: lexText.substring(0, 200), expected: expected.substring(0, 200) });
@@ -1962,7 +2134,7 @@ export async function verifyState({ selector, expected, ref }) {
 }
 
 export async function clearField({ selector }) {
-  const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const sel = escJsSingleQuote(selector);
   return runJS(
     `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';if(el.isContentEditable){el.focus();document.execCommand('selectAll');document.execCommand('delete');el.dispatchEvent(new Event('input',{bubbles:true}));return 'Cleared (contenteditable)';}var t=el._valueTracker;if(t)t.setValue('x');var p=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;var d=Object.getOwnPropertyDescriptor(p,'value');if(d&&d.set)d.set.call(el,'');else el.value='';el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));el.dispatchEvent(new Event('blur',{bubbles:true}));return 'Cleared';})()`
   );
@@ -1978,7 +2150,7 @@ export async function selectOption({ selector, value, ref }) {
   if (ref) {
     finder = `mcpFindRef('${String(ref).replace(/'/g, "\\'")}')`;
   } else if (selector) {
-    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(selector);
     finder = `(document.querySelector('${sel}')||mcpQuerySelectorDeep('${sel}'))`;
   } else {
     throw new Error("selectOption requires 'ref' or 'selector'");
@@ -2001,7 +2173,7 @@ export async function reactSelectSet({ selector, ref, value }) {
     const safeRef = String(ref).replace(/'/g, "\\'");
     finder = `mcpFindRef('${safeRef}')`;
   } else if (selector) {
-    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(selector);
     finder = `mcpQuerySelectorDeep('${sel}')`;
   } else {
     throw new Error("reactSelectSet requires 'ref' or 'selector'");
@@ -2018,7 +2190,7 @@ export async function reactSelectListOptions({ selector, ref }) {
     const safeRef = String(ref).replace(/'/g, "\\'");
     finder = `mcpFindRef('${safeRef}')`;
   } else if (selector) {
-    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(selector);
     finder = `mcpQuerySelectorDeep('${sel}')`;
   } else {
     throw new Error("reactSelectListOptions requires 'ref' or 'selector'");
@@ -2032,7 +2204,7 @@ export async function fillForm({ fields }) {
   // Same React-state-sync logic as `fill`: _valueTracker reset, prototype-correct setter,
   // InputEvent with inputType, composed events for shadow DOM, dialog-aware blur.
   const fieldsJSON = JSON.stringify(fields.map(f => ({
-    s: f.selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'"),
+    s: escJsSingleQuote(f.selector),
     v: f.value.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n"),
   })));
   return runJS(
@@ -2127,7 +2299,7 @@ export async function nativeType({ value, selector, ref }) {
   if (!value) throw new Error("nativeType requires 'value'");
   // Focus the target element if selector/ref provided
   if (ref || selector) {
-    const sel = ref ? refSelector(ref) : selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = ref ? refSelector(ref) : escJsSingleQuote(selector);
     await runJS(`(function(){ var el=document.querySelector('${sel}'); if(el){el.focus();el.click();} return el?'focused':'not found'; })()`);
     await new Promise(r => setTimeout(r, 50));
   }
@@ -2245,13 +2417,28 @@ export async function pressKey({ key, modifiers = [] }) {
   // Non-modifier keys: pure JavaScript (no System Events)
   const jsKey = jsKeyMap[k] || key;
   const safeKey = jsKey.replace(/'/g, "\\'");
+  // W3C `code` values: special keys are NOT "Key"-prefixed ("Enter", "ArrowUp", ...);
+  // only letters are ("KeyA"), digits are "Digit1". Apps that route on event.code
+  // (Notion, Monaco, Google Docs) ignore a bogus "KeyEnter".
+  const jsCodeMap = {
+    "Enter": "Enter", "Tab": "Tab", "Escape": "Escape", " ": "Space",
+    "Backspace": "Backspace", "Delete": "Delete",
+    "ArrowUp": "ArrowUp", "ArrowDown": "ArrowDown", "ArrowLeft": "ArrowLeft", "ArrowRight": "ArrowRight",
+    "Home": "Home", "End": "End", "PageUp": "PageUp", "PageDown": "PageDown",
+    "F1": "F1", "F2": "F2", "F3": "F3", "F4": "F4", "F5": "F5", "F6": "F6",
+  };
+  const jsCode = jsCodeMap[jsKey]
+    || (/^[a-z]$/i.test(jsKey) ? "Key" + jsKey.toUpperCase()
+      : /^[0-9]$/.test(jsKey) ? "Digit" + jsKey
+        : jsKey);
+  const safeCode = jsCode.replace(/'/g, "\\'");
   const shiftKey = hasShift;
   const altKey = modifiers.some((m) => m.toLowerCase() === "alt");
 
   const result = await runJS(
     `(function(){
       var el = document.activeElement || document.body;
-      var opts = {key:'${safeKey}',code:'Key${safeKey.length === 1 ? safeKey.toUpperCase() : safeKey}',bubbles:true,cancelable:true,shiftKey:${shiftKey},altKey:${altKey}};
+      var opts = {key:'${safeKey}',code:'${safeCode}',bubbles:true,cancelable:true,shiftKey:${shiftKey},altKey:${altKey}};
       var down = new KeyboardEvent('keydown', opts);
       var prevented = !el.dispatchEvent(down);
       if (!prevented) {
@@ -2314,13 +2501,7 @@ async function _nativeTypeViaClipboard(text) {
     savedClipboard = await _saveClipboard();
 
     // Set clipboard to our text via pipe (safe from shell injection)
-    await new Promise((resolve, reject) => {
-      const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
-      proc.stdin.write(text);
-      proc.stdin.end();
-      proc.on("close", resolve);
-      proc.on("error", reject);
-    });
+    await _pbcopy(text);
 
     // Paste via CGEvent Cmd+V targeted to Safari window — NO activate, NO focus steal
     // MUST have windowId — global CGEvent (windowId=0) would steal focus and move mouse
@@ -2345,7 +2526,7 @@ async function _nativeTypeViaClipboard(text) {
 export async function typeText({ text, selector, ref }) {
   if (ref) selector = refSelector(ref);
   if (selector) {
-    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(selector);
     await runJS(`document.querySelector('${sel}')?.focus()`);
     // Quick poll for focus to settle (was 200ms fixed sleep)
     await new Promise((r) => setTimeout(r, 30));
@@ -2542,13 +2723,7 @@ export async function replaceEditorContent({ text }) {
       await _acquireClipboardLock();
       try {
         const savedClip = await _saveClipboard();
-        await new Promise((resolve, reject) => {
-          const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
-          proc.stdin.write(text);
-          proc.stdin.end();
-          proc.on("close", resolve);
-          proc.on("error", reject);
-        });
+        await _pbcopy(text);
         await _helperNativeKeyboard(9, ["cmd"], 0); // Cmd+V global
         await new Promise(r => setTimeout(r, 200));
         await _restoreClipboard(savedClip);
@@ -2815,7 +2990,7 @@ export async function screenshot({ fullPage = false } = {}) {
 // ========== ELEMENT SCREENSHOT ==========
 
 export async function screenshotElement({ selector }) {
-  const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const sel = escJsSingleQuote(selector);
   // Use html2canvas-like approach: capture element via SVG foreignObject
   const result = await runJS(
     `(async function(){
@@ -2888,8 +3063,11 @@ export async function screenshotElement({ selector }) {
       // Full window screenshot then crop with sips
       await execFileAsync("screencapture", ["-l" + windowId, "-o", "-x", tmpFile]);
       const { x, y, w, h } = JSON.parse(bounds);
-      // Use sips to crop (macOS built-in)
-      const toolbarHeight = 74; // Safari toolbar approximate height (matches _getSafariWindowGeometry)
+      // Use sips to crop (macOS built-in). Use the DYNAMIC toolbar height — Sequoia+ chrome is
+      // ~90px, not 74, so a hardcoded 74 left element screenshots vertically offset. Fall back
+      // to 74 only if geometry can't be read.
+      let toolbarHeight = 74;
+      try { const g = await _getSafariWindowGeometry(); if (g?.toolbarHeight) toolbarHeight = g.toolbarHeight; } catch {}
       cropFile = join(tmpdir(), `safari-el-crop-${Date.now()}.png`);
       await execFileAsync("sips", [
         "-c", String(h), String(w),
@@ -2928,9 +3106,11 @@ export async function scrollTo({ x = 0, y = 0 }) {
 
 export async function listTabs() {
   await refreshTargetWindow();
-  // If we have a tracked URL, re-resolve the index (it may have shifted)
-  // If no URL tracked, reset index (new session should open its own tab)
-  if (_activeTabURL) {
+  // Re-resolve when EITHER the URL or the tab marker is tracked — the URL may be
+  // cleared after a redirect while the marker is still valid; resetting the index
+  // then caused spurious "tab tracking lost" errors. Only a session with no
+  // tracking at all should reset.
+  if (_activeTabURL || _activeTabMarker) {
     await resolveActiveTab();
   } else {
     _activeTabIndex = null;
@@ -2958,7 +3138,7 @@ export async function listTabs() {
 
 export async function newTab(url = "") {
   await refreshTargetWindow();
-  const safeUrl = url ? url.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/[\r\n]/g, '') : "";
+  const safeUrl = escAppleScriptString(url); // url defaults to "" → escAppleScriptString("") === ""
   try {
     if (url) {
       await osascript(`tell application "Safari"\ntell ${getTargetWindowRef()}\nset userTab to current tab\nmake new tab with properties {URL:"${safeUrl}"}\nset current tab to userTab\nend tell\nend tell`);
@@ -2978,13 +3158,14 @@ export async function newTab(url = "") {
       else { await osascript('tell application "Safari" to make new document'); }
     }
   }
-  // Get count atomically from the same tell block as tab creation (avoids TOCTOU if user opens tabs concurrently)
+  // NOT atomic with the creation call above — a tab the user opens between the two
+  // osascript round-trips can skew this count; the marker stamped below self-corrects
+  // via resolveActiveTab() on the next operation.
   const tabCount = await osascriptFast(`tell application "Safari" to return count of tabs of ${getTargetWindowRef()}`);
   _activeTabIndex = Number(tabCount);  // New tab is always appended as last
   _activeTabURL = url || null;
   _lastResolveTime = Date.now();
   _lastTabCount = Number(tabCount);  // Update tab count cache
-  _lastNewTabAt = Date.now();        // (legacy — grace window superseded by _hasOwnedTab)
   _hasOwnedTab = true;               // Permanently true: this session has opened its own tab,
                                      // so write ops must NEVER fall back to the user's current tab.
   // Set bulletproof tab marker — stamped onto the tab by _stampTab() after load.
@@ -3018,6 +3199,32 @@ export async function newTab(url = "") {
 
 export async function closeTab() {
   await refreshTargetWindow();
+  // ── Guard: never close a window's LAST tab. Closing it shuts the window —
+  // which quits Safari if it's the only window, AND (for profile-targeted
+  // instances) makes the target window vanish so every later op throws
+  // "profile window not found". It also wedges a 0-tab "ghost" window that
+  // resists `close`. Per-window (not global): with SAFARI_PROFILE set, several
+  // skills race closes on the same profile window while other-profile windows
+  // exist, so a global count would wrongly allow shutting the profile window.
+  // If the target window is down to one tab, blank it instead of closing.
+  try {
+    const _winTabs = parseInt(
+      await osascript(`tell application "Safari" to return (count of tabs of ${getTargetWindowRef()})`),
+      10
+    );
+    if (Number.isFinite(_winTabs) && _winTabs <= 1) {
+      const _ref = _activeTabIndex
+        ? `tab ${_activeTabIndex} of ${getTargetWindowRef()}`
+        : `current tab of ${getTargetWindowRef()}`;
+      await osascript(`tell application "Safari" to set URL of ${_ref} to "about:blank"`);
+      _activeTabIndex = null;
+      _activeTabURL = null;
+      _lastTabCount = null;
+      _lastResolveTime = 0;
+      return "Window's last tab blanked instead of closed (closing it would shut the window / quit Safari)";
+    }
+  } catch { /* count check failed — fall through to normal close */ }
+
   if (_activeTabIndex) {
     await osascript(
       `tell application "Safari" to close tab ${_activeTabIndex} of ${getTargetWindowRef()}`
@@ -3067,8 +3274,8 @@ export async function waitFor({ selector, text, timeout = 10000 }) {
   // `do JavaScript` can't await, so an in-page async wait loop returns immediately
   // (handing back an unsettled promise) instead of waiting. The wait loop runs on
   // the Node side: each tick re-evaluates one SYNCHRONOUS check against the page.
-  const safeSelector = selector ? selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'") : "";
-  const safeText = text ? text.replace(/\\/g, "\\\\").replace(/'/g, "\\'") : "";
+  const safeSelector = selector ? escJsSingleQuote(selector) : "";
+  const safeText = text ? escJsSingleQuote(text) : "";
   if (!safeSelector && !safeText) {
     throw new Error("waitFor requires selector or text");
   }
@@ -3235,14 +3442,14 @@ export async function evaluate({ script }) {
 // ========== ELEMENT INFO ==========
 
 export async function getElementInfo({ selector }) {
-  const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const sel = escJsSingleQuote(selector);
   return runJS(
     `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found';var r=el.getBoundingClientRect();return JSON.stringify({tag:el.tagName,text:el.textContent.trim().substring(0,200),href:el.href||'',value:el.value||'',visible:r.width>0&&r.height>0,rect:{x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)},attrs:Object.fromEntries([...el.attributes].map(function(a){return[a.name,a.value.substring(0,100)]}))})})()`
   );
 }
 
 export async function querySelectorAll({ selector, limit = 20 }) {
-  const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const sel = escJsSingleQuote(selector);
   return runJS(
     `JSON.stringify([...document.querySelectorAll('${sel}')].slice(0,${Number(limit)}).map(function(el,i){return{index:i,tag:el.tagName,text:el.textContent.trim().substring(0,100),href:el.href||undefined,value:el.value||undefined}}))`
   );
@@ -3253,7 +3460,7 @@ export async function querySelectorAll({ selector, limit = 20 }) {
 export async function hover({ selector, x, y, ref }) {
   if (ref) selector = refSelector(ref);
   if (selector) {
-    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(selector);
     return runJS(
       `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found';el.scrollIntoView({block:'center'});el.dispatchEvent(new MouseEvent('mouseover',{bubbles:true}));el.dispatchEvent(new MouseEvent('mouseenter',{bubbles:true}));return 'Hovered: '+el.tagName;})()`
     );
@@ -3270,7 +3477,7 @@ export async function hover({ selector, x, y, ref }) {
 
 export async function handleDialog({ action = "accept", text }) {
   if (text !== undefined) {
-    const safeText = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const safeText = escJsSingleQuote(text);
     await runJS(
       `window.__mcp_dialog_response='${safeText}';window.__origPrompt=window.prompt;window.prompt=function(){var r=window.__mcp_dialog_response;window.prompt=window.__origPrompt;return r;}`
     );
@@ -3305,7 +3512,7 @@ export async function getCookies() {
 
 export async function getLocalStorage({ key }) {
   if (key) {
-    const safeKey = key.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const safeKey = escJsSingleQuote(key);
     return runJS(`localStorage.getItem('${safeKey}')`);
   }
   return runJS(
@@ -3325,8 +3532,8 @@ export async function getNetworkRequests({ limit = 50 } = {}) {
 
 export async function drag({ sourceSelector, targetSelector, sourceX, sourceY, targetX, targetY }) {
   if (sourceSelector && targetSelector) {
-    const srcSel = sourceSelector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-    const tgtSel = targetSelector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const srcSel = escJsSingleQuote(sourceSelector);
+    const tgtSel = escJsSingleQuote(targetSelector);
     return runJS(
       `(function(){` +
       `var src=document.querySelector('${srcSel}');var tgt=document.querySelector('${tgtSel}');` +
@@ -3378,7 +3585,9 @@ function _validateFilePath(filePath) {
     for (const b of blocked) {
       if (lower.includes(b)) throw new Error("Blocked: sensitive path " + filePath);
     }
-    if (!checkPath.startsWith('/Users/') && !checkPath.startsWith('/tmp/') && !checkPath.startsWith('/var/folders/') && !checkPath.startsWith('/private/tmp/')) {
+    // realpathSync resolves /var/folders/... to /private/var/folders/... on macOS —
+    // without the /private form an EXISTING file under /var/folders was rejected.
+    if (!checkPath.startsWith('/Users/') && !checkPath.startsWith('/tmp/') && !checkPath.startsWith('/var/folders/') && !checkPath.startsWith('/private/tmp/') && !checkPath.startsWith('/private/var/folders/')) {
       throw new Error("File path must be under /Users/, /tmp/, or /var/folders/: " + filePath);
     }
   }
@@ -3413,7 +3622,7 @@ export async function uploadFile({ selector, filePath }) {
     end tell`
   ).catch(() => {}); // Ignore if no dialog open
 
-  const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const sel = escJsSingleQuote(selector);
   const { basename, extname } = await import("node:path");
   let fileName = basename(filePath);
   let ext = extname(filePath).toLowerCase().replace(".", "");
@@ -3658,7 +3867,7 @@ export async function resetEmulation() {
 
 export async function startConsoleCapture() {
   await runJS(
-    "if(!window.__mcp_console){window.__mcp_console=[];var orig={log:console.log,warn:console.warn,error:console.error,info:console.info};['log','warn','error','info'].forEach(function(level){console[level]=function(){window.__mcp_console.push({level:level,message:[].slice.call(arguments).map(String).join(' '),time:Date.now()});orig[level].apply(console,arguments);};});window.addEventListener('error',function(e){window.__mcp_console.push({level:'error',message:e.message,time:Date.now()});});}"
+    "if(!window.__mcp_console){window.__mcp_console=[];var orig={log:console.log,warn:console.warn,error:console.error,info:console.info};['log','warn','error','info'].forEach(function(level){console[level]=function(){window.__mcp_console.push({level:level,message:[].slice.call(arguments).map(String).join(' '),time:Date.now()});if(window.__mcp_console.length>2000)window.__mcp_console.shift();orig[level].apply(console,arguments);};});window.addEventListener('error',function(e){window.__mcp_console.push({level:'error',message:e.message,time:Date.now()});if(window.__mcp_console.length>2000)window.__mcp_console.shift();});}"
   );
   return "Console capture started";
 }
@@ -3946,10 +4155,14 @@ export function refSelector(ref) {
 // Execute multiple safari.js operations in a single tool call
 // Avoids round-trip overhead of calling tools one by one
 // script is a JSON array of steps: [{action: "navigate", args: {url: "..."}}, {action: "click", args: {selector: "..."}}, ...]
-export async function runScript({ steps }) {
+export async function runScript({ steps, onStep }) {
   const results = [];
   for (const step of steps) {
     const { action, args = {} } = step;
+    // Safety callback (tab-ownership, wired by index.js) runs OUTSIDE the per-step
+    // try/catch: a refusal must abort the whole batch, not be recorded as a step
+    // error and silently continue to the next step.
+    if (onStep) onStep(action, args);
     try {
       // Map action names to safari.js functions
       const actions = {
@@ -3963,6 +4176,10 @@ export async function runScript({ steps }) {
         getCookies, setCookie, deleteCookies, getElementInfo, querySelectorAll,
         extractTables, extractMeta, extractImages, extractLinks,
         analyzePage, detectForms, getAccessibilityTree, getPerformanceMetrics,
+        // Previously-missing actions — these tools existed but couldn't be batched.
+        verifyState, reactSelectSet, reactSelectListOptions,
+        nativeClick, nativeHover, nativeType, nativeKeyboard,
+        replaceEditorContent, uploadFile, mockNetworkRoute,
       };
       const fn = actions[action];
       if (!fn) {
@@ -4037,15 +4254,18 @@ export async function getAccessibilityTree({ selector, maxDepth = 5 }) {
 // ========== COOKIE CRUD ==========
 
 export async function setCookie({ name, value, domain, path: cookiePath, expires, secure, sameSite, httpOnly }) {
-  const safeName = name.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-  const safeValue = value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const safeName = escJsSingleQuote(name);
+  const safeValue = escJsSingleQuote(value);
+  // Every interpolated attribute goes through escJsSingleQuote — path/domain/expires
+  // used to be embedded raw and then "escaped" with a quote-only replace (no
+  // backslash-first), which both broke legitimate values and re-opened the literal.
   let cookie = `${safeName}=${safeValue}`;
-  if (cookiePath) cookie += `; path=${cookiePath}`;
-  if (domain) cookie += `; domain=${domain}`;
-  if (expires) cookie += `; expires=${expires}`;
+  if (cookiePath) cookie += `; path=${escJsSingleQuote(cookiePath)}`;
+  if (domain) cookie += `; domain=${escJsSingleQuote(domain)}`;
+  if (expires) cookie += `; expires=${escJsSingleQuote(expires)}`;
   if (secure) cookie += '; secure';
   if (sameSite) cookie += `; samesite=${sameSite}`;
-  return runJS(`document.cookie='${cookie.replace(/'/g, "\\'")}'; 'Cookie set: ${safeName}'`);
+  return runJS(`document.cookie='${cookie}'; 'Cookie set: ${safeName}'`);
 }
 
 export async function deleteCookies({ name, all }) {
@@ -4055,7 +4275,7 @@ export async function deleteCookies({ name, all }) {
     );
   }
   if (name) {
-    const safeName = name.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const safeName = escJsSingleQuote(name);
     return runJS(
       `document.cookie='${safeName}=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/'; 'Deleted cookie: ${safeName}'`
     );
@@ -4067,7 +4287,7 @@ export async function deleteCookies({ name, all }) {
 
 export async function getSessionStorage({ key }) {
   if (key) {
-    const safeKey = key.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const safeKey = escJsSingleQuote(key);
     return runJS(`sessionStorage.getItem('${safeKey}')`);
   }
   return runJS(
@@ -4076,20 +4296,20 @@ export async function getSessionStorage({ key }) {
 }
 
 export async function setSessionStorage({ key, value }) {
-  const safeKey = key.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-  const safeValue = value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const safeKey = escJsSingleQuote(key);
+  const safeValue = escJsSingleQuote(value);
   return runJS(`sessionStorage.setItem('${safeKey}','${safeValue}'); 'Set sessionStorage: ${safeKey}'`);
 }
 
 export async function setLocalStorage({ key, value }) {
-  const safeKey = key.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-  const safeValue = value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const safeKey = escJsSingleQuote(key);
+  const safeValue = escJsSingleQuote(value);
   return runJS(`localStorage.setItem('${safeKey}','${safeValue}'); 'Set localStorage: ${safeKey}'`);
 }
 
 export async function deleteLocalStorage({ key }) {
   if (key) {
-    const safeKey = key.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const safeKey = escJsSingleQuote(key);
     return runJS(`localStorage.removeItem('${safeKey}'); 'Deleted localStorage: ${safeKey}'`);
   }
   return runJS("var n=localStorage.length; localStorage.clear(); 'Cleared localStorage: '+n+' items'");
@@ -4097,7 +4317,7 @@ export async function deleteLocalStorage({ key }) {
 
 export async function deleteSessionStorage({ key }) {
   if (key) {
-    const safeKey = key.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const safeKey = escJsSingleQuote(key);
     return runJS(`sessionStorage.removeItem('${safeKey}'); 'Deleted sessionStorage: ${safeKey}'`);
   }
   return runJS("var n=sessionStorage.length; sessionStorage.clear(); 'Cleared sessionStorage: '+n+' items'");
@@ -4167,19 +4387,18 @@ export async function clipboardWrite({ text, restore = true }) {
     const oldClipboard = restore ? await _saveClipboard() : null;
 
     // Use spawn + stdin pipe — safe from shell injection (no shell involved)
-    await new Promise((resolve, reject) => {
-      const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
-      proc.stdin.write(text);
-      proc.stdin.end();
-      proc.on("close", resolve);
-      proc.on("error", reject);
-    });
+    await _pbcopy(text);
 
     // Restore clipboard after 2 seconds (reduced from 5s — shorter exposure window)
     if (restore && oldClipboard !== null) {
       if (_clipboardRestoreTimer) clearTimeout(_clipboardRestoreTimer);
+      // Stash the content so flushClipboardRestore() can restore it synchronously if the
+      // process is signalled to exit inside this 2s window — otherwise the user is left
+      // holding the tool's pasted text (violates the clipboard-safety guarantee).
+      _pendingClipboardRestore = oldClipboard;
       _clipboardRestoreTimer = setTimeout(async () => {
         await _restoreClipboard(oldClipboard);
+        _pendingClipboardRestore = undefined;
         _clipboardRestoreTimer = null;
         _releaseClipboardLock();
       }, 2000);
@@ -4194,16 +4413,34 @@ export async function clipboardWrite({ text, restore = true }) {
   }
 }
 
+// Synchronously flush a pending clipboard restore — called from the shutdown handler so the
+// user never inherits the tool's pasted text if the process exits inside the 2s restore
+// window. Uses spawnSync (blocking) because we're on the exit path and can't await a Promise.
+export function flushClipboardRestore() {
+  if (_clipboardRestoreTimer) {
+    clearTimeout(_clipboardRestoreTimer);
+    _clipboardRestoreTimer = null;
+  }
+  if (_pendingClipboardRestore === undefined) return;
+  const content = _pendingClipboardRestore;
+  _pendingClipboardRestore = undefined;
+  try {
+    spawnSync("pbcopy", [], { input: content });
+  } catch { /* best effort — we're exiting anyway */ }
+  _releaseClipboardLock();
+}
+
 // ========== NETWORK MOCKING ==========
 
 // Intercept fetch/XHR requests matching a URL pattern and return mock responses
 export async function mockNetworkRoute({ urlPattern, response }) {
   // Escape backslash FIRST, then quotes — the reverse order double-escapes the quote
   // (\' → \\') and breaks out of the JS string literal.
-  const safePattern = urlPattern.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const safePattern = escJsSingleQuote(urlPattern);
   const safeBody = (response.body || "").replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n");
-  const status = response.status || 200;
-  const contentType = response.contentType || "application/json";
+  const status = Number(response.status) || 200;
+  // contentType reaches the injected JS literal — escape it like every other field.
+  const contentType = escJsSingleQuote(response.contentType || "application/json");
 
   return runJS(
     `(function(){
@@ -4282,9 +4519,9 @@ export async function startNetworkCapture() {
       return origFetch.apply(this,arguments).then(function(resp){
         var entry={url:typeof url==='string'?url:url.url,method:opts.method||'GET',status:resp.status,statusText:resp.statusText,
           type:'fetch',duration:Date.now()-start,headers:Object.fromEntries([...resp.headers.entries()].slice(0,20)),time:new Date().toISOString()};
-        window.__mcp_network.push(entry);return resp;
+        window.__mcp_network.push(entry);if(window.__mcp_network.length>5000)window.__mcp_network.shift();return resp;
       }).catch(function(err){
-        window.__mcp_network.push({url:typeof url==='string'?url:url.url,method:opts.method||'GET',error:err.message,type:'fetch',time:new Date().toISOString()});
+        window.__mcp_network.push({url:typeof url==='string'?url:url.url,method:opts.method||'GET',error:err.message,type:'fetch',time:new Date().toISOString()});if(window.__mcp_network.length>5000)window.__mcp_network.shift();
         throw err;
       });
     };
@@ -4293,10 +4530,10 @@ export async function startNetworkCapture() {
       this.__mcp_method=method;this.__mcp_url=url;this.__mcp_start=Date.now();
       this.addEventListener('load',function(){
         window.__mcp_network.push({url:this.__mcp_url,method:this.__mcp_method,status:this.status,statusText:this.statusText,
-          type:'xhr',duration:Date.now()-this.__mcp_start,responseSize:this.responseText.length,time:new Date().toISOString()});
+          type:'xhr',duration:Date.now()-this.__mcp_start,responseSize:this.responseText.length,time:new Date().toISOString()});if(window.__mcp_network.length>5000)window.__mcp_network.shift();
       });
       this.addEventListener('error',function(){
-        window.__mcp_network.push({url:this.__mcp_url,method:this.__mcp_method,error:'Network error',type:'xhr',time:new Date().toISOString()});
+        window.__mcp_network.push({url:this.__mcp_url,method:this.__mcp_method,error:'Network error',type:'xhr',time:new Date().toISOString()});if(window.__mcp_network.length>5000)window.__mcp_network.shift();
       });
       return origXHR.apply(this,arguments);
     };}`
@@ -4523,7 +4760,7 @@ export async function overrideGeolocation({ latitude, longitude, accuracy = 100 
 // ========== COMPUTED STYLES ==========
 
 export async function getComputedStyles({ selector, properties }) {
-  const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const sel = escJsSingleQuote(selector);
   const propsFilter = properties
     ? `.filter(function(p){return [${properties.map((p) => `'${String(p).replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`).join(",")}].includes(p)})`
     : "";
@@ -4662,7 +4899,7 @@ export async function detectForms() {
 
 export async function scrollToElement({ selector, text, block = "center", timeout = 10000 }) {
   if (selector) {
-    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(selector);
     return runJS(
       `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';el.scrollIntoView({behavior:'smooth',block:'${block}'});var r=el.getBoundingClientRect();return 'Scrolled to: '+el.tagName+' at y='+Math.round(r.y);})()`
     );
@@ -4671,7 +4908,7 @@ export async function scrollToElement({ selector, text, block = "center", timeou
     // Virtual DOM scroll: scroll down repeatedly until text appears (for Airtable, etc.).
     // Each check+scroll is one synchronous step; the loop is driven from Node because
     // `do JavaScript` can't await an in-page delay (see _evaluateAsync).
-    const safeText = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const safeText = escJsSingleQuote(text);
     const safeBlock = String(block).replace(/[^a-z]/gi, '') || 'center';
     const navIndex = _activeTabIndex;
     const stepJs =
@@ -4727,7 +4964,7 @@ export async function navigateAndRead(url, { maxLength = 50000 } = {}) {
 
 // Click + wait for navigation or element — common after clicking a link/button
 export async function clickAndWait({ selector, text, waitFor: waitSelector, timeout = 10000 }) {
-  const esc = (s) => s.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const esc = (s) => escJsSingleQuote(s);
   const safeSel = selector ? esc(selector) : "";
   const safeText = text ? esc(text) : "";
   const safeWait = waitSelector ? esc(waitSelector) : "";
@@ -4772,7 +5009,7 @@ export async function fillAndSubmit({ fields, submitSelector }) {
   await fillForm({ fields });
   const navIndex = _activeTabIndex;
   if (submitSelector) {
-    const sel = submitSelector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(submitSelector);
     await runJS(
       `(function(){var el=document.querySelector('${sel}');if(el)el.click();})()`
     );

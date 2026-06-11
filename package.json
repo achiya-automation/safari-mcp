@@ -11,7 +11,7 @@
   },
   "scripts": {
     "start": "node index.js",
-    "test": "node --test tests/smoke.test.js",
+    "test": "node --test 'tests/*.test.js' 'test/*.test.mjs'",
     "postinstall": "node scripts/postinstall.cjs || true"
   },
   "keywords": [
@@ -53,7 +53,7 @@
     "url": "https://github.com/achiya-automation/safari-mcp/issues"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "os": [
     "darwin"
@@ -61,6 +61,7 @@
   "files": [
     "index.js",
     "safari.js",
+    "ownership-match.js",
     "mcp-helpers.js",
     "safari-helper",
     "safari-helper.entitlements",

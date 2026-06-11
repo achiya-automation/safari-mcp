@@ -9,16 +9,32 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import * as safari from "./safari.js";
+import { findOwnedMatch, pruneExpired } from "./ownership-match.js";
 import { WebSocketServer } from "ws";
 import { createServer } from "node:http";
-import { randomUUID } from "node:crypto";
+import { randomUUID, randomBytes } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 MB cap on POST body — prevents DoS
+
+// Security: local shared-secret for /proxy-command — prevents an unrelated local process
+// (e.g. a malicious npm postinstall) from driving the browser through this bridge.
+// Read/created once with mode 600; all instances share it.
+const PROXY_TOKEN_FILE = join(homedir(), ".safari-mcp-proxy-token");
+function _getProxyToken() {
+  try { return readFileSync(PROXY_TOKEN_FILE, "utf8").trim(); }
+  catch {
+    const tok = randomBytes(32).toString("hex");
+    try { writeFileSync(PROXY_TOKEN_FILE, tok, { mode: 0o600 }); }
+    catch (err) { console.error(`[Safari MCP] Could not persist proxy token: ${err.message} — secondary instances will get 403 on /proxy-command until the file is writable.`); }
+    return tok;
+  }
+}
+const PROXY_TOKEN = _getProxyToken();
 
 // ========== MULTI-INSTANCE: concurrent instances coexist (never kill siblings) ==========
 // This block previously SIGTERM'd every other safari-mcp instance running >10s to
@@ -57,8 +73,12 @@ function _saveOwnershipFile(urls) {
   try {
     if (!existsSync(OWNERSHIP_DIR)) mkdirSync(OWNERSHIP_DIR, { recursive: true });
     const now = Date.now();
-    const entries = Array.from(urls).map(url => ({ url, ts: now }));
-    writeFileSync(OWNERSHIP_FILE, JSON.stringify(entries), { mode: 0o600 });
+    const entries = Array.from(urls).map(url => ({ url, ts: _ownedTabTimestamps.get(url) ?? now }));
+    // Atomic write (tmp + rename) — concurrent MCP instances share this file; a partial
+    // write from one must never corrupt the JSON another instance reads.
+    const tmp = OWNERSHIP_FILE + ".tmp." + process.pid;
+    writeFileSync(tmp, JSON.stringify(entries), { mode: 0o600 });
+    renameSync(tmp, OWNERSHIP_FILE);
   } catch { /* best-effort */ }
 }
 
@@ -75,36 +95,40 @@ const _openedTabs = new Map();
 // Any tool that modifies a tab (navigate, click, fill, etc.) is blocked
 // unless the current tab was opened via safari_new_tab.
 // Hydrated from ~/.safari-mcp/owned-tabs.json so ownership survives MCP restarts.
-const _ownedTabURLs = new Set(_loadOwnershipFile().map(e => e.url));
+const _ownedTabURLs = new Set();
+// Preserve each entry's ORIGINAL timestamp so _saveOwnershipFile doesn't reset it to `now` on
+// every write — otherwise the 30-min TTL never expires anything while a session is active, and
+// stale ownership leaks onto the user's tabs across sessions.
+const _ownedTabTimestamps = new Map();
+for (const e of _loadOwnershipFile()) {
+  _ownedTabURLs.add(e.url);
+  _ownedTabTimestamps.set(e.url, e.ts);
+}
 
+// Touch-on-use + live TTL enforcement. The TTL exists so ownership doesn't outlive the
+// session's actual use of a tab: entries the session keeps asserting against stay fresh;
+// abandoned entries expire after OWNERSHIP_TTL_MS and can no longer match a user's tab.
+// (Previously the TTL was only applied when loading the file at startup, so a long-lived
+// session accumulated ownership forever.)
+function _touchOwned(ownedKey) {
+  _ownedTabTimestamps.set(ownedKey, Date.now());
+  return true;
+}
+function _pruneExpiredOwnership() {
+  if (pruneExpired(_ownedTabURLs, _ownedTabTimestamps, OWNERSHIP_TTL_MS)) {
+    _saveOwnershipFile(_ownedTabURLs);
+  }
+}
+
+// Matching semantics (exact / normalized / same-origin path-prefix with a segment
+// boundary) live in ownership-match.js, where test/ownership-match.test.mjs locks
+// them — including that owning /org never owns /org-evil, and that the broad
+// "own the whole origin" rule stays dead (it defeated tab-safety entirely).
 function _isURLOwned(url) {
   if (!url) return false;
-  if (_ownedTabURLs.has(url)) return true;
-  // Match ignoring query params / fragments / trailing slashes (URL may change slightly after load)
-  const normalize = (u) => u.split('?')[0].split('#')[0].replace(/\/+$/, '');
-  const urlBase = normalize(url);
-  for (const owned of _ownedTabURLs) {
-    const ownedBase = normalize(owned);
-    if (urlBase === ownedBase) return true;
-  }
-  // Same-origin redirect: if a tab navigated from an owned URL to a different path
-  // on the same origin (e.g. /login/device → /login/device/select_account), it's still ours
-  try {
-    const urlOrigin = new URL(url).origin;
-    for (const owned of _ownedTabURLs) {
-      try {
-        if (new URL(owned).origin === urlOrigin && urlBase.startsWith(normalize(owned))) return true;
-      } catch {}
-    }
-    // NOTE: a broader "own ANY URL on this origin → treat ALL same-origin URLs as owned"
-    // check used to live here. It defeated tab-safety: once this session opened a single
-    // tab on github.com / google.com / etc., EVERY tab on that origin — including the
-    // user's own open tabs — counted as ours, so a click/fill could land in the user's tab.
-    // Same-origin redirects stay covered by the path-prefix check above plus final-URL
-    // tracking in safari_navigate (a redirect that changes the path entirely now needs an
-    // explicit safari_navigate, which is the safe default).
-  } catch {}
-  return false;
+  _pruneExpiredOwnership();
+  const match = findOwnedMatch(url, _ownedTabURLs);
+  return match !== null ? _touchOwned(match) : false;
 }
 
 // Sentinel persisted when a blank tab (about:blank) is opened by this session.
@@ -116,6 +140,7 @@ const BLANK_TAB_SENTINEL = "__mcp-blank-tab__";
 
 function _markBlankTabOpened() {
   if (!_ownedTabURLs.has(BLANK_TAB_SENTINEL)) {
+    _ownedTabTimestamps.set(BLANK_TAB_SENTINEL, Date.now());
     _ownedTabURLs.add(BLANK_TAB_SENTINEL);
     _saveOwnershipFile(_ownedTabURLs);
   }
@@ -123,6 +148,7 @@ function _markBlankTabOpened() {
 
 function _addOwnedURL(url) {
   if (url && url !== 'about:blank' && url !== 'favorites://') {
+    if (!_ownedTabTimestamps.has(url)) _ownedTabTimestamps.set(url, Date.now());
     _ownedTabURLs.add(url);
     _saveOwnershipFile(_ownedTabURLs);
   }
@@ -131,13 +157,9 @@ function _addOwnedURL(url) {
 function _removeOwnedURL(url) {
   if (url) {
     _ownedTabURLs.delete(url);
+    _ownedTabTimestamps.delete(url);
     _saveOwnershipFile(_ownedTabURLs);
   }
-}
-
-function _updateOwnedURL(oldUrl, newUrl) {
-  _removeOwnedURL(oldUrl);
-  _addOwnedURL(newUrl);
 }
 
 function _trackTab(tabIndex, url) {
@@ -177,6 +199,41 @@ const WEBKIT_WARNING_THRESHOLD_MB = Math.round(WEBKIT_MEMORY_LIMIT_MB * 0.7); //
 let _memoryCheckTimer = null;
 let _lastMemoryWarningTime = 0;
 
+// ── Cross-instance memory-monitor lock ───────────────────────────────────────
+// Every MCP instance (one per Claude session) runs this monitor and they ALL
+// read the SAME global WebKit memory. Uncoordinated, all of them close tabs at
+// the same moment ("thundering herd") and Safari windows flicker shut. This file
+// lock lets only ONE instance run a close-sweep per cycle; the rest skip it.
+const _MEMORY_LOCK_FILE = join(OWNERSHIP_DIR, "memory-monitor.lock");
+const _MEMORY_LOCK_TTL_MS = 25000; // lock held longer than this = crashed owner, reclaim it
+
+function _tryAcquireMemoryLock() {
+  try {
+    if (!existsSync(OWNERSHIP_DIR)) mkdirSync(OWNERSHIP_DIR, { recursive: true });
+    // Atomic create-if-absent ("wx") — succeeds for exactly one instance.
+    writeFileSync(_MEMORY_LOCK_FILE, `${process.pid}:${Date.now()}`, { flag: "wx" });
+    return true;
+  } catch {
+    // Lock exists — reclaim only if its owner is stale (crashed without releasing).
+    try {
+      const ts = parseInt(readFileSync(_MEMORY_LOCK_FILE, "utf8").split(":")[1], 10) || 0;
+      if (Date.now() - ts > _MEMORY_LOCK_TTL_MS) {
+        writeFileSync(_MEMORY_LOCK_FILE, `${process.pid}:${Date.now()}`, { flag: "w" });
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+}
+
+function _releaseMemoryLock() {
+  try {
+    if (readFileSync(_MEMORY_LOCK_FILE, "utf8").split(":")[0] === String(process.pid)) {
+      unlinkSync(_MEMORY_LOCK_FILE);
+    }
+  } catch {}
+}
+
 function _getWebKitMemoryMB() {
   try {
     const pids = execFileSync("pgrep", ["-f", "WebKit|WebContent"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
@@ -214,6 +271,11 @@ function _startMemoryMonitor() {
   const checkInterval = Math.min(MEMORY_CHECK_INTERVAL_MS, 30000); // Max 30s between checks
   _memoryCheckTimer = setInterval(async () => {
     try {
+      // Only the extension host (the single instance owning the Safari
+      // connection) may sweep tabs. Every instance runs this monitor and reads
+      // the SAME global WebKit memory; if all N swept, they'd close tabs in
+      // lockstep and flicker Safari windows shut. The host is the one actor.
+      if (!_isExtensionHost) return;
       const webkitMB = _getWebKitMemoryMB();
       if (webkitMB <= 0) return;
 
@@ -225,16 +287,24 @@ function _startMemoryMonitor() {
         }
       }
 
-      // Action threshold — close oldest tabs (up to 2) to recover memory
+      // Action threshold — close oldest tabs (up to 2) to recover memory.
+      // Guarded by a cross-instance lock: with N instances all watching the same
+      // global WebKit memory, only ONE may sweep per cycle — otherwise all N close
+      // tabs together and Safari windows flicker shut.
       if (webkitMB > WEBKIT_MEMORY_LIMIT_MB && _openedTabs.size > 1) {
-        console.error(`[Safari MCP] 🔴 WebKit over limit: ${Math.round(webkitMB)}MB — closing oldest MCP tabs`);
-        await _closeOldestMCPTab();
-        // If still over limit and have more tabs, close another
-        if (_openedTabs.size > 1) {
-          const afterMB = _getWebKitMemoryMB();
-          if (afterMB > WEBKIT_MEMORY_LIMIT_MB) {
-            await _closeOldestMCPTab();
+        if (!_tryAcquireMemoryLock()) return; // another instance is already recovering memory
+        try {
+          console.error(`[Safari MCP] 🔴 WebKit over limit: ${Math.round(webkitMB)}MB — closing oldest MCP tabs`);
+          await _closeOldestMCPTab();
+          // If still over limit and have more tabs, close another
+          if (_openedTabs.size > 1) {
+            const afterMB = _getWebKitMemoryMB();
+            if (afterMB > WEBKIT_MEMORY_LIMIT_MB) {
+              await _closeOldestMCPTab();
+            }
           }
+        } finally {
+          _releaseMemoryLock();
         }
       }
     } catch {}
@@ -248,7 +318,13 @@ for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
   process.on(sig, async () => {
     if (_cleaningUp) return; // Prevent double-exit on rapid signal repeat
     _cleaningUp = true;
-    await _cleanupTabs();
+    // Restore the user's clipboard synchronously FIRST — if a native paste is mid-flight, its
+    // 2s restore timer would never fire once we exit, leaving the tool's text on the clipboard.
+    try { safari.flushClipboardRestore(); } catch {}
+    // Cap tab cleanup — if the daemon/Safari is wedged at shutdown (exactly when a SIGTERM
+    // tends to arrive), listTabs/closeTab can each block for their full timeout; never let
+    // that hang the exit past 3s.
+    await Promise.race([_cleanupTabs(), new Promise(r => setTimeout(r, 3000))]);
     process.exit(0);
   });
 }
@@ -373,8 +449,10 @@ try {
     // POST /result — extension sends command result
     if (req.method === "POST" && req.url === "/result") {
       let body = "";
-      req.on("data", (chunk) => { if (res.headersSent) return; body += chunk; if (body.length > MAX_BODY_SIZE) { res.writeHead(413); res.end("Payload too large"); req.destroy(); } });
+      let bodyTooLarge = false; // 'end' can still fire after destroy() — never parse/respond then
+      req.on("data", (chunk) => { if (bodyTooLarge || res.headersSent) return; body += chunk; if (body.length > MAX_BODY_SIZE) { bodyTooLarge = true; res.writeHead(413); res.end("Payload too large"); req.destroy(); } });
       req.on("end", () => {
+        if (bodyTooLarge) return;
         try {
           const msg = JSON.parse(body);
           _handleExtensionResponse(msg);
@@ -414,8 +492,10 @@ try {
     // POST /verify-profile — extension asks server to check which profile has a nonce tab
     if (req.method === "POST" && req.url === "/verify-profile") {
       let body = "";
-      req.on("data", (chunk) => { if (res.headersSent) return; body += chunk; if (body.length > MAX_BODY_SIZE) { res.writeHead(413); res.end("Payload too large"); req.destroy(); } });
+      let bodyTooLarge = false; // 'end' can still fire after destroy() — never parse/respond then
+      req.on("data", (chunk) => { if (bodyTooLarge || res.headersSent) return; body += chunk; if (body.length > MAX_BODY_SIZE) { bodyTooLarge = true; res.writeHead(413); res.end("Payload too large"); req.destroy(); } });
       req.on("end", async () => {
+        if (bodyTooLarge) return;
         try {
           const { nonce, expectedProfile } = JSON.parse(body);
           // Use AppleScript to find which window contains the nonce in a tab title
@@ -473,7 +553,7 @@ try {
 
     // POST /proxy-command — secondary instances send commands through primary
     if (req.method === "POST" && req.url === "/proxy-command") {
-      // חוסם כש-SAFARI_PROFILE מוגדר — אחרת ה-extension עלול לפעול בפרופיל הלא נכון
+      // Blocked when SAFARI_PROFILE is set — otherwise the extension could act in the wrong profile
       if (process.env.SAFARI_PROFILE) {
         res.writeHead(503, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
@@ -481,9 +561,17 @@ try {
         }));
         return;
       }
+      // Security: require the local shared-secret — blocks unrelated local processes
+      if (req.headers["x-local-token"] !== PROXY_TOKEN) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Forbidden: invalid local token" }));
+        return;
+      }
       let body = "";
-      req.on("data", (chunk) => { if (res.headersSent) return; body += chunk; if (body.length > MAX_BODY_SIZE) { res.writeHead(413); res.end("Payload too large"); req.destroy(); } });
+      let bodyTooLarge = false; // 'end' can still fire after destroy() — never parse/respond then
+      req.on("data", (chunk) => { if (bodyTooLarge || res.headersSent) return; body += chunk; if (body.length > MAX_BODY_SIZE) { bodyTooLarge = true; res.writeHead(413); res.end("Payload too large"); req.destroy(); } });
       req.on("end", async () => {
+        if (bodyTooLarge) return;
         try {
           const { type, payload } = JSON.parse(body);
           const timeout = _commandTimeouts[type] || 30000;
@@ -555,7 +643,7 @@ async function _checkPrimaryExtension() {
 async function _proxyToExtension(type, payload, timeoutMs = 30000) {
   const res = await fetch(`http://127.0.0.1:${HTTP_PORT}/proxy-command`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "x-local-token": PROXY_TOKEN },
     body: JSON.stringify({ type, payload }),
     signal: AbortSignal.timeout(timeoutMs),
   });
@@ -626,6 +714,10 @@ function sendToExtension(type, payload = {}, timeoutMs = 30000) {
     const id = randomUUID();
     const timer = setTimeout(() => {
       _pendingRequests.delete(id);
+      // Also drop it from the HTTP poll queue — otherwise the extension could poll this command
+      // long after the caller gave up and run a stale navigate/click out of band.
+      const qi = _commandQueue.findIndex(c => c.id === id);
+      if (qi >= 0) _commandQueue.splice(qi, 1);
       reject(new Error(`Extension timeout after ${timeoutMs}ms`));
     }, timeoutMs);
     _pendingRequests.set(id, { resolve, reject, timer });
@@ -684,30 +776,53 @@ const _noOwnershipCheck = new Set([
   "save_pdf", "analyze_page",
 ]);
 
+// run_script action names (camelCase) that don't require an owned tab — strictly
+// read-only steps, plus newTab/switchTab/listTabs which mirror _noOwnershipCheck.
+// Everything that can change page or tab state (navigate, evaluate, reload, goBack,
+// closeTab, ...) is asserted PER STEP while the batch runs (see the run_script
+// handler): a batch can change the active tab mid-run, so a single pre-flight
+// check is not enough. "evaluate" in particular was exempt here while the
+// standalone safari_evaluate tool was guarded — an inconsistency that allowed
+// arbitrary JS in an unowned tab via batching.
+const _RUNSCRIPT_OWNERSHIP_EXEMPT = new Set([
+  "newTab", "switchTab", "listTabs",
+  "readPage", "getPageSource", "screenshot", "screenshotElement",
+  "waitFor", "waitForTime", "getElementInfo", "querySelectorAll",
+  "extractTables", "extractMeta", "extractImages", "extractLinks",
+  "analyzePage", "detectForms", "getAccessibilityTree", "getPerformanceMetrics",
+  "getLocalStorage", "getSessionStorage", "getCookies",
+]);
+
+// Tab-ownership assertion — shared by extensionOrFallback AND the tools that bypass it
+// (safari_run_script, native_*). Throws if the operation would land on a tab this MCP
+// session didn't open. Read-only / tab-management ops (in _noOwnershipCheck) are exempt.
+// Once any tab has been opened via new_tab, ALL subsequent page-mutating ops must target
+// an owned tab — this is what prevents navigating/clicking in the user's tabs.
+function _assertTabOwnership(opType) {
+  if (_noOwnershipCheck.has(opType)) return;
+  const currentUrl = safari.getActiveTabURL();
+  if (_ownedTabURLs.size === 0 && _openedTabs.size === 0) {
+    // No tabs opened yet — block everything except read-only ops
+    const msg = `⚠️ Tab safety: no tabs opened yet. Call safari_new_tab first before "${opType}".`;
+    console.error(`[Safari MCP] ${msg}`);
+    throw new Error(msg);
+  }
+  if (currentUrl && !_isURLOwned(currentUrl)) {
+    // about:blank tabs are owned if we have any tracked tabs (new_tab creates them at about:blank)
+    const isBlankOwned = (currentUrl === 'about:blank' || currentUrl === 'missing value') && (_openedTabs.size > 0 || _ownedTabURLs.has(BLANK_TAB_SENTINEL));
+    if (!isBlankOwned) {
+      const msg = `⚠️ Tab safety: refusing "${opType}" — current tab (${currentUrl}) was not opened by this MCP session. Use safari_new_tab or safari_switch_tab to target your own tab.`;
+      console.error(`[Safari MCP] ${msg}`);
+      throw new Error(msg);
+    }
+  }
+}
+
 // Try extension first, fall back to AppleScript.
 // When SAFARI_PROFILE is set, skip extension entirely — AppleScript doesn't steal focus.
 async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) {
-  // ========== TAB OWNERSHIP GUARD ==========
-  // Block operations on tabs not opened by this MCP session.
-  // Once any tab has been opened via new_tab, ALL subsequent operations
-  // must target an owned tab. This prevents navigating/clicking in user's tabs.
-  if (!_noOwnershipCheck.has(extensionType)) {
-    const currentUrl = safari.getActiveTabURL();
-    if (_ownedTabURLs.size === 0 && _openedTabs.size === 0) {
-      // No tabs opened yet — block everything except read-only ops
-      const msg = `⚠️ Tab safety: no tabs opened yet. Call safari_new_tab first before "${extensionType}".`;
-      console.error(`[Safari MCP] ${msg}`);
-      throw new Error(msg);
-    } else if (currentUrl && !_isURLOwned(currentUrl)) {
-      // about:blank tabs are owned if we have any tracked tabs (new_tab creates them at about:blank)
-      const isBlankOwned = (currentUrl === 'about:blank' || currentUrl === 'missing value') && (_openedTabs.size > 0 || _ownedTabURLs.has(BLANK_TAB_SENTINEL));
-      if (!isBlankOwned) {
-        const msg = `⚠️ Tab safety: refusing "${extensionType}" — current tab (${currentUrl}) was not opened by this MCP session. Use safari_new_tab or safari_switch_tab to target your own tab.`;
-        console.error(`[Safari MCP] ${msg}`);
-        throw new Error(msg);
-      }
-    }
-  }
+  // Tab-ownership guard — extracted to _assertTabOwnership so run_script / native_* share it.
+  _assertTabOwnership(extensionType);
 
   // ========== FOCUS PRESERVATION ==========
   // Safari AppleScript/extension can steal focus (bring Safari window to front).
@@ -753,7 +868,15 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
     // Restore focus in finally — even when the operation threw, Safari may have come to
     // the front mid-op and must be sent back, or the user is left staring at the
     // automation window with their keystrokes landing in it.
-    await safari.restoreFocusIfStolen(savedApp);
+    //
+    // ...BUT only for AppleScript ops. AppleScript raises Safari to the front itself,
+    // so a restore correctly returns focus to wherever the user was. Extension ops run
+    // as background JS injection and NEVER raise Safari — so if Safari is frontmost
+    // after an extension op, it's because the USER switched into it mid-op. Restoring
+    // then yanks Safari out from under them (the "VS Code jumps in front while I work
+    // in Safari" bug), and the HID-idle guard can't catch it because a user who is
+    // reading (not typing) looks idle. So skip restore entirely for extension ops.
+    if (!usedExtension) await safari.restoreFocusIfStolen(savedApp);
   }
 
   return result;
@@ -775,12 +898,17 @@ server.tool(
   { url: z.string().describe("URL to navigate to") },
   async ({ url }) => {
     const oldUrl = safari.getActiveTabURL();
+    // Pre-register the destination as owned BEFORE navigating. We are navigating OUR
+    // tab, so the target URL is ours even if navigate() throws mid-load on a slow SPA.
+    // Without this, a slow/failed navigate left the new URL unowned and locked the
+    // switch_tab recovery out — the very recovery the lock error tells you to use.
+    _addOwnedURL(url);
     const result = await extensionOrFallback(
       "navigate", { url },
       () => safari.navigate(url)
     );
-    // Update ownership: old URL → new URL (tab is still ours, just different URL)
-    if (oldUrl) _updateOwnedURL(oldUrl, url);
+    // Tab kept its identity, just changed URL — drop the stale old URL from ownership.
+    if (oldUrl && oldUrl !== url && oldUrl !== 'about:blank') _removeOwnedURL(oldUrl);
     return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
 );
@@ -872,6 +1000,9 @@ server.tool(
   },
   async ({ url, maxLength, timeout }) => {
     const oldUrl = safari.getActiveTabURL();
+    // Pre-register destination as owned BEFORE navigating (see safari_navigate) so a
+    // slow/throwing navigate on a heavy SPA cannot lock switch_tab recovery out.
+    _addOwnedURL(url);
     const result = await extensionOrFallback(
       "navigate_and_read", { url, maxLength, timeout },
       async () => {
@@ -879,8 +1010,7 @@ server.tool(
         return safari.readPage({ maxLength });
       }
     );
-    // Update ownership: old URL → new URL
-    if (oldUrl) _updateOwnedURL(oldUrl, url);
+    if (oldUrl && oldUrl !== url && oldUrl !== 'about:blank') _removeOwnedURL(oldUrl);
     return { content: [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result) }] };
   }
 );
@@ -991,7 +1121,10 @@ server.tool(
     doubleClick: z.boolean().optional().default(false).describe("Double-click instead of single click"),
   },
   async (args) => {
-    // Native click always uses AppleScript path (no extension) — it needs OS-level access
+    // Native click always uses AppleScript path (no extension) — it needs OS-level access.
+    // Bypasses extensionOrFallback, so assert tab-ownership explicitly — an OS-level click
+    // on the user's front window would otherwise slip past the safety guard.
+    _assertTabOwnership("native_click");
     const result = await safari.nativeClick(args);
     return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
@@ -1010,6 +1143,7 @@ server.tool(
     restoreMouse: z.boolean().optional().default(true).describe("Restore cursor to original position after dwell"),
   },
   async (args) => {
+    _assertTabOwnership("native_hover");
     const result = await safari.nativeHover(args);
     return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
@@ -1023,6 +1157,7 @@ server.tool(
     modifiers: z.array(z.string()).optional().default([]).describe("Modifier keys: cmd, shift, alt, ctrl"),
   },
   async (args) => {
+    _assertTabOwnership("native_keyboard");
     const result = await safari.nativeKeyboard(args);
     return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
@@ -1037,6 +1172,7 @@ server.tool(
     ref: z.string().optional().describe("Ref ID from safari_snapshot to focus first"),
   },
   async (args) => {
+    _assertTabOwnership("native_type");
     const result = await safari.nativeType(args);
     return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
@@ -1097,6 +1233,8 @@ server.tool(
     value: z.string().describe("Option value or visible label to select"),
   },
   async (args) => {
+    // The engine calls below can bypass extensionOrFallback — assert ownership here.
+    _assertTabOwnership("select_option");
     // ref path: resolve via mcpFindRef (reaches iframes/shadow DOM) on the AppleScript
     // engine — the extension's select_option handler is selector-only.
     if (args.ref) {
@@ -1126,6 +1264,7 @@ server.tool(
     value: z.string().describe("Option label (or value) to select — case-insensitive fallback"),
   },
   async (args) => {
+    _assertTabOwnership("react_select_set");
     const result = await safari.reactSelectSet(args);
     return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
   }
@@ -1576,6 +1715,7 @@ server.tool(
     text: z.string().optional().describe("Text to enter for prompt dialogs"),
   },
   async (args) => {
+    _assertTabOwnership("handle_dialog");
     const result = await safari.handleDialog(args);
     return { content: [{ type: "text", text: result }] };
   }
@@ -1591,6 +1731,7 @@ server.tool(
     height: z.coerce.number().describe("Window height"),
   },
   async (args) => {
+    _assertTabOwnership("resize");
     const result = await safari.resizeWindow(args);
     return { content: [{ type: "text", text: result }] };
   }
@@ -1610,6 +1751,7 @@ server.tool(
     targetY: z.coerce.number().optional().describe("Target Y coordinate"),
   },
   async (args) => {
+    _assertTabOwnership("drag");
     const result = await safari.drag(args);
     return { content: [{ type: "text", text: result }] };
   }
@@ -1625,6 +1767,7 @@ server.tool(
     filePath: z.string().describe("Absolute path to the file to upload"),
   },
   async (args) => {
+    _assertTabOwnership("upload_file");
     const result = await safari.uploadFile(args);
     return { content: [{ type: "text", text: result }] };
   }
@@ -1639,6 +1782,7 @@ server.tool(
     filePath: z.string().describe("Absolute path to the image file (PNG, JPG, WebP)"),
   },
   async ({ filePath }) => {
+    _assertTabOwnership("paste_image");
     const result = await safari.pasteImageFromFile({ filePath });
     return { content: [{ type: "text", text: result }] };
   }
@@ -1657,6 +1801,7 @@ server.tool(
     scale: z.coerce.number().optional().describe("Initial scale (default: 1)"),
   },
   async (args) => {
+    _assertTabOwnership("emulate");
     const result = await safari.emulate(args);
     return { content: [{ type: "text", text: result }] };
   }
@@ -1667,6 +1812,7 @@ server.tool(
   "Reset device emulation back to desktop mode",
   {},
   async () => {
+    _assertTabOwnership("reset_emulation");
     const result = await safari.resetEmulation();
     return { content: [{ type: "text", text: result }] };
   }
@@ -1718,7 +1864,26 @@ server.tool(
     })).describe("Array of steps to execute sequentially"),
   },
   async ({ steps }) => {
-    const result = await safari.runScript({ steps });
+    // Ownership is enforced PER STEP as the batch runs (not just pre-flight): a batch
+    // can change the active tab mid-run (switchTab/navigate/closeTab), so each
+    // non-read-only step re-checks that the tab it will land on is owned by this
+    // session. Tab-opening steps register ownership exactly like their standalone
+    // tools (safari_navigate pre-registers its destination URL).
+    const onStep = (action, stepArgs) => {
+      if (action === "newTab") { _markBlankTabOpened(); return; }
+      if (action === "navigate" || action === "navigateAndRead") {
+        _assertTabOwnership(`run_script:${action}`);
+        const u = stepArgs && typeof stepArgs.url === "string" ? stepArgs.url : null;
+        if (u) {
+          _addOwnedURL(u);
+          // The engine normalizes scheme-less URLs to https:// — own the final form too.
+          if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(u)) _addOwnedURL("https://" + u);
+        }
+        return;
+      }
+      if (!_RUNSCRIPT_OWNERSHIP_EXEMPT.has(action)) _assertTabOwnership(`run_script:${action}`);
+    };
+    const result = await safari.runScript({ steps, onStep });
     return { content: [{ type: "text", text: result }] };
   }
 );
@@ -1797,6 +1962,7 @@ server.tool(
     sameSite: z.enum(["Strict", "Lax", "None"]).optional().describe("SameSite attribute"),
   },
   async (args) => {
+    _assertTabOwnership("set_cookie");
     const result = await safari.setCookie(args);
     return { content: [{ type: "text", text: result }] };
   }
@@ -1810,6 +1976,7 @@ server.tool(
     all: z.boolean().optional().describe("Delete all cookies"),
   },
   async (args) => {
+    _assertTabOwnership("delete_cookies");
     const result = await safari.deleteCookies(args);
     return { content: [{ type: "text", text: result }] };
   }
@@ -1835,6 +2002,7 @@ server.tool(
     value: z.string().describe("Value to store"),
   },
   async (args) => {
+    _assertTabOwnership("set_session_storage");
     const result = await safari.setSessionStorage(args);
     return { content: [{ type: "text", text: result }] };
   }
@@ -1848,6 +2016,7 @@ server.tool(
     value: z.string().describe("Value to store"),
   },
   async (args) => {
+    _assertTabOwnership("set_local_storage");
     const result = await safari.setLocalStorage(args);
     return { content: [{ type: "text", text: result }] };
   }
@@ -1860,6 +2029,7 @@ server.tool(
   "Delete a localStorage key, or clear all localStorage (omit key to clear all)",
   { key: z.string().optional().describe("Key to delete (omit to clear ALL)") },
   async ({ key }) => {
+    _assertTabOwnership("delete_local_storage");
     const result = await safari.deleteLocalStorage({ key });
     return { content: [{ type: "text", text: result }] };
   }
@@ -1870,6 +2040,7 @@ server.tool(
   "Delete a sessionStorage key, or clear all sessionStorage (omit key to clear all)",
   { key: z.string().optional().describe("Key to delete (omit to clear ALL)") },
   async ({ key }) => {
+    _assertTabOwnership("delete_session_storage");
     const result = await safari.deleteSessionStorage({ key });
     return { content: [{ type: "text", text: result }] };
   }
@@ -1892,6 +2063,7 @@ server.tool(
   "Import storage state from JSON (as exported by safari_export_storage) — restores cookies, localStorage, sessionStorage",
   { state: z.string().describe("JSON string from safari_export_storage") },
   async ({ state }) => {
+    _assertTabOwnership("import_storage");
     const result = await safari.importStorageState({ state });
     return { content: [{ type: "text", text: result }] };
   }
@@ -1933,6 +2105,7 @@ server.tool(
     }).describe("Mock response to return"),
   },
   async ({ urlPattern, response }) => {
+    _assertTabOwnership("mock_route");
     const result = await safari.mockNetworkRoute({ urlPattern, response });
     return { content: [{ type: "text", text: result }] };
   }
@@ -2018,6 +2191,7 @@ server.tool(
     downloadKbps: z.coerce.number().optional().describe("Custom download speed in Kbps"),
   },
   async (args) => {
+    _assertTabOwnership("throttle");
     const result = await safari.throttleNetwork(args);
     return { content: [{ type: "text", text: result }] };
   }
@@ -2094,6 +2268,7 @@ server.tool(
     accuracy: z.coerce.number().optional().describe("Accuracy in meters (default: 100)"),
   },
   async (args) => {
+    _assertTabOwnership("override_geolocation");
     const result = await safari.overrideGeolocation(args);
     return { content: [{ type: "text", text: result }] };
   }
@@ -2197,6 +2372,7 @@ server.tool(
     timeout: z.coerce.number().optional().describe("Wait timeout in ms (default: 10000)"),
   },
   async (args) => {
+    _assertTabOwnership("click_and_wait");
     const result = await safari.clickAndWait(args);
     return { content: [{ type: "text", text: result }] };
   }
@@ -2213,6 +2389,7 @@ server.tool(
     submitSelector: z.string().optional().describe("Submit button selector (auto-detected if omitted)"),
   },
   async (args) => {
+    _assertTabOwnership("fill_and_submit");
     const result = await safari.fillAndSubmit(args);
     return { content: [{ type: "text", text: result }] };
   }

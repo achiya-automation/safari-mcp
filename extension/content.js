@@ -20,10 +20,20 @@ if (!window.__mcpShadowPatched) {
     }
     return shadow;
   };
-  // Expose getter for MCP tools (snapshot, deepQuery, click, fill)
-  window.__mcpGetShadowRoot = function(el) {
+  // Expose getter for MCP tools (snapshot, deepQuery, click, fill).
+  // Non-enumerable + non-writable: pages that know the name can still call it
+  // (inherent to MAIN-world injection), but it doesn't surface in enumeration and —
+  // more importantly — page scripts can't REPLACE it to feed MCP fake shadow roots.
+  var _getShadowRoot = function(el) {
     return el.shadowRoot || _closedRoots.get(el) || null;
   };
+  try {
+    Object.defineProperty(window, "__mcpGetShadowRoot", {
+      value: _getShadowRoot, writable: false, enumerable: false, configurable: false
+    });
+  } catch (_e) {
+    window.__mcpGetShadowRoot = _getShadowRoot;
+  }
 }
 
 if (!window.__mcpTrustedPolicy && window.trustedTypes && typeof window.trustedTypes.createPolicy === "function") {

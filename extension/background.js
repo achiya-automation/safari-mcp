@@ -67,8 +67,13 @@ function updateBadge(text) {
 
 // ========== HTTP LONG-POLLING TRANSPORT ==========
 
+let _connecting = false; // re-entrancy lock — the startup promise and the alarm can race into connect()
 async function connect() {
   if (!_enabled) return;
+  // One connect at a time: two near-simultaneous calls (cold start + alarm wake)
+  // could each spawn a poll loop before the other assigned pollAbort.
+  if (_connecting) return;
+  _connecting = true;
   // Cancel any existing poll
   if (pollAbort) {
     try { pollAbort.abort(); } catch {}
@@ -91,6 +96,7 @@ async function connect() {
         if (!isCorrectProfile) {
           console.log(`Safari MCP: wrong profile — server wants "${data.profile}", disconnecting`);
           updateBadge("OFF");
+          _connecting = false;
           return; // Do NOT poll — let the correct profile's extension handle commands
         }
         // Notify server that we passed profile verification
@@ -104,6 +110,7 @@ async function connect() {
       _reconnectDelay = 3000; // Reset backoff on success
       updateBadge("ON");
       _startHeartbeat(); // Keep service worker alive between polls
+      _connecting = false;
       pollForCommands();
       return;
     }
@@ -113,6 +120,7 @@ async function connect() {
   isConnected = false;
   updateBadge("");
   scheduleReconnect();
+  _connecting = false;
 }
 
 function scheduleReconnect() {
@@ -205,6 +213,10 @@ async function handleCommand(type, payload) {
   if (_profileWindowId && targetTab.windowId !== _profileWindowId) {
     throw new Error("Tab belongs to a different profile — refusing to operate on personal tabs");
   }
+
+  // Rehydrate owned-tab state after a possible service-worker restart BEFORE
+  // consulting the guard — an empty post-restart Map used to disable it entirely.
+  await _hydrateOwnedTabs();
 
   // ========== TAB OWNERSHIP GUARD ==========
   // Block write operations on tabs not opened by this session.
@@ -347,7 +359,11 @@ async function handleCommand(type, payload) {
       // Strategy 2: Script element injection (works when inline scripts are allowed)
       const injectResult = await execInTab(async (script) => {
         return await new Promise((resolve) => {
-          const id = "__mcp_eval_" + Date.now();
+          // Unpredictable key — a Date.now()-based name let a hostile page pre-seed
+          // window["__mcp_eval_<now>"] with a fabricated {done:true,v:...} result.
+          const id = "__mcp_eval_" + (crypto.randomUUID
+            ? crypto.randomUUID().replace(/-/g, "")
+            : Date.now().toString(36) + Math.random().toString(36).slice(2));
           window[id] = { done: false };
           const s = document.createElement("script");
           const code = "try{var __r=(function(){" + script + "})();if(__r&&typeof __r.then==='function'){__r.then(function(v){window['" + id + "']={done:true,v:v};}).catch(function(e){window['" + id + "']={done:true,e:e.message};});}else{window['" + id + "']={done:true,v:__r};}}catch(e){window['" + id + "']={done:true,e:e.message};}";
@@ -1087,16 +1103,33 @@ async function handleCommand(type, payload) {
     }
 
     case "close_tab": {
+      // ── Guard: never remove a window's LAST tab — doing so closes the window
+      // (quitting Safari if it's the only one, or making a profile-targeted
+      // window vanish). Per-window, not global, so other-profile windows don't
+      // mask it. If the target window is down to one tab, blank it instead.
+      // Mirrors safari.js closeTab().
+      const _winQuery = _profileWindowId ? { windowId: _profileWindowId } : { currentWindow: true };
+      const _winTabs = await browser.tabs.query(_winQuery);
+      const _isLastTab = _winTabs.length <= 1;
       if (payload.index) {
-        const query = _profileWindowId ? { windowId: _profileWindowId } : { currentWindow: true };
-        const tabs = await browser.tabs.query(query);
-        const target = tabs[payload.index - 1];
+        // Resolve the target from the SAME query as the last-tab count — a second
+        // query here was a TOCTOU window (a tab opened/closed between the two awaits
+        // could resolve the wrong tab or leave a stale last-tab verdict).
+        const target = _winTabs[payload.index - 1];
         if (target) {
           _removeOwnedTab(sessionId, target.id);
+          if (_isLastTab) {
+            await browser.tabs.update(target.id, { url: "about:blank" });
+            return "Last remaining tab blanked instead of closed (closing it would quit Safari)";
+          }
           await browser.tabs.remove(target.id);
         }
       } else {
         _removeOwnedTab(sessionId, tabId);
+        if (_isLastTab) {
+          await browser.tabs.update(tabId, { url: "about:blank" });
+          return "Last remaining tab blanked instead of closed (closing it would quit Safari)";
+        }
         await browser.tabs.remove(tabId);
       }
       return "Tab closed";
@@ -1166,6 +1199,13 @@ async function handleCommand(type, payload) {
       }).catch(() => {});
       await browser.tabs.update(tabId, { url: payload.url });
       await waitForTabLoad(tabId, payload.timeout || 30000);
+      // Update the session cache like every other navigation command — without this,
+      // the next command within TAB_CACHE_MS resolved against the PRE-navigation URL
+      // and could fall through to the user's active tab.
+      try {
+        const updated = await browser.tabs.get(tabId);
+        _setSessionTab(sessionId, updated.id, updated.url);
+      } catch {}
       const maxLen = payload.maxLength || 50000;
       const results = await browser.scripting.executeScript({
         target: { tabId },
@@ -1739,16 +1779,47 @@ const MAX_SESSIONS = 50; // Hard cap on session cache size
 // Prevents operating on user's tabs — only tabs created via new_tab are "owned".
 const _sessionOwnedTabs = new Map(); // sessionId → Set<tabId>
 
+// Persist owned-tab IDs in storage.session: it survives the frequent MV3
+// service-worker terminations (but clears when Safari quits, matching tab-ID
+// lifetime). Without this, every worker restart wiped the Map — and the
+// "no tabs owned yet" compatibility path then silently allowed write commands
+// on ANY tab, including the user's.
+const _OWNED_TABS_KEY = "mcpSessionOwnedTabs";
+let _ownedTabsHydrated = false;
+async function _hydrateOwnedTabs() {
+  if (_ownedTabsHydrated) return;
+  _ownedTabsHydrated = true;
+  try {
+    const data = (await browser.storage.session.get(_OWNED_TABS_KEY))?.[_OWNED_TABS_KEY];
+    if (data) {
+      for (const [sid, ids] of Object.entries(data)) {
+        if (!_sessionOwnedTabs.has(sid)) _sessionOwnedTabs.set(sid, new Set());
+        const set = _sessionOwnedTabs.get(sid);
+        for (const id of ids) set.add(id);
+      }
+    }
+  } catch {} // storage.session unavailable → behave as before (in-memory only)
+}
+function _persistOwnedTabs() {
+  try {
+    const obj = {};
+    for (const [sid, set] of _sessionOwnedTabs) obj[sid] = [...set];
+    browser.storage.session.set({ [_OWNED_TABS_KEY]: obj }).catch(() => {});
+  } catch {}
+}
+
 function _addOwnedTab(sessionId, tabId) {
   const sid = sessionId || _DEFAULT_SESSION;
   if (!_sessionOwnedTabs.has(sid)) _sessionOwnedTabs.set(sid, new Set());
   _sessionOwnedTabs.get(sid).add(tabId);
+  _persistOwnedTabs();
 }
 
 function _removeOwnedTab(sessionId, tabId) {
   const sid = sessionId || _DEFAULT_SESSION;
   const set = _sessionOwnedTabs.get(sid);
   if (set) set.delete(tabId);
+  _persistOwnedTabs();
 }
 
 function _isTabOwnedBySession(sessionId, tabId) {
@@ -1960,11 +2031,21 @@ async function getTargetTab(tabUrl, sessionId) {
       match = all.find(t => t.url && (t.url.startsWith(tabUrl) || tabUrl.startsWith(t.url.split("?")[0])));
     }
     if (match) {
+      // A URL match in a DIFFERENT window must not silently retarget the profile
+      // window — a URL collision with a tab in the user's personal window would
+      // permanently redirect every subsequent command there. Adopt the match's
+      // window only when the tracked profile window no longer exists.
+      if (_profileWindowId && match.windowId !== _profileWindowId) {
+        let profileWindowGone = false;
+        try { await browser.windows.get(_profileWindowId); }
+        catch { profileWindowGone = true; }
+        if (!profileWindowGone) {
+          throw new Error("Tab not found in the MCP profile window (a same-URL tab exists in another window — refusing to cross windows). Use safari_new_tab.");
+        }
+        console.log("Safari MCP: profile window gone — adopting", match.windowId);
+      }
       _setSessionTab(sessionId, match.id, tabUrl);
       if (!_profileWindowId || match.windowId !== _profileWindowId) {
-        if (_profileWindowId && match.windowId !== _profileWindowId) {
-          console.log("Safari MCP: profile window changed:", _profileWindowId, "→", match.windowId);
-        }
         _profileWindowId = match.windowId;
         browser.storage.local.set({ mcpProfileWindowId: _profileWindowId }).catch(() => {});
         console.log("Safari MCP: profile windowId =", _profileWindowId);

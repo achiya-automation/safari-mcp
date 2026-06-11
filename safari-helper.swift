@@ -22,7 +22,9 @@ import AppKit
 // position. Optionally restores the original cursor position after dwell.
 func performNativeHover(x: Double, y: Double, windowId: Int64 = 0, dwellMs: Int = 500, restoreMouse: Bool = true) -> [String: Any] {
   let point = CGPoint(x: x, y: y)
-  let savedPosition = CGEvent(source: nil)?.location ?? CGPoint.zero
+  // nil when the cursor position can't be read (e.g. Accessibility just revoked) —
+  // restoring to a fabricated (0,0) would visibly throw the cursor into the corner.
+  let savedPosition = CGEvent(source: nil)?.location
 
   // Get Safari PID for process-targeted event posting (background hover, no focus steal)
   var safariPID: pid_t = 0
@@ -53,7 +55,7 @@ func performNativeHover(x: Double, y: Double, windowId: Int64 = 0, dwellMs: Int 
   postMove(point)
   let ms = max(0, min(dwellMs, 5000)) // clamp 0-5000ms to prevent runaway blocking
   usleep(UInt32(ms * 1000))
-  if restoreMouse {
+  if restoreMouse, let savedPosition = savedPosition {
     postMove(savedPosition)
   }
 
@@ -115,9 +117,12 @@ func performNativeClick(x: Double, y: Double, doubleClick: Bool = false, windowI
 
   if windowId == 0 {
     // Legacy path: no window targeting. Move mouse + restore (old behavior).
-    let savedPosition = CGEvent(source: nil)?.location ?? CGPoint.zero
+    // Optional: when the position can't be read, skip the restore instead of
+    // jumping the cursor to a fabricated (0,0).
+    let savedPosition = CGEvent(source: nil)?.location
     defer {
-      if let restoreEvent = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: savedPosition, mouseButton: .left) {
+      if let savedPosition = savedPosition,
+         let restoreEvent = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: savedPosition, mouseButton: .left) {
         restoreEvent.post(tap: .cghidEventTap)
       }
     }
@@ -284,13 +289,21 @@ if args.count >= 2 && args[1] == "--paste" {
 
 // ========== Daemon Mode: JSON lines on stdin ==========
 
-while let line = readLine(strippingNewline: true) {
-  guard !line.isEmpty else { continue }
+// Counts AppleScript executions currently blocked inside executeAndReturnError.
+// Each 30s timeout leaves its GCD thread stuck there, and the global pool is
+// finite (~64 threads): past a small threshold the daemon exits so the Node
+// watchdog respawns a clean one instead of degrading into a wedged process
+// that accepts stdin but can no longer dispatch work.
+let _inFlightLock = NSLock()
+var _inFlightScripts = 0
+
+func handleLine(_ line: String) {
+  guard !line.isEmpty else { return }
 
   guard let data = line.data(using: .utf8),
         let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
     respond(["error": "invalid input"])
-    continue
+    return
   }
 
   // Handle CGEvent click command
@@ -300,7 +313,7 @@ while let line = readLine(strippingNewline: true) {
     let isDouble = (clickData["double"] as? Bool) ?? false
     let windowId = Int64((clickData["windowId"] as? Int) ?? 0)
     respond(performNativeClick(x: x, y: y, doubleClick: isDouble, windowId: windowId))
-    continue
+    return
   }
 
   // Handle CGEvent hover command — native mouse move to trigger real :hover / mouseenter
@@ -312,7 +325,7 @@ while let line = readLine(strippingNewline: true) {
     let dwellMs = (hoverData["dwellMs"] as? Int) ?? 500
     let restoreMouse = (hoverData["restoreMouse"] as? Bool) ?? true
     respond(performNativeHover(x: x, y: y, windowId: windowId, dwellMs: dwellMs, restoreMouse: restoreMouse))
-    continue
+    return
   }
 
   // Handle CGEvent keyboard command
@@ -320,6 +333,12 @@ while let line = readLine(strippingNewline: true) {
   // keyCode 9 = V, flags: cmd/shift/alt/ctrl
   if let kbData = json["keyboard"] as? [String: Any],
      let keyCode = kbData["keyCode"] as? Int {
+    // CGEvent virtualKey is UInt16 — a JSON value outside 0...65535 would trap the daemon
+    // on the UInt16() conversion below. Validate before converting.
+    guard keyCode >= 0 && keyCode <= 0xFFFF else {
+      respond(["error": "keyCode out of range (0-65535): \(keyCode)"])
+      return
+    }
     let windowId = Int64((kbData["windowId"] as? Int) ?? 0)
     var flags: CGEventFlags = []
     if let flagNames = kbData["flags"] as? [String] {
@@ -334,14 +353,14 @@ while let line = readLine(strippingNewline: true) {
       }
     }
     respond(performNativeKeyboard(keyCode: UInt16(keyCode), flags: flags, windowId: windowId))
-    continue
+    return
   }
 
   // Handle getFrontApp — returns frontmost application bundle ID (native, ~0.1ms)
   if json["getFrontApp"] != nil {
     let frontApp = NSWorkspace.shared.frontmostApplication
     respond(["result": frontApp?.localizedName ?? "", "bundleId": frontApp?.bundleIdentifier ?? ""])
-    continue
+    return
   }
 
   // Handle activateApp — activate a specific app by bundle ID (native, ~1ms)
@@ -353,7 +372,7 @@ while let line = readLine(strippingNewline: true) {
     } else {
       respond(["error": "app not found: \(bundleId)"])
     }
-    continue
+    return
   }
 
   // Handle hideSafari — hide Safari to prevent focus stealing (native, ~1ms)
@@ -364,13 +383,13 @@ while let line = readLine(strippingNewline: true) {
     } else {
       respond(["error": "Safari not running"])
     }
-    continue
+    return
   }
 
   // Handle AppleScript command
   guard let script = json["script"] as? String else {
     respond(["error": "invalid input — expected 'script', 'click', 'keyboard', 'getFrontApp', or 'hideSafari'"])
-    continue
+    return
   }
 
   // Focus preservation is handled by the Node.js layer (osascript() function
@@ -380,20 +399,30 @@ while let line = readLine(strippingNewline: true) {
 
   guard let nsScript = NSAppleScript(source: script) else {
     respond(["error": "failed to compile AppleScript"])
-    continue
+    return
   }
 
   // Execute on a background thread to avoid blocking stdin reading.
   // Heavy pages (SourceForge, etc.) can cause executeAndReturnError() to block
   // for 10-30+ seconds, preventing ALL subsequent commands from being read.
+  _inFlightLock.lock()
+  let alreadyStuck = _inFlightScripts
+  _inFlightLock.unlock()
+  if alreadyStuck >= 8 {
+    respond(["error": "daemon wedged: \(alreadyStuck) AppleScript executions still blocked past their timeout — exiting for a clean respawn"])
+    exit(1)
+  }
+
   let semaphore = DispatchSemaphore(value: 0)
   var scriptResult: NSAppleEventDescriptor?
   var scriptError: NSDictionary?
 
+  _inFlightLock.lock(); _inFlightScripts += 1; _inFlightLock.unlock()
   DispatchQueue.global(qos: .userInitiated).async {
     var errorDict: NSDictionary?
     scriptResult = nsScript.executeAndReturnError(&errorDict)
     scriptError = errorDict
+    _inFlightLock.lock(); _inFlightScripts -= 1; _inFlightLock.unlock()
     semaphore.signal()
   }
 
@@ -410,3 +439,16 @@ while let line = readLine(strippingNewline: true) {
     respond(["result": scriptResult?.stringValue ?? ""])
   }
 }
+
+while let line = readLine(strippingNewline: true) {
+  // Command-line Swift has no runloop, so the implicit top-level autorelease pool
+  // never drains — every NSAppleScript / NSDictionary allocated per command was
+  // retained until process exit. Drain per command.
+  autoreleasepool { handleLine(line) }
+}
+
+// stdin closed — the parent Node process is gone (clean shutdown or crash). GCD
+// threads still blocked inside executeAndReturnError would keep this process alive
+// as an orphan holding Apple Events / Accessibility grants; with no parent left to
+// read results there is nothing useful to finish. Exit explicitly.
+exit(0)
