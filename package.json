@@ -2,16 +2,19 @@
   "name": "safari-mcp",
   "version": "2.13.0",
   "mcpName": "io.github.achiya-automation/safari-mcp",
-  "description": "Safari browser automation for AI agents — native macOS, zero Chrome overhead. 80 tools via AppleScript + JavaScript.",
+  "description": "Safari browser automation for AI agents — native macOS, zero Chrome overhead. 96 tools via AppleScript + JavaScript.",
   "type": "module",
-  "types": "index.d.ts",
   "main": "index.js",
   "bin": {
     "safari-mcp": "index.js"
   },
   "scripts": {
     "start": "node index.js",
-    "test": "node --test tests/*.test.js test/*.test.mjs",
+    "test": "node --test --test-force-exit tests/*.test.js test/*.test.mjs",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "tsc -p jsconfig.json",
     "postinstall": "node scripts/postinstall.cjs || true"
   },
   "keywords": [
@@ -60,9 +63,12 @@
   ],
   "files": [
     "index.js",
+    "response.js",
     "safari.js",
     "ownership-match.js",
     "mcp-helpers.js",
+    "injected-validators.js",
+    "injected-escape.js",
     "safari-helper",
     "safari-helper.entitlements",
     "safari-helper.swift",
@@ -70,7 +76,6 @@
     "glama.json",
     "LICENSE",
     "README.md",
-    "index.d.ts",
     "scripts/postinstall.cjs"
   ],
   "dependencies": {
@@ -80,5 +85,14 @@
   "overrides": {
     "hono": "^4.12.21",
     "@hono/node-server": "^1.19.13"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^25.9.3",
+    "eslint": "^10.5.0",
+    "globals": "^17.6.0",
+    "jsdom": "^29.1.1",
+    "prettier": "^3.8.4",
+    "typescript": "^6.0.3"
   }
 }

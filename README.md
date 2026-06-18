@@ -478,6 +478,14 @@ The recommended pattern for AI agents using Safari MCP:
 |------|-------------|
 | `safari_run_script` | Run multiple actions in a single call (batch) |
 
+### iOS & WebKit Validation (4)
+| Tool | Description |
+|------|-------------|
+| `safari_inspect_viewport` | Validate the `<meta name=viewport>` tag for iOS Safari (device-width, zoom/WCAG, viewport-fit) |
+| `safari_safe_area_insets` | Read live safe-area-inset values + viewport-fit / `env()` usage (notch / Dynamic Island) |
+| `safari_check_pwa` | Audit iOS "Add to Home Screen" / PWA readiness (apple-touch-icon, manifest, theme-color, splash) |
+| `safari_webkit_compat` | Check page CSS against this Safari via `CSS.supports()` — unsupported props, missing `-webkit-` prefixes, known quirks |
+
 </details>
 
 ---

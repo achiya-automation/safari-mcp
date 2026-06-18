@@ -10,10 +10,11 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import * as safari from "./safari.js";
 import { findOwnedMatch, pruneExpired } from "./ownership-match.js";
+import { textResult, jsonResult, imageResult, errorResult } from "./response.js";
 import { WebSocketServer } from "ws";
 import { createServer } from "node:http";
 import { randomUUID, randomBytes } from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -909,7 +910,7 @@ server.tool(
     );
     // Tab kept its identity, just changed URL — drop the stale old URL from ownership.
     if (oldUrl && oldUrl !== url && oldUrl !== 'about:blank') _removeOwnedURL(oldUrl);
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -957,7 +958,7 @@ server.tool(
       "read_page", { selector, maxLength },
       () => safari.readPage({ selector, maxLength })
     );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -970,7 +971,7 @@ server.tool(
       "get_source", { maxLength },
       () => safari.getPageSource({ maxLength })
     );
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -986,7 +987,7 @@ server.tool(
       "snapshot", { selector: args.selector, gen },
       () => safari.takeSnapshot({ ...args, _gen: gen })
     );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1011,7 +1012,7 @@ server.tool(
       }
     );
     if (oldUrl && oldUrl !== url && oldUrl !== 'about:blank') _removeOwnedURL(oldUrl);
-    return { content: [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1032,7 +1033,7 @@ server.tool(
       "click", { ref: args.ref, selector: args.selector, text: args.text, x: args.x, y: args.y },
       () => safari.click(args)
     );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1069,7 +1070,7 @@ server.tool(
         return safari.readPage({ maxLength: args.maxLength });
       }
     );
-    return { content: [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1086,7 +1087,7 @@ server.tool(
       "double_click", { selector: args.selector, x: args.x, y: args.y },
       () => safari.doubleClick(args)
     );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1103,7 +1104,7 @@ server.tool(
       "right_click", { selector: args.selector, x: args.x, y: args.y },
       () => safari.rightClick(args)
     );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1126,7 +1127,7 @@ server.tool(
     // on the user's front window would otherwise slip past the safety guard.
     _assertTabOwnership("native_click");
     const result = await safari.nativeClick(args);
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1145,7 +1146,7 @@ server.tool(
   async (args) => {
     _assertTabOwnership("native_hover");
     const result = await safari.nativeHover(args);
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1159,7 +1160,7 @@ server.tool(
   async (args) => {
     _assertTabOwnership("native_keyboard");
     const result = await safari.nativeKeyboard(args);
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1174,7 +1175,7 @@ server.tool(
   async (args) => {
     _assertTabOwnership("native_type");
     const result = await safari.nativeType(args);
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1194,7 +1195,7 @@ server.tool(
       "fill", { selector, value: args.value },
       () => safari.fill(args)
     );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1207,7 +1208,7 @@ server.tool(
       "clear_field", { selector: args.selector },
       () => safari.clearField(args)
     );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1220,7 +1221,7 @@ server.tool(
   },
   async (args) => {
     const result = await safari.verifyState(args);
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1251,7 +1252,7 @@ server.tool(
       console.error('[Safari MCP] select_option returned empty value — retrying via AppleScript');
       result = await safari.selectOption(args);
     }
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1266,7 +1267,7 @@ server.tool(
   async (args) => {
     _assertTabOwnership("react_select_set");
     const result = await safari.reactSelectSet(args);
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1279,7 +1280,7 @@ server.tool(
   },
   async (args) => {
     const result = await safari.reactSelectListOptions(args);
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1297,7 +1298,7 @@ server.tool(
       "fill_form", { fields: args.fields },
       () => safari.fillForm(args)
     );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1315,7 +1316,7 @@ server.tool(
       "press_key", { key: args.key, modifiers: args.modifiers },
       () => safari.pressKey(args)
     );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1332,7 +1333,7 @@ server.tool(
       "type_text", { text: args.text, selector: args.ref ? `[data-mcp-ref="${args.ref}"]` : args.selector },
       () => safari.typeText(args)
     );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1349,7 +1350,7 @@ server.tool(
       "replace_editor", { text },
       () => safari.replaceEditorContent({ text })
     );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1413,7 +1414,7 @@ server.tool(
       "scroll", { direction: args.direction, amount: args.amount },
       () => safari.scroll(args)
     );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1429,7 +1430,7 @@ server.tool(
       "scroll_to", { x: args.x, y: args.y },
       () => safari.scrollTo(args)
     );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1457,7 +1458,7 @@ server.tool(
       "reload_extension", {},
       async () => "Extension fallback not available — this command requires the Safari MCP Bridge extension."
     );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1519,7 +1520,7 @@ server.tool(
     const activeIdx = safari.getActiveTabIndex();
     const result = await extensionOrFallback("close_tab", {}, () => safari.closeTab());
     if (activeIdx !== null) _untrackTab(activeIdx);
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1541,7 +1542,7 @@ server.tool(
           if (!isBlankOwned) {
             const msg = `⚠️ Tab safety: refusing switch_tab to index ${index} (${target.url}) — not opened by this MCP session. Use safari_new_tab to open your own tab.`;
             console.error(`[Safari MCP] ${msg}`);
-            return { content: [{ type: "text", text: msg }], isError: true };
+            return errorResult(msg);
           }
         }
       } catch {}
@@ -1574,7 +1575,7 @@ server.tool(
       "wait_for", { selector: args.selector, text: args.text, timeout: args.timeout },
       () => safari.waitFor(args)
     );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1664,7 +1665,7 @@ server.tool(
       "get_element", { selector: args.selector },
       () => safari.getElementInfo(args)
     );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1680,7 +1681,7 @@ server.tool(
       "query_all", { selector: args.selector, limit: args.limit },
       () => safari.querySelectorAll(args)
     );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1701,7 +1702,7 @@ server.tool(
       "hover", { selector: sel },
       () => safari.hover(args)
     );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
 
@@ -1717,7 +1718,7 @@ server.tool(
   async (args) => {
     _assertTabOwnership("handle_dialog");
     const result = await safari.handleDialog(args);
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -1733,7 +1734,7 @@ server.tool(
   async (args) => {
     _assertTabOwnership("resize");
     const result = await safari.resizeWindow(args);
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -1753,7 +1754,7 @@ server.tool(
   async (args) => {
     _assertTabOwnership("drag");
     const result = await safari.drag(args);
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -1769,7 +1770,7 @@ server.tool(
   async (args) => {
     _assertTabOwnership("upload_file");
     const result = await safari.uploadFile(args);
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -1784,7 +1785,7 @@ server.tool(
   async ({ filePath }) => {
     _assertTabOwnership("paste_image");
     const result = await safari.pasteImageFromFile({ filePath });
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -1803,7 +1804,7 @@ server.tool(
   async (args) => {
     _assertTabOwnership("emulate");
     const result = await safari.emulate(args);
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -1814,7 +1815,7 @@ server.tool(
   async () => {
     _assertTabOwnership("reset_emulation");
     const result = await safari.resetEmulation();
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -1848,7 +1849,7 @@ server.tool(
   { limit: z.coerce.number().optional().describe("Max requests to return (default: 50)") },
   async ({ limit }) => {
     const result = await safari.getNetworkRequests({ limit });
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -1884,7 +1885,7 @@ server.tool(
       if (!_RUNSCRIPT_OWNERSHIP_EXEMPT.has(action)) _assertTabOwnership(`run_script:${action}`);
     };
     const result = await safari.runScript({ steps, onStep });
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -1896,7 +1897,7 @@ server.tool(
   {},
   async () => {
     const result = await safari.startConsoleCapture();
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -1906,7 +1907,7 @@ server.tool(
   {},
   async () => {
     const result = await safari.getConsoleMessages();
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -1916,7 +1917,7 @@ server.tool(
   {},
   async () => {
     const result = await safari.clearConsoleCapture();
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -1928,7 +1929,7 @@ server.tool(
   { path: z.string().describe("Absolute file path to save the PDF (e.g. /Users/am/Downloads/page.pdf)") },
   async (args) => {
     const result = await safari.savePDF(args);
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -1943,7 +1944,7 @@ server.tool(
   },
   async (args) => {
     const result = await safari.getAccessibilityTree(args);
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -1964,7 +1965,7 @@ server.tool(
   async (args) => {
     _assertTabOwnership("set_cookie");
     const result = await safari.setCookie(args);
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -1978,7 +1979,7 @@ server.tool(
   async (args) => {
     _assertTabOwnership("delete_cookies");
     const result = await safari.deleteCookies(args);
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2004,7 +2005,7 @@ server.tool(
   async (args) => {
     _assertTabOwnership("set_session_storage");
     const result = await safari.setSessionStorage(args);
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2018,7 +2019,7 @@ server.tool(
   async (args) => {
     _assertTabOwnership("set_local_storage");
     const result = await safari.setLocalStorage(args);
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2031,7 +2032,7 @@ server.tool(
   async ({ key }) => {
     _assertTabOwnership("delete_local_storage");
     const result = await safari.deleteLocalStorage({ key });
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2042,7 +2043,7 @@ server.tool(
   async ({ key }) => {
     _assertTabOwnership("delete_session_storage");
     const result = await safari.deleteSessionStorage({ key });
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2054,7 +2055,7 @@ server.tool(
   {},
   async () => {
     const result = await safari.exportStorageState();
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2065,7 +2066,7 @@ server.tool(
   async ({ state }) => {
     _assertTabOwnership("import_storage");
     const result = await safari.importStorageState({ state });
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2077,7 +2078,7 @@ server.tool(
   {},
   async () => {
     const result = await safari.clipboardRead();
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2087,7 +2088,7 @@ server.tool(
   { text: z.string().describe("Text to copy to clipboard") },
   async (args) => {
     const result = await safari.clipboardWrite(args);
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2107,7 +2108,7 @@ server.tool(
   async ({ urlPattern, response }) => {
     _assertTabOwnership("mock_route");
     const result = await safari.mockNetworkRoute({ urlPattern, response });
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2117,7 +2118,7 @@ server.tool(
   {},
   async () => {
     const result = await safari.clearNetworkMocks();
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2129,7 +2130,7 @@ server.tool(
   { ms: z.coerce.number().describe("Milliseconds to wait") },
   async ({ ms }) => {
     const result = await safari.waitForTime({ ms });
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2141,7 +2142,7 @@ server.tool(
   {},
   async () => {
     const result = await safari.startNetworkCapture();
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2154,7 +2155,7 @@ server.tool(
   },
   async (args) => {
     const result = await safari.getNetworkDetails(args);
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2164,7 +2165,7 @@ server.tool(
   {},
   async () => {
     const result = await safari.clearNetworkCapture();
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2176,7 +2177,7 @@ server.tool(
   {},
   async () => {
     const result = await safari.getPerformanceMetrics();
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2193,7 +2194,7 @@ server.tool(
   async (args) => {
     _assertTabOwnership("throttle");
     const result = await safari.throttleNetwork(args);
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2205,7 +2206,7 @@ server.tool(
   { level: z.enum(["log", "warn", "error", "info"]).describe("Console level to filter") },
   async (args) => {
     const result = await safari.getConsoleByLevel(args);
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2220,7 +2221,7 @@ server.tool(
   },
   async (args) => {
     const result = await safari.extractTables(args);
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2230,7 +2231,7 @@ server.tool(
   {},
   async () => {
     const result = await safari.extractMeta();
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2240,7 +2241,7 @@ server.tool(
   { limit: z.coerce.number().optional().describe("Max images (default: 50)") },
   async (args) => {
     const result = await safari.extractImages(args);
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2253,7 +2254,7 @@ server.tool(
   },
   async (args) => {
     const result = await safari.extractLinks(args);
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2270,7 +2271,7 @@ server.tool(
   async (args) => {
     _assertTabOwnership("override_geolocation");
     const result = await safari.overrideGeolocation(args);
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2285,7 +2286,7 @@ server.tool(
   },
   async (args) => {
     const result = await safari.getComputedStyles(args);
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2297,7 +2298,7 @@ server.tool(
   {},
   async () => {
     const result = await safari.listIndexedDBs();
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2311,7 +2312,7 @@ server.tool(
   },
   async (args) => {
     const result = await safari.getIndexedDB(args);
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2323,7 +2324,61 @@ server.tool(
   {},
   async () => {
     const result = await safari.getCSSCoverage();
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
+  }
+);
+
+// ========== WEBKIT / iOS WEB-DEV VALIDATION ==========
+
+server.tool(
+  "safari_inspect_viewport",
+  "Validate the page's <meta name=viewport> against iOS Safari best practices: width=device-width, initial-scale, disabled-zoom (WCAG 1.4.4), viewport-fit=cover. Returns parsed attributes + severity-tagged issues (error/warning/info).",
+  {},
+  async () => {
+    const result = await safari.inspectViewport();
+    return textResult(result);
+  }
+);
+
+server.tool(
+  "safari_safe_area_insets",
+  "Read the live CSS safe-area-inset values (top/right/bottom/left) as the page sees them, whether viewport-fit=cover is set, and whether env(safe-area-inset-*) is used in any stylesheet. For notch / Dynamic Island layout debugging.",
+  {},
+  async () => {
+    const result = await safari.getSafeAreaInsets();
+    return textResult(result);
+  }
+);
+
+server.tool(
+  "safari_check_pwa",
+  "Audit the page for iOS 'Add to Home Screen' / PWA readiness: apple-mobile-web-app-capable, apple-touch-icon (incl. 180x180), theme-color, status-bar style, web app manifest, splash screens. Returns a pass/total checklist.",
+  {},
+  async () => {
+    const result = await safari.checkPWA();
+    return textResult(result);
+  }
+);
+
+server.tool(
+  "safari_webkit_compat",
+  "Check every CSS property used on the page against THIS Safari via CSS.supports() — reports unsupported properties, properties that need a -webkit- prefix, and known Safari rendering quirks (e.g. position:sticky inside overflow ancestors). Tested in the live engine, so no false positives.",
+  {},
+  async () => {
+    const result = await safari.checkWebKitCompat();
+    return textResult(result);
+  }
+);
+
+// ========== DIAGNOSTICS ==========
+
+server.tool(
+  "safari_doctor",
+  "Diagnose the macOS permission + daemon chain in one shot: Safari running, Apple Events/Automation, native helper daemon, Accessibility (native clicks), Screen Recording, and the helper's codesign identity. Returns a pass/fail checklist with the exact System Settings fix per failure. Run this FIRST when clicks/screenshots/startup 'don't work even with permissions granted'.",
+  {},
+  async () => {
+    const result = await safari.doctor();
+    return textResult(result);
   }
 );
 
@@ -2335,7 +2390,7 @@ server.tool(
   {},
   async () => {
     const result = await safari.detectForms();
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2356,7 +2411,7 @@ server.tool(
       { selector: args.selector, text: args.text, block: args.block },
       () => safari.scrollToElement(args)
     );
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2374,7 +2429,7 @@ server.tool(
   async (args) => {
     _assertTabOwnership("click_and_wait");
     const result = await safari.clickAndWait(args);
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2391,7 +2446,7 @@ server.tool(
   async (args) => {
     _assertTabOwnership("fill_and_submit");
     const result = await safari.fillAndSubmit(args);
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2401,7 +2456,7 @@ server.tool(
   {},
   async () => {
     const result = await safari.analyzePage();
-    return { content: [{ type: "text", text: result }] };
+    return textResult(result);
   }
 );
 
@@ -2421,7 +2476,7 @@ try {
       let version = "?";
       try { version = JSON.parse(readFileSync(pkgPath, "utf8")).version; } catch {}
       console.error("");
-      console.error(`[Safari MCP] 🦁 v${version} ready — 80 tools, native WebKit, zero Chrome.`);
+      console.error(`[Safari MCP] 🦁 v${version} ready — 96 tools, native WebKit, zero Chrome.`);
       console.error(`[Safari MCP] ⭐ Like it? Star: https://github.com/achiya-automation/safari-mcp`);
       console.error("");
       try { writeFileSync(bannerStateFile, String(Date.now()), { mode: 0o600 }); } catch {}
@@ -2430,5 +2485,24 @@ try {
 } catch { /* banner is best-effort, never block startup */ }
 
 _startMemoryMonitor();
+
+// Runtime guard for the silent stale-identity regression (#29): postinstall re-signs the
+// helper to a stable id so the Accessibility grant persists, but `npm ci`, `--ignore-scripts`,
+// Docker and Smithery installs skip postinstall entirely — leaving the swiftc one-off id and
+// a grant that breaks invisibly. Warn once on stderr (non-blocking) so it's diagnosable.
+(function warnIfHelperIdentityDrifted() {
+  try {
+    if (process.platform !== "darwin") return;
+    const helper = join(dirname(fileURLToPath(import.meta.url)), "safari-helper");
+    if (!existsSync(helper)) return;
+    execFile("codesign", ["-d", "--verbose=2", helper], { timeout: 4000 }, (_err, stdout, stderr) => {
+      const text = (stdout || "") + (stderr || "");
+      if (text && !/Identifier=com\.achiya-automation\.safari-mcp/.test(text)) {
+        console.error("[Safari MCP] ⚠ safari-helper codesign identity is not the stable id — native clicks may silently fail. Run the safari_doctor tool to diagnose.");
+      }
+    });
+  } catch { /* best-effort, never block startup */ }
+})();
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
