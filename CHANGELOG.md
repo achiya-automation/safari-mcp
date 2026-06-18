@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.14.0] - 2026-06-18
+
+iOS/WebKit web-dev validation tools, a permission-chain diagnostic, and a reliability +
+tooling hardening pass (see PR #37). 96 tools total.
+
+### Added
+- **`safari_inspect_viewport`** — validate the `<meta name=viewport>` tag against iOS Safari best practices (device-width, initial-scale, disabled-zoom/WCAG 1.4.4, viewport-fit).
+- **`safari_safe_area_insets`** — read live `safe-area-inset` values + `viewport-fit`/`env()` usage (notch / Dynamic Island).
+- **`safari_check_pwa`** — audit iOS "Add to Home Screen" / PWA readiness (apple-touch-icon incl. 180×180, manifest, theme-color, status bar, splash).
+- **`safari_webkit_compat`** — check every CSS property on the page against THIS Safari via `CSS.supports()` (unsupported props, missing `-webkit-` prefixes, known rendering quirks).
+- **`safari_doctor`** — one-shot diagnosis of the macOS permission + daemon chain (Apple Events / Accessibility / Screen Recording / native helper / codesign identity), with the exact System Settings fix per failure.
+
+### Fixed
+- **Native clicks no longer report phantom success (issue #29).** `safari-helper` now runs `CGPreflightPostEventAccess()` before posting CGEvents (click/hover/keyboard); when Accessibility / post-event access is missing it returns an actionable error instead of reporting "clicked" while the page never reacted.
+- **`safari_evaluate` could return the literal `[object Promise]`** for scripts whose value is a thenable without a literal `await`/`.then` (e.g. `Promise.resolve(x)`, an async IIFE). It now detects that at runtime and resolves via the async poller.
+- **Element screenshots cropped wrong on Retina** — `safari_screenshot_element` now scales the crop region by `devicePixelRatio`.
+- **`postinstall` codesign re-sign failed silently.** It now warns loudly when the helper can't be re-signed to the stable identifier and verifies the result; fixed a latent bug where `codesign -d` (without `--verbose`) never emitted `Identifier=`, so the early-return/verify never fired. Added a runtime codesign-identity check at startup (catches `npm ci` / `--ignore-scripts` / Docker installs that skip postinstall).
+
+### Changed
+- Internal: extracted `response.js` (MCP-response helpers — replaced 82 hand-written envelopes), `injected-validators.js`, and `injected-escape.js`; added an `evalReturningJSON` builder.
+- Tooling: added `jsconfig.json` (checkJs), ESLint + Prettier + TypeScript with `lint`/`format`/`typecheck` scripts; `npm test` now uses `--test-force-exit`.
+- Tests: +17 behavioral tests (`evaluate-wrapping`, `injection-safety`, `validators` via jsdom) → 32 total.
+- Removed the stale, hand-maintained `index.d.ts`.
+
 ## [2.13.0] - 2026-06-14
 
 A second correctness/safety + dedup pass following a deep re-audit, and a third
