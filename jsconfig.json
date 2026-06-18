@@ -1,0 +1,19 @@
+{
+  "//": "Editor-only type checking for this plain-JS codebase (no build step, no TS migration). checkJs catches the bugs JS is exposed to — typos in option-object keys, wrong arg counts to runJS callers, missing awaits — without strict-null noise. Advisory: nothing enforces it in CI.",
+  "compilerOptions": {
+    "checkJs": true,
+    "allowJs": true,
+    "noEmit": true,
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "strict": false,
+    "noImplicitAny": false,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "types": ["node"]
+  },
+  "include": ["*.js", "scripts/**/*.cjs", "test/**/*.mjs", "tests/**/*.js"],
+  "exclude": ["node_modules", "extension"]
+}

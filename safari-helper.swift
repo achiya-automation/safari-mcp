@@ -14,6 +14,24 @@ import Darwin
 import CoreGraphics
 import AppKit
 
+// ========== Accessibility preflight (issue #29) ==========
+// Posting synthetic CGEvents requires Accessibility, and macOS 26 (Tahoe) tightened the
+// post-event TCC grant. Without it, post()/postToPid SILENTLY no-op — yet the old code
+// still returned a "clicked"/"hovered"/"key pressed" success, so the page never reacted
+// and the agent had no idea. Check first and fail honestly so the Node layer can surface
+// an actionable error instead of a phantom success.
+func ensurePostEventAccess() -> [String: Any]? {
+  if CGPreflightPostEventAccess() { return nil }
+  // Triggers the one-time system Accessibility prompt for this binary; returns immediately
+  // (does not block for the user's decision) and is a no-op once the choice is remembered.
+  CGRequestPostEventAccess()
+  return [
+    "error": "accessibility-not-granted",
+    "needsApproval": true,
+    "hint": "Grant Accessibility to safari-helper: System Settings > Privacy & Security > Accessibility, then retry."
+  ]
+}
+
 // ========== CGEvent Native Hover ==========
 // Moves the mouse cursor to a target position to trigger native :hover / mouseenter
 // without clicking. Used for revealing tooltips on obfuscated UIs (Discord sidebar,
@@ -21,6 +39,7 @@ import AppKit
 // events aren't enough because the rendering depends on CSS :hover or real pointer
 // position. Optionally restores the original cursor position after dwell.
 func performNativeHover(x: Double, y: Double, windowId: Int64 = 0, dwellMs: Int = 500, restoreMouse: Bool = true) -> [String: Any] {
+  if let denied = ensurePostEventAccess() { return denied }
   let point = CGPoint(x: x, y: y)
   // nil when the cursor position can't be read (e.g. Accessibility just revoked) —
   // restoring to a fabricated (0,0) would visibly throw the cursor into the corner.
@@ -68,6 +87,7 @@ func performNativeHover(x: Double, y: Double, windowId: Int64 = 0, dwellMs: Int 
 // Requires Accessibility permissions (same as AppleScript automation).
 
 func performNativeClick(x: Double, y: Double, doubleClick: Bool = false, windowId: Int64 = 0) -> [String: Any] {
+  if let denied = ensurePostEventAccess() { return denied }
   let point = CGPoint(x: x, y: y)
 
   // --- Window-targeted click ---
@@ -185,6 +205,7 @@ func performNativeClick(x: Double, y: Double, doubleClick: Bool = false, windowI
 // WITHOUT activating Safari or stealing focus. Same principle as native click.
 
 func performNativeKeyboard(keyCode: UInt16, flags: CGEventFlags = [], windowId: Int64 = 0) -> [String: Any] {
+  if let denied = ensurePostEventAccess() { return denied }
   // Get Safari PID
   var safariPID: pid_t = 0
   if windowId > 0 {
@@ -353,6 +374,17 @@ func handleLine(_ line: String) {
       }
     }
     respond(performNativeKeyboard(keyCode: UInt16(keyCode), flags: flags, windowId: windowId))
+    return
+  }
+
+  // Handle preflight — report permission state WITHOUT acting. Used by safari_doctor
+  // to turn the silent-failure permission chain into an actionable checklist (issue #29/#14/#15).
+  if json["preflight"] != nil {
+    respond([
+      "result": "preflight",
+      "accessibility": CGPreflightPostEventAccess(),
+      "screenRecording": CGPreflightScreenCaptureAccess()
+    ])
     return
   }
 

@@ -11,6 +11,8 @@ import { readFile, writeFile, unlink, appendFile } from "node:fs/promises";
 import { readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
+import { VIEWPORT_SCRIPT, SAFE_AREA_SCRIPT, PWA_SCRIPT, WEBKIT_COMPAT_SCRIPT } from "./injected-validators.js";
+import { escJsSingleQuote, escAppleScriptString } from "./injected-escape.js";
 // Extension bridge is handled by index.js (WebSocket server on port 9223)
 
 const execFileAsync = promisify(execFile);
@@ -25,16 +27,9 @@ const SESSION_ID = randomUUID().slice(0, 8);
 // replace ~70 hand-inlined copies of the same recipe — fix the escaping once here, not at every
 // call site. Verified equivalent to the inline pattern by test/escaping.test.mjs.
 
-// Value injected into a SINGLE-QUOTED JS string literal (selector, key, name, …).
-// Exported only so test/escaping.test.mjs can lock the recipe against the historical inline pattern.
-export function escJsSingleQuote(s) {
-  return String(s).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-}
-// String injected into a DOUBLE-QUOTED AppleScript literal — also strips CR/LF, since a raw
-// newline would close the AppleScript string and allow AppleScript injection.
-export function escAppleScriptString(s) {
-  return String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/[\r\n]/g, "");
-}
+// Escaping helpers now live in ./injected-escape.js (pure + test-locked). Imported above
+// for internal use; re-exported here so existing `from "./safari.js"` imports keep working.
+export { escJsSingleQuote, escAppleScriptString };
 
 // ========== SWIFT HELPER DAEMON ==========
 // Persistent process — no subprocess spawn overhead (~5ms vs ~90ms)
@@ -431,6 +426,14 @@ async function _stampTab(idx) {
 // Quick JS execution — exposed for smart-wait checks in index.js
 export async function runJSQuick(js) { return runJS(js); }
 
+// Run a SYNCHRONOUS function body in the page and return its raw result string. The body
+// must `return JSON.stringify(...)` (AppleScript `do JavaScript` can't await). This is the
+// single home for the `(function(){ … })()` wrapper that ~50 extractors hand-write; output
+// is byte-identical to `runJS(\`(function(){BODY})()\`)` — it only removes the boilerplate.
+function evalReturningJSON(body, opts) {
+  return runJS(`(function(){${body}})()`, opts);
+}
+
 // ========== FOCUS PRESERVATION ==========
 // Safari AppleScript can steal focus (bring Safari window to front), especially
 // on macOS Tahoe where window-mutation commands trigger an implicit activate.
@@ -804,6 +807,43 @@ function _osascriptFastHelper(script, timeout) {
   }));
 }
 
+// Ask the helper for its permission state (CGEvent posting + screen capture) without
+// acting. Resolves the FULL parsed object ({accessibility, screenRecording}); doubles as
+// a daemon liveness probe. Used by doctor() (issue #29/#14/#15).
+function _helperPreflight(timeout = 3000) {
+  return _withHelperLock(() => new Promise((resolve, reject) => {
+    if (!_helperProc) startHelper();
+    if (!_helperProc || !_helperProc.stdin || !_helperProc.stdin.writable) {
+      reject(new Error("safari-helper not available"));
+      return;
+    }
+    let resolved = false;
+    const timer = setTimeout(() => {
+      if (resolved) return;
+      resolved = true;
+      const idx = _helperQueue.indexOf(cb);
+      if (idx >= 0) _helperQueue[idx] = () => {}; // no-op consumer for a late reply
+      reject(new Error("preflight timeout"));
+    }, timeout);
+    function cb(line) {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      try { resolve(JSON.parse(line)); }
+      catch { reject(new Error("unparseable preflight reply")); }
+    }
+    _helperQueue.push(cb);
+    try {
+      _helperProc.stdin.write(JSON.stringify({ preflight: true }) + "\n");
+    } catch (writeErr) {
+      const idx = _helperQueue.indexOf(cb);
+      if (idx >= 0) _helperQueue.splice(idx, 1);
+      clearTimeout(timer);
+      reject(new Error("preflight write failed: " + writeErr.message));
+    }
+  }));
+}
+
 // ========== NATIVE CLICK VIA CGEVENT ==========
 // Sends a CGEvent click command to the Swift helper daemon.
 // This produces isTrusted: true events — bypasses WAF protection (G2, etc.)
@@ -1044,6 +1084,10 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
   const target = idx
     ? `tab ${idx} of ${getTargetWindowRef()}`
     : getFallbackTarget();
+  // NEVER activate or raise Safari — that steals the user's foreground. JS runs in the
+  // target tab in the background regardless of window stacking. (rAF/timers stay frozen
+  // while the window is occluded by macOS; that is a deliberate trade-off — measuring an
+  // occluded window's frame rate is not worth stealing focus. Measure when it's visible.)
   const script = `tell application "Safari" to do JavaScript "${escaped}" in ${target}`;
   try {
     if (script.length < 50000) {
@@ -3056,22 +3100,29 @@ export async function screenshotElement({ selector }) {
 
       // Get element bounds relative to screen
       const bounds = await runJS(
-        `(function(){var el=document.querySelector('${sel}');if(!el)return '';var r=el.getBoundingClientRect();return JSON.stringify({x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)});})()`
+        `(function(){var el=document.querySelector('${sel}');if(!el)return '';var r=el.getBoundingClientRect();return JSON.stringify({x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height),dpr:(window.devicePixelRatio||1)});})()`
       );
       if (!bounds) throw new Error(typeof result === 'string' && result.startsWith('Element') ? result : 'Element not found for screenshot');
 
       // Full window screenshot then crop with sips
       await execFileAsync("screencapture", ["-l" + windowId, "-o", "-x", tmpFile]);
-      const { x, y, w, h } = JSON.parse(bounds);
+      const { x, y, w, h, dpr = 1 } = JSON.parse(bounds);
       // Use sips to crop (macOS built-in). Use the DYNAMIC toolbar height — Sequoia+ chrome is
       // ~90px, not 74, so a hardcoded 74 left element screenshots vertically offset. Fall back
       // to 74 only if geometry can't be read.
       let toolbarHeight = 74;
       try { const g = await _getSafariWindowGeometry(); if (g?.toolbarHeight) toolbarHeight = g.toolbarHeight; } catch {}
+      // screencapture writes the window PNG at PHYSICAL resolution (2× on Retina), but the
+      // bounds + toolbar height are CSS points. Scale every crop dimension by devicePixelRatio
+      // so the crop lands on the right physical pixels instead of a half-size top-left region.
+      const sw = Math.round(w * dpr);
+      const sh = Math.round(h * dpr);
+      const sx = Math.round(x * dpr);
+      const sy = Math.round((y + toolbarHeight) * dpr);
       cropFile = join(tmpdir(), `safari-el-crop-${Date.now()}.png`);
       await execFileAsync("sips", [
-        "-c", String(h), String(w),
-        "--cropOffset", String(y + toolbarHeight), String(x),
+        "-c", String(sh), String(sw),
+        "--cropOffset", String(sy), String(sx),
         tmpFile, "--out", cropFile
       ]);
       const data = await readFile(cropFile);
@@ -3433,6 +3484,15 @@ export async function evaluate({ script }) {
   const wrappedJs = `(function(){ try { return (${expr}); } catch(__mcpErr) { return 'Error: ' + __mcpErr.message; } })()`;
   if (process.env.MCP_DEBUG) console.error('[evaluate] wrapped:', wrappedJs.substring(0, 300));
   const result = await runJS(wrappedJs);
+  // The regex async-sniff in _buildEvalExpr only catches a literal await/.then/async.
+  // It misses scripts whose *value* is a thenable — `Promise.resolve(5)`, an async IIFE
+  // with no inner await, any fn returning a promise. `do JavaScript` can't await those,
+  // so they come back as the literal "[object Promise]". Re-run through the async poller
+  // in that case. (Pathological: a script genuinely returning the string "[object Promise]"
+  // re-runs to the same value, so there is no downside.)
+  if (typeof result === 'string' && result.trim() === '[object Promise]') {
+    return _evaluateAsync(expr);
+  }
   if (result === null || result === undefined || result === '') {
     return '(no return value)';
   }
@@ -4826,8 +4886,8 @@ export async function listIndexedDBs() {
 // ========== CSS COVERAGE ==========
 
 export async function getCSSCoverage() {
-  return runJS(
-    `(function(){
+  return evalReturningJSON(
+    `
       var results = [];
       for (var i = 0; i < document.styleSheets.length; i++) {
         try {
@@ -4858,8 +4918,101 @@ export async function getCSSCoverage() {
         }
       }
       return JSON.stringify(results);
-    })()`
+    `
   );
+}
+
+// ========== WEBKIT / iOS WEB-DEV VALIDATION ==========
+
+// Validate <meta name="viewport"> against iOS Safari best practices.
+// Pure read-only DOM inspection — returns parsed attrs + severity-tagged issues.
+export async function inspectViewport() {
+  return runJS(VIEWPORT_SCRIPT);
+}
+
+// Read live CSS safe-area-inset values via a hidden probe element, check
+// viewport-fit=cover, and scan stylesheets for env(safe-area-inset-*) usage.
+export async function getSafeAreaInsets() {
+  return runJS(SAFE_AREA_SCRIPT);
+}
+
+// Audit the page for iOS "Add to Home Screen" / PWA readiness.
+export async function checkPWA() {
+  return runJS(PWA_SCRIPT);
+}
+
+// Check every CSS property used on the page against THIS Safari via
+// CSS.supports() — no regex guessing, tested in the live engine.
+export async function checkWebKitCompat() {
+  return runJS(WEBKIT_COMPAT_SCRIPT);
+}
+
+// ========== DOCTOR (PREFLIGHT DIAGNOSTICS) ==========
+
+// One-shot check of the whole macOS permission + daemon chain, so the
+// "it doesn't work even with permissions granted" failures (#14/#15/#29)
+// surface as one actionable checklist instead of scattered cryptic errors.
+export async function doctor() {
+  const checks = [];
+  const add = (ok, label, detail, fix) => checks.push({ ok, label, detail, fix: ok ? null : fix });
+
+  // 1. Safari running
+  let safariUp = false;
+  try {
+    const { stdout } = await execFileAsync("pgrep", ["-x", "Safari"], { timeout: 2000 });
+    safariUp = stdout.trim().length > 0;
+  } catch { safariUp = false; }
+  add(safariUp, "Safari running", safariUp ? "Safari process is up" : "Safari is not running", "Open Safari, then retry.");
+
+  // 2. Apple Events / Automation — the bridge every AppleScript tool uses
+  let aeOk = false, aeDetail = "";
+  try {
+    const out = await osascript(`tell application "Safari" to return (count of windows) as string`, { timeout: 5000 });
+    aeOk = /^\d+$/.test(String(out).trim());
+    aeDetail = aeOk ? `OK (${String(out).trim()} window(s) visible)` : `unexpected reply: ${String(out).slice(0, 60)}`;
+  } catch (e) {
+    const m = e.message || "";
+    if (m.includes("-1743") || /not authoriz/i.test(m)) aeDetail = "Automation permission denied (-1743)";
+    else if (m.includes("-600") || /isn.t running/i.test(m)) aeDetail = "Safari not running";
+    else aeDetail = m.slice(0, 80);
+  }
+  add(aeOk, "Apple Events / Automation", aeDetail,
+    "System Settings > Privacy & Security > Automation → enable Safari for your terminal/host app; and Safari > Develop > Allow JavaScript from Apple Events.");
+
+  // 3-5. Native helper daemon + Accessibility + Screen Recording (one preflight round-trip)
+  let pf = null, pfErr = "";
+  try { pf = await _helperPreflight(); } catch (e) { pfErr = e.message || String(e); }
+  add(!!pf, "Native helper daemon", pf ? "safari-helper responding" : `not responding: ${pfErr}`,
+    "It auto-restarts; if this persists, reinstall safari-mcp.");
+  add(!!pf && pf.accessibility === true, "Accessibility (native clicks)",
+    pf ? (pf.accessibility ? "CGEvent posting permitted" : "NOT permitted — native clicks silently no-op (the #29 root cause)") : "unknown (helper not responding)",
+    "System Settings > Privacy & Security > Accessibility → enable safari-helper, then retry.");
+  add(!!pf && pf.screenRecording === true, "Screen Recording (screenshots)",
+    pf ? (pf.screenRecording ? "permitted" : "NOT permitted — screenshots will be blank/blocked") : "unknown (helper not responding)",
+    "System Settings > Privacy & Security > Screen Recording → enable your terminal/host app.");
+
+  // 6. Helper codesign identity — a stale/ad-hoc id breaks the Accessibility grant on reinstall
+  let idOk = false, idDetail = "";
+  const helperPath = join(__dirname, "safari-helper");
+  try {
+    const res = await execFileAsync("codesign", ["-d", "--verbose=2", helperPath], { timeout: 4000 })
+      .catch((e) => ({ stdout: "", stderr: e.stderr || "" }));
+    const text = (res.stdout || "") + (res.stderr || "");
+    const m = /Identifier=(.+)/.exec(text);
+    const id = m ? m[1].trim() : "(unknown)";
+    idOk = id === "com.achiya-automation.safari-mcp";
+    idDetail = idOk ? `stable identifier: ${id}` : `unstable identifier "${id}" — Accessibility grant won't persist across reinstalls`;
+  } catch (e) { idDetail = "could not read codesign identity: " + (e.message || "").slice(0, 60); }
+  add(idOk, "Helper codesign identity", idDetail,
+    `Re-sign: codesign -s - -f --identifier com.achiya-automation.safari-mcp --entitlements safari-helper.entitlements "${helperPath}"`);
+
+  const passed = checks.filter((c) => c.ok).length;
+  const lines = [`Safari MCP doctor — ${passed}/${checks.length} checks passed`, ""];
+  for (const c of checks) {
+    lines.push(`${c.ok ? "✅" : "❌"} ${c.label}: ${c.detail}`);
+    if (!c.ok && c.fix) lines.push(`   → ${c.fix}`);
+  }
+  return lines.join("\n");
 }
 
 // ========== FORM AUTO-DETECT ==========
