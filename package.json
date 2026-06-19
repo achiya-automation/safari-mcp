@@ -66,6 +66,7 @@
     "response.js",
     "safari.js",
     "ownership-match.js",
+    "ownership-state.js",
     "mcp-helpers.js",
     "injected-validators.js",
     "injected-escape.js",

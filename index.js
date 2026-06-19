@@ -9,13 +9,17 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import * as safari from "./safari.js";
-import { findOwnedMatch, pruneExpired } from "./ownership-match.js";
 import { textResult, jsonResult, imageResult, errorResult } from "./response.js";
+import {
+  OWNERSHIP_DIR, BLANK_TAB_SENTINEL,
+  _openedTabs, _ownedTabURLs,
+  _isURLOwned, _markBlankTabOpened, _addOwnedURL, _removeOwnedURL, _trackTab, _untrackTab,
+} from "./ownership-state.js";
 import { WebSocketServer } from "ws";
 import { createServer } from "node:http";
 import { randomUUID, randomBytes } from "node:crypto";
 import { execFile, execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, renameSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
@@ -49,130 +53,20 @@ const PROXY_TOKEN = _getProxyToken();
 // ========== SESSION ID (unique per MCP process — enables per-session tab tracking) ==========
 const SESSION_ID = randomUUID().slice(0, 8);
 
-// ========== PERSISTENT TAB OWNERSHIP ==========
-// The in-memory _ownedTabURLs set is wiped when the MCP process restarts
-// (Claude Code periodically recycles MCP servers). Without persistence, every
-// restart re-triggers "Tab safety: no tabs opened yet" errors forcing a
-// re-open of every tab. Persist the set to a JSON file with a TTL so tabs
-// remain "owned" across process restarts for up to OWNERSHIP_TTL_MS.
-const OWNERSHIP_DIR = join(homedir(), ".safari-mcp");
-const OWNERSHIP_FILE = join(OWNERSHIP_DIR, "owned-tabs.json");
-const OWNERSHIP_TTL_MS = 30 * 60 * 1000; // 30 minutes
-
-function _loadOwnershipFile() {
-  try {
-    if (!existsSync(OWNERSHIP_FILE)) return [];
-    const raw = readFileSync(OWNERSHIP_FILE, "utf8");
-    const data = JSON.parse(raw);
-    if (!Array.isArray(data)) return [];
-    const cutoff = Date.now() - OWNERSHIP_TTL_MS;
-    return data.filter(e => e && typeof e.url === "string" && typeof e.ts === "number" && e.ts > cutoff);
-  } catch { return []; }
-}
-
-function _saveOwnershipFile(urls) {
-  try {
-    if (!existsSync(OWNERSHIP_DIR)) mkdirSync(OWNERSHIP_DIR, { recursive: true });
-    const now = Date.now();
-    const entries = Array.from(urls).map(url => ({ url, ts: _ownedTabTimestamps.get(url) ?? now }));
-    // Atomic write (tmp + rename) — concurrent MCP instances share this file; a partial
-    // write from one must never corrupt the JSON another instance reads.
-    const tmp = OWNERSHIP_FILE + ".tmp." + process.pid;
-    writeFileSync(tmp, JSON.stringify(entries), { mode: 0o600 });
-    renameSync(tmp, OWNERSHIP_FILE);
-  } catch { /* best-effort */ }
-}
+// Persistent tab-ownership state + its helpers now live in ownership-state.js
+// (OWNERSHIP_* consts, _ownedTabURLs/_ownedTabTimestamps, _loadOwnershipFile,
+// _saveOwnershipFile, _isURLOwned, _addOwnedURL, _trackTab, … — imported at the top).
+// OWNERSHIP_DIR is re-used below for the memory-monitor lock file.
 
 // ========== MEMORY GUARD: track & auto-close MCP-opened tabs ==========
 const MAX_TABS = parseInt(process.env.MCP_MAX_TABS || "6", 10);
 const MEMORY_CHECK_INTERVAL_MS = parseInt(process.env.MCP_MEMORY_CHECK_MS || "60000", 10);
 const WEBKIT_MEMORY_LIMIT_MB = parseInt(process.env.MCP_WEBKIT_LIMIT_MB || "3000", 10);
 
-// Track tabs opened by THIS session (index → {url, openedAt})
-const _openedTabs = new Map();
-
-// ========== TAB OWNERSHIP: prevent operating on user's tabs ==========
-// Tracks URLs of tabs opened by this MCP session.
-// Any tool that modifies a tab (navigate, click, fill, etc.) is blocked
-// unless the current tab was opened via safari_new_tab.
-// Hydrated from ~/.safari-mcp/owned-tabs.json so ownership survives MCP restarts.
-const _ownedTabURLs = new Set();
-// Preserve each entry's ORIGINAL timestamp so _saveOwnershipFile doesn't reset it to `now` on
-// every write — otherwise the 30-min TTL never expires anything while a session is active, and
-// stale ownership leaks onto the user's tabs across sessions.
-const _ownedTabTimestamps = new Map();
-for (const e of _loadOwnershipFile()) {
-  _ownedTabURLs.add(e.url);
-  _ownedTabTimestamps.set(e.url, e.ts);
-}
-
-// Touch-on-use + live TTL enforcement. The TTL exists so ownership doesn't outlive the
-// session's actual use of a tab: entries the session keeps asserting against stay fresh;
-// abandoned entries expire after OWNERSHIP_TTL_MS and can no longer match a user's tab.
-// (Previously the TTL was only applied when loading the file at startup, so a long-lived
-// session accumulated ownership forever.)
-function _touchOwned(ownedKey) {
-  _ownedTabTimestamps.set(ownedKey, Date.now());
-  return true;
-}
-function _pruneExpiredOwnership() {
-  if (pruneExpired(_ownedTabURLs, _ownedTabTimestamps, OWNERSHIP_TTL_MS)) {
-    _saveOwnershipFile(_ownedTabURLs);
-  }
-}
-
-// Matching semantics (exact / normalized / same-origin path-prefix with a segment
-// boundary) live in ownership-match.js, where test/ownership-match.test.mjs locks
-// them — including that owning /org never owns /org-evil, and that the broad
-// "own the whole origin" rule stays dead (it defeated tab-safety entirely).
-function _isURLOwned(url) {
-  if (!url) return false;
-  _pruneExpiredOwnership();
-  const match = findOwnedMatch(url, _ownedTabURLs);
-  return match !== null ? _touchOwned(match) : false;
-}
-
-// Sentinel persisted when a blank tab (about:blank) is opened by this session.
-// A blank tab has no unique URL to own, but ownership must still survive an MCP
-// process restart (_openedTabs is in-memory only) — otherwise reopening blank
-// tabs falsely trips the "no tabs opened yet" guard. The sentinel is never a
-// real tab URL, so it cannot falsely match a user's page in _isURLOwned().
-const BLANK_TAB_SENTINEL = "__mcp-blank-tab__";
-
-function _markBlankTabOpened() {
-  if (!_ownedTabURLs.has(BLANK_TAB_SENTINEL)) {
-    _ownedTabTimestamps.set(BLANK_TAB_SENTINEL, Date.now());
-    _ownedTabURLs.add(BLANK_TAB_SENTINEL);
-    _saveOwnershipFile(_ownedTabURLs);
-  }
-}
-
-function _addOwnedURL(url) {
-  if (url && url !== 'about:blank' && url !== 'favorites://') {
-    if (!_ownedTabTimestamps.has(url)) _ownedTabTimestamps.set(url, Date.now());
-    _ownedTabURLs.add(url);
-    _saveOwnershipFile(_ownedTabURLs);
-  }
-}
-
-function _removeOwnedURL(url) {
-  if (url) {
-    _ownedTabURLs.delete(url);
-    _ownedTabTimestamps.delete(url);
-    _saveOwnershipFile(_ownedTabURLs);
-  }
-}
-
-function _trackTab(tabIndex, url) {
-  _openedTabs.set(tabIndex, { url: url || "", openedAt: Date.now() });
-  _addOwnedURL(url);
-}
-
-function _untrackTab(tabIndex) {
-  const info = _openedTabs.get(tabIndex);
-  if (info?.url) _removeOwnedURL(info.url);
-  _openedTabs.delete(tabIndex);
-}
+// Tab-ownership state (_openedTabs / _ownedTabURLs / _ownedTabTimestamps), the on-disk
+// persistence + TTL, and the helpers (_isURLOwned, _markBlankTabOpened, _addOwnedURL,
+// _removeOwnedURL, _trackTab, _untrackTab, BLANK_TAB_SENTINEL) are imported from
+// ownership-state.js at the top of this file.
 
 // Close all MCP-opened tabs on process exit
 async function _cleanupTabs() {
