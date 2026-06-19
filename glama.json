@@ -1,7 +1,7 @@
 {
   "$schema": "https://glama.ai/mcp/schemas/server.json",
   "name": "Safari MCP Server",
-  "description": "Native Safari browser automation for AI agents. 80+ tools via AppleScript — zero overhead, keeps logins, runs silently in background.",
+  "description": "Native Safari browser automation for AI agents. 96 tools via AppleScript — zero overhead, keeps logins, runs silently in background.",
   "repository": "https://github.com/achiya-automation/safari-mcp",
   "homepage": "https://github.com/achiya-automation/safari-mcp",
   "author": "achiya-automation",
