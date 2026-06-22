@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="social-preview.png" alt="Safari MCP Server — 80 native browser automation tools for AI agents on macOS" width="100%">
+<img src="social-preview.png" alt="Safari MCP Server — 96 native browser automation tools for AI agents on macOS" width="100%">
 
 <br/>
 
@@ -24,9 +24,9 @@
 <a href="https://insiders.vscode.dev/redirect?url=vscode-insiders:mcp/install?%7B%22safari-mcp%22%3A%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D%7D"><img src="https://img.shields.io/badge/VS_Code_Insiders-Install_Server-24bfa5?logo=visual-studio-code&logoColor=white" alt="Install in VS Code Insiders"></a>
 <a href="cursor://anysphere.cursor-deeplink/mcp/install?name=safari-mcp&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D"><img src="https://img.shields.io/badge/Cursor-Install_Server-f97316?logo=cursor&logoColor=white" alt="Install in Cursor"></a>
 
-**80 tools** · **No Chrome/Puppeteer/Playwright needed** · **~5ms per command** · **60% less CPU than Chrome**
+**96 tools** · **No Chrome/Puppeteer/Playwright needed** · **~5ms per command** · **60% less CPU than Chrome**
 
-[Quick Start](#quick-start) · [All 80 Tools](#tools-80) · [Examples](examples/) · [Why Safari MCP?](#safari-mcp-vs-alternatives) · [Architecture](#architecture) · [Changelog](CHANGELOG.md)
+[Quick Start](#quick-start) · [All 96 Tools](#tools-96) · [Examples](examples/) · [Why Safari MCP?](#safari-mcp-vs-alternatives) · [Architecture](#architecture) · [Changelog](CHANGELOG.md)
 
 ![Safari MCP Demo](https://github.com/achiya-automation/safari-mcp/raw/main/assets/safari-mcp-promo.gif)
 
@@ -44,7 +44,7 @@ Your AI agent needs to browse. So it either:
 
 Your AI drives the **Safari you're already logged into** — Gmail, GitHub, Ahrefs, Slack, banking.
 
-Native WebKit. ~60% less CPU. Background operation. 80 tools. One `npx` command. macOS only.
+Native WebKit. ~60% less CPU. Background operation. 96 tools. One `npx` command. macOS only.
 
 > 📰 **Featured on freeCodeCamp:** [How to Connect Your AI Coding Agent to a Browser on macOS](https://www.freecodecamp.org/news/how-to-connect-your-ai-coding-agent-to-a-browser-on-macos/) · [HackerNoon: Reverse-Engineering React, Shadow DOM, and CSP](https://hackernoon.com/i-had-to-reverse-engineer-react-shadow-dom-and-csp-to-automate-safari-without-chrome)
 
@@ -52,7 +52,7 @@ Native WebKit. ~60% less CPU. Background operation. 80 tools. One `npx` command.
 
 ## Highlights
 
-- **80 tools** — navigation, clicks, forms, screenshots, network, storage, accessibility, and more
+- **96 tools** — navigation, clicks, forms, screenshots, network, storage, accessibility, and more
 - **Zero heat** — native WebKit on Apple Silicon, ~60% less CPU than Chrome
 - **Your real browser** — keeps all logins, cookies, sessions (Gmail, GitHub, Ahrefs, etc.)
 - **Background operation** — Safari stays in the background, no window stealing
@@ -302,7 +302,7 @@ The recommended pattern for AI agents using Safari MCP:
 
 ---
 
-## Tools (80)
+## Tools (96)
 
 <details>
 <summary><b>Click to expand the full tool list — organized by category</b></summary>
@@ -322,7 +322,7 @@ The recommended pattern for AI agents using Safari MCP:
 | `safari_get_source` | Get full HTML source |
 | `safari_navigate_and_read` | Navigate + read in one call |
 
-### Click & Interaction (5)
+### Click & Interaction (6)
 | Tool | Description |
 |------|-------------|
 | `safari_click` | Click by CSS selector, visible text, or coordinates |
@@ -330,8 +330,9 @@ The recommended pattern for AI agents using Safari MCP:
 | `safari_right_click` | Right-click (context menu) |
 | `safari_hover` | Hover over element |
 | `safari_click_and_wait` | Click + wait for navigation |
+| `safari_click_and_read` | Click then return the updated page — saves a round-trip (React Router + full loads) |
 
-### Form Input (7)
+### Form Input (11)
 | Tool | Description |
 |------|-------------|
 | `safari_fill` | Fill input (React/Vue/Angular compatible) |
@@ -341,6 +342,10 @@ The recommended pattern for AI agents using Safari MCP:
 | `safari_fill_and_submit` | Fill form + submit in one call |
 | `safari_type_text` | Type real keystrokes (JS-based, no System Events) |
 | `safari_press_key` | Press key with modifiers |
+| `safari_react_select_set` | Set a react-select v5 value via React fiber — bypasses the menu UI |
+| `safari_react_select_list_options` | List a react-select v5 dropdown's options without opening it |
+| `safari_replace_editor` | Replace all content in a code editor (Monaco, CodeMirror, Ace, ProseMirror) |
+| `safari_verify_state` | Verify an editor's framework-level state matches expected — catch stale DOM before Submit |
 
 ### Screenshots & PDF (3)
 | Tool | Description |
@@ -356,13 +361,14 @@ The recommended pattern for AI agents using Safari MCP:
 | `safari_scroll_to` | Scroll to exact position |
 | `safari_scroll_to_element` | Smooth scroll to element |
 
-### Tab Management (4)
+### Tab Management (5)
 | Tool | Description |
 |------|-------------|
 | `safari_list_tabs` | List all tabs (index, title, URL) |
 | `safari_new_tab` | Open new tab (background, no focus steal) |
 | `safari_close_tab` | Close tab |
 | `safari_switch_tab` | Switch to tab by index |
+| `safari_wait_for_new_tab` | Wait for a new tab (e.g. OAuth popup) and auto-switch to it |
 
 ### Wait (2)
 | Tool | Description |
@@ -383,10 +389,11 @@ The recommended pattern for AI agents using Safari MCP:
 | `safari_get_computed_style` | Computed CSS styles |
 | `safari_detect_forms` | Auto-detect all forms with field selectors |
 
-### Accessibility (1)
+### Accessibility (2)
 | Tool | Description |
 |------|-------------|
 | `safari_accessibility_snapshot` | Full a11y tree: roles, ARIA, focusable elements |
+| `safari_snapshot` | Accessibility tree with ref IDs for every interactive element — preferred way to see page state |
 
 ### Drag & Drop (1)
 | Tool | Description |
@@ -411,7 +418,7 @@ The recommended pattern for AI agents using Safari MCP:
 | `safari_emulate` | Emulate device (iPhone, iPad, Pixel, Galaxy) |
 | `safari_reset_emulation` | Reset to desktop |
 
-### Cookies & Storage (10)
+### Cookies & Storage (11)
 | Tool | Description |
 |------|-------------|
 | `safari_get_cookies` | Get all cookies |
@@ -464,7 +471,7 @@ The recommended pattern for AI agents using Safari MCP:
 | `safari_extract_images` | Images with dimensions and loading info |
 | `safari_extract_links` | Links with rel, external/nofollow detection |
 
-### Advanced (5)
+### Advanced (7)
 | Tool | Description |
 |------|-------------|
 | `safari_override_geolocation` | Override browser geolocation |
@@ -472,11 +479,21 @@ The recommended pattern for AI agents using Safari MCP:
 | `safari_get_indexed_db` | Read IndexedDB records |
 | `safari_css_coverage` | Find unused CSS rules |
 | `safari_analyze_page` | Full page analysis in one call |
+| `safari_doctor` | Diagnose the macOS permission + daemon chain (Apple Events, Accessibility, Screen Recording, codesign) with per-failure fixes |
+| `safari_reload_extension` | Hot-reload the Safari MCP Bridge extension without a manual toggle |
 
 ### Automation (1)
 | Tool | Description |
 |------|-------------|
 | `safari_run_script` | Run multiple actions in a single call (batch) |
+
+### Native Input — CGEvent (4)
+| Tool | Description |
+|------|-------------|
+| `safari_native_click` | OS-level mouse click (CGEvent, `isTrusted: true`) — bypasses WAF/bot detection when `safari_click` is blocked (405/403) |
+| `safari_native_hover` | OS-level cursor hover — triggers real `:hover`/`mouseenter` for tooltips and obfuscated UIs |
+| `safari_native_type` | Insert text via the real paste pipeline — ProseMirror/Slate/Draft.js process it natively so Submit sends real data |
+| `safari_native_keyboard` | OS-level keypress + modifiers to Safari, no focus steal — reaches React trust-gated handlers (Discord/Slack send) |
 
 ### iOS & WebKit Validation (4)
 | Tool | Description |
@@ -512,7 +529,7 @@ Safari MCP runs locally on your Mac with minimal attack surface:
 | Your logins | ✅ Yes | ✅ Yes | ❌ No |
 | macOS native | ✅ WebKit | ❌ Chromium | ❌ Chromium/WebKit |
 | Browser dependencies | None | Chrome + debug port | Playwright runtime |
-| Tools | 80 | ~30 | ~25 |
+| Tools | 96 | ~30 | ~25 |
 | File upload | JS (no dialog) | CDP | Playwright API |
 | Image paste | JS (no clipboard) | CDP | Playwright API |
 | Focus steal | ❌ Background | ❌ Background | ❌ Headless |
@@ -528,7 +545,7 @@ There are several "safari-mcp" projects floating around. Here's how they compare
 
 | Feature | **🦁 safari-mcp** *(this repo)* | [lxman/safari-mcp-server](https://github.com/lxman/safari-mcp-server) | [Epistates/MCPSafari](https://github.com/Epistates/MCPSafari) | [HayoDev/safari-devtools-mcp](https://github.com/HayoDev/safari-devtools-mcp) |
 |---------|:------------------------------:|:----------------------:|:------------:|:----------------------:|
-| **Tools** | **80** | ~10 | 23 | ~15 |
+| **Tools** | **96** | ~10 | 23 | ~15 |
 | **Install** | `npx safari-mcp` | Manual | Binary | `npx` |
 | **Engine** | **Dual** (Extension + AppleScript) | WebDriver | Extension only | DevTools Protocol |
 | **Keeps your real Safari logins** | ✅ Yes | ⚠️ Limited | ✅ Yes | ❌ Debug session |
@@ -795,7 +812,7 @@ If Safari MCP saves you from Chrome overhead, **a star helps others discover it:
 
 [![Star this repo](https://img.shields.io/github/stars/achiya-automation/safari-mcp?style=social)](https://github.com/achiya-automation/safari-mcp)
 
-[Share on Twitter/X](https://twitter.com/intent/tweet?text=Safari%20MCP%20%E2%80%94%20Stop%20running%20Chrome%20just%20so%20your%20AI%20agent%20can%20browse.%2080%20tools%2C%20native%20Safari%2C%2060%25%20less%20CPU.&url=https%3A%2F%2Fgithub.com%2Fachiya-automation%2Fsafari-mcp) · [Share on LinkedIn](https://www.linkedin.com/sharing/share-offsite/?url=https%3A%2F%2Fgithub.com%2Fachiya-automation%2Fsafari-mcp) · [Write about it](https://dev.to/)
+[Share on Twitter/X](https://twitter.com/intent/tweet?text=Safari%20MCP%20%E2%80%94%20Stop%20running%20Chrome%20just%20so%20your%20AI%20agent%20can%20browse.%2096%20tools%2C%20native%20Safari%2C%2060%25%20less%20CPU.&url=https%3A%2F%2Fgithub.com%2Fachiya-automation%2Fsafari-mcp) · [Share on LinkedIn](https://www.linkedin.com/sharing/share-offsite/?url=https%3A%2F%2Fgithub.com%2Fachiya-automation%2Fsafari-mcp) · [Write about it](https://dev.to/)
 
 [![Star History Chart](https://api.star-history.com/svg?repos=achiya-automation/safari-mcp&type=Date)](https://star-history.com/#achiya-automation/safari-mcp&Date)
 
