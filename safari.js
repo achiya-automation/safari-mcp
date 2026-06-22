@@ -4952,6 +4952,31 @@ export async function checkWebKitCompat() {
 // One-shot check of the whole macOS permission + daemon chain, so the
 // "it doesn't work even with permissions granted" failures (#14/#15/#29)
 // surface as one actionable checklist instead of scattered cryptic errors.
+// ========== macOS NATIVE-INPUT COMPAT ==========
+// CGEvent.postToPid (native clicks/keys/hover) can silently no-op on macOS 26+ (Tahoe) even
+// with Accessibility granted — the events are accepted by the API but never cross into Safari's
+// WebContent process (issue #29). doctor() prints the OS version so a bug report carries the
+// single most relevant fact, and flags the known-risky range so users reach for safari_evaluate
+// or extension-based clicks on trust-gated forms instead of chasing a phantom permission grant.
+// Pure (no I/O) so it's unit-tested directly — see test/macos-compat.test.mjs.
+export function macosCompatNote(productVersion) {
+  const raw = String(productVersion ?? "").trim();
+  const major = parseInt(raw.split(".")[0], 10);
+  if (!Number.isFinite(major)) {
+    return {
+      version: "unknown",
+      major: null,
+      risky: false,
+      line: "macOS version: unknown (sw_vers gave no parseable version)",
+    };
+  }
+  const risky = major >= 26;
+  const line = risky
+    ? `macOS ${raw} ⚠ CGEvent native clicks/keys may silently no-op on macOS 26+ even with Accessibility granted (issue #29) — for trust-gated forms prefer safari_evaluate or extension-based safari_click.`
+    : `macOS ${raw} — CGEvent native input supported.`;
+  return { version: raw, major, risky, line };
+}
+
 export async function doctor() {
   const checks = [];
   const add = (ok, label, detail, fix) => checks.push({ ok, label, detail, fix: ok ? null : fix });
@@ -5006,8 +5031,17 @@ export async function doctor() {
   add(idOk, "Helper codesign identity", idDetail,
     `Re-sign: codesign -s - -f --identifier com.achiya-automation.safari-mcp --entitlements safari-helper.entitlements "${helperPath}"`);
 
+  // macOS version — the single most relevant fact for #29-class "native clicks silently fail"
+  // reports. Best-effort: sw_vers is macOS-only and absent in sandboxes/CI, so never block doctor.
+  let osLine = null;
+  try {
+    const { stdout } = await execFileAsync("sw_vers", ["-productVersion"], { timeout: 2000 });
+    osLine = macosCompatNote(stdout).line;
+  } catch { /* sw_vers unavailable — skip the line, the permission checks still stand */ }
+
   const passed = checks.filter((c) => c.ok).length;
   const lines = [`Safari MCP doctor — ${passed}/${checks.length} checks passed`, ""];
+  if (osLine) lines.push(osLine, "");
   for (const c of checks) {
     lines.push(`${c.ok ? "✅" : "❌"} ${c.label}: ${c.detail}`);
     if (!c.ok && c.fix) lines.push(`   → ${c.fix}`);

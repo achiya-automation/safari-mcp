@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`safari_doctor`** now reports the macOS version and flags macOS 26+ (Tahoe), where `CGEvent.postToPid` native clicks/keys can silently no-op even with Accessibility granted (issue #29). Bug reports now carry the single most relevant diagnostic fact, and users on the affected range are steered toward `safari_evaluate` / extension-based clicks for trust-gated forms.
+
 ## [2.14.0] - 2026-06-18
 
 iOS/WebKit web-dev validation tools, a permission-chain diagnostic, and a reliability +
