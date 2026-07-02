@@ -3,10 +3,8 @@ title: "Apple shipped an official Safari MCP. I read all 17 tools — here's why
 published: false
 description: "Apple just added a Model Context Protocol server to Safari Technology Preview 247. As the author of an open-source safari-mcp, I read the whole thing. Here's the honest comparison — what Apple got right, and why the two are built for different jobs."
 tags: ai, macos, opensource, webdev
-cover_image:
+cover_image: https://raw.githubusercontent.com/achiya-automation/safari-mcp/543795ad20a782053ba7d5f13c996252f8a55d02/assets/apple-mcp-cover.png
 ---
-
-> **Draft note (not for publishing yet):** needs a cover image (nano-banana), and a final read. Publishing is gated on approval.
 
 Yesterday Apple did something I've been half-expecting since I open-sourced [safari-mcp](https://github.com/achiya-automation/safari-mcp): they shipped their **own** Safari MCP server.
 
