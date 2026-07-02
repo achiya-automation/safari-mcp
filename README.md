@@ -48,6 +48,8 @@ Native WebKit. ~60% less CPU. Background operation. 96 tools. One `npx` command.
 
 > 📰 **Featured on freeCodeCamp:** [How to Connect Your AI Coding Agent to a Browser on macOS](https://www.freecodecamp.org/news/how-to-connect-your-ai-coding-agent-to-a-browser-on-macos/) · [HackerNoon: Reverse-Engineering React, Shadow DOM, and CSP](https://hackernoon.com/i-had-to-reverse-engineer-react-shadow-dom-and-csp-to-automate-safari-without-chrome)
 
+> 🍎 **Apple shipped an official Safari MCP** (Safari Technology Preview 247, July 2026). It's built on `safaridriver` for isolated debugging sessions. safari-mcp drives the **real Safari you're already logged into** — on stable Safari, with 96 tools. See the full comparison below.
+
 ---
 
 ## Highlights
@@ -538,6 +540,24 @@ Safari MCP runs locally on your Mac with minimal attack surface:
 | Performance trace | ❌ | ✅ | ❌ |
 
 > **Tip:** Use Safari MCP for daily browsing tasks (95% of work) and Chrome DevTools MCP only for Lighthouse/Performance audits.
+
+### vs Apple's Official Safari MCP (safaridriver)
+
+In Safari Technology Preview 247 (July 2026), Apple shipped an **official** Safari MCP server built on `safaridriver`. That's great validation for the category — and it's built for a different job. Apple's server drives an **isolated WebDriver automation session** for debugging; safari-mcp drives the **real Safari you're already logged into**.
+
+| | 🦁 safari-mcp *(this repo)* | Apple `safaridriver --mcp` |
+|---|:---:|:---:|
+| **Your real logins / cookies** | ✅ Your actual Safari | ⚠️ Isolated automation session — no access to AutoFill or browsing activity |
+| **Runs on** | ✅ Stable Safari, every Mac | ❌ Safari Technology Preview 247 only |
+| **Background (no focus steal)** | ✅ Yes | ❌ Dedicated window with a "controlled by automation" banner |
+| **Tools** | **96** | ~17 |
+| **Storage** (cookies, localStorage, IndexedDB) | ✅ 10 tools | ❌ |
+| **Network mocking + throttling** | ✅ Yes | ❌ Read-only network inspection |
+| **Device emulation** (iPhone, iPad) | ✅ Yes | ⚠️ Viewport + media type only |
+| **Setup** | `npx safari-mcp` | Enable "remote automation and external agents" in STP |
+| **Official Apple support** | ❌ Community (MIT) | ✅ Apple, WebDriver-standard |
+
+> **When Apple's server is the right pick:** you specifically want a clean-room, WebDriver-standard session for compatibility debugging and you already run STP. **For everything else — daily automation on the browser you're already signed into, on stable Safari — safari-mcp is built for exactly that.**
 
 ### Why Safari MCP and Not the Other Safari MCP Projects?
 
