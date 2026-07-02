@@ -7,6 +7,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { startTransport } from "./transport.js";
 import { z } from "zod";
 import * as safari from "./safari.js";
 import { textResult, jsonResult, imageResult, errorResult } from "./response.js";
@@ -779,6 +780,11 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
 
 // Read version from package.json to avoid hardcoded mismatch
 const _pkgVersion = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'package.json'), 'utf8')).version;
+// Factory so each MCP session (in HTTP mode) gets its own McpServer — McpServer is single-connection.
+// stdio mode calls this exactly once, identical to the historical inline server. Tool bodies are
+// unchanged; they close over the module-global safari state, which stays shared across sessions
+// (correct: one physical Safari window). See docs/http-transport-design.md.
+function buildServer() {
 const server = new McpServer({
   name: "safari-mcp",
   version: _pkgVersion,
@@ -1545,6 +1551,17 @@ server.tool(
       () => safari.evaluate(args)
     );
     return { content: [{ type: "text", text: (typeof result === 'string' ? result : JSON.stringify(result)) || "(no return value)" }] };
+  }
+);
+
+server.tool(
+  "safari_eval_file",
+  "Execute JavaScript read from a FILE path (avoids passing huge scripts inline / manual copy). Same engine as safari_evaluate: extension-first (no focus steal), AppleScript fallback. Use to upload binary via a generated .js containing base64.",
+  { path: z.string().describe("Absolute path to a .js file whose contents are the script to execute") },
+  async (args) => {
+    const script = readFileSync(args.path, "utf8");
+    const result = await extensionOrFallback("evaluate", { script }, () => safari.evaluate({ script }));
+    return { content: [{ type: "text", text: (typeof result === "string" ? result : JSON.stringify(result)) || "(no return value)" }] };
   }
 );
 
@@ -2354,6 +2371,9 @@ server.tool(
   }
 );
 
+  return server;
+}
+
 // ========== START SERVER ==========
 
 // One-time-per-day startup banner — visible CTA without spamming MCP logs.
@@ -2398,5 +2418,6 @@ _startMemoryMonitor();
   } catch { /* best-effort, never block startup */ }
 })();
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+// Transport is chosen at runtime: default stdio (unchanged), or a shared HTTP instance when
+// SAFARI_MCP_HTTP=1 (many Claude sessions → one process). buildServer is the per-session factory.
+await startTransport(buildServer, process.env);
