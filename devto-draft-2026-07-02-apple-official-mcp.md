@@ -1,78 +1,73 @@
 ---
-title: "Apple shipped an official Safari MCP. I read all 17 tools — here's why I'm keeping mine."
+title: "Apple shipped an official Safari MCP. I read all 17 tools. Here's why I'm keeping mine."
 published: true
-description: "Apple just added a Model Context Protocol server to Safari Technology Preview 247. As the author of an open-source safari-mcp, I read the whole thing. Here's the honest comparison — what Apple got right, and why the two are built for different jobs."
-tags: ai, macos, opensource, webdev
+description: "Apple's WebKit team just shipped a Safari MCP server. I maintain an open-source one. So I read all 17 of their tools and found the single sentence that told me not to delete my repo."
+tags: webdev, ai, opensource, apple
 cover_image: https://raw.githubusercontent.com/achiya-automation/safari-mcp/543795ad20a782053ba7d5f13c996252f8a55d02/assets/apple-mcp-cover.png
 ---
 
-Yesterday Apple did something I've been half-expecting since I open-sourced [safari-mcp](https://github.com/achiya-automation/safari-mcp): they shipped their **own** Safari MCP server.
+Apple shipped the tool I've spent a year building as open source.
 
-It landed in **Safari Technology Preview 247** (July 1, 2026), built by the WebKit team. Any MCP-compatible agent — Claude, Cursor, whatever — can now connect straight to a Safari window and inspect the DOM, read the console, capture network requests, and take screenshots.
+For about ten minutes on Tuesday night, I thought I was cooked. Safari Technology Preview 247 dropped with an official Safari MCP server, built by the WebKit team, the people who actually make the browser. I maintain a scrappy AppleScript version of the same idea. David, meet Goliath's in-house team.
 
-I maintain a tool that does exactly this. So I did the obvious thing: I read the entire release, every one of the ~17 tools, and asked the only question that matters — **do I need to change anything?**
+So I did the only thing that made sense. I read all 17 of their tools, one by one. Somewhere around tool #9 I stopped feeling cooked. By the end I knew I wasn't deleting my repo, and the reason is a single sentence Apple wrote themselves.
 
-Here's the honest answer.
+## First, credit where it's due
 
-## What Apple actually shipped
+The design is clean. It runs on `safaridriver`, the WebDriver binary already shipping inside Safari, so setup is one command. It runs entirely on your machine. No page content, no screenshots, nothing phones home to Apple. The 17 tools cover the boring-but-essential debugging loop: open a URL, read the DOM, click things, watch the network tab, grab the console, screenshot the result.
 
-Credit where it's due. The design is clean and the privacy story is excellent:
+If what you want is an agent that debugs how a page renders in WebKit, this is a first-party, well-built way to get it. And honestly? It's the best validation I could ask for. A year ago people asked me why anyone would let an AI drive a browser. Apple just answered that for me.
 
-- It runs on `safaridriver`, Safari's built-in WebDriver binary. Enable *"remote automation and external agents"* in STP and connect with one command.
-- It runs **entirely locally**. No network calls to Apple. Page content, screenshots, and console logs go straight to your agent — not to Apple's servers.
-- The ~17 tools cover the real debugging loop: `navigate_to_url`, `get_page_content`, `evaluate_javascript`, `page_interactions` (click/type/scroll/hover), `screenshot`, `list_network_requests`, `browser_console_messages`, `browser_dialogs`, tab management, `set_viewport_size`, `set_emulated_media`.
+## The one sentence
 
-If your job is "let an agent debug how a page renders in WebKit," this is a first-party, well-built way to do it. It's also the strongest possible validation that the category I've been building in is real.
-
-## The one line that decides everything
-
-From Apple's own docs:
+Here's the line, straight from Apple's own docs:
 
 > "The Safari MCP server does not have access to your personal information in Safari (e.g. AutoFill or other browser activity)."
 
-That sentence is the whole story. `safaridriver` drives an **isolated WebDriver automation session** — a clean-room window with a "controlled by automation" banner. It is *not* the Safari you're already using, with your tabs and your logins.
+Read that again if you build automation. `safaridriver` spins up a clean, isolated WebDriver session. Fresh window. A "controlled by automation" banner across the top. None of your logins. None of your cookies. Not the twelve tabs you already have open.
 
-And that's not a bug. For a debugging tool, an isolated session is the *correct* design. Reproducible, no personal-state leakage, standards-based.
+For a debugging tool, that's the right call. Reproducible, sandboxed, no personal state leaking into a test run. I'd have designed it the same way.
 
-But it's the opposite of what I built.
+It's also the exact problem I built my tool to avoid.
 
-## safari-mcp was built for the other 95%
+## Why mine exists at all
 
-I didn't build safari-mcp to debug rendering. I built it so an agent could **drive the browser I'm already signed into** — Gmail, GitHub, Ahrefs, my bank — using native AppleScript + a Safari extension, in the background, without stealing focus, on **stable Safari**, on every Mac.
+I never built safari-mcp to debug rendering. I built it because I wanted an agent to drive the Safari I'm *already* logged into: my Gmail, my GitHub, my Ahrefs dashboard, my bank. No re-auth, no fresh profile, no QR code. It runs on native AppleScript in the background, on the stable Safari you already have, on any Mac. No Technology Preview required.
 
-So here's the comparison I put in the README, straight up:
+That's the whole difference. Apple's server opens a sterile room and hands your agent a key. Mine walks into the room you're already sitting in.
+
+Here's the honest scorecard I dropped into my README:
 
 | | safari-mcp | Apple `safaridriver --mcp` |
 |---|:---:|:---:|
 | Your real logins / cookies | ✅ Your actual Safari | ⚠️ Isolated automation session |
-| Runs on | ✅ Stable Safari, every Mac | ❌ Safari Technology Preview 247 only |
-| Background (no focus steal) | ✅ Yes | ❌ Dedicated "automation" window |
+| Runs on | ✅ Stable Safari, every Mac | ❌ Technology Preview 247 only |
+| Background, no focus steal | ✅ Yes | ❌ Dedicated automation window |
 | Tools | 96 | ~17 |
-| Storage (cookies, localStorage, IndexedDB) | ✅ 10 tools | ❌ |
-| Network mocking + throttling | ✅ Yes | ❌ Read-only inspection |
-| Official Apple support | ❌ Community (MIT) | ✅ Apple, WebDriver-standard |
+| Cookies / localStorage / IndexedDB | ✅ 10 tools | ❌ |
+| Network mocking + throttling | ✅ Yes | ❌ Read-only |
+| Official Apple support | ❌ Community, MIT | ✅ Apple, WebDriver-standard |
 
-Two numbers I want to be honest about, because I checked them on my own machine before writing this:
+I checked two of those rows on my own machine before writing this, because I didn't want to bluff. Stable `safaridriver` in Safari 26.5 has `--port`, `--bidi`, `--enable`, `--diagnose`. No `--mcp`. It only exists in the Preview today. And the isolated session really does mean no logins. That's the wall, and I built safari-mcp to climb over it.
 
-1. **`safaridriver --mcp` only exists in STP 247.** The stable `safaridriver` that ships with Safari 26.5 has `--port`, `--bidi`, `--enable`, `--diagnose` — no `--mcp`. So today, using Apple's server means installing Technology Preview.
-2. **The isolated session means no logins.** Which is exactly the wall I built safari-mcp to get around.
+## So am I changing anything? Yes. Three things, none of them "switch."
 
-## So am I changing anything? Yes — three things. None of them is "switch."
+**Positioning.** Apple didn't kill safari-mcp. They told the world what it's for. Theirs is the clean-room debugger; mine drives the browser you live in. I rewrote my README to say that out loud instead of pretending we compete.
 
-**1. Positioning, not code.** Apple didn't make safari-mcp obsolete; they clarified what it's *for*. Their server is the clean-room debugger. Mine is the "drive the browser you already trust" tool. Different jobs. I updated the README to say so out loud.
+**A safaridriver backend, eventually.** My tool already runs two engines under the hood, a Safari extension and AppleScript. Bolting on a third opt-in WebDriver backend, for people who genuinely want a sterile session, isn't a rewrite. It's a weekend. But it waits until `--mcp` reaches stable Safari, because right now it only lives in the Preview.
 
-**2. An opt-in `safaridriver` backend — later, not now.** My architecture is already dual-engine (extension + AppleScript). Adding a third, opt-in WebDriver backend for people who specifically want a standards-based clean session is a natural extension, not a rewrite. It's gated on STP going stable, so it waits.
-
-**3. Steal the one thing they do better.** WebDriver input is a rock-solid, officially-supported way to synthesize events. My native-input path leans on CGEvent, which gets fragile across macOS releases. `safaridriver` is a good model for a more stable input fallback. That's a genuine improvement I owe my users.
+**Stealing their best idea.** WebDriver synthesizes input events the official, rock-solid way. My native-click path leans on CGEvent, which macOS quietly breaks every other release (ask me how I know). Apple just handed me a sturdier fallback. I'd be silly not to take it.
 
 ## The takeaway
 
-When a platform vendor ships an official version of your open-source tool, the reflex is panic. But "official" and "replacement" are different words. Read the whole thing before you react. Nine times out of ten it's built for a slightly different job than yours — and the honest comparison is better marketing than any launch post.
+When the company that makes the browser ships an official version of your side project, the reflex is to panic. Don't. "Official" and "replacement" are different words. I read all 17 tools before I reacted, and the honest comparison turned out to be better marketing than any launch-day panic post could have been.
 
-Apple built the clean-room debugger. I built the tool that drives the browser you're already logged into. Both should exist.
+Apple built the sterile room. I built the tool for the room you already live in. Both should exist.
+
+I just know which one I'll actually reach for on a Tuesday.
 
 ---
 
-*safari-mcp is open source (MIT) — [github.com/achiya-automation/safari-mcp](https://github.com/achiya-automation/safari-mcp). It's native macOS Safari automation for AI agents: 96 tools, `npx safari-mcp`, no Chrome. More on what I build at [achiya-automation.com](https://achiya-automation.com).*
+*safari-mcp is open source (MIT): [github.com/achiya-automation/safari-mcp](https://github.com/achiya-automation/safari-mcp). 96 tools, `npx safari-mcp`, no Chrome, native macOS. I write about the things I build at [achiya-automation.com](https://achiya-automation.com).*
 
-**What would make you reach for an isolated debugging session over your real, logged-in browser — or the other way around? I'd genuinely like to know.**
+**Genuine question, because I keep flip-flopping on it: would you ever trade your logged-in browser for a clean automation session? What would have to be true to make that worth it?**
