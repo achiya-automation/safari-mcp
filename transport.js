@@ -71,6 +71,19 @@ export async function startTransport(createMcpServer, env = process.env) {
       }
 
       if (!transport) {
+        if (sid) {
+          // The client presented a session id we don't have — it expired, was evicted, or the
+          // daemon restarted under it. Per the MCP StreamableHTTP spec this MUST be 404 (NOT 400):
+          // a 404 tells the client the session is gone so it transparently re-initializes a fresh
+          // one. The old 400 wedged the client permanently on "No valid session" — every shared
+          // Claude Code session died the moment its session dropped, with no self-healing.
+          res.statusCode = 404;
+          res.end(
+            JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message: "Session not found" }, id: null })
+          );
+          return;
+        }
+        // No session id and not an initialize: a genuinely malformed first request.
         res.statusCode = 400;
         res.end(
           JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "No valid session" }, id: null })

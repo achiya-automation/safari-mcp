@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.15.1] - 2026-07-03
+
+### Fixed
+- **Shared HTTP mode (`SAFARI_MCP_HTTP`) now self-heals when a session drops.** A request carrying an unknown/expired `Mcp-Session-Id` returned **HTTP 400**, which wedged the MCP client permanently on `"No valid session"` — every shared Claude Code session died the moment its session dropped (idle SSE close, daemon restart, eviction) with no recovery. It now returns **HTTP 404** per the StreamableHTTP spec, so the client transparently re-initializes a fresh session. (A no-session-id, non-`initialize` request still returns 400.)
+
 ## [2.15.0] - 2026-07-03
 
 ### Added
