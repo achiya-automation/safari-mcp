@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="social-preview.png" alt="Safari MCP Server — 96 native browser automation tools for AI agents on macOS" width="100%">
+<img src="social-preview.png" alt="Safari MCP Server — 97 native browser automation tools for AI agents on macOS" width="100%">
 
 <br/>
 
@@ -24,9 +24,9 @@
 <a href="https://insiders.vscode.dev/redirect?url=vscode-insiders:mcp/install?%7B%22safari-mcp%22%3A%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D%7D"><img src="https://img.shields.io/badge/VS_Code_Insiders-Install_Server-24bfa5?logo=visual-studio-code&logoColor=white" alt="Install in VS Code Insiders"></a>
 <a href="cursor://anysphere.cursor-deeplink/mcp/install?name=safari-mcp&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D"><img src="https://img.shields.io/badge/Cursor-Install_Server-f97316?logo=cursor&logoColor=white" alt="Install in Cursor"></a>
 
-**96 tools** · **No Chrome/Puppeteer/Playwright needed** · **~5ms per command** · **60% less CPU than Chrome**
+**97 tools** · **No Chrome/Puppeteer/Playwright needed** · **~5ms per command** · **60% less CPU than Chrome**
 
-[Quick Start](#quick-start) · [All 96 Tools](#tools-96) · [Examples](examples/) · [Why Safari MCP?](#safari-mcp-vs-alternatives) · [Architecture](#architecture) · [Changelog](CHANGELOG.md)
+[Quick Start](#quick-start) · [All 97 Tools](#tools-97) · [Examples](examples/) · [Why Safari MCP?](#safari-mcp-vs-alternatives) · [Architecture](#architecture) · [Changelog](CHANGELOG.md)
 
 ![Safari MCP Demo](https://github.com/achiya-automation/safari-mcp/raw/main/assets/safari-mcp-promo.gif)
 
@@ -44,17 +44,17 @@ Your AI agent needs to browse. So it either:
 
 Your AI drives the **Safari you're already logged into** — Gmail, GitHub, Ahrefs, Slack, banking.
 
-Native WebKit. ~60% less CPU. Background operation. 96 tools. One `npx` command. macOS only.
+Native WebKit. ~60% less CPU. Background operation. 97 tools. One `npx` command. macOS only.
 
 > 📰 **Featured on freeCodeCamp:** [How to Connect Your AI Coding Agent to a Browser on macOS](https://www.freecodecamp.org/news/how-to-connect-your-ai-coding-agent-to-a-browser-on-macos/) · [HackerNoon: Reverse-Engineering React, Shadow DOM, and CSP](https://hackernoon.com/i-had-to-reverse-engineer-react-shadow-dom-and-csp-to-automate-safari-without-chrome)
 
-> 🍎 **Apple shipped an official Safari MCP** (Safari Technology Preview 247, July 2026). It's built on `safaridriver` for isolated debugging sessions. safari-mcp drives the **real Safari you're already logged into** — on stable Safari, with 96 tools. See the full comparison below.
+> 🍎 **Apple shipped an official Safari MCP** (Safari Technology Preview 247, July 2026). It's built on `safaridriver` for isolated debugging sessions. safari-mcp drives the **real Safari you're already logged into** — on stable Safari, with 97 tools. See the full comparison below.
 
 ---
 
 ## Highlights
 
-- **96 tools** — navigation, clicks, forms, screenshots, network, storage, accessibility, and more
+- **97 tools** — navigation, clicks, forms, screenshots, network, storage, accessibility, and more
 - **Zero heat** — native WebKit on Apple Silicon, ~60% less CPU than Chrome
 - **Your real browser** — keeps all logins, cookies, sessions (Gmail, GitHub, Ahrefs, etc.)
 - **Background operation** — Safari stays in the background, no window stealing
@@ -304,7 +304,7 @@ The recommended pattern for AI agents using Safari MCP:
 
 ---
 
-## Tools (96)
+## Tools (97)
 
 <details>
 <summary><b>Click to expand the full tool list — organized by category</b></summary>
@@ -382,6 +382,7 @@ The recommended pattern for AI agents using Safari MCP:
 | Tool | Description |
 |------|-------------|
 | `safari_evaluate` | Execute arbitrary JavaScript, return result |
+| `safari_eval_file` | Execute JavaScript read from a file path (avoids huge inline scripts) |
 
 ### Element Inspection (4)
 | Tool | Description |
@@ -531,7 +532,7 @@ Safari MCP runs locally on your Mac with minimal attack surface:
 | Your logins | ✅ Yes | ✅ Yes | ❌ No |
 | macOS native | ✅ WebKit | ❌ Chromium | ❌ Chromium/WebKit |
 | Browser dependencies | None | Chrome + debug port | Playwright runtime |
-| Tools | 96 | ~30 | ~25 |
+| Tools | 97 | ~30 | ~25 |
 | File upload | JS (no dialog) | CDP | Playwright API |
 | Image paste | JS (no clipboard) | CDP | Playwright API |
 | Focus steal | ❌ Background | ❌ Background | ❌ Headless |
@@ -550,7 +551,7 @@ In Safari Technology Preview 247 (July 2026), Apple shipped an **official** Safa
 | **Your real logins / cookies** | ✅ Your actual Safari | ⚠️ Isolated automation session — no access to AutoFill or browsing activity |
 | **Runs on** | ✅ Stable Safari, every Mac | ❌ Safari Technology Preview 247 only |
 | **Background (no focus steal)** | ✅ Yes | ❌ Dedicated window with a "controlled by automation" banner |
-| **Tools** | **96** | ~17 |
+| **Tools** | **97** | ~17 |
 | **Storage** (cookies, localStorage, IndexedDB) | ✅ 10 tools | ❌ |
 | **Network mocking + throttling** | ✅ Yes | ❌ Read-only network inspection |
 | **Device emulation** (iPhone, iPad) | ✅ Yes | ⚠️ Viewport + media type only |
@@ -565,7 +566,7 @@ There are several "safari-mcp" projects floating around. Here's how they compare
 
 | Feature | **🦁 safari-mcp** *(this repo)* | [lxman/safari-mcp-server](https://github.com/lxman/safari-mcp-server) | [Epistates/MCPSafari](https://github.com/Epistates/MCPSafari) | [HayoDev/safari-devtools-mcp](https://github.com/HayoDev/safari-devtools-mcp) |
 |---------|:------------------------------:|:----------------------:|:------------:|:----------------------:|
-| **Tools** | **96** | ~10 | 23 | ~15 |
+| **Tools** | **97** | ~10 | 23 | ~15 |
 | **Install** | `npx safari-mcp` | Manual | Binary | `npx` |
 | **Engine** | **Dual** (Extension + AppleScript) | WebDriver | Extension only | DevTools Protocol |
 | **Keeps your real Safari logins** | ✅ Yes | ⚠️ Limited | ✅ Yes | ❌ Debug session |
