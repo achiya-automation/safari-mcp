@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.15.2] - 2026-07-05
+
+### Fixed
+- **Clean installs were broken since 2.14.0 — `ERR_MODULE_NOT_FOUND: transport.js`.** `index.js` imports `./transport.js`, but the file was missing from the `package.json` `files` allowlist, so every published tarball from 2.14.0 through 2.15.1 omitted it. A fresh `npx safari-mcp` (with no local git checkout) exited immediately and the MCP client saw "Connection closed". `transport.js` is now published. Thanks to @e3nemyMine for the precise report (#50). Workaround for older releases: pin `safari-mcp@2.13.0`.
+
+### Internal
+- Added `test/packaging.test.mjs` — asserts every relative import in a published JS file is itself published, so an imported-but-unshipped file turns CI red instead of shipping a broken tarball.
+
 ## [2.15.1] - 2026-07-03
 
 ### Fixed
