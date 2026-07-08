@@ -848,3 +848,7 @@ If Safari MCP saves you from Chrome overhead, **a star helps others discover it:
 ## License
 
 MIT — use it however you want.
+
+---
+
+Built by **[Achiya Automation](https://achiya-automation.com)** — automation & AI agents for business.
