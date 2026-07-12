@@ -2731,6 +2731,11 @@ export async function typeText({ text, selector, ref }) {
     // Closure/Medium: char-by-char with keyboard events + Enter handling
     `var isClosure=el.isContentEditable&&(Object.keys(el).some(function(k){return k.startsWith('closure_uid_');})||location.hostname.includes('medium.com'));` +
     `if(isClosure){var txt='${safeText}';for(var i=0;i<txt.length;i++){var target=document.activeElement||el;var ch=txt[i];if(ch==='\\n'){target.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',keyCode:13,bubbles:true}));document.execCommand('insertParagraph');target.dispatchEvent(new KeyboardEvent('keyup',{key:'Enter',keyCode:13,bubbles:true}));continue;}var kc=ch.charCodeAt(0);target.dispatchEvent(new KeyboardEvent('keydown',{key:ch,keyCode:kc,bubbles:true}));document.execCommand('insertText',false,ch);target.dispatchEvent(new InputEvent('input',{data:ch,inputType:'insertText',bubbles:true}));target.dispatchEvent(new KeyboardEvent('keyup',{key:ch,keyCode:kc,bubbles:true}));}return 'Typed ${text.length} chars (Closure char-by-char)';}` +
+    // Typeahead/combobox (LinkedIn Ember, ARIA autocomplete): needs real per-char key
+    // events so the widget runs its async server search. execCommand's single InputEvent
+    // opens the menu (aria-expanded=true) but never fires the fetch → empty option list.
+    `var isCombo=('value' in el)&&(el.getAttribute('role')==='combobox'||el.getAttribute('aria-autocomplete')||el.hasAttribute('aria-controls'));` +
+    `if(isCombo){var tc='${safeText}';for(var j=0;j<tc.length;j++){var cc=tc[j];var kk=cc.charCodeAt(0);el.dispatchEvent(new KeyboardEvent('keydown',{key:cc,keyCode:kk,bubbles:true}));document.execCommand('insertText',false,cc);el.dispatchEvent(new InputEvent('input',{data:cc,inputType:'insertText',bubbles:true}));el.dispatchEvent(new KeyboardEvent('keyup',{key:cc,keyCode:kk,bubbles:true}));}return 'Typed '+${text.length}+' chars (combobox char-by-char)';}` +
     // Default: execCommand
     `var ok=document.execCommand('insertText',false,'${safeText}');if(ok)return 'Typed '+${text.length}+' chars';` +
     // Fallback for inputs where execCommand failed
