@@ -6,6 +6,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
+import { sessionCtx } from "./session-context.js";
+import { _dropSession } from "./safari.js";
 
 const DEFAULT_HTTP_PORT = 9225; // distinct from the 9224 Safari-extension port
 
@@ -64,7 +66,7 @@ export async function startTransport(createMcpServer, env = process.env) {
           },
         });
         transport.onclose = () => {
-          if (transport.sessionId) transports.delete(transport.sessionId);
+          if (transport.sessionId) { transports.delete(transport.sessionId); _dropSession(transport.sessionId); }
         };
         const server = createMcpServer(); // fresh server per session (McpServer is single-connection)
         await server.connect(transport);
@@ -91,7 +93,7 @@ export async function startTransport(createMcpServer, env = process.env) {
         return;
       }
 
-      await transport.handleRequest(req, res, body);
+      await sessionCtx.run({ sessionId: sid ?? "_init" }, () => transport.handleRequest(req, res, body));
     } catch {
       if (!res.headersSent) {
         res.statusCode = 500;

@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { VIEWPORT_SCRIPT, SAFE_AREA_SCRIPT, PWA_SCRIPT, WEBKIT_COMPAT_SCRIPT } from "./injected-validators.js";
 import { escJsSingleQuote, escAppleScriptString } from "./injected-escape.js";
+import { currentSessionId } from "./session-context.js";
 // Extension bridge is handled by index.js (WebSocket server on port 9223)
 
 const execFileAsync = promisify(execFile);
@@ -202,24 +203,34 @@ async function _restoreClipboard(savedContent) {
 // we track which tab we're "working on" by URL (not index, because indices shift
 // when the user opens/closes tabs). Before each operation we resolve the URL
 // to the current index.
-let _activeTabIndex = null; // null = use front document (default)
-let _activeTabURL = null;   // URL-based tracking (stable even when tabs shift)
-// Timestamp of most recent new_tab — within this grace window we MUST NOT fall
-// back to "current tab of window" (which is the USER'S active tab). New tabs
-// often start at about:blank if their URL fails to load (file://, blocked, etc.),
-// and the URL-based marker resolution can fail until the page actually loads.
-// During the grace window, navigate/click/fill operations either use the cached
-// _activeTabIndex or fail loudly — never silently target the user's tab.
-// Becomes true once safari_new_tab is called for the first time in this session.
-// Once true, write operations (navigate/click/fill) MUST NOT fall back to
-// "current tab of window" — that targets the USER'S active tab. The 30s grace
-// window was insufficient: tab tracking can be lost much later in a session
-// (e.g. tab ghost recovery in runJS), and silently falling back to the user's
-// tab caused incidents where the user's working tab was overwritten.
-let _hasOwnedTab = false;
-let _lastResolveTime = 0;   // Cache: skip resolve if verified recently
-let _lastTabCount = null;   // Track tab count for smart cache invalidation
-let _activeTabMarker = null; // window.__mcpTabMarker — survives same-tab navigation, bulletproof tab identity
+// ── Per-session tab state (see session-context.js) ──────────────────────────
+// Was six module-global `let`s. In HTTP-daemon mode one process serves many Claude
+// sessions and they overwrote each other's tab pointer → operations drifted onto the
+// wrong (often the user's) tab. Now keyed per MCP session via _st(). Field notes:
+//   activeTabIndex  — null = use front document (default)
+//   activeTabURL    — URL-based tracking (stable even when tabs shift)
+//   hasOwnedTab     — once true (after first safari_new_tab in the session), write ops
+//                     (navigate/click/fill) MUST NOT fall back to "current tab of window"
+//                     (the USER'S tab). The 30s grace window was insufficient — tracking
+//                     can be lost late in a session (e.g. tab ghost recovery in runJS);
+//                     silent fallback overwrote the user's working tab in past incidents.
+//   lastResolveTime — cache: skip resolve if verified recently
+//   lastTabCount    — track tab count for smart cache invalidation
+//   activeTabMarker — window.__mcpTabMarker; survives same-tab navigation, bulletproof id
+//   markerId        — per-session unique id baked into the marker string
+const _sessions = new Map();
+function _st() {
+  const sid = currentSessionId();
+  let s = _sessions.get(sid);
+  if (!s) {
+    s = { activeTabIndex: null, activeTabURL: null, hasOwnedTab: false,
+          lastResolveTime: 0, lastTabCount: null, activeTabMarker: null,
+          markerId: randomUUID().slice(0, 8) };
+    _sessions.set(sid, s);
+  }
+  return s;
+}
+export function _dropSession(sid) { _sessions.delete(sid); } // called on MCP session close
 const RESOLVE_CACHE_MS = 100; // Brief cache — was 500, reduced to catch tabs added by user/popups (v2.8.3 fix)
 
 // ========== DIAGNOSTIC LOG ==========
@@ -358,13 +369,13 @@ function isStaleWindowError(err) {
 // during the new-tab grace window. Without this, navigate/fill/click silently
 // target whatever tab the user is looking at when our cached index is lost.
 function _assertNotFallingBackToUserTab(opName) {
-  if (_activeTabIndex) return; // we have a tracked index — fine
+  if (_st().activeTabIndex) return; // we have a tracked index — fine
   // If we ever opened our own tab in this session, we MUST NOT fall back to
   // "current tab of window" — that's the USER'S active tab. Always throw,
   // regardless of how long ago the tab was opened. The previous 30-second
   // grace window was insufficient: long-running sessions (Reddit warmup,
   // multi-step workflows) routinely exceed it, and the danger persists.
-  if (_hasOwnedTab) {
+  if (_st().hasOwnedTab) {
     throw new Error(
       `Tab tracking lost — refusing to ${opName} via fallback to "current tab of window" (would target the user's active tab). ` +
       `This session previously opened its own tab via safari_new_tab; re-run safari_new_tab to recover, or call safari_list_tabs and safari_switch_tab to re-anchor to a known tab.`
@@ -411,8 +422,8 @@ function _buildStampJS(marker) {
 // Identity-critical: a missed stamp loses the tab marker, so this is NOT best-effort —
 // a daemon hiccup falls back to the reliable osascript subprocess.
 async function _stampTab(idx) {
-  if (!idx || !_activeTabMarker) return;
-  const js = _buildStampJS(_activeTabMarker).replace(/"/g, '\\"');
+  if (!idx || !_st().activeTabMarker) return;
+  const js = _buildStampJS(_st().activeTabMarker).replace(/"/g, '\\"');
   const script = `tell application "Safari" to do JavaScript "${js}" in tab ${idx} of ${getTargetWindowRef()}`;
   try {
     await osascriptFast(script, { timeout: 5000 });
@@ -553,30 +564,30 @@ function _helperActivateApp(bundleId, timeout = 2000) {
 }
 
 export function setFocusGuard(active) { _focusGuardActive = active; }
-export function getActiveTabIndex() { return _activeTabIndex; }
-export function setActiveTabIndex(idx) { _activeTabIndex = idx; }
-export function getActiveTabURL() { return _activeTabURL; }
-export function setActiveTabURL(url) { _activeTabURL = url; _lastResolveTime = Date.now(); }
+export function getActiveTabIndex() { return _st().activeTabIndex; }
+export function setActiveTabIndex(idx) { _st().activeTabIndex = idx; }
+export function getActiveTabURL() { return _st().activeTabURL; }
+export function setActiveTabURL(url) { _st().activeTabURL = url; _st().lastResolveTime = Date.now(); }
 
 // Resolve our tracked URL to current tab index — single combined osascript call
 async function resolveActiveTab() {
-  if (!_activeTabURL && !_activeTabMarker) return _activeTabIndex;
+  if (!_st().activeTabURL && !_st().activeTabMarker) return _st().activeTabIndex;
 
   // Strategy 1: identity marker — window.name (survives ALL navigation: full loads,
   // redirects, cross-origin) or window.__mcpTabMarker (survives SPA routing).
   // One AppleScript call loops every tab internally: faster and far more reliable
   // than N separate daemon round-trips (a daemon hiccup mid-scan used to silently
   // mis-resolve to the user's tab).
-  if (_activeTabMarker) {
+  if (_st().activeTabMarker) {
     try {
-      const safeMarker = _activeTabMarker.replace(/'/g, "\\'");
+      const safeMarker = _st().activeTabMarker.replace(/'/g, "\\'");
       const check = `(function(){try{return (window.name==='${safeMarker}'||window.__mcpTabMarker==='${safeMarker}')?'1':'0'}catch(e){return '0'}})()`;
       const scanScript = `tell application "Safari"
         set w to ${getTargetWindowRef()}
         set n to count of tabs of w
-        ${_activeTabIndex ? `try
-          if n is greater than or equal to ${_activeTabIndex} then
-            if (do JavaScript "${check}" in tab ${_activeTabIndex} of w) is "1" then return ${_activeTabIndex}
+        ${_st().activeTabIndex ? `try
+          if n is greater than or equal to ${_st().activeTabIndex} then
+            if (do JavaScript "${check}" in tab ${_st().activeTabIndex} of w) is "1" then return ${_st().activeTabIndex}
           end if
         end try` : ''}
         repeat with i from n to 1 by -1
@@ -591,36 +602,36 @@ async function resolveActiveTab() {
       if (res === null) res = await osascript(scanScript).catch(() => null);
       if (res !== null) {
         const found = Number(String(res).trim());
-        if (found > 0) { _activeTabIndex = found; return found; }
+        if (found > 0) { _st().activeTabIndex = found; return found; }
         // Reliable scan completed and the marker is on NO tab — it is genuinely
         // gone (tab closed, or a site overwrote window.name). Drop it; the URL
         // strategy below is the last chance before we fail safe.
-        _activeTabMarker = null;
+        _st().activeTabMarker = null;
       }
       // res === null → both attempts errored; can't verify — keep marker, fall through.
     } catch { /* fall through to URL strategy */ }
   }
 
-  if (!_activeTabURL) {
+  if (!_st().activeTabURL) {
     // No URL to resolve. If this session owns a tab but the marker is gone, we can
     // no longer positively identify our tab — refuse to return a stale index that
     // may now point at the user's tab. runJS will throw a clear re-anchor error.
-    if (_hasOwnedTab && !_activeTabMarker) { _activeTabIndex = null; }
-    return _activeTabIndex;
+    if (_st().hasOwnedTab && !_st().activeTabMarker) { _st().activeTabIndex = null; }
+    return _st().activeTabIndex;
   }
 
   try {
-    const safeUrl = _activeTabURL.replace(/"/g, '\\"');
-    const domain = _activeTabURL.replace(/^https?:\/\//, '').split('/')[0].replace(/"/g, '\\"');
+    const safeUrl = _st().activeTabURL.replace(/"/g, '\\"');
+    const domain = _st().activeTabURL.replace(/^https?:\/\//, '').split('/')[0].replace(/"/g, '\\"');
     // Single AppleScript call: verify current index, then search by URL, then by domain
     // Also returns tabCount so we can clamp stale indices
     const result = await osascriptFast(
       `tell application "Safari"
         set w to ${getTargetWindowRef()}
         set tabCount to count of tabs of w
-        ${_activeTabIndex ? `try
-          if tabCount >= ${_activeTabIndex} then
-            if URL of tab ${_activeTabIndex} of w starts with "${safeUrl}" then return ${_activeTabIndex}
+        ${_st().activeTabIndex ? `try
+          if tabCount >= ${_st().activeTabIndex} then
+            if URL of tab ${_st().activeTabIndex} of w starts with "${safeUrl}" then return ${_st().activeTabIndex}
           end if
         end try` : ''}
         repeat with i from tabCount to 1 by -1
@@ -637,35 +648,35 @@ async function resolveActiveTab() {
     if (resultStr.includes(':')) {
       // Not found — clamp stale index to tabCount
       const tabCount = Number(resultStr.split(':')[1]) || 1;
-      _lastTabCount = tabCount;
-      _activeTabURL = null;
-      if (_hasOwnedTab && !_activeTabMarker) {
+      _st().lastTabCount = tabCount;
+      _st().activeTabURL = null;
+      if (_st().hasOwnedTab && !_st().activeTabMarker) {
         // Identity fully lost: marker gone AND URL matches no tab. Returning the
         // stale index could silently target the user's tab. Fail safe — drop it.
         console.error('[Safari MCP] Tab identity lost (marker + URL unresolved) — clearing index to avoid targeting the user\'s tab');
-        _activeTabIndex = null;
+        _st().activeTabIndex = null;
         return null;
       }
-      if (_activeTabIndex && _activeTabIndex > tabCount) {
-        console.error(`[Safari MCP] Tab ghost proactive fix: index ${_activeTabIndex} > tabCount ${tabCount}, clamping to ${tabCount}`);
-        _activeTabIndex = tabCount;
+      if (_st().activeTabIndex && _st().activeTabIndex > tabCount) {
+        console.error(`[Safari MCP] Tab ghost proactive fix: index ${_st().activeTabIndex} > tabCount ${tabCount}, clamping to ${tabCount}`);
+        _st().activeTabIndex = tabCount;
       }
-      return _activeTabIndex;
+      return _st().activeTabIndex;
     }
     const num = Number(result);
     if (num > 0) {
-      _activeTabIndex = num;
+      _st().activeTabIndex = num;
       return num;
     }
     if (num < 0) {
       // Domain match (negative = partial match)
-      _activeTabIndex = -num;
+      _st().activeTabIndex = -num;
       return -num;
     }
-    _activeTabURL = null;
-    return _activeTabIndex;
+    _st().activeTabURL = null;
+    return _st().activeTabIndex;
   } catch {
-    return _activeTabIndex;
+    return _st().activeTabIndex;
   }
 }
 
@@ -848,7 +859,14 @@ function _helperPreflight(timeout = 3000) {
 // Sends a CGEvent click command to the Swift helper daemon.
 // This produces isTrusted: true events — bypasses WAF protection (G2, etc.)
 
+// Guarded at the root: a CGEvent hits the window's SELECTED tab, so every caller — not just
+// nativeClick — must have our tab selected first. _withTargetTabFronted is re-entrant, so the
+// public native* wrappers (which front the tab before measuring coordinates) cost nothing extra.
 function _helperNativeClick(x, y, doubleClick = false, windowId = 0, timeout = 5000) {
+  return _withTargetTabFronted(() => _helperNativeClickRaw(x, y, doubleClick, windowId, timeout));
+}
+
+function _helperNativeClickRaw(x, y, doubleClick = false, windowId = 0, timeout = 5000) {
   return _withHelperLock(() => new Promise((resolve, reject) => {
     if (!_helperProc) startHelper();
     if (!_helperProc || !_helperProc.stdin || !_helperProc.stdin.writable) {
@@ -946,6 +964,10 @@ function _helperNativeHover(x, y, windowId = 0, dwellMs = 500, restoreMouse = tr
 // Sends a CGEvent keyboard command to the Swift helper daemon.
 // No focus stealing — sends key events directly to the target window via PID.
 function _helperNativeKeyboard(keyCode, flags = [], windowId = 0, timeout = 5000) {
+  return _withTargetTabFronted(() => _helperNativeKeyboardRaw(keyCode, flags, windowId, timeout));
+}
+
+function _helperNativeKeyboardRaw(keyCode, flags = [], windowId = 0, timeout = 5000) {
   return _withHelperLock(() => new Promise((resolve, reject) => {
     if (!_helperProc) startHelper();
     if (!_helperProc || !_helperProc.stdin || !_helperProc.stdin.writable) {
@@ -1049,6 +1071,68 @@ async function _getSafariWindowGeometry() {
   };
 }
 
+// ========== NATIVE-EVENT TAB GUARD ==========
+// A CGEvent is delivered to a WINDOW, and the window routes it to whichever tab is
+// SELECTED — there is no per-tab CGEvent target. runJS does not have this problem: it
+// reaches background tabs through AppleScript. So every native_* op has a split brain —
+// coordinates measured against OUR tab, event delivered to the USER'S tab. A native click
+// aimed at our tab 8 landed on the user's tab 4 (facebook.com/groups) instead: silently
+// wrong, and an OS-level click on a tab we never owned.
+//
+// Fix: select the target tab for the duration of the event, then put the user's tab back.
+// `set current tab` switches within the window only — it never calls `activate`, so Safari
+// is not raised and foreground focus is not stolen. If we own no tab, or already hold the
+// selection, this is a no-op and no switch happens.
+const NATIVE_TAB_SETTLE_MS = 120; // let the selected tab paint before the event lands
+
+// Re-entrancy: the guard sits on both the public native* fns (so coordinates are measured
+// against a fronted tab) and the low-level _helperNative* calls (so no caller can slip past
+// it). A multi-event op like replaceEditorContent — Cmd+A then Cmd+V — must not flip tabs
+// between keystrokes, so nested calls run inside the selection the outermost one took.
+let _tabFrontedDepth = 0;
+
+async function _withTargetTabFronted(fn) {
+  if (_tabFrontedDepth > 0) return await fn(); // already inside a fronted section
+
+  const idx = _st().activeTabIndex;
+  if (!idx) return await fn(); // no owned tab — nothing to front
+
+  const winRef = getTargetWindowRef();
+  let prev;
+  try {
+    prev = Number(
+      await osascriptFast(`tell application "Safari" to tell ${winRef} to return (index of current tab) as text`)
+    );
+  } catch (_e) {
+    // Can't read the selection — switching blind risks stranding the user on our tab.
+    // Deliver the event as-is rather than leave the selection somewhere they didn't put it.
+    return await fn();
+  }
+
+  if (!Number.isFinite(prev)) return await fn();
+
+  // Already selected? Then no switch and no restore — but still mark the section, so nested
+  // _helperNative* calls skip re-checking the selection on every keystroke.
+  const mustSwitch = prev !== idx;
+  if (mustSwitch) {
+    await osascriptFast(`tell application "Safari" to tell ${winRef} to set current tab to tab ${idx}`);
+    await new Promise((r) => setTimeout(r, NATIVE_TAB_SETTLE_MS));
+  }
+
+  _tabFrontedDepth++;
+  try {
+    return await fn();
+  } finally {
+    _tabFrontedDepth--;
+    // Always hand the user's tab back — even if the event threw.
+    if (mustSwitch) {
+      try {
+        await osascriptFast(`tell application "Safari" to tell ${winRef} to set current tab to tab ${prev}`);
+      } catch (_e) { /* restore is best-effort; never mask the real result */ }
+    }
+  }
+}
+
 // Run JavaScript in Safari — fastest path, no focus stealing
 // Uses osascriptFast (persistent process, ~5ms) for short scripts,
 // falls back to osascript (~80ms) for long scripts that exceed stdin limits
@@ -1063,22 +1147,25 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
     .replace(/\t/g, " ");
   // Resolve tab: explicit tabIndex > cached index > URL-tracked tab > front document
   let idx = tabIndex;
-  if (!idx && _activeTabIndex && _activeTabURL && (Date.now() - _lastResolveTime < RESOLVE_CACHE_MS)) {
-    // Recently verified and tab count unchanged — use cached index
-    idx = _activeTabIndex;
-  } else if (!idx && (_activeTabURL || _activeTabMarker)) {
+  if (!idx && _st().activeTabIndex && _st().activeTabURL && !_st().activeTabMarker && (Date.now() - _st().lastResolveTime < RESOLVE_CACHE_MS)) {
+    // Recently verified and tab count unchanged — use cached index.
+    // Skipped when we hold a tab marker: a live marker means re-resolving is cheap
+    // (resolveActiveTab checks the cached index first) and closes the ~100ms window in
+    // which a user tab-shift could leave the cached index pointing at the user's tab.
+    idx = _st().activeTabIndex;
+  } else if (!idx && (_st().activeTabURL || _st().activeTabMarker)) {
     // Resolve by URL or marker — the marker scan still finds an owned tab
-    // even after _activeTabURL has been cleared by a failed URL lookup.
+    // even after _st().activeTabURL has been cleared by a failed URL lookup.
     const resolved = await resolveActiveTab();
-    if (resolved) { idx = resolved; _lastResolveTime = Date.now(); }
+    if (resolved) { idx = resolved; _st().lastResolveTime = Date.now(); }
   }
-  // ALWAYS fall back to _activeTabIndex — never clear it from resolve failures
-  if (!idx) idx = _activeTabIndex;
+  // ALWAYS fall back to _st().activeTabIndex — never clear it from resolve failures
+  if (!idx) idx = _st().activeTabIndex;
   // Once this session owns a tab, never silently run on the user's current tab —
   // regardless of SAFARI_PROFILE. Without a profile getFallbackTarget() returns
   // "front document" (the user's active tab), so the guard matters MOST there.
-  // Mirrors runJSLarge and the ghost-recovery guard below, which key on _hasOwnedTab alone.
-  if (!idx && _hasOwnedTab) {
+  // Mirrors runJSLarge and the ghost-recovery guard below, which key on _st().hasOwnedTab alone.
+  if (!idx && _st().hasOwnedTab) {
     throw new Error('Tab tracking lost during runJS — refusing to target the user\'s current tab. Call safari_new_tab to reopen.');
   }
   const target = idx
@@ -1088,23 +1175,45 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
   // target tab in the background regardless of window stacking. (rAF/timers stay frozen
   // while the window is occluded by macOS; that is a deliberate trade-off — measuring an
   // occluded window's frame rate is not worth stealing focus. Measure when it's visible.)
-  const script = `tell application "Safari" to do JavaScript "${escaped}" in ${target}`;
+  // Atomic tab-identity guard: prepend a JS check that throws MCP_WRONG_TAB if the target tab
+  // does not carry OUR marker. Makes the op fail-closed at EXECUTION time regardless of how
+  // `idx` resolved — a drift to the user's tab (shared profile window) throws instead of
+  // running on their page. Skipped when the caller passed an explicit tabIndex.
+  const _guard = (_st().activeTabMarker && !tabIndex)
+    ? `if(window.name!=='${_st().activeTabMarker}'&&window.__mcpTabMarker!=='${_st().activeTabMarker}'){throw new Error('MCP_WRONG_TAB')};`
+    : '';
+  const script = `tell application "Safari" to do JavaScript "${_guard}${escaped}" in ${target}`;
   try {
     if (script.length < 50000) {
       return await osascriptFast(script, { timeout });
     }
     return await osascript(script, { timeout });
   } catch (err) {
+    // Atomic guard tripped: op reached a tab WITHOUT our marker (drift to the user's tab in
+    // the shared profile window). Re-resolve via a full marker scan and retry once on the
+    // correct tab; if unresolved, fail closed rather than touch the user's tab.
+    const _gmsg = err.message || '';
+    if (_guard && _gmsg.includes('MCP_WRONG_TAB')) {
+      console.error('[Safari MCP] Atomic guard tripped — re-resolving marked tab via full scan');
+      _st().lastResolveTime = 0; _st().activeTabIndex = null;
+      const _reIdx = (_st().activeTabURL || _st().activeTabMarker) ? await resolveActiveTab() : null;
+      if (_reIdx) {
+        const _gs = `tell application "Safari" to do JavaScript "${_guard}${escaped}" in tab ${_reIdx} of ${getTargetWindowRef()}`;
+        if (_gs.length < 50000) return await osascriptFast(_gs, { timeout });
+        return await osascript(_gs, { timeout });
+      }
+      throw new Error('Tab tracking lost — marked tab not found (atomic guard fail-closed). Call safari_new_tab to reopen.');
+    }
     // Tab ghost recovery: "Can't get tab X" → re-resolve and retry once.
     // Match both apostrophes — Safari emits a typographic apostrophe (U+2019),
     // so a plain "Can't" includes() check silently missed every ghost error.
     const msg = err.message || '';
     if (idx && (/[Cc]an.t get tab/.test(msg) || msg.includes("-1728"))) {
       console.error(`[Safari MCP] Tab ghost detected (tab ${idx}), re-resolving...`);
-      _lastResolveTime = 0; // Force re-resolve
-      _lastTabCount = null;  // Invalidate tab count cache
-      _activeTabIndex = null;
-      if (_activeTabURL || _activeTabMarker) {
+      _st().lastResolveTime = 0; // Force re-resolve
+      _st().lastTabCount = null;  // Invalidate tab count cache
+      _st().activeTabIndex = null;
+      if (_st().activeTabURL || _st().activeTabMarker) {
         const newIdx = await resolveActiveTab();
         if (newIdx && newIdx !== idx) {
           console.error(`[Safari MCP] Tab ghost resolved: ${idx} → ${newIdx}`);
@@ -1118,7 +1227,7 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
       // fall back to "current tab of window" (which is the USER'S active tab).
       // Falling back would silently run our JS (potentially writes:
       // document.title=, location.href=) on the user's working page.
-      if (_hasOwnedTab) {
+      if (_st().hasOwnedTab) {
         throw new Error(
           `Tab tracking lost during runJS — original tab ${idx} no longer exists, and URL-based resolution failed. ` +
           `Refusing to fall back to "current tab of window" (would target user's active tab). ` +
@@ -1142,16 +1251,16 @@ async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
   // Resolve tab the same way runJS does — verify cached index via URL
   let idx = tabIndex;
   // Match runJS: resolve when EITHER the URL or the tab marker is tracked — after a
-  // redirect clears _activeTabURL the marker is still authoritative; skipping the
+  // redirect clears _st().activeTabURL the marker is still authoritative; skipping the
   // scan meant large-payload ops (upload/paste) could target a stale index.
-  if (!idx && ((_activeTabURL && _activeTabURL !== 'about:blank' && _activeTabURL !== '') || _activeTabMarker)) {
+  if (!idx && ((_st().activeTabURL && _st().activeTabURL !== 'about:blank' && _st().activeTabURL !== '') || _st().activeTabMarker)) {
     const resolved = await resolveActiveTab();
-    if (resolved) { idx = resolved; _lastResolveTime = Date.now(); }
+    if (resolved) { idx = resolved; _st().lastResolveTime = Date.now(); }
   }
-  if (!idx) idx = _activeTabIndex;
+  if (!idx) idx = _st().activeTabIndex;
   // If we previously owned a tab but lost tracking, refuse to target current tab
   // (which is the USER'S active tab). Same protection as navigate/runJS fallback.
-  if (!idx && _hasOwnedTab) {
+  if (!idx && _st().hasOwnedTab) {
     throw new Error(
       `Tab tracking lost during runJSLarge — refusing to fall back to "current tab of window" (would target user's active tab). ` +
       `Call safari_new_tab to open a fresh tab and retry.`
@@ -1203,14 +1312,14 @@ export async function navigate(url) {
   // the AppleScript string literal and allow AppleScript injection.
   const safeUrl = targetUrl.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/[\r\n]/g, '');
     // Resolve tab by URL first (in case indices shifted)
-    if (_activeTabURL) await resolveActiveTab();
+    if (_st().activeTabURL) await resolveActiveTab();
     _assertNotFallingBackToUserTab('navigate');
     // Capture our tab index ONCE. Every internal runJS below targets it explicitly:
     // re-resolving mid-navigation is unsafe — a cross-origin load transiently wipes
     // window.name (a browser privacy feature) and the tracked URL is stale until the
     // new page settles, so resolveActiveTab() would conclude "identity lost" and drop
     // the very tab we are navigating.
-    const navIndex = _activeTabIndex;
+    const navIndex = _st().activeTabIndex;
     const navTarget = navIndex
       ? `tab ${navIndex} of ${getTargetWindowRef()}`
       : getFallbackTarget();
@@ -1232,9 +1341,9 @@ export async function navigate(url) {
     // on a heavy SPA; if any step throws mid-load, resolveActiveTab() can still re-find
     // this tab by URL instead of clearing the index and locking the session out of its
     // own tab. Corrected to the real landed URL once the page settles (below).
-    _activeTabURL = targetUrl;
-    _activeTabIndex = navIndex;
-    _lastResolveTime = Date.now();
+    _st().activeTabURL = targetUrl;
+    _st().activeTabIndex = navIndex;
+    _st().lastResolveTime = Date.now();
 
     // about:blank and any already-loaded page report readyState 'complete' the instant
     // we poll, BEFORE the async set-URL takes effect — so breaking on readyState alone
@@ -1307,9 +1416,9 @@ export async function navigate(url) {
       if (retryUrl && retryUrl === preNavUrl) {
         // Preserve tab tracking (index + the page actually showing) so the session can
         // recover via switch_tab / re-navigate instead of being locked out of its tab.
-        _activeTabURL = preNavUrl;
-        _activeTabIndex = navIndex;
-        _lastResolveTime = Date.now();
+        _st().activeTabURL = preNavUrl;
+        _st().activeTabIndex = navIndex;
+        _st().lastResolveTime = Date.now();
         throw new Error(`navigate failed: page stayed on ${preNavUrl} — Safari "set URL" to ${targetUrl} had no effect (Safari automation/daemon issue, retry exhausted)`);
       }
     }
@@ -1342,10 +1451,10 @@ export async function navigate(url) {
         // Update URL tracking with actual URL after HTTP retry
         try {
           const retryParsed = JSON.parse(retry);
-          if (retryParsed.url) _activeTabURL = retryParsed.url;
+          if (retryParsed.url) _st().activeTabURL = retryParsed.url;
         } catch {}
-        _activeTabIndex = navIndex;
-        _lastResolveTime = Date.now();
+        _st().activeTabIndex = navIndex;
+        _st().lastResolveTime = Date.now();
         await _stampTab(navIndex);
         return retry;
       }
@@ -1354,12 +1463,12 @@ export async function navigate(url) {
     // Update URL tracking after navigation (non-blocked path)
     try {
       const parsed = JSON.parse(result);
-      _activeTabURL = parsed.url || targetUrl;
+      _st().activeTabURL = parsed.url || targetUrl;
     } catch {
-      _activeTabURL = targetUrl;
+      _st().activeTabURL = targetUrl;
     }
-    _activeTabIndex = navIndex;
-    _lastResolveTime = Date.now();
+    _st().activeTabIndex = navIndex;
+    _st().lastResolveTime = Date.now();
 
     // Re-stamp identity marker + visibility spoof onto the settled page. A cross-origin
     // navigation clears window.name, and any full load wipes __mcpTabMarker and the
@@ -1395,31 +1504,31 @@ async function _pollReadyAndRead(navIndex, { maxLength } = {}) {
 
 export async function goBack() {
   await refreshTargetWindow();
-  const navIndex = _activeTabIndex;
+  const navIndex = _st().activeTabIndex;
   // history.back() is synchronous; the page-load wait is polled from Node (see _pollReadyAndRead).
   await runJS("history.back()", { tabIndex: navIndex, timeout: 5000 });
   const result = await _pollReadyAndRead(navIndex);
-  try { const p = JSON.parse(result); if (p.url) _activeTabURL = p.url; } catch {}
+  try { const p = JSON.parse(result); if (p.url) _st().activeTabURL = p.url; } catch {}
   return result;
 }
 
 export async function goForward() {
   await refreshTargetWindow();
-  const navIndex = _activeTabIndex;
+  const navIndex = _st().activeTabIndex;
   await runJS("history.forward()", { tabIndex: navIndex, timeout: 5000 });
   const result = await _pollReadyAndRead(navIndex);
-  try { const p = JSON.parse(result); if (p.url) _activeTabURL = p.url; } catch {}
+  try { const p = JSON.parse(result); if (p.url) _st().activeTabURL = p.url; } catch {}
   return result;
 }
 
 export async function reload(hardReload = false) {
   await refreshTargetWindow();
-  const navIndex = _activeTabIndex;
+  const navIndex = _st().activeTabIndex;
   // Reload destroys JS context — fire it, then poll readyState from Node.
   await runJS(hardReload ? "location.reload(true)" : "location.reload()", { tabIndex: navIndex });
   await new Promise((r) => setTimeout(r, 100)); // Brief wait for reload to start
   const result = await _pollReadyAndRead(navIndex);
-  try { const p = JSON.parse(result); if (p.url) _activeTabURL = p.url; } catch {}
+  try { const p = JSON.parse(result); if (p.url) _st().activeTabURL = p.url; } catch {}
   // A reload destroys the JS context — re-stamp marker + visibility spoof.
   await _stampTab(navIndex);
   return result;
@@ -1492,11 +1601,20 @@ const _HELPERS_ESCAPED = INJECT_MCP_HELPERS
 // Skips runJS overhead (escaping, tab resolution) since we already have the escaped string
 async function _injectHelpersfast() {
   await refreshTargetWindow();
-  let idx = _activeTabIndex;
+  let idx = _st().activeTabIndex;
+  // Re-verify identity via the tab marker before trusting the cached index. This path
+  // used _st().activeTabIndex directly, so a user tab-shift (which changes which tab lives at
+  // that index) would inject helpers into the USER's tab. resolveActiveTab() scans for our
+  // marker and is fail-closed (returns null when identity is lost), so the guard below
+  // then throws instead of hitting the user's tab.
+  if (_st().hasOwnedTab && (_st().activeTabURL || _st().activeTabMarker)) {
+    const resolved = await resolveActiveTab();
+    idx = resolved || null;
+  }
   // Same guard as runJS: once this session has owned a tab, NEVER fall back to
   // "front document" — that's the user's active tab, and injecting the helpers
   // there is script injection into a page the user is working in.
-  if (!idx && _hasOwnedTab) {
+  if (!idx && _st().hasOwnedTab) {
     throw new Error("Tab tracking lost — refusing to inject helpers into the front (user) tab.");
   }
   const target = idx
@@ -1515,12 +1633,12 @@ const HELPERS_CACHE_MS = 10000; // Re-verify every 10s max
 async function ensureHelpers() {
   // Skip check if we recently verified helpers on the same URL
   const now = Date.now();
-  if (_activeTabURL && _helpersInjectedForUrl === _activeTabURL && (now - _helpersInjectedAt) < HELPERS_CACHE_MS) return;
+  if (_st().activeTabURL && _helpersInjectedForUrl === _st().activeTabURL && (now - _helpersInjectedAt) < HELPERS_CACHE_MS) return;
 
   // Check if helpers are actually present (not just version flag)
   const check = await runJS("(typeof mcpClickWithReact==='function'&&typeof mcpFindText==='function'&&typeof mcpReactSelectSet==='function')?'ok':'missing'").catch(() => 'missing');
   if (check === 'ok') {
-    _helpersInjectedForUrl = _activeTabURL;
+    _helpersInjectedForUrl = _st().activeTabURL;
     _helpersInjectedAt = now;
     return;
   }
@@ -1531,7 +1649,7 @@ async function ensureHelpers() {
   if (typeof result === 'string' && result.startsWith('INJECT_ERR:')) {
     throw new Error('ensureHelpers failed: ' + result);
   }
-  _helpersInjectedForUrl = _activeTabURL;
+  _helpersInjectedForUrl = _st().activeTabURL;
   _helpersInjectedAt = now;
 }
 
@@ -1659,8 +1777,13 @@ export async function rightClick({ selector, x, y }) {
 // Sites with WAF protection (G2, Cloudflare, etc.) that check isTrusted will accept these.
 // Trade-off: this moves the physical mouse cursor and requires Safari to be visible.
 
-export async function nativeClick({ selector, text, x, y, ref, doubleClick = false }) {
+export async function nativeClick(args) {
   await ensureHelpers();
+  // The event is routed to the window's SELECTED tab, so ours has to be it. See _withTargetTabFronted.
+  return await _withTargetTabFronted(() => _nativeClickImpl(args));
+}
+
+async function _nativeClickImpl({ selector, text, x, y, ref, doubleClick = false }) {
 
   // Step 1: Get element's viewport coordinates via JavaScript
   let viewportCoords;
@@ -1756,8 +1879,12 @@ export async function nativeClick({ selector, text, x, y, ref, doubleClick = fal
 // tooltips) only respond to a real OS-level cursor position. This function
 // moves the physical cursor to the target, dwells for tooltips to render,
 // then optionally restores the cursor to its original position.
-export async function nativeHover({ selector, text, x, y, ref, dwellMs = 500, restoreMouse = true }) {
+export async function nativeHover(args) {
   await ensureHelpers();
+  return await _withTargetTabFronted(() => _nativeHoverImpl(args));
+}
+
+async function _nativeHoverImpl({ selector, text, x, y, ref, dwellMs = 500, restoreMouse = true }) {
 
   // Step 1: Get element's viewport coordinates via JavaScript
   let viewportCoords;
@@ -2338,9 +2465,13 @@ const macKeyCodeMap = {
 // Unlike safari_fill's synthetic paste, this updates the framework's internal
 // model state, so subsequent operations (like pressing Enter to submit in Discord)
 // see the text as "really there".
-export async function nativeType({ value, selector, ref }) {
+export async function nativeType(args) {
   await ensureHelpers();
-  if (!value) throw new Error("nativeType requires 'value'");
+  if (!args || !args.value) throw new Error("nativeType requires 'value'");
+  return await _withTargetTabFronted(() => _nativeTypeImpl(args));
+}
+
+async function _nativeTypeImpl({ value, selector, ref }) {
   // Focus the target element if selector/ref provided
   if (ref || selector) {
     const sel = ref ? refSelector(ref) : escJsSingleQuote(selector);
@@ -2350,9 +2481,13 @@ export async function nativeType({ value, selector, ref }) {
   return await _nativeTypeViaClipboard(value);
 }
 
-export async function nativeKeyboard({ key, modifiers = [] }) {
+export async function nativeKeyboard(args) {
   await ensureHelpers();
-  if (!key) throw new Error("nativeKeyboard requires 'key'");
+  if (!args || !args.key) throw new Error("nativeKeyboard requires 'key'");
+  return await _withTargetTabFronted(() => _nativeKeyboardImpl(args));
+}
+
+async function _nativeKeyboardImpl({ key, modifiers = [] }) {
   const k = String(key).toLowerCase();
   const keyCode = macKeyCodeMap[k];
   if (keyCode === undefined) {
@@ -2902,12 +3037,12 @@ export async function screenshot({ fullPage = false } = {}) {
   try {
     // Check if target tab is a background tab — if so, use JS screenshot to avoid tab jumping
     let isBackgroundTab = false;
-    if (_activeTabIndex) {
+    if (_st().activeTabIndex) {
       try {
         const currentIdx = await osascriptFast(
           `tell application "Safari" to return index of current tab of ${getTargetWindowRef()}`
         );
-        isBackgroundTab = Number(currentIdx) !== _activeTabIndex;
+        isBackgroundTab = Number(currentIdx) !== _st().activeTabIndex;
       } catch (_) {}
     }
     // When on a background tab, go straight to JS-based screenshot (no tab switch, no focus steal)
@@ -3161,10 +3296,10 @@ export async function listTabs() {
   // cleared after a redirect while the marker is still valid; resetting the index
   // then caused spurious "tab tracking lost" errors. Only a session with no
   // tracking at all should reset.
-  if (_activeTabURL || _activeTabMarker) {
+  if (_st().activeTabURL || _st().activeTabMarker) {
     await resolveActiveTab();
   } else {
-    _activeTabIndex = null;
+    _st().activeTabIndex = null;
   }
 
   const result = await osascript(
@@ -3213,16 +3348,16 @@ export async function newTab(url = "") {
   // osascript round-trips can skew this count; the marker stamped below self-corrects
   // via resolveActiveTab() on the next operation.
   const tabCount = await osascriptFast(`tell application "Safari" to return count of tabs of ${getTargetWindowRef()}`);
-  _activeTabIndex = Number(tabCount);  // New tab is always appended as last
-  _activeTabURL = url || null;
-  _lastResolveTime = Date.now();
-  _lastTabCount = Number(tabCount);  // Update tab count cache
-  _hasOwnedTab = true;               // Permanently true: this session has opened its own tab,
+  _st().activeTabIndex = Number(tabCount);  // New tab is always appended as last
+  _st().activeTabURL = url || null;
+  _st().lastResolveTime = Date.now();
+  _st().lastTabCount = Number(tabCount);  // Update tab count cache
+  _st().hasOwnedTab = true;               // Permanently true: this session has opened its own tab,
                                      // so write ops must NEVER fall back to the user's current tab.
   // Set bulletproof tab marker — stamped onto the tab by _stampTab() after load.
   // window.name survives ALL navigation (full loads, redirects, cross-origin);
   // __mcpTabMarker survives SPA routing.
-  _activeTabMarker = `MCP_${SESSION_ID}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  _st().activeTabMarker = `MCP_${_st().markerId}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
   // Wait for page load if URL given. Poll readyState from the Node side — Safari's
   // `do JavaScript` does NOT await async IIFEs, so an in-page wait loop returns
   // immediately without waiting. Stamping before the page settles loses the marker.
@@ -3230,8 +3365,8 @@ export async function newTab(url = "") {
     for (let i = 0; i < 50; i++) {
       await new Promise(r => setTimeout(r, 200));
       try {
-        const st = await runJS('document.readyState', { tabIndex: _activeTabIndex, timeout: 5000 });
-        const href = await runJS('location.href', { tabIndex: _activeTabIndex, timeout: 5000 });
+        const st = await runJS('document.readyState', { tabIndex: _st().activeTabIndex, timeout: 5000 });
+        const href = await runJS('location.href', { tabIndex: _st().activeTabIndex, timeout: 5000 });
         if ((st === 'complete' || st === 'interactive') && href && href !== 'about:blank') break;
       } catch { /* tab still loading */ }
     }
@@ -3239,11 +3374,11 @@ export async function newTab(url = "") {
     await new Promise(r => setTimeout(r, 200));
   }
   // Stamp identity marker + visibility spoof onto the loaded document.
-  await _stampTab(_activeTabIndex);
-  const info = await runJS(`JSON.stringify({title:document.title,url:location.href,tabIndex:${_activeTabIndex}})`, { tabIndex: _activeTabIndex });
+  await _stampTab(_st().activeTabIndex);
+  const info = await runJS(`JSON.stringify({title:document.title,url:location.href,tabIndex:${_st().activeTabIndex}})`, { tabIndex: _st().activeTabIndex });
   try {
     const parsed = JSON.parse(info);
-    if (parsed.url && parsed.url !== 'about:blank') _activeTabURL = parsed.url;
+    if (parsed.url && parsed.url !== 'about:blank') _st().activeTabURL = parsed.url;
   } catch {}
   return info;
 }
@@ -3264,43 +3399,43 @@ export async function closeTab() {
       10
     );
     if (Number.isFinite(_winTabs) && _winTabs <= 1) {
-      const _ref = _activeTabIndex
-        ? `tab ${_activeTabIndex} of ${getTargetWindowRef()}`
+      const _ref = _st().activeTabIndex
+        ? `tab ${_st().activeTabIndex} of ${getTargetWindowRef()}`
         : `current tab of ${getTargetWindowRef()}`;
       await osascript(`tell application "Safari" to set URL of ${_ref} to "about:blank"`);
-      _activeTabIndex = null;
-      _activeTabURL = null;
-      _lastTabCount = null;
-      _lastResolveTime = 0;
+      _st().activeTabIndex = null;
+      _st().activeTabURL = null;
+      _st().lastTabCount = null;
+      _st().lastResolveTime = 0;
       return "Window's last tab blanked instead of closed (closing it would shut the window / quit Safari)";
     }
   } catch { /* count check failed — fall through to normal close */ }
 
-  if (_activeTabIndex) {
+  if (_st().activeTabIndex) {
     await osascript(
-      `tell application "Safari" to close tab ${_activeTabIndex} of ${getTargetWindowRef()}`
+      `tell application "Safari" to close tab ${_st().activeTabIndex} of ${getTargetWindowRef()}`
     );
-    _activeTabIndex = null;
-    _activeTabURL = null;
+    _st().activeTabIndex = null;
+    _st().activeTabURL = null;
   } else {
     await osascript(
       `tell application "Safari" to close current tab of ${getTargetWindowRef()}`
     );
   }
-  _lastTabCount = null;    // Invalidate — tab count changed
-  _lastResolveTime = 0;    // Force re-resolve on next operation
+  _st().lastTabCount = null;    // Invalidate — tab count changed
+  _st().lastResolveTime = 0;    // Force re-resolve on next operation
   return "Tab closed";
 }
 
 export async function switchTab(index) {
   const idx = Number(index);
-  _activeTabIndex = idx;
+  _st().activeTabIndex = idx;
   // Claiming this tab: stamp it with a FRESH identity marker so resolveActiveTab can
   // re-find it after the user shifts tab indices. A fresh marker (not a reused one)
   // ensures a previously-claimed tab — which still carries the old marker string —
   // is never mistaken for this one.
-  _activeTabMarker = `MCP_${SESSION_ID}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-  _hasOwnedTab = true;
+  _st().activeTabMarker = `MCP_${_st().markerId}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  _st().hasOwnedTab = true;
   await _stampTab(idx);
   // Do NOT visually switch the tab — it brings the Safari window to foreground
   // and interrupts the user. Visual switching only happens in screenshot() when needed.
@@ -3313,9 +3448,9 @@ export async function switchTab(index) {
   // Track by URL so we can find this tab even if indices shift
   try {
     const parsed = JSON.parse(result);
-    _activeTabURL = parsed.url || null;
+    _st().activeTabURL = parsed.url || null;
   } catch {}
-  _lastResolveTime = Date.now();
+  _st().lastResolveTime = Date.now();
   return result;
 }
 
@@ -3797,9 +3932,90 @@ export async function uploadFile({ selector, filePath }) {
     { timeout: 30000 }
   );
 
+  // Strategy 3: synthetic injection (files=/drop) is silently rejected by isTrusted-gated
+  // or custom upload handlers — GitHub's <file-attachment>, some WAF-fronted forms. Escalate
+  // to a REAL native file dialog: a CGEvent click opens the OS NSOpenPanel, then System Events
+  // types the path. That is an isTrusted:true selection, which those handlers accept.
+  let finalResult = result;
+  if (/verified 0 file|Upload attempted|el\.files is empty/i.test(result)) {
+    try {
+      finalResult = await _nativeFileUpload(sel, resolvedPath, safeName);
+    } catch (nativeErr) {
+      finalResult = `${result} | Native file-dialog fallback failed: ${nativeErr.message}`;
+    }
+  }
+
   // Clean up the temp PNG produced by any sips image conversion above (was leaked before).
   if (resolvedPath !== filePath) await unlink(resolvedPath).catch(() => {});
-  return result;
+  return finalResult;
+}
+
+// ========== NATIVE FILE UPLOAD (real NSOpenPanel — isTrusted, works on GitHub etc.) ==========
+// Fallback for uploadFile when synthetic injection is rejected by isTrusted-gated / custom
+// upload handlers (GitHub <file-attachment>, WAF forms). Momentarily makes the (usually
+// hidden) <input type=file> clickable, native-clicks it to open the OS file dialog, then
+// drives the dialog via System Events (Cmd+Shift+G → path → Return → Return). `sel` is
+// already escJsSingleQuote-escaped by the caller.
+async function _nativeFileUpload(sel, absPath, safeName) {
+  // 1. Make the input clickable (hidden inputs have no hit-box) and read its viewport centre.
+  const coordsJson = await runJS(
+    `(function(){var el=document.querySelector('${sel}');if(!el){var all=document.querySelectorAll('*');for(var i=0;i<all.length;i++){var sr=all[i].shadowRoot;if(sr){el=sr.querySelector('${sel}');if(el)break;}}}if(!el)return JSON.stringify({error:'Element not found: ${sel}'});el.setAttribute('data-mcp-oldstyle',el.getAttribute('style')||'');el.style.cssText='position:fixed !important;top:42% !important;left:38% !important;width:320px !important;height:120px !important;opacity:0.02 !important;z-index:2147483647 !important;display:block !important;visibility:visible !important;pointer-events:auto !important';var r=el.getBoundingClientRect();return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)});})()`
+  );
+  let c;
+  try { c = JSON.parse(coordsJson); } catch { throw new Error("coord parse failed: " + coordsJson); }
+  if (c.error) throw new Error(c.error);
+
+  // 2. Native (CGEvent, isTrusted:true) click on the input → opens the OS file dialog.
+  const geo = await _getSafariWindowGeometry();
+  if (!geo.windowId) throw new Error("no Safari window id (cannot native-click without focus steal)");
+  const screenX = geo.windowX + c.x;
+  const screenY = geo.windowY + geo.toolbarHeight + c.y;
+  // Safari must already be frontmost when the file input is clicked, otherwise the OS file
+  // dialog either does not open or opens unfocused. Activate with noFocusGuard so it STAYS
+  // frontmost (the normal osascript focus-guard would immediately restore focus elsewhere).
+  await osascriptFast('tell application "Safari" to activate', { noFocusGuard: true }).catch(() => {});
+  await new Promise((r) => setTimeout(r, 450));
+  // A targeted (windowId) click does NOT open the OS file dialog — that requires a real,
+  // hardware-like click that physically moves the cursor. Use the legacy path (windowId=0)
+  // for THIS click only; it briefly moves the mouse to the input, which opens the NSOpenPanel.
+  await _helperNativeClick(screenX, screenY, false, 0);
+
+  // 3. Drive the NSOpenPanel: wait for the sheet, Cmd+Shift+G, type the absolute path, confirm.
+  const pathEsc = absPath.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  // Activate + drive the dialog in ONE osascript so Safari stays frontmost throughout (a
+  // separate activate call would be undone by osascript()'s focus-guard restore). Generous
+  // timeout: the sheet-wait + Cmd+Shift+G + typing a long path can exceed the 10s default.
+  const dlgStatus = await osascript(
+    `tell application "Safari" to activate
+    delay 0.3
+    tell application "System Events"
+      tell process "Safari"
+        set _t to 0
+        repeat until (exists sheet 1 of window 1) or _t > 25
+          delay 0.1
+          set _t to _t + 1
+        end repeat
+        set _hadSheet to (exists sheet 1 of window 1)
+        delay 0.25
+        keystroke "g" using {command down, shift down}
+        delay 0.45
+        keystroke "${pathEsc}"
+        delay 0.35
+        key code 36
+        delay 0.6
+        key code 36
+        return "sheet=" & _hadSheet
+      end tell
+    end tell`,
+    { timeout: 30000 }
+  ).catch((e) => "osaerr:" + e.message);
+
+  // 4. Restore the input's original style, then report the resulting file count.
+  await new Promise((r) => setTimeout(r, 900));
+  const filesLen = await runJS(
+    `(function(){var el=document.querySelector('${sel}');if(!el)return 'gone';var old=el.getAttribute('data-mcp-oldstyle');if(old!==null){if(old){el.setAttribute('style',old);}else{el.removeAttribute('style');}el.removeAttribute('data-mcp-oldstyle');}return String(el.files?el.files.length:0);})()`
+  ).catch(() => "?");
+  return `Uploaded via native file dialog (isTrusted): ${safeName} — input.files=${filesLen}, ${dlgStatus}. Real OS selection; accepted by isTrusted-gated handlers (GitHub etc.). Verify with safari_snapshot.`;
 }
 
 // ========== PASTE IMAGE FROM FILE ==========
@@ -3892,7 +4108,7 @@ export async function emulate({ device, width, height, userAgent, scale = 1 }) {
 
   // Reload to apply changes, then wait for load — polled from Node (`do JavaScript`
   // can't await an in-page loop).
-  const navIndex = _activeTabIndex;
+  const navIndex = _st().activeTabIndex;
   await runJS("location.reload()", { tabIndex: navIndex });
   await new Promise(r => setTimeout(r, 200));
   await _pollReadyAndRead(navIndex);
@@ -3916,7 +4132,7 @@ export async function resetEmulation() {
     `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {0, 0, 1440, 900}`
   );
   // Reload + wait for load — polled from Node (`do JavaScript` can't await an in-page loop).
-  const navIndex = _activeTabIndex;
+  const navIndex = _st().activeTabIndex;
   await runJS("location.reload()", { tabIndex: navIndex });
   await new Promise(r => setTimeout(r, 200));
   await _pollReadyAndRead(navIndex);
@@ -5097,7 +5313,7 @@ export async function scrollToElement({ selector, text, block = "center", timeou
     // `do JavaScript` can't await an in-page delay (see _evaluateAsync).
     const safeText = escJsSingleQuote(text);
     const safeBlock = String(block).replace(/[^a-z]/gi, '') || 'center';
-    const navIndex = _activeTabIndex;
+    const navIndex = _st().activeTabIndex;
     const stepJs =
       `(function(){` +
       `var scrollable=document.querySelector('[class*="grid"],[class*="virtual"],[class*="scroll"],[role="grid"],[role="table"]')||document.scrollingElement||document.documentElement;` +
@@ -5133,18 +5349,18 @@ export async function navigateAndRead(url, { maxLength = 50000 } = {}) {
   // Escape backslash first, then quotes; strip CR/LF — a newline would break out of
   // the AppleScript string literal and allow AppleScript injection.
   const safeUrl = targetUrl.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/[\r\n]/g, '');
-  if (_activeTabURL) await resolveActiveTab();
+  if (_st().activeTabURL) await resolveActiveTab();
   _assertNotFallingBackToUserTab('navigateAndRead');
-  const navIndex = _activeTabIndex;
+  const navIndex = _st().activeTabIndex;
   const navTarget = navIndex ? `tab ${navIndex} of ${getTargetWindowRef()}` : getFallbackTarget();
   await osascriptFast(`tell application "Safari" to set URL of ${navTarget} to "${safeUrl}"`);
-  _activeTabURL = targetUrl;
+  _st().activeTabURL = targetUrl;
   // Poll readyState from Node, then read — `do JavaScript` can't await an async IIFE.
   const navResult = await _pollReadyAndRead(navIndex, { maxLength });
-  // Update _activeTabURL with the actual URL after navigation
+  // Update _st().activeTabURL with the actual URL after navigation
   try {
     const parsed = JSON.parse(navResult);
-    if (parsed.url && parsed.url !== 'about:blank') _activeTabURL = parsed.url;
+    if (parsed.url && parsed.url !== 'about:blank') _st().activeTabURL = parsed.url;
   } catch {}
   return navResult;
 }
@@ -5155,7 +5371,7 @@ export async function clickAndWait({ selector, text, waitFor: waitSelector, time
   const safeSel = selector ? esc(selector) : "";
   const safeText = text ? esc(text) : "";
   const safeWait = waitSelector ? esc(waitSelector) : "";
-  const navIndex = _activeTabIndex;
+  const navIndex = _st().activeTabIndex;
   // Step 1: find + click — fully synchronous, so it runs inside one `do JavaScript`.
   const clickResult = await runJS(
     `(function(){
@@ -5194,7 +5410,7 @@ export async function clickAndWait({ selector, text, waitFor: waitSelector, time
 // Fill form + submit — common for login, search, etc.
 export async function fillAndSubmit({ fields, submitSelector }) {
   await fillForm({ fields });
-  const navIndex = _activeTabIndex;
+  const navIndex = _st().activeTabIndex;
   if (submitSelector) {
     const sel = escJsSingleQuote(submitSelector);
     await runJS(

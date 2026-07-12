@@ -66,6 +66,7 @@
     "transport.js",
     "response.js",
     "safari.js",
+    "session-context.js",
     "ownership-match.js",
     "ownership-state.js",
     "mcp-helpers.js",

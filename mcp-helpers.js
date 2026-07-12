@@ -144,28 +144,42 @@ if (window.__mcpVersion !== 6) {
     var beforeUrl = location.href;
     var anchor = target.closest ? target.closest('a[href]') : null;
     var href = anchor && anchor.href && !anchor.href.startsWith('javascript:') ? anchor.href : '';
+    // Dispatch from the LEAF under the click point, not from the actionable ancestor.
+    // A real click's `event.target` is the topmost node at that pixel — the inner label —
+    // while `currentTarget` is the <a>/<button>. Handlers that gate on e.target (Facebook's
+    // rel="dialog" links, most SPA routers) see a target they never expected when the event
+    // is fired straight at the <a>, bail out, and the click silently degrades into a plain
+    // navigation. Firing from the leaf reproduces the real bubble path exactly.
+    var from = window.mcpElementFromPoint(x, y);
+    if (!from || !(target === from || target.contains(from))) from = target;
     var s = { bubbles: true, cancelable: true, composed: true, view: window, clientX: x, clientY: y, button: 0, detail: 1 };
     var p = { ...s, pointerId: 1, pointerType: 'mouse', isPrimary: true, width: 1, height: 1, pressure: 0.5 };
-    target.dispatchEvent(new PointerEvent('pointerover', { ...p, buttons: 0 }));
-    target.dispatchEvent(new MouseEvent('mouseover', { ...s, buttons: 0 }));
-    target.dispatchEvent(new PointerEvent('pointerenter', { ...p, buttons: 0 }));
-    target.dispatchEvent(new MouseEvent('mouseenter', { ...s, buttons: 0 }));
-    target.dispatchEvent(new PointerEvent('pointermove', { ...p, buttons: 0 }));
-    target.dispatchEvent(new MouseEvent('mousemove', { ...s, buttons: 0 }));
-    target.dispatchEvent(new PointerEvent('pointerdown', { ...p, buttons: 1 }));
-    target.dispatchEvent(new MouseEvent('mousedown', { ...s, buttons: 1 }));
+    from.dispatchEvent(new PointerEvent('pointerover', { ...p, buttons: 0 }));
+    from.dispatchEvent(new MouseEvent('mouseover', { ...s, buttons: 0 }));
+    from.dispatchEvent(new PointerEvent('pointerenter', { ...p, buttons: 0 }));
+    from.dispatchEvent(new MouseEvent('mouseenter', { ...s, buttons: 0 }));
+    from.dispatchEvent(new PointerEvent('pointermove', { ...p, buttons: 0 }));
+    from.dispatchEvent(new MouseEvent('mousemove', { ...s, buttons: 0 }));
+    from.dispatchEvent(new PointerEvent('pointerdown', { ...p, buttons: 1 }));
+    from.dispatchEvent(new MouseEvent('mousedown', { ...s, buttons: 1 }));
+    // Focus the actionable element, not the leaf — a <span> inside a button isn't focusable.
     if (target.focus) { try { target.focus({ preventScroll: true }); } catch (e) { try { target.focus(); } catch (_) {} } }
-    target.dispatchEvent(new PointerEvent('pointerup', { ...p, buttons: 0, pressure: 0 }));
-    target.dispatchEvent(new MouseEvent('mouseup', { ...s, buttons: 0 }));
+    from.dispatchEvent(new PointerEvent('pointerup', { ...p, buttons: 0, pressure: 0 }));
+    from.dispatchEvent(new MouseEvent('mouseup', { ...s, buttons: 0 }));
+    // .click() on an anchor (or a node inside one) triggers the browser's own navigation
+    // with target === the anchor, which is the exact shape the gate rejects. For anchors,
+    // let the dispatched event below carry the default action instead.
     try {
-      if (typeof target.click === 'function') {
-        target.click();
-        if (href && href !== beforeUrl) {
-          location.href = href;
-        }
-      }
+      if (!href && typeof from.click === 'function') from.click();
     } catch (e) {}
-    target.dispatchEvent(new MouseEvent('click', { ...s, buttons: 0 }));
+    var clickEv = new MouseEvent('click', { ...s, buttons: 0 });
+    var notPrevented = from.dispatchEvent(clickEv);
+    // Navigate only if nothing claimed the click. A handler that called preventDefault owns
+    // it — it just opened a dialog or pushed an SPA route, and forcing location.href here
+    // would tear that down. (dispatchEvent returns false iff preventDefault was called.)
+    if (href && notPrevented && location.href === beforeUrl) {
+      location.href = href;
+    }
     // Vue v-model / Lit @change / framework-agnostic toggle sync — for checkbox/radio,
     // Vue 3 listens for `change` via v-model; some Vue components subscribe to `input` instead.
     // Native target.click() fires both, but in production-stripped Vue apps (no fiber/proxy
@@ -178,9 +192,9 @@ if (window.__mcpVersion !== 6) {
       target.dispatchEvent(new Event('input', toggleOpts));
       target.dispatchEvent(new Event('change', toggleOpts));
     }
-    if (href && href !== beforeUrl) {
-      location.href = href;
-    }
+    // (Navigation is handled above, gated on notPrevented. A second unconditional
+    // `location.href = href` used to live here and fired even when a handler had called
+    // preventDefault — tearing down the dialog/route it had just opened.)
     var form = target.closest ? target.closest('form') : null;
     if (form && (target.type === 'submit' || (target.tagName === 'BUTTON' && target.type !== 'button' && target.type !== 'reset'))) {
       try { form.requestSubmit ? form.requestSubmit(target.type === 'submit' ? target : undefined) : form.submit(); } catch (e) {}
