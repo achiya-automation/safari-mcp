@@ -533,7 +533,14 @@ function _helperHideSafari(timeout = 2000) {
   return _withHelperLock(() => new Promise((resolve) => {
     if (!_helperProc || !_helperProc.stdin?.writable) { resolve(); return; }
     let resolved = false;
-    const timer = setTimeout(() => { if (!resolved) { resolved = true; resolve(); } }, timeout);
+    const timer = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        const idx = _helperQueue.indexOf(cb);
+        if (idx >= 0) _helperQueue[idx] = () => {};
+        resolve();
+      }
+    }, timeout);
     function cb() {
       if (resolved) return;
       resolved = true;
@@ -542,7 +549,12 @@ function _helperHideSafari(timeout = 2000) {
     }
     _helperQueue.push(cb);
     try { _helperProc.stdin.write('{"hideSafari":true}\n'); }
-    catch { clearTimeout(timer); resolve(); }
+    catch {
+      const idx = _helperQueue.indexOf(cb);
+      if (idx >= 0) _helperQueue.splice(idx, 1);
+      clearTimeout(timer);
+      resolve();
+    }
   }));
 }
 
@@ -550,7 +562,14 @@ function _helperActivateApp(bundleId, timeout = 2000) {
   return _withHelperLock(() => new Promise((resolve) => {
     if (!_helperProc || !_helperProc.stdin?.writable) { resolve(); return; }
     let resolved = false;
-    const timer = setTimeout(() => { if (!resolved) { resolved = true; resolve(); } }, timeout);
+    const timer = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        const idx = _helperQueue.indexOf(cb);
+        if (idx >= 0) _helperQueue[idx] = () => {};
+        resolve();
+      }
+    }, timeout);
     function cb() {
       if (resolved) return;
       resolved = true;
@@ -559,7 +578,12 @@ function _helperActivateApp(bundleId, timeout = 2000) {
     }
     _helperQueue.push(cb);
     try { _helperProc.stdin.write(JSON.stringify({ activateApp: bundleId }) + '\n'); }
-    catch { clearTimeout(timer); resolve(); }
+    catch {
+      const idx = _helperQueue.indexOf(cb);
+      if (idx >= 0) _helperQueue.splice(idx, 1);
+      clearTimeout(timer);
+      resolve();
+    }
   }));
 }
 
@@ -1020,7 +1044,14 @@ function _helperGetFrontApp(timeout = 2000) {
   return _withHelperLock(() => new Promise((resolve) => {
     if (!_helperProc || !_helperProc.stdin?.writable) { resolve(null); return; }
     let resolved = false;
-    const timer = setTimeout(() => { if (!resolved) { resolved = true; resolve(null); } }, timeout);
+    const timer = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        const idx = _helperQueue.indexOf(cb);
+        if (idx >= 0) _helperQueue[idx] = () => {};
+        resolve(null);
+      }
+    }, timeout);
     function cb(line) {
       if (resolved) return;
       resolved = true;
@@ -1029,7 +1060,12 @@ function _helperGetFrontApp(timeout = 2000) {
     }
     _helperQueue.push(cb);
     try { _helperProc.stdin.write('{"getFrontApp":true}\n'); }
-    catch { clearTimeout(timer); resolve(null); }
+    catch {
+      const idx = _helperQueue.indexOf(cb);
+      if (idx >= 0) _helperQueue.splice(idx, 1);
+      clearTimeout(timer);
+      resolve(null);
+    }
   }));
 }
 
