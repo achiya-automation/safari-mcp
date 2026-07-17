@@ -670,7 +670,7 @@ async function resolveActiveTab() {
     // Parse result — can be "N" (found) or "0:tabCount" (not found)
     const resultStr = String(result);
     if (resultStr.includes(':')) {
-      // Not found — clamp stale index to tabCount
+      // Not found — every exit below fails closed (drops the index); nothing here guesses.
       const tabCount = Number(resultStr.split(':')[1]) || 1;
       _st().lastTabCount = tabCount;
       _st().activeTabURL = null;
@@ -682,8 +682,16 @@ async function resolveActiveTab() {
         return null;
       }
       if (_st().activeTabIndex && _st().activeTabIndex > tabCount) {
-        console.error(`[Safari MCP] Tab ghost proactive fix: index ${_st().activeTabIndex} > tabCount ${tabCount}, clamping to ${tabCount}`);
-        _st().activeTabIndex = tabCount;
+        // Our index is past the end of the window: the user closed a tab or tore one
+        // into its own window, so the index no longer names any tab — least of all ours.
+        // This used to clamp to `tabCount` ("tab ghost proactive fix"), which silently
+        // retargeted us at the LAST tab in the window — the user's. That predates the
+        // identity marker (clamp: Mar 31, marker: v2.8.3 Apr 14) and was the one exit
+        // here that still guessed. Fail closed like the two branches above; callers
+        // re-anchor via _assertNotFallingBackToUserTab's "re-run safari_new_tab" error.
+        console.error(`[Safari MCP] Tab identity lost (index ${_st().activeTabIndex} > tabCount ${tabCount}) — clearing index to avoid targeting the user's tab`);
+        _st().activeTabIndex = null;
+        return null;
       }
       return _st().activeTabIndex;
     }
