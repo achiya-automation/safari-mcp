@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.15.4] - 2026-07-21
+
+### Fixed
+- **A tracked tab index past the end of the window no longer retargets the session at a user tab.** When the tracked index exceeded the window's tab count (the user closed a tab, or tore one into its own window), `resolveActiveTab()` clamped the index to the *last* tab in the window — which is whatever the user happens to have open there — and logged it as a "proactive fix". Every subsequent navigate/click/fill then landed on that tab, destroying page state (#54). The clamp predates the identity marker (`window.name` / `__mcpTabMarker`, v2.8.3) and was never rewired when its neighbouring branches were; it now fails closed like they do — the session drops ownership and returns `null` instead of guessing (#59).
+
+## [2.15.3] - 2026-07-15
+
+### Fixed
+- Clicks and synthetic events are now dispatched with the owning tab fronted (`_withTargetTabFronted`), so they land on our tab and element instead of whatever tab was frontmost.
+- `typeText` fires per-character key events on ARIA comboboxes, so async typeahead lists actually load.
+- The focus-helper FIFO stays aligned when a request times out — a stale callback no longer swallows a later daemon reply and cascade-times-out `doctor`/`newTab`. Thanks to @jrepp (#53).
+
 ## [2.15.2] - 2026-07-05
 
 ### Fixed
