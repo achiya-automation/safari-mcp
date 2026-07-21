@@ -1,0 +1,62 @@
+name: Stale green PR
+
+# PR ירוק, נקי וללא הערות ביקורת שיושב יותר מ-48 שעות מסומן בלייבל.
+# המטרה היא לא לכפות מיזוג — אלא להפוך "אני עדיין מחזיק את זה" להחלטה שמתקבלת מחדש.
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  pull-requests: write
+  issues: write
+
+jobs:
+  flag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const LABEL = 'stale-green';
+            const MAX_AGE_H = 48;
+            const now = Date.now();
+
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner, repo: context.repo.repo, state: 'open', per_page: 100,
+            });
+
+            for (const pr of prs) {
+              const ageH = (now - new Date(pr.created_at)) / 36e5;
+              const hadLabel = pr.labels.some(l => l.name === LABEL);
+
+              const { data: full } = await github.rest.pulls.get({
+                owner: context.repo.owner, repo: context.repo.repo, pull_number: pr.number,
+              });
+              const { data: reviewComments } = await github.rest.pulls.listReviewComments({
+                owner: context.repo.owner, repo: context.repo.repo, pull_number: pr.number, per_page: 1,
+              });
+
+              const stale = ageH > MAX_AGE_H
+                && full.mergeable_state === 'clean'
+                && reviewComments.length === 0
+                && !full.draft;
+
+              if (stale && !hadLabel) {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: pr.number, labels: [LABEL],
+                });
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner, repo: context.repo.repo, issue_number: pr.number,
+                  body: `⏳ Green and unmerged for ${Math.floor(ageH / 24)} days — checks passing, \`mergeable_state: clean\`, no review comments.\n\nNot a request to merge, just a reminder that holding it is a decision. Remove the \`${LABEL}\` label to silence this.`,
+                });
+                core.notice(`flagged #${pr.number} (${Math.floor(ageH)}h)`);
+              } else if (!stale && hadLabel) {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: pr.number, name: LABEL,
+                }).catch(() => {});
+              }
+            }

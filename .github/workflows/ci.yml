@@ -11,6 +11,36 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # שינוי התנהגותי בקוד המקור חייב רשומת CHANGELOG — אחרת התיקון נשלח בלי שאף אחד יראה אותו
+  changelog:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Behavioural change requires a CHANGELOG entry
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          if [[ ",$LABELS," == *",skip-changelog,"* ]]; then
+            echo "skip-changelog label present — skipping"; exit 0
+          fi
+          changed=$(git diff --name-only "$BASE" "$HEAD")
+          src=$(echo "$changed" | grep -E '^(index|safari|mcp-helpers|transport)\.js$' || true)
+          if [[ -z "$src" ]]; then
+            echo "no source change — skipping"; exit 0
+          fi
+          if echo "$changed" | grep -qx 'CHANGELOG.md'; then
+            echo "CHANGELOG.md updated ✓"; exit 0
+          fi
+          echo "::error::This PR changes $(echo "$src" | tr '\n' ' ')but not CHANGELOG.md."
+          echo "Add an entry under [Unreleased], or apply the 'skip-changelog' label if the change is not user-visible."
+          exit 1
+
   build:
     runs-on: macos-latest
 
