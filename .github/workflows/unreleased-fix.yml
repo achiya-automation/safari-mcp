@@ -1,0 +1,69 @@
+name: Unreleased fix
+
+# תיקון שיושב ב-[Unreleased] על main יותר מ-48 שעות = משתמשים עדיין מתקינים את הבאג.
+# החלון שמעניין הוא מהקומיט שמתקן ועד ה-dist-tag שמפיץ, לא גיל ה-PR — ולכן המשקיף
+# הזה יושב אחרי המיזוג, במקום ש-stale-green-pr.yml נעצר.
+
+on:
+  schedule:
+    - cron: "15 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  flag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - id: check
+        run: node .github/scripts/unreleased-age.mjs >> "$GITHUB_OUTPUT"
+
+      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const LABEL = 'unreleased-fix';
+            const ageH = Number('${{ steps.check.outputs.age_hours }}');
+            const stale = ageH > 48;
+
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: LABEL, per_page: 10,
+            });
+
+            if (!stale) {
+              for (const i of open) {
+                await github.rest.issues.update({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: i.number, state: 'closed', state_reason: 'completed',
+                });
+              }
+              return;
+            }
+
+            const days = Math.floor(ageH / 24);
+            const body = [
+              `⏳ \`main\` has carried an unreleased entry in \`CHANGELOG.md\` under \`[Unreleased]\` for **${days} day(s)** (oldest touch ${Math.floor(ageH)}h ago).`,
+              '',
+              'CI being green means the fix is *valid*. It does not mean anyone can install it — every `npm i safari-mcp` in this window still gets the old behaviour.',
+              '',
+              'Cut a release, or move the entry out if it does not warrant one. This issue closes itself once `[Unreleased]` is empty again.',
+            ].join('\n');
+
+            if (open.length) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: open[0].number, body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title: `Unreleased changes on main for ${days} day(s)`,
+                labels: [LABEL], body,
+              });
+            }
