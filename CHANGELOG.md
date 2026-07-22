@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Two paths could run caller-supplied JavaScript on a tab this session does not own.** The atomic identity guard — the only check that does not depend on how the tab index was resolved — was built at a single call site instead of where the script is assembled, so two targeted paths went without it: `runJS`'s ghost-recovery retry dropped the prefix (the retry runs precisely when the index has already proven wrong, making the least trustworthy path the only unchecked one), and `runJSLarge` never carried it at all — that is `safari_upload_file` and `safari_paste_image`, the largest payloads in the toolset. The guard now lives in `_tabIdentityGuard()` and every tab-targeted path uses it; `runJSLarge` fails closed instead of retrying, since re-running a file payload on a freshly guessed tab is the exact guess the guard exists to prevent (#64).
+
 ## [2.15.4] - 2026-07-21
 
 ### Fixed

@@ -1177,6 +1177,18 @@ async function _withTargetTabFronted(fn) {
   }
 }
 
+// Atomic tab-identity guard, as a JS prefix. Belongs here and not at a call site: it is the
+// only check that is independent of how `idx` was resolved, so every path that builds a
+// targeted `do JavaScript` needs it — most of all the retry paths, which run precisely when
+// the index has already proven untrustworthy. Empty string when the caller named a tab
+// explicitly, or when this session owns no marked tab (front-document fallback is then
+// intentional). See #64.
+function _tabIdentityGuard(explicitTabIndex) {
+  const marker = _st().activeTabMarker;
+  if (!marker || explicitTabIndex) return '';
+  return `if(window.name!=='${marker}'&&window.__mcpTabMarker!=='${marker}'){throw new Error('MCP_WRONG_TAB')};`;
+}
+
 // Run JavaScript in Safari — fastest path, no focus stealing
 // Uses osascriptFast (persistent process, ~5ms) for short scripts,
 // falls back to osascript (~80ms) for long scripts that exceed stdin limits
@@ -1223,9 +1235,7 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
   // does not carry OUR marker. Makes the op fail-closed at EXECUTION time regardless of how
   // `idx` resolved — a drift to the user's tab (shared profile window) throws instead of
   // running on their page. Skipped when the caller passed an explicit tabIndex.
-  const _guard = (_st().activeTabMarker && !tabIndex)
-    ? `if(window.name!=='${_st().activeTabMarker}'&&window.__mcpTabMarker!=='${_st().activeTabMarker}'){throw new Error('MCP_WRONG_TAB')};`
-    : '';
+  const _guard = _tabIdentityGuard(tabIndex);
   const script = `tell application "Safari" to do JavaScript "${_guard}${escaped}" in ${target}`;
   try {
     if (script.length < 50000) {
@@ -1262,7 +1272,10 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
         if (newIdx && newIdx !== idx) {
           console.error(`[Safari MCP] Tab ghost resolved: ${idx} → ${newIdx}`);
           const newTarget = `tab ${newIdx} of ${getTargetWindowRef()}`;
-          const retryScript = `tell application "Safari" to do JavaScript "${escaped}" in ${newTarget}`;
+          // Keep the guard on the retry. `newIdx` came from a re-resolve triggered by the
+          // index being wrong; dropping the check here made the least trustworthy path the
+          // only unchecked one (#64).
+          const retryScript = `tell application "Safari" to do JavaScript "${_guard}${escaped}" in ${newTarget}`;
           if (retryScript.length < 50000) return osascriptFast(retryScript, { timeout });
           return osascript(retryScript, { timeout });
         }
@@ -1321,7 +1334,10 @@ async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
     .replace(/\n/g, " ")
     .replace(/\r/g, "")
     .replace(/\t/g, " ");
-  const appleScript = `tell application "Safari" to do JavaScript "${escaped}" in ${target}`;
+  // Same execution-time identity check runJS gets. These are the upload / paste-image ops —
+  // the largest blast radius in the toolset — and they were the one targeted path with no
+  // guard at all (#64).
+  const appleScript = `tell application "Safari" to do JavaScript "${_tabIdentityGuard(tabIndex)}${escaped}" in ${target}`;
   const tmpFile = join(tmpdir(), `safari-mcp-${Date.now()}.scpt`);
   await writeFile(tmpFile, appleScript, "utf8");
   // Save frontmost app via daemon before subprocess execution
@@ -1334,6 +1350,13 @@ async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
       maxBuffer: 10 * 1024 * 1024,
     });
     return stdout.trim();
+  } catch (err) {
+    // No retry here, unlike runJS: these payloads carry file data, and re-running one on a
+    // freshly resolved tab is exactly the guess this guard exists to prevent.
+    if ((err.message || '').includes('MCP_WRONG_TAB')) {
+      throw new Error('Tab tracking lost during runJSLarge — target tab does not carry this session\'s marker (atomic guard fail-closed). Call safari_new_tab to reopen.', { cause: err });
+    }
+    throw err;
   } finally {
     unlink(tmpFile).catch(() => {});
     // Awaited restore — caller must not return to user-space while Safari is still frontmost.
