@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.15.6] - 2026-07-23
+
 ### Fixed
 - **A session that lost its transport could run caller JavaScript on the user's current tab.** Every fail-closed branch in the tab layer keys on `hasOwnedTab`, which lives in per-MCP-session state. In HTTP-daemon mode a dropped transport makes the client re-initialise, which mints a new session id, and `_st()` hands it a fresh empty state — `hasOwnedTab` false, `activeTabMarker` null. So the guards all read "this session owns nothing" at precisely the moment an agent is mid-task and already owns a tab, and the next op falls through to the front document: whatever the user is looking at. Reproduced live — a `safari_evaluate` issued right after a transport drop returned a user tab's DOM, which is the report in #64. The session state dies; the marker stamped on the tab does not, so the guard now uses it: with no marker of its own, a run refuses any front document whose `window.name` carries an `MCP_` marker (a tab some MCP session opened and this one does not own) and fails closed with no retry. An unmarked front document stays reachable, so "read the page I'm looking at" still works for a session that genuinely never opened a tab (#64).
 
