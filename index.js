@@ -210,19 +210,21 @@ function _startMemoryMonitor() {
 
 // Cleanup on exit
 let _cleaningUp = false;
+async function _shutdown() {
+  if (_cleaningUp) return;
+  _cleaningUp = true;
+  // Restore the user's clipboard synchronously FIRST — if a native paste is mid-flight, its
+  // 2s restore timer would never fire once we exit, leaving the tool's text on the clipboard.
+  try { safari.flushClipboardRestore(); } catch {}
+  // Cap tab cleanup — if the daemon/Safari is wedged at shutdown (exactly when a SIGTERM
+  // tends to arrive), listTabs/closeTab can each block for their full timeout; never let
+  // that hang the exit past 3s.
+  await Promise.race([_cleanupTabs(), new Promise(r => setTimeout(r, 3000))]);
+  process.exit(0);
+}
+
 for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
-  process.on(sig, async () => {
-    if (_cleaningUp) return; // Prevent double-exit on rapid signal repeat
-    _cleaningUp = true;
-    // Restore the user's clipboard synchronously FIRST — if a native paste is mid-flight, its
-    // 2s restore timer would never fire once we exit, leaving the tool's text on the clipboard.
-    try { safari.flushClipboardRestore(); } catch {}
-    // Cap tab cleanup — if the daemon/Safari is wedged at shutdown (exactly when a SIGTERM
-    // tends to arrive), listTabs/closeTab can each block for their full timeout; never let
-    // that hang the exit past 3s.
-    await Promise.race([_cleanupTabs(), new Promise(r => setTimeout(r, 3000))]);
-    process.exit(0);
-  });
+  process.on(sig, _shutdown);
 }
 process.on("exit", () => {
   if (_openedTabs.size > 0) {
@@ -2420,4 +2422,12 @@ _startMemoryMonitor();
 
 // Transport is chosen at runtime: default stdio (unchanged), or a shared HTTP instance when
 // SAFARI_MCP_HTTP=1 (many Claude sessions → one process). buildServer is the per-session factory.
-await startTransport(buildServer, process.env);
+const transportHandle = await startTransport(buildServer, process.env);
+
+if (transportHandle.kind === "stdio") {
+  // A client can disappear without delivering a signal. Treat its pipe closing as the stdio
+  // server's lifecycle boundary, while leaving the opt-in HTTP daemon independent of stdin.
+  process.stdin.once("end", _shutdown);
+  process.stdin.once("close", _shutdown);
+  if (process.stdin.readableEnded || process.stdin.destroyed) void _shutdown();
+}
