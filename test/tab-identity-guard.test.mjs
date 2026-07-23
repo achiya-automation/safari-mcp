@@ -60,9 +60,45 @@ test("every tab-targeted user-script site carries the guard", () => {
   }
 });
 
-test("the guard is inert for an explicit tabIndex and absent marker", () => {
+test("an explicit tabIndex is the only way to opt out of the guard", () => {
   const body = src.slice(src.indexOf("function _tabIdentityGuard("));
-  assert.match(body, /if \(!marker \|\| explicitTabIndex\) return ''/, "both opt-outs must remain");
+  assert.match(body, /if \(explicitTabIndex\) return ''/, "naming a tab stays an explicit opt-out");
+  assert.doesNotMatch(
+    body.slice(0, body.indexOf("MCP_WRONG_TAB")),
+    /if \(!marker[^)]*\) return ''/,
+    "an absent marker must NOT drop the guard: a session re-initialised after a transport " +
+      "drop reports no marker while already owning a tab, and the unguarded fallback is the " +
+      "user's front document (#64)"
+  );
+});
+
+test("a markerless session refuses a front document that carries a foreign MCP marker", () => {
+  const body = src.slice(src.indexOf("function _tabIdentityGuard("));
+  const noMarkerBranch = body.slice(0, body.indexOf("MCP_WRONG_TAB"));
+  assert.match(
+    noMarkerBranch,
+    /window\.name\.indexOf\('MCP_'\)\s*===\s*0[\s\S]{0,80}MCP_FOREIGN_TAB/,
+    "the no-marker branch must throw MCP_FOREIGN_TAB on any MCP-marked tab"
+  );
+});
+
+test("both run paths translate a foreign-tab trip into a terminal fail-closed error", () => {
+  for (const where of ["runJS", "runJSLarge"]) {
+    assert.ok(
+      src.includes(`_foreignTabError('${where}'`),
+      `${where} must map MCP_FOREIGN_TAB to the fail-closed error`
+    );
+  }
+  // Terminal on purpose: with no marker there is nothing to re-resolve to, so neither path
+  // may retry after this guard trips.
+  const runJSBody = src.slice(src.indexOf("async function runJS("), src.indexOf("async function runJSLarge("));
+  const foreignAt = runJSBody.indexOf("MCP_FOREIGN_TAB");
+  const wrongAt = runJSBody.indexOf("MCP_WRONG_TAB', ");
+  assert.ok(foreignAt > 0, "runJS must handle MCP_FOREIGN_TAB");
+  assert.ok(
+    wrongAt === -1 || foreignAt < wrongAt,
+    "the foreign-tab check must run before the re-resolve-and-retry branch"
+  );
 });
 
 test("runJSLarge translates a tripped guard into a fail-closed error", () => {

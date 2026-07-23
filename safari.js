@@ -1180,13 +1180,40 @@ async function _withTargetTabFronted(fn) {
 // Atomic tab-identity guard, as a JS prefix. Belongs here and not at a call site: it is the
 // only check that is independent of how `idx` was resolved, so every path that builds a
 // targeted `do JavaScript` needs it — most of all the retry paths, which run precisely when
-// the index has already proven untrustworthy. Empty string when the caller named a tab
-// explicitly, or when this session owns no marked tab (front-document fallback is then
-// intentional). See #64.
+// the index has already proven untrustworthy. Empty only when the caller named a tab
+// explicitly. See #64.
 function _tabIdentityGuard(explicitTabIndex) {
+  if (explicitTabIndex) return '';
   const marker = _st().activeTabMarker;
-  if (!marker || explicitTabIndex) return '';
+  // No marker → this session owns no tab, so the target is the front document: the tab the
+  // user is looking at. That fallback is intentional for a session that genuinely never
+  // opened one — but "owns no tab" is also what a *re-initialised* session reports. In
+  // HTTP-daemon mode a dropped transport makes the client re-init, which mints a new
+  // MCP session id, and `_st()` hands it a fresh empty state: `hasOwnedTab` false,
+  // `activeTabMarker` null. Every fail-closed branch keys on `hasOwnedTab`, so they all read
+  // false at exactly the moment an agent is mid-task and already owns a tab — and the next
+  // op runs, unguarded, on the user's current page.
+  //
+  // The session state died; the marker on the tab did not. A front document carrying any
+  // `MCP_` marker is a tab some MCP session opened and this one does not own, so it is
+  // never a legitimate implicit target — refuse it. An unmarked front document stays
+  // reachable, which keeps "read the page I'm looking at" working for real fresh sessions.
+  if (!marker) {
+    return `if(typeof window.name==='string'&&window.name.indexOf('MCP_')===0){throw new Error('MCP_FOREIGN_TAB')};`;
+  }
   return `if(window.name!=='${marker}'&&window.__mcpTabMarker!=='${marker}'){throw new Error('MCP_WRONG_TAB')};`;
+}
+
+// A tripped foreign-tab guard is terminal: with no marker of our own there is nothing to
+// re-resolve to, and retrying is the guess the guard just refused.
+function _foreignTabError(where, cause) {
+  return new Error(
+    `Tab tracking lost during ${where} — the target is a tab opened by another MCP session ` +
+    `that this session does not own (atomic guard fail-closed). This session holds no tab ` +
+    `marker, which is also what a session re-initialised after a transport drop reports. ` +
+    `Call safari_new_tab to open a tab this session owns.`,
+    cause ? { cause } : undefined
+  );
 }
 
 // Run JavaScript in Safari — fastest path, no focus stealing
@@ -1247,6 +1274,7 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
     // the shared profile window). Re-resolve via a full marker scan and retry once on the
     // correct tab; if unresolved, fail closed rather than touch the user's tab.
     const _gmsg = err.message || '';
+    if (_gmsg.includes('MCP_FOREIGN_TAB')) throw _foreignTabError('runJS', err);
     if (_guard && _gmsg.includes('MCP_WRONG_TAB')) {
       console.error('[Safari MCP] Atomic guard tripped — re-resolving marked tab via full scan');
       _st().lastResolveTime = 0; _st().activeTabIndex = null;
@@ -1353,6 +1381,7 @@ async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
   } catch (err) {
     // No retry here, unlike runJS: these payloads carry file data, and re-running one on a
     // freshly resolved tab is exactly the guess this guard exists to prevent.
+    if ((err.message || '').includes('MCP_FOREIGN_TAB')) throw _foreignTabError('runJSLarge', err);
     if ((err.message || '').includes('MCP_WRONG_TAB')) {
       throw new Error('Tab tracking lost during runJSLarge — target tab does not carry this session\'s marker (atomic guard fail-closed). Call safari_new_tab to reopen.', { cause: err });
     }
