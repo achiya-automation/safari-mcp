@@ -7,8 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.15.7] - 2026-07-24
+
 ### Fixed
-- Stdio servers now clean up and exit when their client closes stdin without sending a termination signal, preventing stale Safari MCP process trees from accumulating after sessions end.
+- Stdio servers now clean up and exit when their client closes stdin without sending a termination signal, preventing stale Safari MCP process trees from accumulating after sessions end. Thanks to @jgimeno for the fix (#67).
 
 ## [2.15.6] - 2026-07-23
 
