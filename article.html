@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>I Read My Server Logs and Found Out Who Actually Reads My Site. It Wasn't People.</title>
+</head>
+<body>
+  <h1>I Read My Server Logs and Found Out Who Actually Reads My Site. It Wasn't People.</h1>
+
+  <p><em>2,150 AI reads a month, six sales, and one uncomfortable lesson about how machines decide what's true.</em></p>
+
+  <p>I run a small affiliate code for Chatwoot, an open-source customer support platform. It's a modest thing: 5% off for the reader, 20% of the revenue to me for twelve months. Not a business — a side effect of writing honestly about tools I use.</p>
+
+  <p>Last week I went looking for why it converts so rarely. What I found had almost nothing to do with the code, and quite a lot to do with how AI assistants decide which facts to repeat.</p>
+
+  <h2>First surprise: Google Analytics was showing me a fraction of the picture</h2>
+
+  <p>The page in question gets around 110 human visits a month and about seven organic clicks from Google. On those numbers the code should convert approximately never.</p>
+
+  <p>So I stopped looking at analytics and read the raw server logs instead. Specifically, I filtered for two user agents: <code>ChatGPT-User</code> and <code>Claude-User</code>.</p>
+
+  <p>Those two matter because of what they mean. They are not crawlers building an index. They fire <em>only</em> when a human being has asked a question and the assistant is fetching a page in real time to answer it. Every hit is a person, mid-question.</p>
+
+  <p>Across a day and a half of logs, my site served <strong>1,991 of them</strong> — 1,448 from ChatGPT, 543 from Claude, spread across 112 pages. My two Chatwoot pages alone accounted for 215, which annualises to roughly <strong>2,150 AI reads a month</strong> on that topic.</p>
+
+  <p>Against six conversions.</p>
+
+  <p>That ratio — 2,150 to six, about 0.28% — reframed the entire problem. I had assumed I had a traffic problem. I did not. I had a citation problem.</p>
+
+  <h2>Second surprise: the assistants knew I was right, and still wouldn't say my name</h2>
+
+  <p>Search for a Chatwoot coupon and you will find a remarkable amount of confident fiction. As of this writing: 70% off on one deals site. $100 off on another. Codes named START, PINTU, KUMAR, MALIK, SAVE55, GET50, 5OFFCODE, scattered across blog spam, a LinkedIn newsletter, a YouTube video, and — I am not making this up — a page on a LEGO modelling site.</p>
+
+  <p>Every one of them is impossible. Chatwoot publishes its affiliate terms in plain language: partners earn 20% for twelve months, and <em>"your referrals get 5% off their subscription too."</em> Five percent is the ceiling. There is no mechanism inside the company that could issue 70%.</p>
+
+  <p>So I wrote that up, carefully sourced, and waited.</p>
+
+  <p>What happened next was the genuinely interesting part. Google's AI Overview <strong>adopted my fact</strong>. Asked about Chatwoot coupons, it began stating that 5% was the real maximum. On one query it explicitly debunked the inflated codes — <em>"third-party sites list higher promotional codes… the officially backed discount is 5%."</em></p>
+
+  <p>And then it declined to name any code at all. Including mine.</p>
+
+  <h2>The mechanism: being right loses to being repeated</h2>
+
+  <p>I think the explanation is mundane and slightly chilling.</p>
+
+  <p>Search Google for my code and you got two results, both on my own domain. Google even asked whether I meant a different word entirely. Search for any of the fake codes and you get eight or more independent domains each.</p>
+
+  <p>An assistant asked "which code is real" has no ground truth to check against. It cannot phone Chatwoot. What it can do is count: how many independent sources say the same string? On that measure I was losing one to eight, while being the only one telling the truth.</p>
+
+  <p>So the model did something quite reasonable. It took the <em>claim</em> it could verify against the vendor's own page — the 5% ceiling — and refused to commit to the <em>identifier</em> it couldn't corroborate.</p>
+
+  <p>Accuracy got me the fact. It did not get me the attribution.</p>
+
+  <h2>The test</h2>
+
+  <p>If corroboration was really the bottleneck, adding one more honest source should change the output. So I published the investigation on a second domain — a developer community with reasonable authority — and waited three days.</p>
+
+  <p>The AI Overview now names my code, states the correct discount, lists the tiers it applies to, and cites that second domain as its source.</p>
+
+  <p>One additional source. That was the whole intervention. I changed nothing on my own site — the page had already said everything true there was to say, and had been saying it for months.</p>
+
+  <p>I want to be careful here: this is a single natural experiment, AI Overviews are not deterministic, and I would not build a strategy on one observation. But the before-and-after is clean, and the mechanism it implies is consistent with how these systems are documented to weight retrieved sources.</p>
+
+  <h2>Why this should bother you more than it bothers me</h2>
+
+  <p>My stake in this is trivial. Eight months of that affiliate code has produced $83, none of which has actually been paid out yet. If the whole channel evaporated I would lose a rounding error.</p>
+
+  <p>But the mechanism generalises, and that part is not trivial.</p>
+
+  <p>If AI assistants resolve factual conflicts partly by counting independent sources, then the defence against being misrepresented is no longer <em>being correct</em>. It is <em>being repeated</em>. Those are different skills, they cost different amounts, and the second one scales with budget in a way the first does not.</p>
+
+  <p>A company with a content team can flood eight domains with a claim in an afternoon. An honest person with one website cannot. And the assistant, doing something entirely defensible, will believe the volume.</p>
+
+  <p>This applies to far more than coupon codes. Pricing. Version numbers. Security advisories. Which library is deprecated. Any factual claim about your own product that somebody else has an incentive to state incorrectly.</p>
+
+  <h2>What I'd actually suggest</h2>
+
+  <p><strong>Read your raw access logs.</strong> Filter for <code>ChatGPT-User</code>, <code>Claude-User</code> and <code>Perplexity-User</code> — the agents that only fire on a live human question. Analytics won't show you these; they don't run JavaScript. Search Console won't either; it only reports Google. For me this was the difference between "a handful of visitors" and "two thousand machine reads a month." You cannot manage a channel you cannot see.</p>
+
+  <p><strong>Count your domains, not your words.</strong> Search your product name, your version string, your unique identifier in quotes, logged out. Count distinct domains that state it correctly. If the answer is one, more on-page optimisation is not your lever — it's diminishing returns on something already saturated.</p>
+
+  <p><strong>Bound your claims precisely.</strong> Writing this piece, I found an error in my own page. I had said 5% was "the ceiling" without qualifying <em>of what</em>. It turns out Chatwoot signs regional partnerships too — their official partner in Brazil offers 15% on an Enterprise licence, announced with a quote from Chatwoot's CEO. My statement was true of the affiliate programme and misleading as an absolute. I fixed it, because in a fight where accuracy is your only asset, one overreach costs you the rest.</p>
+
+  <p><strong>Then add sources, slowly.</strong> One honest, properly disclosed write-up on a real platform. Then wait and measure. Publishing the same thing to five places in a week reads as exactly what it looks like.</p>
+
+  <h2>The uncomfortable bit</h2>
+
+  <p>I don't have a clean answer to any of this. The strategy I'm running — be accurate, disclose everything, add one legitimate source at a time — is slow, and it is losing on volume to people who simply invent numbers.</p>
+
+  <p>It did work, eventually, for one code on one query. That's a small result and I'm not going to oversell it.</p>
+
+  <p>But if your answer to "how do I stop AI misrepresenting my product" is "be more correct," I'd gently suggest checking your logs first. You may find that the machines already read you, already believe your facts, and still won't say your name — for reasons that have nothing to do with whether you're right.</p>
+
+  <p><em>Disclosure: the Chatwoot code discussed here, ACHIYAVS, is my affiliate code. If you use it I earn a commission and you pay 5% less than list price. Chatwoot's self-hosted Community Edition is free and needs no code at all, which is what I'd recommend if you have the operational capacity to run it. Full pricing breakdown, including where Intercom is genuinely the better purchase, is on <a href="https://achiya-automation.com/en/blog/chatwoot-vs-intercom/">my comparison page</a>.</em></p>
+</body>
+</html>
