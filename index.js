@@ -81,10 +81,9 @@ async function _cleanupTabs() {
       const tabs = await safari.listTabs();
       const parsed = typeof tabs === 'string' ? JSON.parse(tabs) : tabs;
       const match = parsed.find(t => t.url === url);
-      if (match) {
-        safari.setActiveTabIndex(match.index);
-        await safari.closeTab();
-      }
+      // Name the tab explicitly: it was just resolved out of our own opened-tab table, and
+      // closeTab refuses anything it cannot prove it owns (#68).
+      if (match) await safari.closeTab(match.index);
     } catch {}
   }
   _openedTabs.clear();
@@ -153,10 +152,7 @@ async function _closeOldestMCPTab() {
         const tabs = await safari.listTabs();
         const parsed = typeof tabs === 'string' ? JSON.parse(tabs) : tabs;
         const match = parsed.find(t => t.url === info.url);
-        if (match) {
-          safari.setActiveTabIndex(match.index);
-          await safari.closeTab();
-        }
+        if (match) await safari.closeTab(match.index);
       }
     } catch {}
     _untrackTab(oldestIdx);
@@ -657,8 +653,12 @@ const _nullMeansFailure = new Set([
 
 // Operations that don't need tab ownership (read-only or tab management)
 const _noOwnershipCheck = new Set([
-  // Tab management
-  "new_tab", "list_tabs", "close_tab", "switch_tab",
+  // Tab management. NOTE: "close_tab" is deliberately NOT here. It sat in this set as
+  // "tab management" next to new_tab/list_tabs/switch_tab, but it is the only member that
+  // destroys a user tab: new_tab creates one, list_tabs reads, and switch_tab carries its
+  // own ownership check at the tool. close_tab had none — exempt from the shared guard and
+  // unguarded underneath, which is how it closed a user's tab in #68.
+  "new_tab", "list_tabs", "switch_tab",
   // Extension self-management (doesn't touch tabs)
   "reload_extension",
   // Read-only — don't modify the page
@@ -1378,8 +1378,7 @@ server.tool(
       if (oldestIdx !== null) {
         console.error(`[Safari MCP] Tab limit (${MAX_TABS}) reached — closing oldest tab #${oldestIdx}`);
         try {
-          safari.setActiveTabIndex(oldestIdx);
-          await safari.closeTab();
+          await safari.closeTab(oldestIdx);
         } catch {}
         _untrackTab(oldestIdx);
       }

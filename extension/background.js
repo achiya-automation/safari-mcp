@@ -226,7 +226,14 @@ async function handleCommand(type, payload) {
     if (anyOwned) {
       throw new Error(`⚠️ Tab safety: refusing "${type}" on tab ${tabId} (${targetTab.url || 'unknown'}) — not opened by this MCP session. Use safari_new_tab first.`);
     }
-    // If no tabs owned yet, allow operation (backward compatibility for sessions that don't use new_tab)
+    // No tabs owned yet → allow, for sessions that never call new_tab. That leniency is
+    // survivable for a write (worst case: it edits the page the user is already on) but not
+    // for a close, which throws their tab away. It also fires for a session re-initialised
+    // after a transport drop, which reports owning nothing while its tab is still open —
+    // the state in which close_tab destroyed a user's tab (#68).
+    if (_destructiveTabCommands.has(type)) {
+      throw new Error(`⚠️ Tab safety: refusing "${type}" on tab ${tabId} (${targetTab.url || 'unknown'}) — this session owns no tabs, so it has none to close. Use safari_new_tab first.`);
+    }
   }
 
   switch (type) {
@@ -1117,6 +1124,11 @@ async function handleCommand(type, payload) {
         // could resolve the wrong tab or leave a stale last-tab verdict).
         const target = _winTabs[payload.index - 1];
         if (target) {
+          // The ownership guard above checked `tabId` — this branch closes a tab chosen by
+          // index instead, so it must be checked on its own or the guard is decorative.
+          if (!_isTabOwnedBySession(sessionId, target.id)) {
+            throw new Error(`⚠️ Tab safety: refusing to close tab ${payload.index} (${target.url || 'unknown'}) — not opened by this MCP session.`);
+          }
           _removeOwnedTab(sessionId, target.id);
           if (_isLastTab) {
             await browser.tabs.update(target.id, { url: "about:blank" });
@@ -1827,6 +1839,10 @@ function _isTabOwnedBySession(sessionId, tabId) {
   const set = _sessionOwnedTabs.get(sid);
   return set ? set.has(tabId) : false;
 }
+
+// Commands that destroy a tab rather than change a page. They get no "no tabs owned yet"
+// leniency: a session that owns nothing has nothing to close (#68).
+const _destructiveTabCommands = new Set(["close_tab"]);
 
 // Read-only commands that don't modify the page — allowed on any tab
 const _readOnlyCommands = new Set([

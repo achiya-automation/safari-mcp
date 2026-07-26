@@ -3484,8 +3484,37 @@ export async function newTab(url = "") {
   return info;
 }
 
-export async function closeTab() {
+// A tab index this session can prove it owns, or null. Destructive paths only: they may
+// never guess, so "can't prove it" has to read as null rather than as the front document.
+// `resolveActiveTab()` re-finds the tab through its identity marker (surviving the index
+// shifts of #54) and fails closed to null when the marker is on no tab at all.
+async function _provenOwnTabIndex() {
+  return (await resolveActiveTab()) || null;
+}
+
+// `explicitIndex` — the caller naming the tab, the same opt-out convention the identity
+// guard uses. Internal cleanup resolves its own indices out of the opened-tab table and
+// passes them here; everything else must prove ownership.
+export async function closeTab(explicitIndex) {
   await refreshTargetWindow();
+
+  // ── Guard: close nothing this session cannot prove it owns. There is deliberately no
+  // front-document fallback here, unlike the read paths: `close current tab of window` is
+  // the tab the USER is looking at whenever our index is unknown — and "unknown" is exactly
+  // what a session re-initialised after a transport drop reports, mid-task, while a tab of
+  // its own is still open. That fail-open destroyed a user's tab (#68, the destructive
+  // sibling of #64). An unmarked front document stays readable for a genuinely fresh
+  // session, because a bad read costs information; a bad close costs their work.
+  const idx = explicitIndex || (await _provenOwnTabIndex());
+  if (!idx) {
+    throw new Error(
+      `Tab tracking lost — refusing to close a tab this session cannot prove it opened ` +
+      `(closing "current tab of window" would close the user's active tab). ` +
+      `Call safari_new_tab to open a tab this session owns, or safari_list_tabs and ` +
+      `safari_switch_tab to re-anchor to a known one.`
+    );
+  }
+
   // ── Guard: never close a window's LAST tab. Closing it shuts the window —
   // which quits Safari if it's the only window, AND (for profile-targeted
   // instances) makes the target window vanish so every later op throws
@@ -3500,10 +3529,11 @@ export async function closeTab() {
       10
     );
     if (Number.isFinite(_winTabs) && _winTabs <= 1) {
-      const _ref = _st().activeTabIndex
-        ? `tab ${_st().activeTabIndex} of ${getTargetWindowRef()}`
-        : `current tab of ${getTargetWindowRef()}`;
-      await osascript(`tell application "Safari" to set URL of ${_ref} to "about:blank"`);
+      // Blanking is destructive too — it throws away whatever page is loaded — so it
+      // targets the proven index, never the front document.
+      await osascript(
+        `tell application "Safari" to set URL of tab ${idx} of ${getTargetWindowRef()} to "about:blank"`
+      );
       _st().activeTabIndex = null;
       _st().activeTabURL = null;
       _st().lastTabCount = null;
@@ -3512,16 +3542,15 @@ export async function closeTab() {
     }
   } catch { /* count check failed — fall through to normal close */ }
 
-  if (_st().activeTabIndex) {
-    await osascript(
-      `tell application "Safari" to close tab ${_st().activeTabIndex} of ${getTargetWindowRef()}`
-    );
+  await osascript(
+    `tell application "Safari" to close tab ${idx} of ${getTargetWindowRef()}`
+  );
+  if (!explicitIndex || idx === _st().activeTabIndex) {
     _st().activeTabIndex = null;
     _st().activeTabURL = null;
-  } else {
-    await osascript(
-      `tell application "Safari" to close current tab of ${getTargetWindowRef()}`
-    );
+    // The tab is gone, so its marker is too — keeping it would let a later resolve
+    // match a stale identity.
+    _st().activeTabMarker = null;
   }
   _st().lastTabCount = null;    // Invalidate — tab count changed
   _st().lastResolveTime = 0;    // Force re-resolve on next operation
