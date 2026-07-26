@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.15.8] - 2026-07-26
+
 ### Fixed
 - **`safari_close_tab` could close one of the user's tabs.** With no tab index of its own, the close path fell back to `close current tab of window` — the tab the user is actually looking at. "No index of its own" is exactly what a session re-initialised after a transport drop reports while its own tab is still open, so the fallback fired at the worst moment; it closed a user's tab during a real run (#68). This is the destructive sibling of #64, and the fail-open sat in all three layers with one shape — *no ownership recorded* read as permission rather than as refusal: `close_tab` was listed among the ownership-exempt "tab management" operations next to `new_tab`/`list_tabs`/`switch_tab` (the only one of the four that destroys a user tab, and the only one with no compensating check), the AppleScript engine fell back to the front document, and the extension engine's "no tabs owned yet → allow" backward-compatibility branch let the close through. The read paths keep that leniency on purpose — a wrong read costs information, so "read the page I'm looking at" still works for a session that never opened a tab — but the destructive path now closes a tab it can prove it owns or throws. Blanking a window's last tab is pinned to the same proven index, internal cleanup names its tab explicitly, and the extension checks the tab it actually removes rather than the one the guard happened to resolve (#68).
 
