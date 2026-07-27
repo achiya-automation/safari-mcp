@@ -94,7 +94,7 @@
     "@types/node": "^26.0.0",
     "eslint": "^10.5.0",
     "globals": "^17.6.0",
-    "jsdom": "^29.1.1",
+    "jsdom": "^30.0.0",
     "prettier": "^3.8.4",
     "typescript": "^7.0.2"
   }
