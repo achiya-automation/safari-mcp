@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.15.10] - 2026-07-28
+
+### Security
+- **`npm audit`: 0 vulnerabilities** (was 1 high + 2 moderate). Bumped `@modelcontextprotocol/sdk` to 1.30.0 and pinned `@hono/node-server` to `^2.0.5` via an npm override — the SDK accepts `^1.19.9 || ^2.0.5`, but npm's resolver never crosses the major on its own, so the serve-static path-traversal advisory (GHSA, Windows-only; not reachable in safari-mcp, which is macOS-only and never serves static files) kept resolving to 1.x. Also cleared a high-severity `brace-expansion` unbounded-expansion DoS advisory via in-range `npm audit fix`.
+
 ## [2.15.9] - 2026-07-28
 
 ### Fixed
