@@ -304,6 +304,38 @@ The recommended pattern for AI agents using Safari MCP:
 
 ---
 
+## Running several agents at once
+
+Multiple agents or subagents driving one Safari at the same time will fight over the active tab — unless you run them against a **shared HTTP daemon** instead of one process per client:
+
+```bash
+SAFARI_MCP_HTTP=1 SAFARI_MCP_HTTP_PORT=9225 npx safari-mcp
+```
+
+Then point every client at it:
+
+```json
+{ "mcpServers": { "safari-mcp": { "type": "http", "url": "http://127.0.0.1:9225/mcp" } } }
+```
+
+One daemon, many sessions — and each session gets its **own tab state**. The server keys `activeTabIndex`, the ownership flag and a unique tab marker off the MCP session id, so session A physically cannot read or steer session B's tab.
+
+Two properties make this safe rather than merely tidy:
+
+- **Tab identity is a marker, not an index.** Each session stamps a unique id into the page it opens, so ownership survives navigation *and* survives the user reordering or closing other tabs. An index alone would silently drift onto the wrong tab.
+- **It fails closed.** If a session's marked tab can't be re-found, every tool refuses instead of falling back to whatever tab is in front — because that tab is usually yours:
+
+  ```
+  Tab tracking lost — refusing to fall back to "current tab of window"
+  (would target the user's active tab). Call safari_new_tab to reopen.
+  ```
+
+This also drops process count sharply: ~17 node processes for 17 concurrent sessions becomes 1.
+
+`SAFARI_PROFILE` stays optional — leave it unset and sessions bind to your ordinary Safari windows, cookies and logins intact. Details in [docs/http-transport-design.md](docs/http-transport-design.md).
+
+---
+
 ## Tools (97)
 
 <details>

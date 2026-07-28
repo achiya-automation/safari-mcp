@@ -17,3 +17,6 @@ mcp-publisher
 *.bak-before-*
 .archive/
 audit-*.md
+
+# כלי עזר מקומי (TCC) — לא חלק מהחבילה
+claude-tcc-fixer.swift

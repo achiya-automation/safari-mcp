@@ -41,4 +41,6 @@ A single launchd daemon runs the `SAFARI_MCP_HTTP=1` instance; all Claude sessio
 
 ## Out of scope (for now)
 
-Per-session tab isolation (deliberately shared), command queue (add only if a real race appears), auth (localhost-only bind).
+Command queue (add only if a real race appears), auth (localhost-only bind).
+
+**Superseded:** per-session tab isolation was listed here as deliberately shared, and that turned out to be wrong in practice — two concurrent sessions overwrote each other's active-tab pointer and drifted onto the user's tab. It now ships: `session-context.js` runs every HTTP request inside an `AsyncLocalStorage` context keyed by MCP session id, and `safari.js` keys its whole tab state (`activeTabIndex`, `activeTabURL`, `hasOwnedTab`, `activeTabMarker`, per-session `markerId`) off that id. Ownership of _URLs_ remains shared and on-disk as designed; only the per-session tab pointer is isolated.
