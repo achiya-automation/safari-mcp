@@ -508,7 +508,7 @@ export async function restoreFocusIfStolen(savedBundleId) {
 // callers fail toward "user is idle" (preserving the pre-existing hide behavior).
 async function _userIdleSeconds() {
   try {
-    const { stdout } = await execFileAsync("ioreg", ["-c", "IOHIDSystem", "-r", "-d", "1"], { timeout: 1500 });
+    const { stdout } = await execFileAsync("/usr/sbin/ioreg", ["-c", "IOHIDSystem", "-r", "-d", "1"], { timeout: 1500 });
     const m = stdout.match(/"HIDIdleTime"\s*=\s*(\d+)/);
     if (!m) return Infinity;
     return parseInt(m[1], 10) / 1e9; // nanoseconds → seconds
@@ -3154,7 +3154,7 @@ export async function screenshot({ fullPage = false } = {}) {
       `tell application "Safari" to return id of ${getTargetWindowRef()}`
     ).catch(() => null) : null;
     // Window IDs are OS-assigned integers — reject anything non-numeric before it reaches
-    // `do shell script "screencapture -l<id>"` (defense-in-depth against odd AppleScript stdout).
+    // `do shell script "/usr/sbin/screencapture -l<id>"` (defense-in-depth against odd AppleScript stdout).
     const windowId = windowIdRaw != null && /^\d+$/.test(String(windowIdRaw).trim()) ? String(windowIdRaw).trim() : null;
 
     // On macOS Tahoe, screencapture -l may briefly steal focus.
@@ -3178,9 +3178,10 @@ export async function screenshot({ fullPage = false } = {}) {
           );
           try {
             await new Promise((r) => setTimeout(r, 500));
-            // Use do shell script to inherit osascript's Screen Recording permission
-            await osascript(
-              `do shell script "screencapture -l${windowId} -o -x '${tmpFile}'"`,
+            // Route capture through the TCC-granted helper (NSAppleScript → do shell script):
+            // under the launchd daemon, node has no Screen Recording grant — the helper does.
+            await osascriptFast(
+              `do shell script "/usr/sbin/screencapture -l${windowId} -o -x '${tmpFile}'"`,
               { timeout: 15000 }
             );
           } finally {
@@ -3192,13 +3193,13 @@ export async function screenshot({ fullPage = false } = {}) {
         } else {
           // Try direct execFile first (works if VS Code has Screen Recording permission)
           try {
-            await execFileAsync("screencapture", ["-l" + windowId, "-o", "-x", tmpFile]);
+            await execFileAsync("/usr/sbin/screencapture", ["-l" + windowId, "-o", "-x", tmpFile]);
             const testData = await readFile(tmpFile);
             if (testData.length < 100) throw new Error("empty");
           } catch (_) {
-            // Fallback: use do shell script (osascript may have permission)
-            await osascript(
-              `do shell script "screencapture -l${windowId} -o -x '${tmpFile}'"`,
+            // Fallback: do shell script via the TCC-granted helper (node lacks Screen Recording under launchd)
+            await osascriptFast(
+              `do shell script "/usr/sbin/screencapture -l${windowId} -o -x '${tmpFile}'"`,
               { timeout: 15000 }
             );
           }
@@ -3340,8 +3341,17 @@ export async function screenshotElement({ selector }) {
       );
       if (!bounds) throw new Error(typeof result === 'string' && result.startsWith('Element') ? result : 'Element not found for screenshot');
 
-      // Full window screenshot then crop with sips
-      await execFileAsync("screencapture", ["-l" + windowId, "-o", "-x", tmpFile]);
+      // Full window screenshot then crop with sips. Direct execFile works when this process
+      // has Screen Recording (stdio mode); under the launchd daemon it doesn't — fall back
+      // to the TCC-granted helper.
+      try {
+        await execFileAsync("/usr/sbin/screencapture", ["-l" + windowId, "-o", "-x", tmpFile]);
+      } catch {
+        await osascriptFast(
+          `do shell script "/usr/sbin/screencapture -l${windowId} -o -x '${tmpFile}'"`,
+          { timeout: 15000 }
+        );
+      }
       const { x, y, w, h, dpr = 1 } = JSON.parse(bounds);
       // Use sips to crop (macOS built-in). Use the DYNAMIC toolbar height — Sequoia+ chrome is
       // ~90px, not 74, so a hardcoded 74 left element screenshots vertically offset. Fall back
@@ -4291,76 +4301,58 @@ export async function clearConsoleCapture() {
 export async function savePDF({ path: pdfPath }) {
   await refreshTargetWindow();
   _validateFilePath(pdfPath);  // allowlist (/Users//tmp//var-folders) + block sensitive paths — prevents arbitrary overwrite
-  // NO focus stealing — uses screencapture + Python Quartz to generate PDF
+  // NO app focus stealing — tab selection, window resize and screencapture all stay
+  // inside our window; the user's frontmost app is never activated.
 
-  // Step 1: Get full page dimensions
-  const dims = await runJS("JSON.stringify({h:document.documentElement.scrollHeight,w:document.documentElement.scrollWidth})");
-  const { h, w } = JSON.parse(dims);
-
-  // Step 2: Save current bounds and resize to capture full page
-  const origBounds = await osascript(
-    `tell application "Safari" to return bounds of ${getTargetWindowRef()}`
-  );
-  const captureHeight = Math.min(Number(h) + 100, 16000);
-  await osascript(
-    `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {0, 0, ${Number(w)}, ${captureHeight}}`
-  );
-  await new Promise(r => setTimeout(r, 500)); // Let page reflow
-
-  // Step 3: Take screenshot via screencapture -l (window-targeted, NO focus steal)
-  const windowIdRaw = await osascript(
-    `tell application "Safari" to return id of ${getTargetWindowRef()}`
-  );
-  const windowId = windowIdRaw != null && /^\d+$/.test(String(windowIdRaw).trim()) ? String(windowIdRaw).trim() : null;
-  if (!windowId) throw new Error("Cannot get Safari window ID for PDF capture");
   const tmpPng = join(tmpdir(), `safari-mcp-pdf-${Date.now()}.png`);
-  try {
-    // Use do shell script to inherit osascript's Screen Recording permission
-    await osascript(
-      `do shell script "screencapture -l${windowId} -o -x '${tmpPng}'"`,
-      { timeout: 15000 }
+  // screencapture -l grabs the window's SELECTED tab — front ours for the duration
+  // (selection restored by _withTargetTabFronted), otherwise the PDF shows whatever
+  // tab the user last left selected in that window.
+  await _withTargetTabFronted(async () => {
+    // Step 1: Get full page dimensions
+    const dims = await runJS("JSON.stringify({h:document.documentElement.scrollHeight,w:document.documentElement.scrollWidth})");
+    const { h, w } = JSON.parse(dims);
+
+    // Step 2: Save current bounds and resize to capture full page
+    const origBounds = await osascript(
+      `tell application "Safari" to return bounds of ${getTargetWindowRef()}`
     );
-  } catch (err) {
-    // Restore bounds on failure
-    await osascript(`tell application "Safari" to set bounds of ${getTargetWindowRef()} to {${origBounds}}`).catch(() => {});
-    throw new Error(`PDF screenshot capture failed: ${err.message}`);
-  }
+    const captureHeight = Math.min(Number(h) + 100, 16000);
+    await osascript(
+      `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {0, 0, ${Number(w)}, ${captureHeight}}`
+    );
+    await new Promise(r => setTimeout(r, 500)); // Let page reflow
 
-  // Step 4: Restore original bounds
-  await osascript(
-    `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {${origBounds}}`
-  ).catch(() => {});
+    // Step 3: Take screenshot via screencapture -l (window-targeted, NO focus steal)
+    const windowIdRaw = await osascript(
+      `tell application "Safari" to return id of ${getTargetWindowRef()}`
+    );
+    const windowId = windowIdRaw != null && /^\d+$/.test(String(windowIdRaw).trim()) ? String(windowIdRaw).trim() : null;
+    if (!windowId) throw new Error("Cannot get Safari window ID for PDF capture");
+    try {
+      // Route capture through the TCC-granted helper (NSAppleScript → do shell script):
+      // under the launchd daemon, node has no Screen Recording grant — the helper does.
+      await osascriptFast(
+        `do shell script "/usr/sbin/screencapture -l${windowId} -o -x '${tmpPng}'"`,
+        { timeout: 15000 }
+      );
+    } catch (err) {
+      // Restore bounds on failure
+      await osascript(`tell application "Safari" to set bounds of ${getTargetWindowRef()} to {${origBounds}}`).catch(() => {});
+      throw new Error(`PDF screenshot capture failed: ${err.message}`);
+    }
 
-  // Step 5: Convert screenshot to PDF using Python3 + macOS Quartz (no external deps).
-  // Paths are passed as argv — NOT interpolated into the source — so there is no shell
-  // or Python string-escaping to get wrong, and no code-injection surface.
+    // Step 4: Restore original bounds
+    await osascript(
+      `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {${origBounds}}`
+    ).catch(() => {});
+  });
+
+  // Step 5: Convert screenshot to PDF with sips (macOS built-in). Replaces the previous
+  // python3+Quartz converter: current macOS ships pyobjc for neither the system nor the
+  // homebrew python3, so any bare `python3` died with ModuleNotFoundError: Quartz.
   try {
-    await execFileAsync("python3", ["-c", `
-import sys
-from Quartz import CGImageSourceCreateWithURL, CGImageSourceCreateImageAtIndex, CGImageGetWidth, CGImageGetHeight, CGPDFContextCreateWithURL, CGRectMake, CGPDFContextBeginPage, CGPDFContextEndPage, CGContextDrawImage
-from CoreFoundation import CFURLCreateFromFileSystemRepresentation
-
-png_path = sys.argv[1].encode('utf-8')
-pdf_path = sys.argv[2].encode('utf-8')
-
-src_url = CFURLCreateFromFileSystemRepresentation(None, png_path, len(png_path), False)
-img_src = CGImageSourceCreateWithURL(src_url, None)
-if not img_src:
-    print("ERROR: failed to read screenshot", file=sys.stderr); sys.exit(1)
-img = CGImageSourceCreateImageAtIndex(img_src, 0, None)
-if not img:
-    print("ERROR: failed to decode image", file=sys.stderr); sys.exit(1)
-w = CGImageGetWidth(img)
-h = CGImageGetHeight(img)
-
-pdf_url = CFURLCreateFromFileSystemRepresentation(None, pdf_path, len(pdf_path), False)
-ctx = CGPDFContextCreateWithURL(pdf_url, CGRectMake(0, 0, w, h), None)
-CGPDFContextBeginPage(ctx, None)
-CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), img)
-CGPDFContextEndPage(ctx)
-del ctx
-print(f"OK {w}x{h}")
-`.trim(), tmpPng, pdfPath], { timeout: 15000 });
+    await execFileAsync("/usr/bin/sips", ["-s", "format", "pdf", tmpPng, "--out", pdfPath], { timeout: 15000 });
   } catch (err) {
     throw new Error(`PDF conversion failed: ${err.message}`);
   } finally {

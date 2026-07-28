@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.15.9] - 2026-07-28
+
+### Fixed
+- **`safari_save_pdf` was broken end to end in daemon mode — four stacked failures, each unmasked by fixing the previous one.** The tool now works and is verified against a live page; the first three fixes also harden the screenshot fallback paths, which shared them:
+  - **PATH:** launchd agents and MCP hosts commonly run with a trimmed PATH (e.g. `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`), and `do shell script` inherits it — so every capture path that spawned a bare `screencapture` died with `sh: screencapture: command not found` (127). All `screencapture` invocations plus the `ioreg` idle-time probe — the only two spawned binaries living in `/usr/sbin` — now use absolute paths.
+  - **Screen Recording TCC:** with PATH fixed, capture failed with `could not create image from window`. Spawning `screencapture` from the node daemon (directly or via an `osascript` subprocess) attributes the TCC check to node, which has no Screen Recording grant under launchd — only the signed `safari-helper` does (`safari_doctor` was already green because its preflight runs in the helper). Every capture now routes through `osascriptFast` (NSAppleScript inside the helper), so the shell inherits the helper's grant; the element-screenshot crop path got the same helper fallback behind its direct `execFile` attempt.
+  - **PNG→PDF conversion:** the converter ran `python3 -c 'from Quartz import …'`, but current macOS ships pyobjc for neither the system nor the homebrew python3 — `ModuleNotFoundError: Quartz`. Replaced ~30 lines of embedded Python with a single macOS-native call: `/usr/bin/sips -s format pdf`.
+  - **Wrong tab captured:** `screencapture -l` grabs the window's *selected* tab, and `savePDF` never selected the session's target tab — so the PDF showed whatever tab the user last left in front, rendered at the target page's width. The measure/resize/capture sequence is now wrapped in `_withTargetTabFronted`, which selects our tab within the window (no app-level focus steal) and restores the user's selection afterwards.
+
 ## [2.15.8] - 2026-07-26
 
 ### Fixed
