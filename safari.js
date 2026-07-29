@@ -18,10 +18,6 @@ import { currentSessionId } from "./session-context.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = dirname(fileURLToPath(import.meta.url));
-// Local session ID — kept in sync with index.js SESSION_ID for tab marker generation
-// Both files need their own const because they're separate ES modules; the marker only needs to be unique per process
-const SESSION_ID = randomUUID().slice(0, 8);
-
 // ========== STRING ESCAPING (single source of truth) ==========
 // Escaping ORDER is security-relevant: the backslash MUST be escaped before the quote, or the
 // backslash inserted in front of the quote gets doubled and the string breaks out. These helpers

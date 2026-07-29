@@ -8,6 +8,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { startTransport } from "./transport.js";
+import { currentSessionId } from "./session-context.js";
 import { z } from "zod";
 import * as safari from "./safari.js";
 import { textResult, jsonResult, imageResult, errorResult } from "./response.js";
@@ -736,7 +737,11 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
       try {
         const t0 = Date.now();
         const tabUrl = safari.getActiveTabURL();
-        const payload = { ...extensionPayload, sessionId: SESSION_ID, ...(tabUrl ? { tabUrl } : {}) };
+        // Composite id: SESSION_ID alone is process-wide, so in HTTP-daemon mode every
+        // MCP client looked like ONE extension session and could target another client's
+        // cached tab (#76). currentSessionId() alone would collapse all stdio processes
+        // into "_default" — so both parts are needed.
+        const payload = { ...extensionPayload, sessionId: `${SESSION_ID}:${currentSessionId()}`, ...(tabUrl ? { tabUrl } : {}) };
         const timeout = _commandTimeouts[extensionType] || 30000;
         result = await sendToExtension(extensionType, payload, timeout);
         const isCspError = typeof result === 'string' && (result.includes('unsafe-eval') || result.includes('trusted-types') || result.includes('Trusted Type') || result.includes('Content Security Policy'));
