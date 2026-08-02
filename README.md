@@ -334,7 +334,7 @@ This also drops process count sharply: ~17 node processes for 17 concurrent sess
 
 `SAFARI_PROFILE` stays optional — leave it unset and sessions bind to your ordinary Safari windows, cookies and logins intact. Details in [docs/http-transport-design.md](docs/http-transport-design.md).
 
-Prefer stdio (one process per agent) over a persistent daemon? That works too — isolation then comes from the process boundary itself. If your client multiplexes agents through [mcporter](https://github.com/openclaw/mcporter), [mcporter-lanes](https://pi.dev/packages/mcporter-lanes) (a pi extension by [@maxim](https://github.com/maxim), born out of [#76](https://github.com/achiya-automation/safari-mcp/issues/76)) gives each agent session its own daemon dir — and therefore its own safari-mcp — with an idle timeout so processes don't pile up.
+Prefer stdio (one process per agent) over a persistent daemon? That works too — isolation then comes from the process boundary itself. One caveat: if your client multiplexes agents through [mcporter](https://github.com/openclaw/mcporter), mcporter caches a single MCP client for all of them — whichever transport you pick — so the server never sees distinct sessions and per-session isolation can't engage. [mcporter-lanes](https://pi.dev/packages/mcporter-lanes) (a pi extension by [@maxim](https://github.com/maxim), born out of [#76](https://github.com/achiya-automation/safari-mcp/issues/76)) fixes this upstream: each agent session gets its own daemon dir — and therefore its own safari-mcp — with an idle timeout so processes don't pile up.
 
 ---
 
