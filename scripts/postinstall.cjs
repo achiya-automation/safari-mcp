@@ -3,7 +3,7 @@
 // Skipped silently in CI and when stdout is not a TTY (npm install in scripts).
 
 const path = require("path");
-const { execSync } = require("child_process");
+const { execFileSync, spawnSync } = require("child_process");
 const fs = require("fs");
 
 const c = {
@@ -31,7 +31,10 @@ function readHelperId(helper) {
     // NOTE: the Identifier= line is only emitted with --verbose. Plain `codesign -d`
     // prints nothing matchable, so the old grep always failed → the early-return never
     // fired and any verify read came back empty (a false "re-sign failed" signal).
-    return execSync(`codesign -d --verbose=2 -- "${helper}" 2>&1 | grep "^Identifier="`, { encoding: "utf8" }).trim();
+    const result = spawnSync("codesign", ["-d", "--verbose=2", "--", helper], { encoding: "utf8" });
+    const output = (result.stdout || "") + (result.stderr || "");
+    const match = output.split("\n").find((l) => l.startsWith("Identifier="));
+    return match ? match.trim() : "";
   } catch { return ""; }
 }
 function ensureCodesign() {
@@ -43,9 +46,11 @@ function ensureCodesign() {
     const current = readHelperId(helper);
     if (current.includes(STABLE_ID)) return;
     const entitlements = path.join(__dirname, "..", "safari-helper.entitlements");
-    const entFlag = fs.existsSync(entitlements) ? `--entitlements "${entitlements}"` : "";
+    const codesignArgs = ["-s", "-", "-f", "--identifier", STABLE_ID];
+    if (fs.existsSync(entitlements)) codesignArgs.push("--entitlements", entitlements);
+    codesignArgs.push(helper);
     // NOTE: do NOT swallow codesign's stderr (the old `2>/dev/null` hid real failures).
-    execSync(`codesign -s - -f --identifier ${STABLE_ID} ${entFlag} "${helper}"`, { stdio: ["ignore", "ignore", "pipe"] });
+    execFileSync("codesign", codesignArgs, { stdio: ["ignore", "ignore", "pipe"] });
     // Verify the re-sign actually took. A SILENT failure here is the #1 cause of native
     // clicks "succeeding" while never reaching the page — the Accessibility grant is keyed
     // to the identifier, so a wrong/unstable identifier breaks it invisibly. Make it loud.
