@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Most "AI Agents" Are Just Rule-Based Bots Wearing AI Clothing</title>
+</head>
+<body>
+  <h1>Most "AI Agents" Are Just Rule-Based Bots Wearing AI Clothing</h1>
+  <p><em>I build them for a living. This morning I audited my own production server — and the numbers say more about the "AI agent" market than any pitch deck.</em></p>
+
+  <img src="https://achiya-automation.github.io/safari-mcp/hero-2026-08-04.png" alt="A glowing AI chatbot contained inside a neon boundary ring">
+
+  <p>This morning, before writing this, I ran one SQL query against my main production server — the one that runs automation for real businesses, every day, mostly in Israel: <strong>56 active workflows. Exactly 14 of them contain a call to an AI model. The other 42 — 75% — are deterministic logic.</strong> Triggers, conditions, database lookups, API calls. Not a neuron in sight.</p>
+
+  <p>Here's the uncomfortable part: clients call all of it "the AI system." Vendors — my competitors, and sometimes, if I'm honest, my own marketing — call all of it "AI agents."</p>
+
+  <p>So am I selling you a lie? No. And understanding <em>why</em> not is the single most useful thing you can learn before you sign a contract for an "AI agent" this year.</p>
+
+  <h2>What's actually inside the box</h2>
+
+  <p>When a business buys an "AI agent" for WhatsApp or their website, here's what typically ships:</p>
+
+  <ul>
+    <li><strong>A trigger layer.</strong> A message arrives, a form is submitted, a payment fails. Zero AI.</li>
+    <li><strong>A routing and rules layer.</strong> Is this a new customer? Is it after business hours? Has this phone number already been contacted this week? All deterministic. Zero AI.</li>
+    <li><strong>Integrations.</strong> Calendar, CRM, invoicing, human handoff. Zero AI.</li>
+    <li><strong>And somewhere in the middle — a model call.</strong> Usually for one of three narrow jobs: understand free-form text, extract structured fields from it ("which city? which service?"), or draft a human-sounding reply.</li>
+  </ul>
+
+  <p>The model is real, and it earns its keep — natural language is genuinely hard, and in Hebrew, with its slang and its right-to-left quirks, it's harder. But the model is a <em>component</em>, not the machine. The machine is rules.</p>
+
+  <p>That's not a scandal. That's the correct architecture. And the reason is what happened to me in late July.</p>
+
+  <h2>The day the model made a decision — and nobody noticed it was wrong</h2>
+
+  <p>For one client — a lead-qualification agent for a home-services company — we let the model make an actual <em>routing</em> decision: should this lead get an automated question, or be escalated to a human?</p>
+
+  <p>During acceptance testing, one scenario failed: a lead who simply hadn't mentioned their city. The intended behavior was obvious — ask them one question: "Which city are you in?" Instead, the agent silently opened a task for a human reviewer. The question it had already drafted — a perfectly good question — <strong>was never sent to the customer.</strong></p>
+
+  <p>Nothing crashed. No error, no alert. The classification "worked," the text was excellent, and the lead sat waiting for a human who thought a machine was handling it.</p>
+
+  <p>The root cause was two instructions in the prompt that both touched the same case. One said unclear locations should go to a human. Another said missing fields alone should never trigger escalation. A missing city fits both — and the model picked the broader rule. The only reason we caught it is that we force the model to output a <em>reason code</em> with every decision: it explicitly told us which rule it had applied, and it named the wrong one.</p>
+
+  <p>Sit with that for a second. When a <strong>rule</strong> is wrong, you read the rule and fix it. When a <strong>model</strong> is wrong, it fails <em>silently, plausibly, and politely</em> — and unless your vendor built an audit trail into every decision, nobody will ever know why, or that it happened at all.</p>
+
+  <p>That's why the 42 deterministic workflows on my server are deterministic. Anything that touches money, bookings, or a promise to a customer runs on rails. The model gets the jobs where being occasionally, detectably wrong is survivable — and every one of its decisions is logged with its reasoning.</p>
+
+  <h2>"But ours uses the latest model"</h2>
+
+  <p>The second thing the audit teaches: model names are the wrong question.</p>
+
+  <p>In July we ran a proper A/B for a client-facing WhatsApp agent: six combinations of model and prompt, twelve scenarios each — 72 real model runs, scored by an independent LLM judge across four rounds. Two results should interest any buyer:</p>
+
+  <p><strong>First: prompt engineering moved the needle far more than model tier.</strong> The same prompt rewrite lifted the <em>cheapest</em> model in the lineup from 8.4 to 9.4 out of 10. The premium model, with the identical improvement, crawled from 6.9 to 7.7 — still behind where the cheap model had <em>started</em>. The winner of the entire test was the smallest, cheapest model with a carefully engineered prompt.</p>
+
+  <p><strong>Second: the flagship "reasoning" model took about 55 seconds to answer a chat message.</strong> Eleven minutes for a twelve-message conversation. It may be brilliant, but no customer on WhatsApp waits 55 seconds for "hi" to be answered. The cheap model answered in about two and a half.</p>
+
+  <p>So when a vendor justifies their price with "we use [impressive model name]" — that's roughly like a contractor justifying his quote with the brand of his drill. The engineering around the model is what you're paying for. Or should be.</p>
+
+  <h2>The four questions to ask before you buy an "AI agent"</h2>
+
+  <p>If you take one thing from a guy who runs 56 of these in production, take this checklist:</p>
+
+  <ol>
+    <li><strong>"Which decisions does the model actually make, and which are hard-coded rules?"</strong> A good vendor answers instantly, with a short list. A hand-waver says "it's all AI."</li>
+    <li><strong>"When the model decides something, where's the log of <em>why</em>?"</strong> If there are no reason codes, no audit trail, then the first silent misroute — and there will be one — becomes undetectable.</li>
+    <li><strong>"What's deterministic on the money path?"</strong> Payments, bookings, legal notices, opt-outs. If the answer is "the AI handles it," walk away.</li>
+    <li><strong>"Why this model — did you test it against cheaper ones?"</strong> You now know the honest answer can be "the cheapest one won." If they've never run that comparison, you're funding their guesswork.</li>
+  </ol>
+
+  <p>None of these questions require you to know what a token is. They just require the vendor to have done their job.</p>
+
+  <p>I've had versions of this conversation dozens of times as <a href="https://achiya-automation.com/services/whatsapp-bot/">the team behind 50+ WhatsApp bot deployments</a>, and the pattern holds: the businesses that get burned aren't the ones that bought "too little AI." They're the ones that bought a black box and never asked what was inside.</p>
+
+  <h2>Bottom line</h2>
+
+  <p>"AI agent" is a marketing term for a machine that is mostly rules, with a model doing a few hard jobs in the middle — and that's exactly what it should be. The rules are why it's reliable. The model is why it feels human. The audit trail is why you'll know when it's wrong.</p>
+
+  <p>75% of my production workloads have no AI in them at all. I consider that a feature, and after the missing-city incident, so do my clients.</p>
+
+  <p><strong>Here's my question for you:</strong> if you're already paying for an "AI agent" — ask your vendor this week which of last month's decisions were made by the model versus by rules, and whether they can show you one reason code. What did they answer? I genuinely want to know, because in dozens of these conversations, I've almost never met a buyer who got a straight number.</p>
+
+  <hr>
+
+  <p><em>Achiya Cohen builds WhatsApp bots and business automation for Israeli SMBs at <a href="https://achiya-automation.com">achiya-automation.com</a>. The production numbers above are from his own servers, queried August 4, 2026.</em></p>
+</body>
+</html>
