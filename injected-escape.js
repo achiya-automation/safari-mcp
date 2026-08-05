@@ -9,7 +9,13 @@
 // and test/injection-safety.test.mjs.
 
 export function escJsSingleQuote(s) {
-  return String(s).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  return String(s)
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "\\'")
+    .replace(/\r/g, "\\r")
+    .replace(/\n/g, "\\n")
+    .replace(/ /g, "\\u2028")
+    .replace(/ /g, "\\u2029");
 }
 
 // Also strips CR/LF: a raw newline would close the AppleScript string and allow injection.
