@@ -7,11 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.15.12] - 2026-08-05
+
 ### Fixed
 - **The WebKit memory guard could never fire in multi-instance setups (#83).** The monitor bailed out for every instance that was not the extension host (the one process that won the port-9224 bind race) — but the host can only sweep tabs *it* opened, so tabs held by the other instances were unreachable by any sweeper and the guard was inert exactly where it was needed. The `_isExtensionHost` gate was redundant with the existing cross-instance `memory-monitor.lock` (atomic `wx` create + stale reclaim), which already guarantees a single sweeper per cycle; the gate is gone, and every instance can now sweep its own tabs, still one at a time.
 - **Concurrent instances silently dropped each other's tab-ownership entries (#82).** `_saveOwnershipFile` wrote a snapshot of only the writing process's in-memory Set over the shared `~/.safari-mcp/owned-tabs.json`, so with two live instances the second writer erased every entry the first added after the second hydrated — spurious "no tabs opened yet" refusals and lost restart recovery (fail-safe, but wrong). Saves now merge with the on-disk state (newest timestamp wins) and propagate deletions explicitly so removals aren't resurrected by the merge. The residual read-vs-rename race window shrinks from process-lifetime to sub-millisecond, and losing it still only ever *loses* ownership, never grants it.
 - **The profile-window poll never backed off (#81).** With `SAFARI_PROFILE` set and that profile's window closed, the background verification loop retried every 3 seconds forever — and because a genuinely absent window returns the same answer as a flaky detection, the "retry once with a plain `osascript` subprocess" fallback fired on every cycle: ~1,200 process spawns and log lines per hour, per instance, with no cap on `/tmp/safari-mcp-profile.log`. The poll now backs off exponentially per consecutive miss (3s → 6s → … → 60s cap, reset on the first successful detection), the subprocess fallback disarms after 3 consecutive misses (re-armed by any success, so it still covers the flaky-helper case it was built for), and the "window not found" warning logs on the transition into the missing state and then at most once per 5 minutes.
 - **`restore-trace.log` no longer lives inside the installed package (#81).** It was written to `__dirname` — wiped on reinstall, read-only in container setups, and mutable state inside `node_modules` either way. It now lives with the rest of the state in `~/.safari-mcp/`.
+
+## [2.15.11] - 2026-07-29
+
+### Fixed
+- **All HTTP-daemon clients shared one extension session (#76).** Every client of a shared daemon sent the extension the same process-wide `SESSION_ID`, so the extension keyed all of them as ONE session and could serve one client another client's cached tab. The extension id is now a composite of the process id and the per-connection MCP session id, so per-session isolation holds across the extension bridge too. (Entry backfilled — the release shipped without one.)
 
 ## [2.15.10] - 2026-07-28
 
