@@ -5,9 +5,9 @@
 
 import { execFile, spawn, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import { join, dirname, resolve as resolvePath } from "node:path";
-import { readFile, writeFile, unlink, appendFile } from "node:fs/promises";
+import { readFile, writeFile, unlink, appendFile, mkdir } from "node:fs/promises";
 import { readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
@@ -261,6 +261,11 @@ function getTargetWindowRef() {
   return _targetWindowRef || 'front window';
 }
 
+// Consecutive failed profile-window detections (#81) — drives the poll backoff,
+// the subprocess-fallback cutoff, and the missing-window log rate limit.
+let _profileMisses = 0;
+let _lastMissingLogTime = 0;
+
 async function refreshTargetWindow(force = false) {
   if (!SAFARI_PROFILE) return;
   const now = Date.now();
@@ -272,7 +277,12 @@ async function refreshTargetWindow(force = false) {
   // The persistent helper occasionally returns '0|' for a window that genuinely
   // exists (daemon timeout / restart race). Before concluding the window is
   // missing, retry once with a plain osascript subprocess \u2014 slower but reliable.
-  if (String(result).split('|')[0] === '0') {
+  // Once consecutive misses have established the window is genuinely ABSENT
+  // (not flakily undetected), skip the subprocess retry — an absent window
+  // returns '0|' every cycle, so the fallback would otherwise spawn an
+  // osascript process per poll, forever (#81). The first successful detection
+  // re-arms it for the flaky-helper case it was added for.
+  if (String(result).split('|')[0] === '0' && _profileMisses < 3) {
     result = await osascript(detectScript).catch(() => '0|');
   }
   const [idStr, windowName] = String(result).split('|');
@@ -286,19 +296,35 @@ async function refreshTargetWindow(force = false) {
     _targetWindowId = id;
     _targetWindowCacheTime = now;
     _profileWindowMissing = false;
+    _profileMisses = 0;
   } else {
     // Profile window not found — clear ref so getTargetWindowRef() will throw
     _targetWindowRef = null;
     _targetWindowId = null;
     _targetWindowCacheTime = 0;
     _profileWindowMissing = true;
-    _logProfile(`WARNING: Profile "${SAFARI_PROFILE}" window not found — refusing to use front window`);
+    _profileMisses++;
+    // Log on transition into the missing state, then at most once per 5 minutes —
+    // this steady state used to append one line per poll, unbounded (#81).
+    if (_profileMisses === 1 || now - _lastMissingLogTime > 300000) {
+      _lastMissingLogTime = now;
+      _logProfile(`WARNING: Profile "${SAFARI_PROFILE}" window not found — refusing to use front window`);
+    }
   }
 }
 
 // Background verification: periodically check that cached window ID still belongs to profile
 if (SAFARI_PROFILE) {
-  setInterval(async () => {
+  // Self-scheduling poll with exponential backoff (#81): 3s while the window is
+  // present (or flakily undetected), doubling per consecutive miss up to 60s
+  // while it is absent — a closed profile window is a steady state, and the
+  // fixed 3s cadence used to spawn an osascript subprocess per cycle, forever.
+  // The first successful detection resets to 3s, so rediscovery stays
+  // responsive: once the user opens the window, the next poll lands within 60s
+  // and everything after it is back on the 3s cadence.
+  const _POLL_BASE_MS = 3000;
+  const _POLL_MAX_MS = 60000;
+  const _pollOnce = async () => {
     // No cached window (e.g. flaky detection at startup) — keep trying to
     // rediscover it so the server self-heals instead of staying stuck.
     if (!_targetWindowRef || !_targetWindowId) {
@@ -329,7 +355,18 @@ if (SAFARI_PROFILE) {
       _targetWindowCacheTime = 0;
       await refreshTargetWindow(true);
     }
-  }, 3000); // Check every 3 seconds
+  };
+  const _schedulePoll = () => {
+    const delay =
+      _profileMisses > 0
+        ? Math.min(_POLL_BASE_MS * 2 ** Math.min(_profileMisses, 5), _POLL_MAX_MS)
+        : _POLL_BASE_MS;
+    setTimeout(async () => {
+      await _pollOnce().catch(() => {});
+      _schedulePoll();
+    }, delay);
+  };
+  _schedulePoll();
 }
 
 // Initialize profile window at startup (ES module top-level await)
@@ -519,10 +556,14 @@ async function _userIsActive() {
 
 // Lightweight trace of every restore decision — confirms WHICH instance (pid)
 // restored focus and whether the user-active guard vetoed it. Best-effort; never
-// throws into the hot path. Tail ~/safari-mcp/restore-trace.log to watch live.
-const _RESTORE_TRACE = join(__dirname, "restore-trace.log");
+// throws into the hot path. Tail ~/.safari-mcp/restore-trace.log to watch live.
+// Lives under ~/.safari-mcp, NOT __dirname (#81) — the package dir is wiped on
+// reinstall and read-only in container/CI setups; mutable state doesn't belong there.
+const _RESTORE_TRACE = join(homedir(), ".safari-mcp", "restore-trace.log");
 function _traceRestore(savedBundleId, decision) {
-  appendFile(_RESTORE_TRACE, `${new Date().toISOString()} pid=${process.pid} saved=${savedBundleId} -> ${decision}\n`).catch(() => {});
+  mkdir(dirname(_RESTORE_TRACE), { recursive: true })
+    .then(() => appendFile(_RESTORE_TRACE, `${new Date().toISOString()} pid=${process.pid} saved=${savedBundleId} -> ${decision}\n`))
+    .catch(() => {});
 }
 
 function _helperHideSafari(timeout = 2000) {
