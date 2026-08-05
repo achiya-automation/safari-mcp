@@ -25,10 +25,13 @@ after(() => {
 });
 
 // Clean module state before each test (the module is a process-wide singleton).
+// The disk file is wiped too — _saveOwnershipFile merges with disk (#82), so
+// leftovers from a previous test would otherwise bleed into the next one's file.
 beforeEach(() => {
   own._ownedTabURLs.clear();
   own._ownedTabTimestamps.clear();
   own._openedTabs.clear();
+  rmSync(OWNERSHIP_FILE, { force: true });
 });
 
 test("add → isOwned → remove roundtrip (exact URL)", () => {
@@ -92,6 +95,26 @@ test("TTL: an entry older than OWNERSHIP_TTL_MS is pruned and no longer matches"
   own._pruneExpiredOwnership();
   assert.equal(own._ownedTabURLs.has("https://stale.example/y"), false);
   assert.equal(own._isURLOwned("https://stale.example/y"), false);
+});
+
+test("merge-on-write (#82): a save must not drop entries another instance wrote", () => {
+  // Simulate another instance's entry already on disk…
+  own._addOwnedURL("https://instance-b.example/tab");
+  // …that THIS instance never saw in memory (it hydrated before B wrote):
+  own._ownedTabURLs.clear();
+  own._ownedTabTimestamps.clear();
+  own._addOwnedURL("https://instance-a.example/tab");
+  const urls = JSON.parse(readFileSync(OWNERSHIP_FILE, "utf8")).map((e) => e.url);
+  assert.ok(urls.includes("https://instance-a.example/tab"));
+  // Before the merge-on-write fix, B's entry was silently dropped here.
+  assert.ok(urls.includes("https://instance-b.example/tab"));
+});
+
+test("merge-on-write (#82): explicit removals are not resurrected by the merge", () => {
+  own._addOwnedURL("https://gone.example/tab");
+  own._removeOwnedURL("https://gone.example/tab");
+  const urls = JSON.parse(readFileSync(OWNERSHIP_FILE, "utf8")).map((e) => e.url);
+  assert.ok(!urls.includes("https://gone.example/tab"));
 });
 
 test("touch-on-use: asserting against an entry refreshes its timestamp (keeps it alive)", () => {

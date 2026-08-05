@@ -36,16 +36,28 @@ export function _loadOwnershipFile() {
   }
 }
 
-export function _saveOwnershipFile(urls) {
+export function _saveOwnershipFile(urls, removed = []) {
   try {
     if (!existsSync(OWNERSHIP_DIR)) mkdirSync(OWNERSHIP_DIR, { recursive: true });
     const now = Date.now();
-    const entries = Array.from(urls).map((url) => ({
-      url,
-      ts: _ownedTabTimestamps.get(url) ?? now,
-    }));
-    // Atomic write (tmp + rename) — concurrent MCP instances share this file; a partial
-    // write from one must never corrupt the JSON another instance reads.
+    // Merge with disk before writing (#82): this file is shared by every instance on the
+    // machine, and a snapshot of only THIS process's Set silently drops entries concurrent
+    // instances added after we hydrated. Union disk+local (newest ts wins), then apply this
+    // write's explicit removals so deletions propagate instead of being resurrected by the
+    // merge. _loadOwnershipFile() TTL-filters, so expired disk entries fall away here too.
+    // Residual race: two writers between read and rename can still drop one entry — that
+    // window is sub-millisecond (was: entire process lifetime) and losing an entry is
+    // fail-safe: ownership is lost, so a tool refuses; it never gains a user's tab.
+    const mergedTs = new Map();
+    for (const e of _loadOwnershipFile()) mergedTs.set(e.url, e.ts);
+    for (const url of urls) {
+      const localTs = _ownedTabTimestamps.get(url) ?? now;
+      mergedTs.set(url, Math.max(localTs, mergedTs.get(url) ?? 0));
+    }
+    for (const url of removed) mergedTs.delete(url);
+    const entries = Array.from(mergedTs, ([url, ts]) => ({ url, ts }));
+    // Atomic write (tmp + rename) — a partial write from one instance must never corrupt
+    // the JSON another instance reads.
     const tmp = OWNERSHIP_FILE + ".tmp." + process.pid;
     writeFileSync(tmp, JSON.stringify(entries), { mode: 0o600 });
     renameSync(tmp, OWNERSHIP_FILE);
@@ -82,8 +94,12 @@ export function _touchOwned(ownedKey) {
   return true;
 }
 export function _pruneExpiredOwnership() {
+  const before = new Set(_ownedTabURLs);
   if (pruneExpired(_ownedTabURLs, _ownedTabTimestamps, OWNERSHIP_TTL_MS)) {
-    _saveOwnershipFile(_ownedTabURLs);
+    // Pass the pruned URLs as explicit removals so the merge-on-write in
+    // _saveOwnershipFile doesn't resurrect them from the disk copy.
+    const removed = [...before].filter((u) => !_ownedTabURLs.has(u));
+    _saveOwnershipFile(_ownedTabURLs, removed);
   }
 }
 
@@ -125,7 +141,7 @@ export function _removeOwnedURL(url) {
   if (url) {
     _ownedTabURLs.delete(url);
     _ownedTabTimestamps.delete(url);
-    _saveOwnershipFile(_ownedTabURLs);
+    _saveOwnershipFile(_ownedTabURLs, [url]);
   }
 }
 
