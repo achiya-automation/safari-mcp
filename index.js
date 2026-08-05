@@ -164,11 +164,12 @@ function _startMemoryMonitor() {
   const checkInterval = Math.min(MEMORY_CHECK_INTERVAL_MS, 30000); // Max 30s between checks
   _memoryCheckTimer = setInterval(async () => {
     try {
-      // Only the extension host (the single instance owning the Safari
-      // connection) may sweep tabs. Every instance runs this monitor and reads
-      // the SAME global WebKit memory; if all N swept, they'd close tabs in
-      // lockstep and flicker Safari windows shut. The host is the one actor.
-      if (!_isExtensionHost) return;
+      // Every instance may sweep — but only its OWN _openedTabs, and only one
+      // per cycle: _tryAcquireMemoryLock() below already serializes sweepers
+      // machine-wide. The old `_isExtensionHost` gate here was redundant with
+      // that lock and made the guard inert in multi-instance setups — only the
+      // port-9224 winner could ever sweep, and it can't reach tabs the other
+      // instances opened (#83).
       const webkitMB = _getWebKitMemoryMB();
       if (webkitMB <= 0) return;
 
