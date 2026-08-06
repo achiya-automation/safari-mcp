@@ -1,19 +1,36 @@
 #!/usr/bin/env node
 /**
- * Unit test for the string-escaping helpers (escJsSingleQuote, escAppleScriptString) extracted in
- * the 2026-06-05 dedup pass. Locks each helper's output to the historical inline recipe it replaced,
- * so the dedup is provably behavior-preserving and a future edit can't silently flip the escaping
- * ORDER — which is security-relevant: backslash must be escaped before the quote, or the backslash
- * inserted in front of the quote gets doubled and the string breaks out.
+ * Unit test for the string-escaping helpers (escJsSingleQuote, escAppleScriptString).
+ * Locks each helper to the current recipe so a future edit can't silently flip the escaping
+ * ORDER — which is security-relevant: backslash must be escaped before the quote, or the
+ * backslash inserted in front of the quote gets doubled and the string breaks out.
+ *
+ * escJsSingleQuote recipe (in order):
+ *   1. \\ → \\\\  (backslash — MUST be first)
+ *   2. '  → \\'   (single quote)
+ *   3. \r → \\r   (CR)
+ *   4. \n → \\n   (LF)
+ *   5. U+2028 → \\u2028  (ECMAScript LineTerminator — raw form is a SyntaxError in regex)
+ *   6. U+2029 → \\u2029  (ECMAScript LineSeparator — same)
+ *
+ * NOTE: steps 3–6 are a deliberate behavior change — multiline values now round-trip as
+ * escape sequences inside the single-quoted JS literal instead of being silently
+ * space-flattened by runJS downstream.
  *
  * Run:  node test/escaping.test.mjs
  */
 import assert from "node:assert";
 import { escJsSingleQuote, escAppleScriptString } from "../safari.js";
 
-// The EXACT inline patterns these helpers replaced across safari.js. If safari.js's helper ever
-// drifts from this recipe, the loop below fails.
-const inlineJs = (s) => s.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+// The EXACT current recipe for escJsSingleQuote. If the helper ever drifts from this, the
+// loop below fails — intentional, because escaping order is security-relevant.
+const inlineJs = (s) =>
+  s.replace(/\\/g, "\\\\")
+   .replace(/'/g, "\\'")
+   .replace(/\r/g, "\\r")
+   .replace(/\n/g, "\\n")
+   .replace(/\u2028/g, "\\u2028")
+   .replace(/\u2029/g, "\\u2029");
 const inlineAs = (s) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/[\r\n]/g, "");
 
 const cases = [
