@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>The Free WhatsApp Window Closes October 1</title>
+</head>
+<body>
+  <h1>The Free WhatsApp Window Closes October 1</h1>
+  <img src="https://achiya-automation.github.io/safari-mcp/toi-utility-hero.jpg" alt="A cafe owner checks his phone next to a chalkboard price board">
+  <p><em>Meta has spent a year using WhatsApp&rsquo;s price list to tell businesses what kind of messages it wants. Most haven&rsquo;t read the message &mdash; and the friendliest part of the deal ends October 1.</em></p>
+
+  <p>This week I ran a post-mortem on a WhatsApp campaign that went badly wrong. An Israeli business sent a perfectly polite promotional message to 2,000 contacts through the official WhatsApp Business API. On one of their phone numbers, 94 percent of the messages never arrived. Meta&rsquo;s filters blocked 79 percent of the marketing sends outright &mdash; not because the text was spammy, but because the number&rsquo;s quality rating had slipped to red, and Meta has quietly decided that red-rated numbers don&rsquo;t get to do marketing at cold audiences anymore.</p>
+
+  <p>Meanwhile, on the same account, appointment reminders and payment confirmations sailed through untouched, at about half a US cent apiece.</p>
+
+  <p>That contrast is not an accident. It&rsquo;s policy, and Meta has been writing it into its price list for a year. If you run a customer-facing business on WhatsApp &mdash; and in Israel, where I work, nearly every business does &mdash; the pricing table is telling you exactly what Meta wants from you. Most businesses I meet haven&rsquo;t read the message. And on October 1, the friendliest part of the deal changes.</p>
+
+  <h2>What the price list actually says</h2>
+
+  <p>Since July 2025, Meta bills the WhatsApp Business API per delivered template message, priced by category and by the recipient&rsquo;s country. There are three paid categories: marketing, utility (order updates, appointment reminders, payment confirmations), and authentication (one-time codes).</p>
+
+  <p>In the first half of 2026, Meta cut utility rates across many markets &mdash; in Israel the reduction came to roughly 45 percent. Where the categories stand now for Israeli recipients, per published rate cards: a utility message runs about $0.0054 (half a cent). A marketing message costs about $0.0353 (six and a half times more). Authentication sits in between at about $0.02.</p>
+
+  <p>Read that as an incentive structure rather than a price list, and it&rsquo;s blunt: messages your customer expects and wants are being made almost free. Messages your customer didn&rsquo;t ask for are being made expensive &mdash; and, as my client discovered, increasingly undeliverable regardless of what you&rsquo;re willing to pay. The per-message price is only the visible half of the squeeze; the invisible half is quality ratings, per-user marketing frequency caps, and template category enforcement that reclassifies or rejects promotional content dressed up as a notification.</p>
+
+  <p>There&rsquo;s also a hard ceiling many businesses discover the painful way: the daily messaging limit (typically 2,000 new conversations per day at the common verification tier) is enforced across your whole business portfolio, not per phone number. Adding a second number does not double your reach. I&rsquo;ve watched businesses architect entire campaigns around an assumption that turned out to be false.</p>
+
+  <h2>The October 1 change nobody is pricing in</h2>
+
+  <p>Until now, the genuinely free lane in WhatsApp has been the 24-hour customer-service window: when a customer messages you first, you can reply freely &mdash; no template, no per-message charge &mdash; for 24 hours. Every WhatsApp bot I know of, including the ones my studio builds, leans on that window. Customer asks a question, bot answers, human follows up: zero marginal cost.</p>
+
+  <p>From October 1, 2026, that ends. Meta has announced that service messages &mdash; the replies inside that 24-hour window &mdash; become chargeable, with the exact rates to be published by September 1. Nobody outside Meta knows yet whether it lands closer to the utility half-cent or somewhere less comfortable. Either way, the last free lane on the platform is getting a toll booth.</p>
+
+  <p>For a small business answering thirty chats a day, this will be a rounding error. For businesses running high-volume conversational flows &mdash; quiz-style lead qualification, long support conversations, chatty AI agents that send five bubbles where one would do &mdash; the meter starts running on every reply. A bot that sends five messages per customer conversation will cost five times more than a bot that sends one well-written message, for identical business value. Verbosity is about to become a line item.</p>
+
+  <h2>What I&rsquo;m telling clients to do before October</h2>
+
+  <p>First, audit your template categories. Businesses habitually send everything as marketing because that&rsquo;s the template that got approved first. If your &ldquo;campaign&rdquo; is actually a payment reminder or a delivery update, recategorizing it as utility cuts the per-message price by six and a half times and dramatically improves deliverability. In my experience &mdash; full disclosure, my studio, Achiya Automation, builds these systems for small businesses, so I see this weekly &mdash; a meaningful share of what businesses send as marketing is utility wearing the wrong label.</p>
+
+  <p>Second, treat your quality rating as an asset with a balance sheet. The client with the blocked campaign didn&rsquo;t lose money on the messages Meta refused to deliver &mdash; Meta doesn&rsquo;t charge for blocked sends. They lost the campaign, the phone number&rsquo;s reputation, and weeks of warming it back up. A red rating is functionally a marketing ban. The way you keep a green rating is unglamorous: send to people who actually opted in, honor stop requests instantly, and keep frequency low enough that recipients don&rsquo;t hit the report button.</p>
+
+  <p>Third, count your bot&rsquo;s words. Before October, measure how many service messages your automation actually sends per conversation. Then trim. The multi-bubble, emoji-confetti style that no-code templates love was harmless when replies were free. From October it&rsquo;s a cost multiplier you&rsquo;re choosing voluntarily.</p>
+
+  <p>And finally: don&rsquo;t build your unit economics on any lane staying free. The lesson of the last two years of WhatsApp pricing &mdash; service conversations made unlimited and free in late 2024, per-message billing in 2025, those same service messages chargeable in 2026 &mdash; is that Meta first grows dependence on a lane, then monetizes it. Whatever you build, run the numbers as if every message costs something; if you want a concrete baseline, here is <a href="https://achiya-automation.com/en/pricing/">what a professionally built WhatsApp bot actually costs</a>. On WhatsApp, sooner or later, every message will have a price.</p>
+
+  <h2>The deeper shift</h2>
+
+  <p>WhatsApp is completing its transformation from a free chat app that businesses happened to use into paid infrastructure, priced like SMS was &mdash; except with a behavioral thumb on the scale. Meta is not just charging for messages; it&rsquo;s using price to decide what kind of messages exist. Reminders: subsidized. Blasts: taxed and filtered. Conversations: metered starting October 1.</p>
+
+  <p>Here&rsquo;s my question for the business owners reading this: when the 24-hour window stops being free on October 1, which of your current WhatsApp flows would you cut first &mdash; and which would you happily keep paying for? The answer probably tells you which of them your customers actually wanted all along.</p>
+
+  <hr>
+
+  <p><em>Achiya Cohen builds WhatsApp bots and business automation for Israeli SMBs at <a href="https://achiya-automation.com">achiya-automation.com</a>.</em></p>
+</body>
+</html>
