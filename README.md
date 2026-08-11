@@ -1,3 +1,5 @@
+[![MCP Toplist](https://mcptoplist.com/badge/io.github.achiya-automation%2Fsafari-mcp.svg)](https://mcptoplist.com/server/io.github.achiya-automation%2Fsafari-mcp)
+
 <div align="center">
 
 <img src="social-preview.png" alt="Safari MCP Server — 97 native browser automation tools for AI agents on macOS" width="100%">
