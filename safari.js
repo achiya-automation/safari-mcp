@@ -3171,25 +3171,15 @@ export async function replaceEditorContent({ text }) {
 
 export async function screenshot({ fullPage = false } = {}) {
   await refreshTargetWindow();
+  return _withTargetTabFronted(() => _screenshotFronted({ fullPage }));
+}
+
+async function _screenshotFronted({ fullPage }) {
   const tmpFile = join(tmpdir(), `safari-screenshot-${Date.now()}.png`);
   try {
-    // Check if target tab is a background tab — if so, use JS screenshot to avoid tab jumping
-    let isBackgroundTab = false;
-    if (_st().activeTabIndex) {
-      try {
-        const currentIdx = await osascriptFast(
-          `tell application "Safari" to return index of current tab of ${getTargetWindowRef()}`
-        );
-        isBackgroundTab = Number(currentIdx) !== _st().activeTabIndex;
-      } catch (_) {}
-    }
-    // When on a background tab, go straight to JS-based screenshot (no tab switch, no focus steal)
-    const skipScreencapture = isBackgroundTab;
-
-    // Try screencapture — use osascript's do shell script to bypass VS Code permission issue
-    const windowIdRaw = !skipScreencapture ? await osascript(
+    const windowIdRaw = await osascript(
       `tell application "Safari" to return id of ${getTargetWindowRef()}`
-    ).catch(() => null) : null;
+    ).catch(() => null);
     // Window IDs are OS-assigned integers — reject anything non-numeric before it reaches
     // `do shell script "/usr/sbin/screencapture -l<id>"` (defense-in-depth against odd AppleScript stdout).
     const windowId = windowIdRaw != null && /^\d+$/.test(String(windowIdRaw).trim()) ? String(windowIdRaw).trim() : null;
@@ -3308,6 +3298,11 @@ export async function screenshot({ fullPage = false } = {}) {
 // ========== ELEMENT SCREENSHOT ==========
 
 export async function screenshotElement({ selector }) {
+  await refreshTargetWindow();
+  return _withTargetTabFronted(() => _screenshotElementFronted({ selector }));
+}
+
+async function _screenshotElementFronted({ selector }) {
   const sel = escJsSingleQuote(selector);
   // Use html2canvas-like approach: capture element via SVG foreignObject
   const result = await runJS(

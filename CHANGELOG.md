@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Screenshots from an MCP-owned background tab either failed with a false Screen Recording error or captured the user's selected tab.** `safari_screenshot` deliberately skipped window capture for background tabs, then fell into an async canvas fallback that Safari AppleScript cannot await. `safari_screenshot_element` took the opposite path and cropped the selected tab of the window, which could expose unrelated personal content. Both tools now reuse the existing select-capture-restore guard: the owned tab is selected only inside the background window, Safari is never raised, and the user's previous tab is restored even when capture fails.
+
 ## [2.15.12] - 2026-08-05
 
 ### Fixed
