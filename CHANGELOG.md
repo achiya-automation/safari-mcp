@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.16.0] - 2026-08-14
 
 ### Added
 - **`safari_query_all` now sees inside cross-origin iframes.** When the main frame matches nothing, the extension re-runs the query across all frames (same fallback click/fill already use) and merges the results instead of reporting "no matches" — embedded editors and third-party widget lists (e.g. GoHighLevel's workflow list) become queryable. Each element now also reports `x`/`y` (center point, relative to its own frame's viewport) and `frame` (the frame's URL) so callers can tell which frame a match came from. Extension 2.10.3 — reload the extension after updating.
