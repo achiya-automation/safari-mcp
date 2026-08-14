@@ -1755,7 +1755,7 @@ async function handleCommand(type, payload) {
 
     // --- Query All ---
     case "query_all": {
-      return await execInTab((selector, limit) => {
+      const queryFn = (selector, limit) => {
         const els = (window.__mcpDeepQueryAll || document.querySelectorAll.bind(document))(selector, limit);
         const results = [];
         for (let i = 0; i < Math.min(els.length, limit); i++) {
@@ -1766,10 +1766,27 @@ async function handleCommand(type, payload) {
             text: (el.innerText || "").substring(0, 100),
             href: el.href || "", value: el.value || "",
             visible: r.width > 0 && r.height > 0,
+            // Center point relative to the element's OWN frame viewport. In the main
+            // frame that equals page-viewport coordinates; in a cross-origin iframe it
+            // is iframe-relative — check `frame` and offset by the iframe's position
+            // before clicking by coordinates.
+            x: Math.round(r.left + r.width / 2),
+            y: Math.round(r.top + r.height / 2),
+            frame: location.href.substring(0, 120),
           });
         }
         return JSON.stringify(results);
-      }, [payload.selector, payload.limit || 20], tabId);
+      };
+
+      const mainResult = await execInTab(queryFn, [payload.selector, payload.limit || 20], tabId);
+      // The main frame is authoritative when it matches. Cross-origin iframes (GHL's
+      // workflow list, embedded editors) are invisible to it, so fall back the same
+      // way click/fill already do rather than reporting "no matches".
+      try {
+        if (mainResult && JSON.parse(mainResult).length > 0) return mainResult;
+      } catch { return mainResult; }
+      const frameResult = await execAcrossFrames(queryFn, [payload.selector, payload.limit || 20], tabId);
+      return frameResult || mainResult;
     }
 
     default:
@@ -2146,6 +2163,33 @@ async function execInAllFrames(func, args = [], tabId = null) {
   } catch (err) {
     // allFrames may fail on some pages — fall back to main frame only
     return execInTab(func, args, tabId);
+  }
+}
+
+// Like execInAllFrames, but for functions that return a JSON array: it skips frames
+// that matched nothing instead of stopping at the first non-null result. The main
+// frame nearly always returns "[]" — non-null — which would otherwise mask every
+// cross-origin frame behind it.
+async function execAcrossFrames(func, args = [], tabId = null) {
+  const id = tabId || (await getActiveTab()).id;
+  try {
+    const results = await browser.scripting.executeScript({
+      target: { tabId: id, allFrames: true },
+      world: "MAIN",
+      func,
+      args,
+    });
+    const merged = [];
+    for (const r of results) {
+      if (!r || r.result == null) continue;
+      try {
+        const parsed = JSON.parse(r.result);
+        if (Array.isArray(parsed) && parsed.length) merged.push(...parsed);
+      } catch { /* frame returned a non-array payload — ignore it */ }
+    }
+    return merged.length ? JSON.stringify(merged) : null;
+  } catch {
+    return null;
   }
 }
 

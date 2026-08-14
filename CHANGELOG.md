@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`safari_query_all` now sees inside cross-origin iframes.** When the main frame matches nothing, the extension re-runs the query across all frames (same fallback click/fill already use) and merges the results instead of reporting "no matches" — embedded editors and third-party widget lists (e.g. GoHighLevel's workflow list) become queryable. Each element now also reports `x`/`y` (center point, relative to its own frame's viewport) and `frame` (the frame's URL) so callers can tell which frame a match came from. Extension 2.10.3 — reload the extension after updating.
+
 ### Fixed
 - **Screenshots from an MCP-owned background tab either failed with a false Screen Recording error or captured the user's selected tab.** `safari_screenshot` deliberately skipped window capture for background tabs, then fell into an async canvas fallback that Safari AppleScript cannot await. `safari_screenshot_element` took the opposite path and cropped the selected tab of the window, which could expose unrelated personal content. Both tools now reuse the existing select-capture-restore guard: the owned tab is selected only inside the background window, Safari is never raised, and the user's previous tab is restored even when capture fails.
 
