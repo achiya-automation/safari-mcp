@@ -3262,6 +3262,64 @@ async function _screenshotFronted({ fullPage }) {
       }
     }
 
+    // Fallback: full-screen capture + crop to the window rect.
+    //
+    // macOS 26 (Tahoe) broke `screencapture -l<windowId>` for Safari: it exits 1
+    // with "could not create image from window" for EVERY window, while a plain
+    // full-screen `screencapture -x` from the same process succeeds. So this is
+    // not a TCC problem — safari_doctor reports Screen Recording as granted and
+    // is telling the truth. Diagnosed 17.08.2026, when the by-id path started
+    // failing mid-session and the misleading "permission may have been lost"
+    // error below sent the investigation after a permission that was never gone.
+    //
+    // Crop math: AppleScript bounds are in points, the capture is in pixels.
+    // devicePixelRatio from the page gives the backing-scale factor.
+    if (windowId) {
+      try {
+        // A locked screen captures as solid black. Say so instead of returning a
+        // black rectangle the caller has to guess at.
+        const locked = await execFileAsync("/bin/sh", ["-c",
+          "ioreg -n Root -d1 -r -a 2>/dev/null | grep -c CGSSessionScreenIsLocked || true"])
+          .then((r) => String(r.stdout).trim() !== "0").catch(() => false);
+        if (locked) {
+          throw new Error("SCREEN_LOCKED");
+        }
+        const boundsRaw = await osascript(
+          `tell application "Safari" to return bounds of ${getTargetWindowRef()}`
+        );
+        const [x1, y1, x2, y2] = String(boundsRaw).split(",").map((v) => parseInt(v.trim(), 10));
+        const dpr = Math.max(1, Math.round(Number(await runJS("window.devicePixelRatio")) || 1));
+        const w = (x2 - x1) * dpr, h = (y2 - y1) * dpr;
+        if ([x1, y1, x2, y2].every(Number.isFinite) && w > 0 && h > 0) {
+          const fullFile = tmpFile.replace(/\.png$/, "-full.png");
+          const cropFile = tmpFile.replace(/\.png$/, "-crop.jpg");
+          try {
+            // Direct first (VS Code / terminal grant), helper second (launchd daemon has no grant of its own)
+            await execFileAsync("/usr/sbin/screencapture", ["-x", fullFile], { timeout: 15000 })
+              .catch(() => osascriptFast(`do shell script "/usr/sbin/screencapture -x '${fullFile}'"`, { timeout: 15000 }));
+            await execFileAsync("sips", [
+              "-c", String(h), String(w), "--cropOffset", String(y1 * dpr), String(x1 * dpr),
+              fullFile, "--out", cropFile,
+            ], { timeout: 10000 });
+            await execFileAsync("sips", [
+              "-s", "format", "jpeg", "-s", "formatOptions", "50", "--resampleWidth", "1200",
+              cropFile, "--out", cropFile,
+            ], { timeout: 10000 });
+            const cropped = await readFile(cropFile);
+            if (cropped.length > 100) return cropped.toString("base64");
+          } finally {
+            await unlink(fullFile).catch(() => {});
+            await unlink(cropFile).catch(() => {});
+          }
+        }
+      } catch (e) {
+        if (e && e.message === "SCREEN_LOCKED") {
+          throw new Error("screenshot unavailable — the screen is locked, so the capture would be solid black. Unlock the Mac and retry. (Text-based tools — safari_snapshot / safari_read_page / safari_evaluate — work regardless.)");
+        }
+        // crop path failed too — fall through to the JS canvas method
+      }
+    }
+
     // Fallback: JS-based screenshot via canvas (no permissions needed)
     const dataUrl = await runJS(
       `(async function(){` +
