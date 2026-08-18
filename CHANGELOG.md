@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.16.1] - 2026-08-18
+
+### Fixed
+- **Screenshots failed on macOS 26 (Tahoe) with a misleading "Screen Recording permission may have been lost" error.** Tahoe broke `screencapture -l<windowId>` for Safari — it exits 1 with "could not create image from window" for every window, while a plain full-screen capture from the same process succeeds, so permissions were never the problem. When the by-id capture fails, the server now falls back to a full-screen capture cropped to the Safari window's bounds (scaled by `devicePixelRatio`). A locked screen is detected up front and reported as such instead of returning a solid-black image.
+
 ## [2.16.0] - 2026-08-14
 
 ### Added
