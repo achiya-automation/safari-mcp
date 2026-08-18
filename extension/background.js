@@ -1941,6 +1941,10 @@ browser.tabs.onRemoved.addListener((tabId) => {
 async function _verifyProfileMatch(expectedProfile) {
   try {
     const allWindows = await browser.windows.getAll({ populate: true });
+    // No window in this profile → it cannot be the profile the server drives, and probing
+    // would have to CREATE one: browser.tabs.create() with no open window opens a fresh window
+    // that jumps to the front. That is the personal profile popping up every reconnect.
+    if (!allWindows.length) return false;
     // Check if any window's tab titles contain the profile name pattern "ProfileName —"
     // Safari profile windows show: "ProfileName — Tab Title" in window name
     // But the extension only sees its OWN profile's windows, so we check if tabs exist at all.
