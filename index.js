@@ -403,7 +403,7 @@ try {
           const execFileAsync = pfy(execFileCb);
           // Don't launch Safari if it's not running
           try {
-            await execFileAsync("pgrep", ["-x", "Safari"], { timeout: 2000 });
+            await execFileAsync("pgrep", ["-x", "Safari"], { timeout: 1000 });
           } catch {
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ match: false, error: "Safari is not running" }));
@@ -423,7 +423,11 @@ try {
             end repeat
             return "notfound"
           end tell`;
-          const { stdout } = await execFileAsync("osascript", ["-e", script], { timeout: 5000 });
+          // Must finish well inside the extension's 5s fetch timeout: if the extension aborts
+          // first it never caches the verdict, so it re-probes every few seconds — and each probe
+          // opens a *new window* in any profile that has none (the personal profile popping up).
+          // 1s pgrep + 2.5s osascript = 3.5s worst case, and the catch below still answers 200.
+          const { stdout } = await execFileAsync("osascript", ["-e", script], { timeout: 2500 });
           const out = stdout.trim();
           if (out === "match") {
             res.writeHead(200, { "Content-Type": "application/json" });
