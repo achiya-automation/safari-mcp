@@ -17,6 +17,12 @@ mcp-publisher
 *.bak-before-*
 .archive/
 audit-*.md
+.playwright-cli/
 
 # כלי עזר מקומי (TCC) — לא חלק מהחבילה
 claude-tcc-fixer.swift
+
+# תוצרי ביניים של צנרת התוכן (טיוטות לייבוא, תמונות הירו) — נשארים מקומית בלבד
+devto-draft-*.md
+meta-agent-il-*.html
+hero-*.png

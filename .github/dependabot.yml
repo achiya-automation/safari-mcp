@@ -5,6 +5,12 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    ignore:
+      # jsdom 30 requires Node ^22.13; we still support engines ">=20".
+      # Test-only dep — not worth dropping Node 20 for users. Remove this
+      # ignore when the Node 20 row leaves the CI matrix.
+      - dependency-name: "jsdom"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
