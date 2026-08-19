@@ -64,12 +64,27 @@ Native WebKit. ~60% less CPU. Background operation. 97 tools. One `npx` command.
 
 ---
 
+## In users' own words
+
+Not solicited testimonials — quotes lifted from the public issue tracker, each linked to the thread it came from.
+
+> "I run multiple Pi sessions/subagents against my normal Safari profile in parallel. **Sharing its cookies and logins is intentional.**"
+> — [@maxim](https://github.com/achiya-automation/safari-mcp/issues/76), on running concurrent agents against a real browser
+
+> "The server has a deliberate tab-ownership model … **the code is careful about this, and for the default case that's the right safety posture.**"
+> — [@turner-moore](https://github.com/achiya-automation/safari-mcp/issues/92), on why the guards refuse to touch your tabs
+
+> "Direct local validation from the package: **Safari MCP doctor 6/6.**"
+> — [@jrepp](https://github.com/achiya-automation/safari-mcp/pull/53), who found and fixed a queue-alignment bug in the focus helper
+
+---
+
 ## Quick Start
 
 ### Prerequisites
 
 - macOS (any version with Safari)
-- Node.js 18+
+- Node.js 20+
 - Safari → Settings → Advanced → **Show features for web developers** ✓
 - Safari → Develop → **Allow JavaScript from Apple Events** ✓
 
@@ -869,7 +884,7 @@ If Safari MCP saves you from Chrome overhead, **a star helps others discover it:
 
 [![Star this repo](https://img.shields.io/github/stars/achiya-automation/safari-mcp?style=social)](https://github.com/achiya-automation/safari-mcp)
 
-[Share on Twitter/X](https://twitter.com/intent/tweet?text=Safari%20MCP%20%E2%80%94%20Stop%20running%20Chrome%20just%20so%20your%20AI%20agent%20can%20browse.%2096%20tools%2C%20native%20Safari%2C%2060%25%20less%20CPU.&url=https%3A%2F%2Fgithub.com%2Fachiya-automation%2Fsafari-mcp) · [Share on LinkedIn](https://www.linkedin.com/sharing/share-offsite/?url=https%3A%2F%2Fgithub.com%2Fachiya-automation%2Fsafari-mcp) · [Write about it](https://dev.to/)
+[Share on Twitter/X](https://twitter.com/intent/tweet?text=Safari%20MCP%20%E2%80%94%20Stop%20running%20Chrome%20just%20so%20your%20AI%20agent%20can%20browse.%2097%20tools%2C%20native%20Safari%2C%2060%25%20less%20CPU.&url=https%3A%2F%2Fgithub.com%2Fachiya-automation%2Fsafari-mcp) · [Share on LinkedIn](https://www.linkedin.com/sharing/share-offsite/?url=https%3A%2F%2Fgithub.com%2Fachiya-automation%2Fsafari-mcp) · [Write about it](https://dev.to/)
 
 [![Star History Chart](https://api.star-history.com/svg?repos=achiya-automation/safari-mcp&type=Date)](https://star-history.com/#achiya-automation/safari-mcp&Date)
 
