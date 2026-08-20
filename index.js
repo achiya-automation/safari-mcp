@@ -15,7 +15,7 @@ import { textResult, jsonResult, imageResult, errorResult } from "./response.js"
 import {
   OWNERSHIP_DIR, BLANK_TAB_SENTINEL,
   _openedTabs, _ownedTabURLs,
-  _isURLOwned, _markBlankTabOpened, _addOwnedURL, _removeOwnedURL, _trackTab, _untrackTab,
+  _isURLOwned, _isExactURLOwned, _markBlankTabOpened, _addOwnedURL, _removeOwnedURL, _trackTab, _untrackTab,
 } from "./ownership-state.js";
 import { WebSocketServer } from "ws";
 import { createServer } from "node:http";
@@ -73,6 +73,14 @@ const WEBKIT_MEMORY_LIMIT_MB = parseInt(process.env.MCP_WEBKIT_LIMIT_MB || "3000
 // Close all MCP-opened tabs on process exit
 async function _cleanupTabs() {
   if (_openedTabs.size === 0) return;
+  // A named Safari profile is extension-only: never mutate it through the
+  // AppleScript compatibility backend during process shutdown. Explicit tab
+  // closes are ownership-checked by the extension while the session is alive.
+  if (process.env.SAFARI_PROFILE) {
+    console.error(`[Safari MCP] Cleanup: leaving ${_openedTabs.size} profile tabs for extension-safe cleanup`);
+    _openedTabs.clear();
+    return;
+  }
   console.error(`[Safari MCP] Cleanup: closing ${_openedTabs.size} MCP-opened tabs`);
   // Close by URL (not index) — indices shift as tabs are closed
   const urlsToClose = [..._openedTabs.values()].map(v => v.url).filter(Boolean);
@@ -142,6 +150,7 @@ function _getWebKitMemoryMB() {
 }
 
 async function _closeOldestMCPTab() {
+  if (process.env.SAFARI_PROFILE) return;
   let oldestIdx = null, oldestTime = Infinity;
   for (const [idx, info] of _openedTabs) {
     if (info.openedAt < oldestTime) { oldestTime = info.openedAt; oldestIdx = idx; }
@@ -237,6 +246,18 @@ process.on("exit", () => {
 // backend that still works when macOS temporarily denies Apple Events (-1743).
 const _preferAppleScript = !!process.env.SAFARI_PROFILE;
 let _profileExtensionVerified = !process.env.SAFARI_PROFILE;
+
+// A named profile is driven only by its verified WebExtension worker. The worker
+// can create a background window through browser.windows.create() when the last
+// profile window was closed, so no AppleScript/UI-scripting recovery is needed.
+async function _waitForVerifiedProfileExtension(timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (_extensionConnected && _profileExtensionVerified) return true;
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  return false;
+}
 
 // ========== EXTENSION BRIDGE (WebSocket + HTTP polling) ==========
 function _bridgePort(name, fallback) {
@@ -495,7 +516,17 @@ try {
         try {
           const { type, payload, profile = "" } = JSON.parse(body);
           const hostProfile = process.env.SAFARI_PROFILE || "";
-          if (profile !== hostProfile || (_preferAppleScript && !_profileExtensionVerified)) {
+          if (profile !== hostProfile) {
+            res.writeHead(409, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Refusing proxy command: verified Safari profile does not match" }));
+            return;
+          }
+          // A secondary MCP process proxies extension commands directly and does
+          // not execute this host's safari_new_tab tool body. Give a suspended
+          // profile worker time to wake before the verification gate; the worker
+          // itself will create a background profile window if none exists.
+          if (type === "new_tab") await _waitForVerifiedProfileExtension(30000);
+          if (_preferAppleScript && !_profileExtensionVerified) {
             res.writeHead(409, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: "Refusing proxy command: verified Safari profile does not match" }));
             return;
@@ -576,7 +607,9 @@ async function _proxyToExtension(type, payload, timeoutMs = 30000) {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-local-token": PROXY_TOKEN },
     body: JSON.stringify({ type, payload, profile: process.env.SAFARI_PROFILE || "" }),
-    signal: AbortSignal.timeout(timeoutMs),
+    // new_tab may first wait for a suspended profile worker to reconnect on the
+    // host, so its proxy envelope must outlive the command timeout itself.
+    signal: AbortSignal.timeout(timeoutMs + (type === "new_tab" ? 35000 : 5000)),
   });
   if (!res.ok) throw new Error(`Proxy error: ${res.status}`);
   const data = await res.json();
@@ -668,13 +701,18 @@ function sendToExtension(type, payload = {}, timeoutMs = 30000) {
 
 // Per-command timeouts — fast commands get short timeouts, nav/screenshot get longer ones
 const _commandTimeouts = {
-  click: 10000, fill: 5000, read_page: 30000, get_source: 10000, evaluate: 30000,
-  type_text: 5000, press_key: 5000, scroll: 3000, scroll_to: 3000, scroll_to_element: 15000,
-  hover: 5000, list_tabs: 5000, new_tab: 15000, close_tab: 5000, switch_tab: 30000,
-  wait_for: 30000, navigate: 30000, navigate_and_read: 30000, go_back: 10000, go_forward: 10000,
-  reload: 15000, screenshot: 15000, snapshot: 30000, click_and_read: 15000,
-  double_click: 10000, right_click: 10000, clear_field: 5000, select_option: 5000, fill_form: 10000,
-  replace_editor: 10000, get_url: 3000, get_title: 3000,
+  // Safari can suspend a profile extension worker for 20–25 seconds even while
+  // its window remains open. Short deadlines caused a queued mutating command to
+  // be abandoned and then retried through AppleScript, which is both unreliable
+  // and unsafe for clicks/typing. Keep every profile command above that wake-up
+  // window; fast workers still return immediately.
+  click: 30000, fill: 30000, read_page: 30000, get_source: 30000, evaluate: 30000,
+  type_text: 30000, press_key: 30000, scroll: 30000, scroll_to: 30000, scroll_to_element: 30000,
+  hover: 30000, list_tabs: 30000, new_tab: 30000, close_tab: 30000, switch_tab: 30000,
+  wait_for: 30000, navigate: 45000, navigate_and_read: 45000, go_back: 30000, go_forward: 30000,
+  reload: 30000, screenshot: 30000, snapshot: 30000, click_and_read: 30000,
+  double_click: 30000, right_click: 30000, clear_field: 30000, select_option: 30000, fill_form: 30000,
+  replace_editor: 30000, get_url: 30000, get_title: 30000,
 };
 
 // Commands where null result means failure (should fall back to AppleScript)
@@ -754,16 +792,24 @@ function _assertTabOwnership(opType) {
   }
 }
 
-// Try the profile-verified extension first, fall back to AppleScript.
+// Try the profile-verified extension first. Named profiles are extension-only:
+// crossing to AppleScript would lose the extension's profile and tab-id proof.
 async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) {
   // Tab-ownership guard — extracted to _assertTabOwnership so run_script / native_* share it.
   _assertTabOwnership(extensionType);
+
+  // Safari may terminate an otherwise healthy profile worker between two tool
+  // calls. If no command has been sent yet, waiting for its verified reconnect is
+  // safe even for non-idempotent actions (click/fill): there is nothing to repeat.
+  if (_preferAppleScript && (!_extensionConnected || !_profileExtensionVerified)) {
+    await _waitForVerifiedProfileExtension(30000);
+  }
 
   // ========== FOCUS PRESERVATION ==========
   // Safari AppleScript/extension can steal focus (bring Safari window to front).
   // Save the frontmost app before the operation and restore it after if Safari stole focus.
   // Set focusGuard flag so inner osascript/runJSLarge calls skip their own focus logic.
-  const savedApp = await safari.saveFrontmostApp();
+  const savedApp = _preferAppleScript ? null : await safari.saveFrontmostApp();
   safari.setFocusGuard(true);
 
   let result;
@@ -777,7 +823,15 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
         // MCP client looked like ONE extension session and could target another client's
         // cached tab (#76). currentSessionId() alone would collapse all stdio processes
         // into "_default" — so both parts are needed.
-        const payload = { ...extensionPayload, sessionId: `${SESSION_ID}:${currentSessionId()}`, ...(tabUrl ? { tabUrl } : {}) };
+        // Callers that recover after a daemon/session restart may provide the exact
+        // marked URL explicitly (notably close_tab). Let that durable receipt override
+        // safari.js's process-global active URL, while the server-owned session id stays
+        // authoritative.
+        const payload = {
+          ...(tabUrl ? { tabUrl } : {}),
+          ...extensionPayload,
+          sessionId: `${SESSION_ID}:${currentSessionId()}`,
+        };
         const timeout = _commandTimeouts[extensionType] || 30000;
         result = await sendToExtension(extensionType, payload, timeout);
         const isCspError = typeof result === 'string' && (result.includes('unsafe-eval') || result.includes('trusted-types') || result.includes('Trusted Type') || result.includes('Content Security Policy'));
@@ -794,10 +848,18 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
           usedExtension = true;
         }
       } catch (err) {
+        // A profile extension ownership refusal is a security boundary, not a
+        // transient backend failure. Falling back to AppleScript here would bypass
+        // the extension's tab-id proof and could switch to or mutate a user's tab.
+        if (String(err?.message || err).includes("Tab safety:")) throw err;
+        if (_preferAppleScript) throw new Error(`Safari profile extension unavailable for "${extensionType}": ${err.message}`);
         console.error(`[Safari MCP] ${extensionType} extension failed: ${err.message} — falling back to AppleScript`);
       }
     }
     if (!usedExtension) {
+      if (_preferAppleScript) {
+        throw new Error(`Safari profile extension unavailable for "${extensionType}"; refusing AppleScript fallback`);
+      }
       const t0 = Date.now();
       result = await fallbackFn();
       console.error(`[Safari MCP] ${extensionType} via AppleScript (${Date.now() - t0}ms)`);
@@ -815,7 +877,7 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
     // then yanks Safari out from under them (the "VS Code jumps in front while I work
     // in Safari" bug), and the HID-idle guard can't catch it because a user who is
     // reading (not typing) looks idle. So skip restore entirely for extension ops.
-    if (!usedExtension) await safari.restoreFocusIfStolen(savedApp);
+    if (!usedExtension && savedApp) await safari.restoreFocusIfStolen(savedApp);
   }
 
   return result;
@@ -1410,6 +1472,11 @@ server.tool(
   "Open a new tab, optionally with a URL",
   { url: z.string().optional().describe("URL to open (empty for blank tab)") },
   async ({ url }) => {
+    // Safari may suspend the profile worker between calls. Give it one full wake
+    // cycle; once connected, the extension creates a background profile window
+    // itself when the previous last window was closed.
+    if (process.env.SAFARI_PROFILE) await _waitForVerifiedProfileExtension(30000);
+
     // Enforce tab limit — close oldest MCP tab if at max
     if (_openedTabs.size >= MAX_TABS) {
       let oldestIdx = null, oldestTime = Infinity;
@@ -1419,7 +1486,11 @@ server.tool(
       if (oldestIdx !== null) {
         console.error(`[Safari MCP] Tab limit (${MAX_TABS}) reached — closing oldest tab #${oldestIdx}`);
         try {
-          await safari.closeTab(oldestIdx);
+          await extensionOrFallback(
+            "close_tab",
+            { index: oldestIdx },
+            () => safari.closeTab(oldestIdx)
+          );
         } catch {}
         _untrackTab(oldestIdx);
       }
@@ -1456,12 +1527,23 @@ server.tool(
 
 server.tool(
   "safari_close_tab",
-  "Close the current tab",
-  {},
-  async () => {
+  "Close the current tab. After a daemon/session restart, pass the exact marked URL returned by safari_list_tabs to recover and close only that MCP-owned tab.",
+  { url: z.string().optional().describe("Exact MCP-owned tab URL, including its mcp-tab receipt") },
+  async ({ url }) => {
     const activeIdx = safari.getActiveTabIndex();
-    const result = await extensionOrFallback("close_tab", {}, () => safari.closeTab());
-    if (activeIdx !== null) _untrackTab(activeIdx);
+    const serverOwnedReceipt = !!url && /(?:[?#&])mcp-tab=[A-Za-z0-9_-]{12,}(?:[&#]|$)/.test(url) && _isExactURLOwned(url);
+    const result = await extensionOrFallback(
+      "close_tab",
+      url ? { tabUrl: url, serverOwnedReceipt } : {},
+      () => safari.closeTab()
+    );
+    if (url) {
+      const tracked = [..._openedTabs.entries()].find(([, info]) => info?.url === url);
+      if (tracked) _untrackTab(tracked[0]);
+      _removeOwnedURL(url);
+    } else if (activeIdx !== null) {
+      _untrackTab(activeIdx);
+    }
     return textResult(result);
   }
 );
@@ -1497,6 +1579,11 @@ server.tool(
     safari.setActiveTabIndex(index);
     if (result && typeof result === 'object' && result.url) {
       safari.setActiveTabURL(result.url);
+      // The extension returns `owned: true` only after verifying the destination's
+      // concrete Safari tab id belongs to this MCP session. Redirects can change the
+      // URL after new_tab (for example /dashboard -> /login), so register that actual
+      // URL only from this ownership receipt — never from an AppleScript result.
+      if (result.owned === true) _addOwnedURL(result.url);
     }
     return { content: [{ type: "text", text: JSON.stringify(result) }] };
   }

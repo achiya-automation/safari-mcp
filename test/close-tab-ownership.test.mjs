@@ -112,6 +112,42 @@ test("close_tab is not exempt from the shared tab-ownership assertion", () => {
   }
 });
 
+test("close_tab can recover an exact marked tab without trusting global active state", () => {
+  const start = index.indexOf('server.tool(\n  "safari_close_tab"');
+  const end = index.indexOf('\n);', start);
+  assert.ok(start > 0 && end > start, "safari_close_tab tool should exist");
+  const tool = index.slice(start, end + 3);
+  assert.match(tool, /url: z\.string\(\)\.optional\(\)/);
+  assert.match(tool, /_isExactURLOwned\(url\)/);
+  assert.match(tool, /url \? \{ tabUrl: url, serverOwnedReceipt \} : \{\}/);
+  assert.match(tool, /_removeOwnedURL\(url\)/);
+
+  const routingStart = index.indexOf("async function extensionOrFallback(");
+  const routingEnd = index.indexOf("// Read version from package.json", routingStart);
+  const routing = index.slice(routingStart, routingEnd);
+  assert.ok(
+    routing.indexOf("...extensionPayload") < routing.indexOf("sessionId: `${SESSION_ID}:${currentSessionId()}`"),
+    "an explicit tabUrl may override global active state, but never the server-owned session id"
+  );
+});
+
+test("extension restart recovery requires the server's exact marked-URL receipt", () => {
+  const start = background.indexOf("function _canAdoptServerOwnedReceipt(");
+  const end = background.indexOf("\n}", start);
+  assert.ok(start > 0 && end > start, "server receipt verifier should exist");
+  const source = background.slice(start, end + 2);
+  assert.match(source, /payload\?\.serverOwnedReceipt !== true/);
+  assert.match(source, /actual !== requested/);
+  assert.match(source, /actualMarker !== requestedMarker/);
+  assert.match(source, /requestedUrl\.origin === actualUrl\.origin/);
+
+  const guard = background.slice(
+    background.indexOf("TAB OWNERSHIP GUARD"),
+    background.indexOf("switch (type)")
+  );
+  assert.match(guard, /_canAdoptServerOwnedReceipt\(targetTab, payload\)/);
+});
+
 test("internal cleanup names its tab instead of mutating shared active-tab state", () => {
   assert.ok(
     !/setActiveTabIndex\([^)]*\);\s*\n\s*await safari\.closeTab\(\)/.test(index),

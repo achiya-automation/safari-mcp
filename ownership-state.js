@@ -114,6 +114,14 @@ export function _isURLOwned(url) {
   return match !== null ? _touchOwned(match) : false;
 }
 
+// Destructive recovery must never inherit the broader same-path matching used by
+// normal navigation. It needs the exact marked URL that new_tab persisted.
+export function _isExactURLOwned(url) {
+  if (!url) return false;
+  _pruneExpiredOwnership();
+  return _ownedTabURLs.has(url) ? _touchOwned(url) : false;
+}
+
 // Sentinel persisted when a blank tab (about:blank) is opened by this session.
 // A blank tab has no unique URL to own, but ownership must still survive an MCP
 // process restart (_openedTabs is in-memory only) — otherwise reopening blank

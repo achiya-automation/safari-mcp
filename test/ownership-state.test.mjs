@@ -41,6 +41,15 @@ test("add → isOwned → remove roundtrip (exact URL)", () => {
   assert.equal(own._isURLOwned("https://example.com/a"), false);
 });
 
+test("exact ownership recovery never inherits a sibling query or route", () => {
+  const marked = "https://example.com/a#mcp-tab=receipt_A1B2C3D4";
+  own._addOwnedURL(marked);
+  assert.equal(own._isExactURLOwned(marked), true);
+  assert.equal(own._isExactURLOwned("https://example.com/a"), false);
+  assert.equal(own._isExactURLOwned("https://example.com/a#mcp-tab=receipt_Z9Y8X7W6"), false);
+  assert.equal(own._isExactURLOwned("https://example.com/a/child"), false);
+});
+
 test("about:blank and favorites:// are never owned", () => {
   own._addOwnedURL("about:blank");
   own._addOwnedURL("favorites://");
