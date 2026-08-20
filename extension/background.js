@@ -2,7 +2,11 @@
 // Uses HTTP long-polling to communicate with MCP server
 // Safari terminates idle service workers after ~30s, so we keep an active fetch() going
 
-const HTTP_URL = "http://127.0.0.1:9224";
+// Each Safari profile can have its own MCP daemon. The extension worker is also
+// profile-scoped, so it discovers the daemon whose declared profile matches its
+// stored identity instead of letting whichever daemon won port 9224 own every profile.
+const BRIDGE_PORTS = [9224, 9228, 9232, 9236];
+let HTTP_URL = `http://127.0.0.1:${BRIDGE_PORTS[0]}`;
 let isConnected = false;
 let pollAbort = null;
 let _targetProfile = null;   // Profile name from server (e.g. "Automations")
@@ -11,6 +15,20 @@ let _enabled = true;         // Toggle from popup — when false, stops polling 
 let _reconnectTimer = null;  // Single reconnect timer — prevents exponential growth
 let _reconnectDelay = 3000;  // Current backoff delay (resets on successful connect)
 const _RECONNECT_MAX = 60000; // Max backoff: 60 seconds
+
+// Profile verification used to persist the server's raw AppleScript verdict, e.g.
+// "wrong:אוטומציות — Start Page". When another profile happened to own port 9224,
+// that value permanently poisoned the *correct* profile on every later reconnect.
+// Reduce both the old verdict and the current format to the stable profile name so
+// an extension can reuse a previously proven identity without Apple Events/TCC.
+function _canonicalProfileName(value) {
+  let name = String(value || "").normalize("NFC").trim();
+  if (!name || name === "notfound" || name === "__personal__") return "";
+  name = name.replace(/^wrong:/, "").trim();
+  const titleSeparator = name.indexOf(" — ");
+  if (titleSeparator > 0) name = name.slice(0, titleSeparator);
+  return name.normalize("NFC").trim();
+}
 
 // ========== GLOBAL ERROR HANDLER ==========
 // Prevent unhandled errors from crashing the service worker
@@ -80,32 +98,42 @@ async function connect() {
     pollAbort = null;
   }
 
-  try {
-    const res = await fetch(`${HTTP_URL}/connect`, {
-      method: "POST",
-      signal: AbortSignal.timeout(5000),
-    });
-    if (res.ok) {
+  const storedBridge = await browser.storage.local.get("mcpBridgeUrl").catch(() => ({}));
+  const candidates = [
+    storedBridge.mcpBridgeUrl,
+    ...BRIDGE_PORTS.map((port) => `http://127.0.0.1:${port}`),
+  ].filter((url, index, all) => url && all.indexOf(url) === index);
+
+  for (const candidate of candidates) {
+    try {
+      HTTP_URL = candidate;
+      // Version the handshake in the URL so stale workers still cached by Safari are
+      // rejected before they reach the legacy profile probe that creates a visible tab.
+      // A query parameter keeps this a CORS-simple POST (a custom header would preflight).
+      const res = await fetch(`${HTTP_URL}/connect?verifier=existing-tab-v1`, {
+        method: "POST",
+        signal: AbortSignal.timeout(1500),
+      });
+      if (!res.ok) continue;
+
       const data = await res.json().catch(() => ({}));
       if (data.profile) {
         _targetProfile = data.profile;
-        // Verify this extension is running in the correct profile.
-        // Safari runs a separate service worker per profile — if this worker
-        // belongs to the personal profile, it must NOT poll for commands.
+        // Safari runs a separate service worker per profile. Reject this daemon and
+        // keep scanning when its target does not match the worker's proven identity.
         const isCorrectProfile = await _verifyProfileMatch(data.profile);
         if (!isCorrectProfile) {
-          console.log(`Safari MCP: wrong profile — server wants "${data.profile}", disconnecting`);
-          updateBadge("OFF");
-          _connecting = false;
-          return; // Do NOT poll — let the correct profile's extension handle commands
+          console.log(`Safari MCP: bridge ${candidate} wants profile "${data.profile}" — trying next bridge`);
+          continue;
         }
-        // Notify server that we passed profile verification
         await fetch(`${HTTP_URL}/extension-verified`, {
           method: "POST",
-          signal: AbortSignal.timeout(3000),
+          signal: AbortSignal.timeout(1500),
         }).catch(() => {});
         await _discoverProfileWindow();
       }
+
+      await browser.storage.local.set({ mcpBridgeUrl: HTTP_URL }).catch(() => {});
       isConnected = true;
       _reconnectDelay = 3000; // Reset backoff on success
       updateBadge("ON");
@@ -113,10 +141,10 @@ async function connect() {
       _connecting = false;
       pollForCommands();
       return;
-    }
-  } catch {}
+    } catch {}
+  }
 
-  // Server not available — single retry with exponential backoff
+  // No matching server available — retry with exponential backoff.
   isConnected = false;
   updateBadge("");
   scheduleReconnect();
@@ -222,17 +250,25 @@ async function handleCommand(type, payload) {
   // Block write operations on tabs not opened by this session.
   // new_tab is always allowed (it creates owned tabs). Read-only ops are allowed on any tab.
   if (type !== "new_tab" && !_readOnlyCommands.has(type) && !_isTabOwnedBySession(sessionId, tabId)) {
-    const anyOwned = _sessionOwnedTabs.has(sessionId) && _sessionOwnedTabs.get(sessionId).size > 0;
-    if (anyOwned) {
-      throw new Error(`⚠️ Tab safety: refusing "${type}" on tab ${tabId} (${targetTab.url || 'unknown'}) — not opened by this MCP session. Use safari_new_tab first.`);
-    }
-    // No tabs owned yet → allow, for sessions that never call new_tab. That leniency is
-    // survivable for a write (worst case: it edits the page the user is already on) but not
-    // for a close, which throws their tab away. It also fires for a session re-initialised
-    // after a transport drop, which reports owning nothing while its tab is still open —
-    // the state in which close_tab destroyed a user's tab (#68).
-    if (_destructiveTabCommands.has(type)) {
-      throw new Error(`⚠️ Tab safety: refusing "${type}" on tab ${tabId} (${targetTab.url || 'unknown'}) — this session owns no tabs, so it has none to close. Use safari_new_tab first.`);
+    // Some MCP hosts create a fresh protocol session for every tool call. Let that
+    // stateless caller resume only a tab that (a) the extension itself created,
+    // (b) still has the exact requested URL, and (c) carries an explicit high-entropy
+    // mcp-tab marker. Ordinary user tabs and ordinary cross-session tabs stay isolated.
+    if (_canAdoptMarkedOwnedTab(targetTab, payload.tabUrl)) {
+      _addOwnedTab(sessionId, tabId);
+    } else {
+      const anyOwned = _sessionOwnedTabs.has(sessionId) && _sessionOwnedTabs.get(sessionId).size > 0;
+      if (anyOwned) {
+        throw new Error(`⚠️ Tab safety: refusing "${type}" on tab ${tabId} (${targetTab.url || 'unknown'}) — not opened by this MCP session. Use safari_new_tab first.`);
+      }
+      // No tabs owned yet → allow, for sessions that never call new_tab. That leniency is
+      // survivable for a write (worst case: it edits the page the user is already on) but not
+      // for a close, which throws their tab away. It also fires for a session re-initialised
+      // after a transport drop, which reports owning nothing while its tab is still open —
+      // the state in which close_tab destroyed a user's tab (#68).
+      if (_destructiveTabCommands.has(type)) {
+        throw new Error(`⚠️ Tab safety: refusing "${type}" on tab ${tabId} (${targetTab.url || 'unknown'}) — this session owns no tabs, so it has none to close. Use safari_new_tab first.`);
+      }
     }
   }
 
@@ -471,7 +507,24 @@ async function handleCommand(type, payload) {
 
     // --- Click & Input ---
     case "click": {
-      const result = await execInTab((selector, text, x, y, ref) => {
+      let result;
+      try {
+        const response = await sendContentCommand(tabId, "mcp-content-click", {
+          selector: payload.selector, text: payload.text,
+          x: payload.x, y: payload.y, ref: payload.ref,
+        });
+        if (!response || typeof response.result !== "string") {
+          throw new Error("content click bridge returned no result");
+        }
+        result = response.result;
+      } catch (contentError) {
+        console.warn("content click bridge unavailable:", contentError?.message || String(contentError));
+        if ((targetTab.url || "").includes("business.facebook.com")) {
+          throw new Error("content click bridge unavailable: " + (contentError?.message || String(contentError)));
+        }
+        // Excluded domains and pages loaded before the bridge was installed keep the
+        // scripting fallback. A reload/new navigation installs the persistent bridge.
+        result = await execInTabIsolated((selector, text, x, y, ref) => {
         // Use shared deep query (defined by ensureHelpers / _deepQueryScript)
         const dq = window.__mcpDeepQuery || document.querySelector.bind(document);
 
@@ -607,6 +660,30 @@ async function handleCommand(type, payload) {
           return "Element is DISABLED — cannot click: " + reason + ". Check if form requirements are met (required fields, permissions, etc.)";
         }
 
+        // Meta's legacy rel=dialog router needs the click to originate on the inner
+        // label, but its event stack throws a generic Safari WebExtension injection
+        // error when it also receives the synthetic pointer prelude. Use the smallest
+        // browser-shaped event for this well-defined link contract.
+        const relDialogAnchor = el.closest ? el.closest('a[rel="dialog"]') : null;
+        if (relDialogAnchor) {
+          relDialogAnchor.scrollIntoView({ block: "center", inline: "center" });
+          const rr = relDialogAnchor.getBoundingClientRect();
+          const rx = rr.left + rr.width / 2, ry = rr.top + rr.height / 2;
+          let dialogFrom = document.elementFromPoint(rx, ry);
+          if (!dialogFrom || !(dialogFrom === relDialogAnchor || relDialogAnchor.contains(dialogFrom))) {
+            dialogFrom = relDialogAnchor;
+          }
+          try {
+            const claimed = !dialogFrom.dispatchEvent(new MouseEvent("click", {
+              bubbles: true, cancelable: true, composed: true, view: window,
+              clientX: rx, clientY: ry, button: 0, buttons: 0, detail: 1,
+            }));
+            return claimed ? "Clicked rel=dialog link" : "rel=dialog handler did not claim click";
+          } catch (err) {
+            return "rel=dialog click failed: " + (err?.message || String(err));
+          }
+        }
+
         // React checkbox/radio: reset _valueTracker so React sees the flip as "new"
         if (el.tagName === "INPUT" && (el.type === "checkbox" || el.type === "radio")) {
           (window.__mcpResetTracker || function(){})(el, el.checked ? "true" : "");
@@ -617,12 +694,19 @@ async function handleCommand(type, payload) {
         const r = el.getBoundingClientRect();
         const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
 
+        // Real clicks bubble from the deepest node under the pointer. Dispatching from
+        // the actionable ancestor makes event.target === currentTarget; Meta rel=dialog
+        // and SPA router gates reject that synthetic shape. Keep the actionable element
+        // for focus/form logic, but fire the event sequence from the leaf.
+        let from = document.elementFromPoint(cx, cy);
+        if (!from || !(from === el || el.contains(from))) from = el;
+
         // --- Full event sequence (matches AppleScript path) ---
         const s = { bubbles: true, cancelable: true, composed: true, view: window, clientX: cx, clientY: cy, button: 0, detail: 1 };
         const p = { ...s, pointerId: 1, pointerType: "mouse", isPrimary: true, width: 1, height: 1, pressure: 0.5 };
 
-        el.dispatchEvent(new PointerEvent("pointerover", { ...p, buttons: 0 }));
-        el.dispatchEvent(new MouseEvent("mouseover", { ...s, buttons: 0 }));
+        from.dispatchEvent(new PointerEvent("pointerover", { ...p, buttons: 0 }));
+        from.dispatchEvent(new MouseEvent("mouseover", { ...s, buttons: 0 }));
         // Native <select>: synthetic click can't open the dropdown (browser security).
         // Instead, focus + dispatch showPicker (Safari 16+) or return guidance.
         if (el.tagName === "SELECT") {
@@ -632,63 +716,28 @@ async function handleCommand(type, payload) {
           return "SELECT element focused. Use safari_select_option to set a value, or safari_press_key with 'space' to open the dropdown.";
         }
 
-        el.dispatchEvent(new PointerEvent("pointerenter", { ...p, buttons: 0 }));
-        el.dispatchEvent(new MouseEvent("mouseenter", { ...s, buttons: 0 }));
-        el.dispatchEvent(new PointerEvent("pointermove", { ...p, buttons: 0 }));
-        el.dispatchEvent(new MouseEvent("mousemove", { ...s, buttons: 0 }));
-        el.dispatchEvent(new PointerEvent("pointerdown", { ...p, buttons: 1 }));
-        el.dispatchEvent(new MouseEvent("mousedown", { ...s, buttons: 1 }));
+        from.dispatchEvent(new PointerEvent("pointerenter", { ...p, buttons: 0 }));
+        from.dispatchEvent(new MouseEvent("mouseenter", { ...s, buttons: 0 }));
+        from.dispatchEvent(new PointerEvent("pointermove", { ...p, buttons: 0 }));
+        from.dispatchEvent(new MouseEvent("mousemove", { ...s, buttons: 0 }));
+        from.dispatchEvent(new PointerEvent("pointerdown", { ...p, buttons: 1 }));
+        from.dispatchEvent(new MouseEvent("mousedown", { ...s, buttons: 1 }));
         if (el.focus) el.focus();
-        el.dispatchEvent(new PointerEvent("pointerup", { ...p, buttons: 0, pressure: 0 }));
-        el.dispatchEvent(new MouseEvent("mouseup", { ...s, buttons: 0 }));
+        from.dispatchEvent(new PointerEvent("pointerup", { ...p, buttons: 0, pressure: 0 }));
+        from.dispatchEvent(new MouseEvent("mouseup", { ...s, buttons: 0 }));
 
-        // Native .click() triggers default browser behavior (link navigation, form submit)
-        // dispatchEvent alone does NOT trigger defaults for synthetic events
         const beforeUrl = location.href;
         const anchor = el.closest ? el.closest("a[href]") : null;
         const href = anchor && anchor.href && !anchor.href.startsWith("javascript:") ? anchor.href : "";
-        try {
-          if (typeof el.click === "function") {
-            el.click();
-            if (href && href !== beforeUrl) { location.href = href; }
-          }
-        } catch (_) {}
-        el.dispatchEvent(new MouseEvent("click", { ...s, buttons: 0 }));
-
-        // --- React Fiber — traverse up to 15 parents (full: __reactProps$, __reactFiber$, __reactInternalInstance$) ---
-        let node = el, reactFired = false;
-        for (let depth = 0; depth < 15 && node; depth++) {
-          const keys = Object.keys(node);
-          // Try __reactProps$ first (React 18+)
-          const pk = keys.find(k => k.startsWith("__reactProps$"));
-          if (pk && node[pk]) {
-            const props = node[pk];
-            const synth = { type: "click", target: el, currentTarget: node, clientX: cx, clientY: cy, preventDefault() {}, stopPropagation() {}, nativeEvent: new MouseEvent("click"), persist() {}, bubbles: true, isDefaultPrevented() { return false; }, isPropagationStopped() { return false; } };
-            if (props.onClick) { props.onClick(synth); reactFired = true; break; }
-            if (props.onMouseDown) { props.onMouseDown({ ...synth, type: "mousedown" }); reactFired = true; break; }
-          }
-          // Try __reactFiber$ / __reactInternalInstance$ (React 16/17)
-          // Traverse up to 20 levels — React portals (modals, dialogs) can have deeply nested fiber trees
-          if (!reactFired) {
-            const fk = keys.find(k => k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$"));
-            if (fk && node[fk]) {
-              let fiber = node[fk];
-              for (let f = 0; f < 20 && fiber; f++) {
-                if (fiber.memoizedProps) {
-                  if (fiber.memoizedProps.onClick) { fiber.memoizedProps.onClick({ type: "click", target: el, currentTarget: node, clientX: cx, clientY: cy, preventDefault() {}, stopPropagation() {}, persist() {}, bubbles: true, nativeEvent: new MouseEvent("click"), isDefaultPrevented() { return false; }, isPropagationStopped() { return false; } }); reactFired = true; break; }
-                }
-                fiber = fiber.return;
-              }
-              if (reactFired) break;
-            }
-          }
-          node = node.parentElement;
-        }
-
-        // A-tag fallback (if native .click() didn't navigate)
-        if (href && href !== beforeUrl && location.href === beforeUrl) {
-          location.href = href;
-          return "Navigated to: " + href;
+        const anchorTarget = anchor ? (anchor.getAttribute("target") || "") : "";
+        // One click only. Calling `.click()` and then dispatching another click used to
+        // toggle custom comboboxes open and immediately closed. Dispatch from the leaf so
+        // event.target/currentTarget match a real click; explicit navigation/form handling
+        // below supplies the native defaults synthetic dispatch does not guarantee.
+        const clickEvent = new MouseEvent("click", { ...s, buttons: 0 });
+        const notPrevented = from.dispatchEvent(clickEvent);
+        if (href && notPrevented && location.href === beforeUrl && (!anchorTarget || anchorTarget === "_self")) {
+          return "__MCP_NAVIGATE__:" + href;
         }
 
         // Form submit fallback — use requestSubmit to fire submit event + validation
@@ -704,7 +753,19 @@ async function handleCommand(type, payload) {
         }
 
         return "Clicked: " + el.tagName + (el.textContent ? ' "' + el.textContent.trim().substring(0, 50) + '"' : "");
-      }, [payload.selector, payload.text, payload.x, payload.y, payload.ref], tabId);
+        }, [payload.selector, payload.text, payload.x, payload.y, payload.ref], tabId);
+      }
+
+      if (typeof result === "string" && result.startsWith("__MCP_NAVIGATE__:")) {
+        const href = result.substring("__MCP_NAVIGATE__:".length);
+        await browser.tabs.update(tabId, { url: href });
+        await waitForTabLoad(tabId, payload.timeout || 30000);
+        try {
+          const updated = await browser.tabs.get(tabId);
+          _setSessionTab(sessionId, updated.id, updated.url);
+        } catch {}
+        return "Navigated to: " + href;
+      }
 
       // Fallback: if element not found in main frame, try all frames (cross-origin iframes)
       if (result && (result.startsWith("Element not found") || result === "No click target")) {
@@ -768,6 +829,17 @@ async function handleCommand(type, payload) {
     }
 
     case "fill": {
+      try {
+        const response = await sendContentCommand(tabId, "mcp-content-fill", {
+          selector: payload.selector, ref: payload.ref, value: payload.value,
+        });
+        if (response && response.ok && typeof response.result === "string") {
+          return response.result;
+        }
+      } catch (contentError) {
+        console.warn("content fill bridge unavailable:", contentError?.message || String(contentError));
+        // Pages without the content bridge retain the framework-aware fallback below.
+      }
       const fillFn = (selector, value) => {
         const el = (window.__mcpDeepQuery || document.querySelector.bind(document))(selector);
         if (!el) return "Element not found: " + selector;
@@ -1096,7 +1168,9 @@ async function handleCommand(type, payload) {
       // Open in profile window if known (not in user's personal window)
       if (_profileWindowId) createOpts.windowId = _profileWindowId;
       const newTab = await browser.tabs.create(createOpts);
-      if (payload.url) await waitForTabLoad(newTab.id);
+      // Return immediately. Waiting for a slow authenticated app page used to exceed
+      // the bridge's 15s command timeout after the tab was already created, so callers
+      // saw a failure and lost the only ownership receipt for a perfectly valid tab.
       const updated = await browser.tabs.get(newTab.id);
       // Learn profile window from newly created tab
       if (!_profileWindowId) { _profileWindowId = updated.windowId; browser.storage.local.set({ mcpProfileWindowId: _profileWindowId }).catch(() => {}); }
@@ -1765,6 +1839,9 @@ async function handleCommand(type, payload) {
             index: i, tag: el.tagName,
             text: (el.innerText || "").substring(0, 100),
             href: el.href || "", value: el.value || "",
+            id: el.id || "", name: el.name || "", type: el.type || "",
+            placeholder: el.getAttribute("placeholder") || "",
+            ariaLabel: el.getAttribute("aria-label") || "",
             visible: r.width > 0 && r.height > 0,
             // Center point relative to the element's OWN frame viewport. In the main
             // frame that equals page-viewport coordinates; in a cross-origin iframe it
@@ -1857,6 +1934,23 @@ function _isTabOwnedBySession(sessionId, tabId) {
   return set ? set.has(tabId) : false;
 }
 
+function _isTabOwnedByAnySession(tabId) {
+  for (const set of _sessionOwnedTabs.values()) {
+    if (set.has(tabId)) return true;
+  }
+  return false;
+}
+
+function _canAdoptMarkedOwnedTab(tab, requestedUrl) {
+  if (!tab || !_isTabOwnedByAnySession(tab.id)) return false;
+  const actual = String(tab.url || "");
+  const requested = String(requestedUrl || "");
+  if (!actual || actual !== requested) return false;
+  // At least 12 URL-safe characters keeps accidental collisions out while allowing
+  // callers to use a readable task prefix plus a random suffix.
+  return /(?:#|[?#&])mcp-tab=[A-Za-z0-9_-]{12,}(?:[&#]|$)/.test(actual);
+}
+
 // Commands that destroy a tab rather than change a page. They get no "no tabs owned yet"
 // leniency: a session that owns nothing has nothing to close (#68).
 const _destructiveTabCommands = new Set(["close_tab"]);
@@ -1940,9 +2034,10 @@ browser.tabs.onRemoved.addListener((tabId) => {
 // If the server expects a specific profile but this worker's windows don't match, we're in the wrong profile.
 async function _verifyProfileMatch(expectedProfile) {
   try {
+    const expected = _canonicalProfileName(expectedProfile);
     const allWindows = await browser.windows.getAll({ populate: true });
     // No window in this profile → it cannot be the profile the server drives, and probing
-    // would have to CREATE one: browser.tabs.create() with no open window opens a fresh window
+    // would have to CREATE one: the tab-creation API with no open window opens a fresh window
     // that jumps to the front. That is the personal profile popping up every reconnect.
     if (!allWindows.length) return false;
     // Check if any window's tab titles contain the profile name pattern "ProfileName —"
@@ -1951,25 +2046,56 @@ async function _verifyProfileMatch(expectedProfile) {
     // The key insight: if this extension is in the personal profile, it will see personal windows.
     // We use a stored marker to identify which profile this extension belongs to.
     const stored = await browser.storage.local.get("mcpVerifiedProfile").catch(() => ({}));
-    if (stored.mcpVerifiedProfile === expectedProfile) return true;
-    if (stored.mcpVerifiedProfile && stored.mcpVerifiedProfile !== expectedProfile) return false;
+    const storedProfile = _canonicalProfileName(stored.mcpVerifiedProfile);
+    if (storedProfile) {
+      if (storedProfile === expected) {
+        // Migrate old values such as "wrong:<profile> — <tab title>" in place.
+        if (stored.mcpVerifiedProfile !== expected) {
+          await browser.storage.local.set({ mcpVerifiedProfile: expected });
+        }
+        return true;
+      }
+      return false;
+    }
 
-    // First time: we don't know yet. Open a test tab, check if we can see it from
-    // the expected profile. Simpler approach: ask user via badge, or use a heuristic.
-    // Heuristic: create a unique marker in storage and check from the other side.
-    // Simplest: the server sends a nonce, the extension writes it to a tab title,
-    // and the AppleScript side verifies which window has it.
-
-    // Practical approach: try to find a window with profile-matching title via tab inspection
-    // Actually, the simplest reliable method: the extension opens a special URL,
-    // the server checks via AppleScript which profile window has that URL.
+    // First time: identify this worker's profile without creating a tab. A temporary
+    // tab-creation probe used to make a tab appear and disappear in the user's
+    // personal window on every transient verification failure. Instead, stamp a nonce
+    // into the title of an existing background tab, let the server locate that window,
+    // and restore the original title in finally. Prefer inactive web tabs so even the
+    // short-lived title change stays out of the user's current page.
     const nonce = `mcp-profile-check-${Date.now()}`;
-    const checkTab = await browser.tabs.create({
-      url: `data:text/html,<title>${nonce}</title>`,
-      active: false,
-    });
-    // Give it a moment to load
-    await new Promise(r => setTimeout(r, 500));
+    const candidateTabs = allWindows
+      .flatMap(window => window.tabs || [])
+      .filter(tab => Number.isInteger(tab.id) && /^(https?|file):/i.test(String(tab.url || "")))
+      .sort((a, b) => Number(a.active) - Number(b.active));
+    let checkTab = null;
+    let previousTitle = "";
+    for (const candidate of candidateTabs) {
+      try {
+        const injected = await browser.scripting.executeScript({
+          target: { tabId: candidate.id },
+          func: (marker) => {
+            const title = document.title;
+            document.title = marker;
+            return { applied: document.title === marker, title };
+          },
+          args: [nonce],
+        });
+        const probe = injected?.[0]?.result;
+        if (probe?.applied) {
+          checkTab = candidate;
+          previousTitle = typeof probe.title === "string" ? probe.title : "";
+          break;
+        }
+      } catch (_) {
+        // Restricted/internal pages cannot be scripted; try another existing tab.
+      }
+    }
+    if (!checkTab) {
+      console.log("Safari MCP: no existing injectable tab for profile verification — rejecting without opening a tab");
+      return false;
+    }
 
     // Ask the server to verify which profile has this nonce
     let verifyRes;
@@ -1981,8 +2107,15 @@ async function _verifyProfileMatch(expectedProfile) {
         signal: AbortSignal.timeout(5000),
       });
     } finally {
-      // Always clean up test tab — even if fetch fails
-      await browser.tabs.remove(checkTab.id).catch(() => {});
+      // Restore only if this is still the same document and still carries our marker.
+      // If the page navigated while verification ran, leave its new title untouched.
+      await browser.scripting.executeScript({
+        target: { tabId: checkTab.id },
+        func: (marker, title) => {
+          if (document.title === marker) document.title = title;
+        },
+        args: [nonce, previousTitle],
+      }).catch(() => {});
     }
 
     if (verifyRes && verifyRes.ok) {
@@ -1993,11 +2126,18 @@ async function _verifyProfileMatch(expectedProfile) {
         console.warn("Safari MCP: profile verification response invalid JSON — rejecting");
         return false;
       }
-      if (result.match) {
-        await browser.storage.local.set({ mcpVerifiedProfile: expectedProfile });
+      const detectedProfile = _canonicalProfileName(result.actualProfile);
+      if (result.match || detectedProfile === expected) {
+        await browser.storage.local.set({ mcpVerifiedProfile: expected });
         return true;
       } else {
-        await browser.storage.local.set({ mcpVerifiedProfile: result.actualProfile || "__personal__" });
+        // Persist only a positive identity for this extension instance. "notfound" and
+        // transient Apple Events errors are not identities and must not poison retries.
+        if (detectedProfile) {
+          await browser.storage.local.set({ mcpVerifiedProfile: detectedProfile });
+        } else {
+          await browser.storage.local.remove("mcpVerifiedProfile").catch(() => {});
+        }
         return false;
       }
     }
@@ -2062,10 +2202,21 @@ async function getTargetTab(tabUrl, sessionId) {
   if (tabUrl) {
     const searchScope = _profileWindowId ? { windowId: _profileWindowId } : {};
     let all = await browser.tabs.query(searchScope);
-    let match = all.find(t => t.url && (t.url.startsWith(tabUrl) || tabUrl.startsWith(t.url.split("?")[0])));
+    let matches = all.filter(t => t.url === tabUrl);
+    if (matches.length === 0) {
+      matches = all.filter(t => t.url && (t.url.startsWith(tabUrl) || tabUrl.startsWith(t.url.split("?")[0])));
+    }
+    // Duplicate URLs are common during concurrent automation. Always prefer the tab
+    // this session actually opened; picking the first same-URL tab makes the ownership
+    // guard reject a legitimate command (or, worse, target another session's tab).
+    let match = matches.find(t => _isTabOwnedBySession(sessionId, t.id)) || matches[0];
     if (!match && _profileWindowId) {
       all = await browser.tabs.query({});
-      match = all.find(t => t.url && (t.url.startsWith(tabUrl) || tabUrl.startsWith(t.url.split("?")[0])));
+      matches = all.filter(t => t.url === tabUrl);
+      if (matches.length === 0) {
+        matches = all.filter(t => t.url && (t.url.startsWith(tabUrl) || tabUrl.startsWith(t.url.split("?")[0])));
+      }
+      match = matches.find(t => _isTabOwnedBySession(sessionId, t.id)) || matches[0];
     }
     if (match) {
       // A URL match in a DIFFERENT window must not silently retarget the profile
@@ -2123,6 +2274,88 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === "loading") _helpersInjected.delete(tabId);
 });
 
+async function sendContentCommand(tabId, type, payload, timeoutMs = 1500) {
+  const send = async () => {
+    let timer;
+    return Promise.race([
+      browser.tabs.sendMessage(tabId, { type, payload }),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(type + " bridge timed out")), timeoutMs);
+      }),
+    ]).finally(() => clearTimeout(timer));
+  };
+
+  try {
+    const initial = await send();
+    if (initial !== undefined && initial !== null) return initial;
+    throw new Error(type + " bridge returned no result");
+  } catch (_) {
+    // Reloading/updating a Safari extension invalidates content-script listeners in
+    // already-open tabs. Safari 18 also fails to return responses from listeners
+    // injected into such a tab. Schedule a small, self-contained DOM action and
+    // return BEFORE it runs: page-listener exceptions then cannot be misreported as
+    // an executeScript failure, and a filled form survives an extension repair.
+    const scheduled = await browser.scripting.executeScript({
+      target: { tabId },
+      world: "ISOLATED",
+      func: (commandType, commandPayload) => {
+        const find = () => {
+          if (commandPayload.ref) {
+            const safe = String(commandPayload.ref).replace(/["\\]/g, "\\$&");
+            return document.querySelector('[data-mcp-ref="' + safe + '"]');
+          }
+          if (commandPayload.selector) {
+            try { return document.querySelector(commandPayload.selector); } catch (_) { return null; }
+          }
+          if (commandPayload.x !== undefined && commandPayload.y !== undefined) {
+            return document.elementFromPoint(Number(commandPayload.x), Number(commandPayload.y));
+          }
+          if (commandPayload.text) {
+            const candidates = document.querySelectorAll("button,a,[role='button'],[role='link'],[role='option'],[role='combobox']");
+            for (const candidate of candidates) {
+              if ((candidate.innerText || candidate.textContent || "").trim() === commandPayload.text) return candidate;
+            }
+          }
+          return null;
+        };
+        setTimeout(() => {
+          try {
+            const el = find();
+            if (!el) return;
+            if (commandType === "mcp-content-fill") {
+              const value = String(commandPayload.value ?? "");
+              el.focus();
+              if (el.isContentEditable) {
+                el.textContent = value;
+              } else if ("value" in el) {
+                const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+                setter ? setter.call(el, value) : (el.value = value);
+              }
+              el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: value }));
+              el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+              return;
+            }
+            el.scrollIntoView({ block: "center", inline: "center" });
+            const rect = el.getBoundingClientRect();
+            const cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2;
+            let from = document.elementFromPoint(cx, cy);
+            if (!from || !(from === el || el.contains(from))) from = el;
+            try { el.focus({ preventScroll: true }); } catch (_) { try { el.focus(); } catch (_) {} }
+            from.dispatchEvent(new MouseEvent("click", {
+              bubbles: true, cancelable: true, composed: true, view: window,
+              clientX: cx, clientY: cy, button: 0, buttons: 0, detail: 1,
+            }));
+          } catch (_) {}
+        }, 0);
+        return { ok: true, result: "Scheduled " + commandType };
+      },
+      args: [type, payload],
+    });
+    return scheduled[0]?.result;
+  }
+}
+
 async function execInTab(func, args = [], tabId = null) {
   const id = tabId || (await getActiveTab()).id;
   try {
@@ -2142,10 +2375,39 @@ async function execInTab(func, args = [], tabId = null) {
       func,
       args,
     });
-    return results[0]?.result;
+    const first = results[0];
+    // Safari can report an injection exception on the result item instead of
+    // rejecting executeScript(). Treating that as a successful `null` hid the
+    // real click failure and triggered an unrelated AppleScript fallback.
+    if (first?.error) throw new Error(first.error);
+    return first?.result;
   } catch (err) {
     console.error("execInTab error on tabId=" + id + ":", err.message);
     throw new Error("execInTab failed: " + err.message);
+  }
+}
+
+// Event dispatch from Safari's MAIN injection world can inherit an exception from
+// a page listener as the opaque "JavaScript extension error", even though normal
+// browser event dispatch would only report that exception to the page console. The
+// isolated world shares the same DOM/event path but keeps page exceptions from
+// aborting the WebExtension command. Clicks need that boundary; reads and framework
+// introspection continue to use MAIN through execInTab().
+async function execInTabIsolated(func, args = [], tabId = null) {
+  const id = tabId || (await getActiveTab()).id;
+  try {
+    const results = await browser.scripting.executeScript({
+      target: { tabId: id },
+      world: "ISOLATED",
+      func,
+      args,
+    });
+    const first = results[0];
+    if (first?.error) throw new Error(first.error);
+    return first?.result;
+  } catch (err) {
+    console.error("execInTabIsolated error on tabId=" + id + ":", err.message);
+    throw new Error("execInTabIsolated failed: " + err.message);
   }
 }
 

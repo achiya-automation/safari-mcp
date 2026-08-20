@@ -39,6 +39,8 @@
 		81D8D8EF2F6B75B900E1895F /* images in Resources */ = {isa = PBXBuildFile; fileRef = 81D8D8E52F6B75B900E1895F /* images */; };
 		81D8D8F02F6B75B900E1895F /* manifest.json in Resources */ = {isa = PBXBuildFile; fileRef = 81D8D8E62F6B75B900E1895F /* manifest.json */; };
 		81D8D8F12F6B75B900E1895F /* content.js in Resources */ = {isa = PBXBuildFile; fileRef = 81D8D8E72F6B75B900E1895F /* content.js */; };
+		81D8D8F22F6B75B900E1895F /* command-content.js in Resources */ = {isa = PBXBuildFile; fileRef = 81D8D8F42F6B75B900E1895F /* command-content.js */; };
+		81D8D8F32F6B75B900E1895F /* command-content.js in Resources */ = {isa = PBXBuildFile; fileRef = 81D8D8F42F6B75B900E1895F /* command-content.js */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -110,6 +112,7 @@
 		81D8D8E52F6B75B900E1895F /* images */ = {isa = PBXFileReference; lastKnownFileType = folder; name = images; path = ../../../extension/images; sourceTree = "<group>"; };
 		81D8D8E62F6B75B900E1895F /* manifest.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; name = manifest.json; path = ../../../extension/manifest.json; sourceTree = "<group>"; };
 		81D8D8E72F6B75B900E1895F /* content.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; name = content.js; path = ../../../extension/content.js; sourceTree = "<group>"; };
+		81D8D8F42F6B75B900E1895F /* command-content.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; name = command-content.js; path = ../../../extension/command-content.js; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -244,6 +247,7 @@
 				81D8D8E52F6B75B900E1895F /* images */,
 				81D8D8E62F6B75B900E1895F /* manifest.json */,
 				81D8D8E72F6B75B900E1895F /* content.js */,
+				81D8D8F42F6B75B900E1895F /* command-content.js */,
 			);
 			name = Resources;
 			path = "Shared (Extension)";
@@ -415,6 +419,7 @@
 				81D8D8EE2F6B75B900E1895F /* background.js in Resources */,
 				81D8D8ED2F6B75B900E1895F /* popup in Resources */,
 				81D8D8F12F6B75B900E1895F /* content.js in Resources */,
+				81D8D8F22F6B75B900E1895F /* command-content.js in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -427,6 +432,7 @@
 				81D8D8E92F6B75B900E1895F /* background.js in Resources */,
 				81D8D8E82F6B75B900E1895F /* popup in Resources */,
 				81D8D8EC2F6B75B900E1895F /* content.js in Resources */,
+				81D8D8F32F6B75B900E1895F /* command-content.js in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **A profile-scoped Safari MCP could become unusable after Apple Events error `-1743`.** Extension workers now discover profile-specific local bridge ports, verify against an existing background tab without opening or focusing a window, migrate the legacy poisoned profile verdict, and may safely carry commands when Apple Events is unavailable only after the profile match is proven.
+- **Stateless MCP calls could lose their own form tab, and synthetic clicks failed on Meta Direct Support.** An exact, marked extension-owned tab can now be safely adopted after a transport/session change; duplicate URLs prefer the caller's owned tab; isolated-world click/fill handling dispatches from the real leaf target and preserves `preventDefault`; and `new_tab` returns ownership before slow authenticated pages finish loading.
+- **The extension installation guide could disable the extension it had just built.** The documented ad-hoc deep-sign step has been removed in favor of a clean Apple Development-signed build, with an explicit warning not to overwrite the wrapper and embedded-extension signatures.
+
 ## [2.16.2] - 2026-08-20
 
 ### Fixed

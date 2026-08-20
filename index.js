@@ -231,15 +231,20 @@ process.on("exit", () => {
 });
 
 // ========== EXTENSION FOCUS SAFETY ==========
-// When SAFARI_PROFILE is set, the extension's browser.scripting.executeScript()
-// can steal window focus in Safari (bringing the automation window to front).
-// AppleScript's `do JavaScript in tab N of window id X` does NOT steal focus.
-// So when a profile is configured, we prefer the AppleScript path to avoid disruption.
+// Before the extension proves its Safari profile, AppleScript is the only safe path:
+// accepting whichever extension polls first can cross from Automation into Personal.
+// Once profile verification succeeds, the extension is both profile-pinned and the only
+// backend that still works when macOS temporarily denies Apple Events (-1743).
 const _preferAppleScript = !!process.env.SAFARI_PROFILE;
+let _profileExtensionVerified = !process.env.SAFARI_PROFILE;
 
 // ========== EXTENSION BRIDGE (WebSocket + HTTP polling) ==========
-const WS_PORT = 9223;
-const HTTP_PORT = 9224;
+function _bridgePort(name, fallback) {
+  const value = Number.parseInt(process.env[name] || "", 10);
+  return Number.isInteger(value) && value >= 1024 && value <= 65535 ? value : fallback;
+}
+const HTTP_PORT = _bridgePort("SAFARI_MCP_BRIDGE_PORT", 9224);
+const WS_PORT = _bridgePort("SAFARI_MCP_BRIDGE_WS_PORT", HTTP_PORT - 1);
 let _extensionWs = null;
 let _extensionConnected = false;
 
@@ -285,7 +290,7 @@ try {
   const httpServer = createServer((req, res) => {
     // CORS headers — restricted to browser extension origin only.
     // Safari extensions use moz-extension:// or safari-web-extension:// origins.
-    // "*" was a security risk: any webpage could POST to localhost:9224 and execute MCP commands.
+    // "*" was a security risk: any webpage could POST to the localhost bridge and execute MCP commands.
     const origin = req.headers.origin || "";
     const isSafeOrigin = !origin || origin.startsWith("safari-web-extension://") || origin.startsWith("moz-extension://") || origin.startsWith("chrome-extension://");
     if (isSafeOrigin) {
@@ -307,6 +312,14 @@ try {
 
     // GET /poll — extension asks for next command (long-poll, up to 5s)
     if (req.method === "GET" && req.url === "/poll") {
+      // A profile-scoped server never releases queued commands until an extension has
+      // proved it belongs to that profile. This keeps an old/wrong worker from draining
+      // commands during reconnect races.
+      if (process.env.SAFARI_PROFILE && !_profileExtensionVerified) {
+        res.writeHead(409);
+        res.end("Profile verification required");
+        return;
+      }
       _extensionLastPollTime = Date.now(); // Keep connection alive — critical for stale detection
       if (!_extensionConnected) {
         _extensionConnected = true;
@@ -360,7 +373,16 @@ try {
     }
 
     // POST /connect — extension announces it's alive
-    if (req.method === "POST" && req.url === "/connect") {
+    if (req.method === "POST" && req.url.startsWith("/connect")) {
+      const connectUrl = new URL(req.url, `http://127.0.0.1:${HTTP_PORT}`);
+      // Safari can retain old per-profile workers after a development build is replaced.
+      // Those workers use the legacy visible-tab verifier. Fail them closed before the
+      // server reveals a target profile, while current workers use the no-new-tab verifier.
+      if (process.env.SAFARI_PROFILE && connectUrl.searchParams.get("verifier") !== "existing-tab-v1") {
+        res.writeHead(426, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "upgrade_required" }));
+        return;
+      }
       // When SAFARI_PROFILE is set, don't mark as connected until profile is verified.
       // A personal-profile extension connecting first would incorrectly set the flag.
       if (!process.env.SAFARI_PROFILE && !_extensionConnected) {
@@ -375,6 +397,7 @@ try {
 
     // POST /extension-verified — extension confirmed it's in the correct profile
     if (req.method === "POST" && req.url === "/extension-verified") {
+      _profileExtensionVerified = true;
       if (!_extensionConnected) {
         _extensionConnected = true;
         console.error("[Safari MCP] Extension connected and profile-verified via HTTP polling");
@@ -445,22 +468,19 @@ try {
     }
 
     // GET /proxy-check — secondary instances check if extension is connected
-    if (req.method === "GET" && req.url === "/proxy-check") {
+    if (req.method === "GET" && req.url.startsWith("/proxy-check")) {
+      const requestUrl = new URL(req.url, `http://127.0.0.1:${HTTP_PORT}`);
+      const requestedProfile = requestUrl.searchParams.get("profile") || "";
+      const hostProfile = process.env.SAFARI_PROFILE || "";
+      const profileMatch = requestedProfile === hostProfile;
+      const extensionUsable = _extensionConnected && profileMatch && (!_preferAppleScript || _profileExtensionVerified);
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ extensionConnected: _extensionConnected }));
+      res.end(JSON.stringify({ extensionConnected: extensionUsable, profileMatch }));
       return;
     }
 
     // POST /proxy-command — secondary instances send commands through primary
     if (req.method === "POST" && req.url === "/proxy-command") {
-      // Blocked when SAFARI_PROFILE is set — otherwise the extension could act in the wrong profile
-      if (process.env.SAFARI_PROFILE) {
-        res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          error: `Refusing /proxy-command: SAFARI_PROFILE="${process.env.SAFARI_PROFILE}" is set on the host instance. The Safari extension may be connected to a different profile window, which would execute commands in the wrong profile. Use the safari_* MCP tools instead — they route through AppleScript when SAFARI_PROFILE is set and stay within the configured profile window.`
-        }));
-        return;
-      }
       // Security: require the local shared-secret — blocks unrelated local processes
       if (req.headers["x-local-token"] !== PROXY_TOKEN) {
         res.writeHead(403, { "Content-Type": "application/json" });
@@ -473,7 +493,13 @@ try {
       req.on("end", async () => {
         if (bodyTooLarge) return;
         try {
-          const { type, payload } = JSON.parse(body);
+          const { type, payload, profile = "" } = JSON.parse(body);
+          const hostProfile = process.env.SAFARI_PROFILE || "";
+          if (profile !== hostProfile || (_preferAppleScript && !_profileExtensionVerified)) {
+            res.writeHead(409, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Refusing proxy command: verified Safari profile does not match" }));
+            return;
+          }
           const timeout = _commandTimeouts[type] || 30000;
           const result = await sendToExtension(type, payload, timeout);
           res.writeHead(200, { "Content-Type": "application/json" });
@@ -520,7 +546,8 @@ setTimeout(() => {
 async function _checkPrimaryExtension() {
   if (_isExtensionHost) return; // Already hosting — stop polling
   try {
-    const res = await fetch(`http://127.0.0.1:${HTTP_PORT}/proxy-check`, {
+    const profile = encodeURIComponent(process.env.SAFARI_PROFILE || "");
+    const res = await fetch(`http://127.0.0.1:${HTTP_PORT}/proxy-check?profile=${profile}`, {
       method: "GET",
       signal: AbortSignal.timeout(2000),
     });
@@ -529,7 +556,11 @@ async function _checkPrimaryExtension() {
       _primaryHasExtension = data.extensionConnected;
       if (_primaryHasExtension) {
         _extensionConnected = true; // Enable extension path in extensionOrFallback
+        _profileExtensionVerified = true;
         console.error(`[Safari MCP] Primary instance has extension — proxy mode enabled`);
+      } else {
+        _extensionConnected = false;
+        if (process.env.SAFARI_PROFILE) _profileExtensionVerified = false;
       }
     }
   } catch {
@@ -544,7 +575,7 @@ async function _proxyToExtension(type, payload, timeoutMs = 30000) {
   const res = await fetch(`http://127.0.0.1:${HTTP_PORT}/proxy-command`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-local-token": PROXY_TOKEN },
-    body: JSON.stringify({ type, payload }),
+    body: JSON.stringify({ type, payload, profile: process.env.SAFARI_PROFILE || "" }),
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) throw new Error(`Proxy error: ${res.status}`);
@@ -571,6 +602,7 @@ _staleHttpTimer.unref();  // stale-detection must not keep the Node process aliv
 
 // Drain pending requests and command queue on disconnect — allows fast fallback to AppleScript
 function _drainOnDisconnect(reason) {
+  if (process.env.SAFARI_PROFILE) _profileExtensionVerified = false;
   // Reject all in-flight requests immediately (instead of waiting for timeout)
   for (const [id, pending] of _pendingRequests) {
     clearTimeout(pending.timer);
@@ -722,8 +754,7 @@ function _assertTabOwnership(opType) {
   }
 }
 
-// Try extension first, fall back to AppleScript.
-// When SAFARI_PROFILE is set, skip extension entirely — AppleScript doesn't steal focus.
+// Try the profile-verified extension first, fall back to AppleScript.
 async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) {
   // Tab-ownership guard — extracted to _assertTabOwnership so run_script / native_* share it.
   _assertTabOwnership(extensionType);
@@ -738,7 +769,7 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
   let result;
   let usedExtension = false;
   try {
-    if (_extensionConnected && !_preferAppleScript) {
+    if (_extensionConnected && (!_preferAppleScript || _profileExtensionVerified)) {
       try {
         const t0 = Date.now();
         const tabUrl = safari.getActiveTabURL();

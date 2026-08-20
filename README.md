@@ -568,7 +568,7 @@ Safari MCP runs locally on your Mac with minimal attack surface:
 | Network | **No remote connections** — all communication is local (stdio + localhost) |
 | Permissions | macOS system permissions required (Screen Recording for screenshots) |
 | Data | No telemetry, no analytics, no data sent anywhere |
-| Extension | Communicates only with `localhost:9224`, validated by Safari |
+| Extension | Communicates only with the local profile bridges (`localhost:9224/9228/9232/9236`), validated by Safari |
 | Code | Fully open source (MIT) — audit every line |
 
 ---
@@ -698,22 +698,24 @@ The extension requires a one-time build with Xcode (free, included with macOS).
 git clone https://github.com/achiya-automation/safari-mcp.git
 cd safari-mcp
 
-# 2. Build the extension
+# 2. Build a clean, Apple Development-signed app
+# If needed, first choose your Team in Xcode → Signing & Capabilities.
 xcodebuild -project "xcode/Safari MCP/Safari MCP.xcodeproj" \
-  -scheme "Safari MCP (macOS)" -configuration Release build
+  -scheme "Safari MCP (macOS)" -configuration Release \
+  -allowProvisioningUpdates clean build
 
-# 3. Ad-hoc sign the built app so Safari will load it
-# (xcodebuild without a signing identity produces a bundle Safari silently rejects)
+# 3. Locate the signed app
 APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData/Safari_MCP-*/Build/Products/Release -name "Safari MCP.app" -maxdepth 2 | head -1)
-codesign --sign - --force --deep "$APP_PATH"
 
 # 4. Re-sign safari-helper with the Apple Events entitlement
 # (helps macOS surface the TCC Automation prompt reliably)
 codesign --sign - --force --entitlements safari-helper.entitlements safari-helper
 
-# 4. Open the app (needed once so Safari registers the extension)
+# 5. Open the app (needed once so Safari registers the extension)
 open "$APP_PATH"
 ```
+
+> **Do not ad-hoc re-sign `Safari MCP.app` with `codesign --deep --sign -`.** That replaces the Apple Development identity on the wrapper and embedded extension; current Safari can then silently disable or mark the extension as removed. If a previous build was ad-hoc signed, run the `clean build` command above again.
 
 Alternatively, open `xcode/Safari MCP/Safari MCP.xcodeproj` directly in Xcode, select your Apple ID under Signing & Capabilities, and click Run. A free personal Apple Developer account is sufficient for local use.
 
@@ -722,7 +724,7 @@ Then in Safari:
 2. Safari → Develop → **Allow Unsigned Extensions** (required each Safari restart)
 3. Safari → Settings → Extensions → enable **Safari MCP Bridge**
 
-The extension connects automatically to the MCP server on port `9224`.
+The extension connects automatically to the first local bridge whose declared Safari profile matches its own. The default bridge ports are `9224`, `9228`, `9232`, and `9236`; a single-profile setup normally uses `9224`.
 
 > **Note:** "Allow Unsigned Extensions" resets every time Safari restarts. You'll need to re-enable it in the Develop menu after each restart. The extension itself stays installed.
 
