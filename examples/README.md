@@ -5,7 +5,7 @@ Practical examples showing how AI agents use Safari MCP tools via the Model Cont
 **What makes Safari MCP unique:**
 - Uses your real Safari with all existing logins (Gmail, GitHub, Slack -- already authenticated)
 - Zero Chrome overhead -- native WebKit on Apple Silicon, ~60% less CPU
-- 80 tools covering navigation, forms, screenshots, network, storage, accessibility, and more
+- 97 tools covering navigation, forms, screenshots, network, storage, accessibility, and more
 - Background operation -- Safari never steals window focus
 
 ## Examples

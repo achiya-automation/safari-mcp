@@ -2401,7 +2401,10 @@ try {
       let version = "?";
       try { version = JSON.parse(readFileSync(pkgPath, "utf8")).version; } catch {}
       console.error("");
-      console.error(`[Safari MCP] 🦁 v${version} ready — 96 tools, native WebKit, zero Chrome.`);
+      // Count tools at runtime — a hardcoded number here drifted to 96 while the code had 97.
+      const toolCount = Object.keys(server._registeredTools ?? {}).length;
+      const toolsPhrase = toolCount ? `${toolCount} tools, ` : "";
+      console.error(`[Safari MCP] 🦁 v${version} ready — ${toolsPhrase}native WebKit, zero Chrome.`);
       console.error(`[Safari MCP] ⭐ Like it? Star: https://github.com/achiya-automation/safari-mcp`);
       console.error("");
       try { writeFileSync(bannerStateFile, String(Date.now()), { mode: 0o600 }); } catch {}

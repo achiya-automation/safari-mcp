@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.16.2] - 2026-08-20
+
+### Fixed
+- **Every "how many tools" surface said something different.** The code registers **97** tools, but the startup banner said 96, `package.json` and `glama.json` said 96, and `.mcp.json`/`mcp.json` still said 80 — the last of which is what the GitHub repo description and downstream directories (mcp.so, Glama) had been mirroring since launch. All of them now say 97, and the startup banner no longer carries a hardcoded number at all: it counts the registered tools at runtime, so it cannot drift again.
+
 ## [2.16.1] - 2026-08-18
 
 ### Fixed
