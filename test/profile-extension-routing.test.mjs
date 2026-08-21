@@ -363,3 +363,28 @@ test("switch_tab proves the destination tab before registering a redirected URL"
   assert.match(index, /if \(result\.owned === true\) _addOwnedURL\(result\.url\)/);
   assert.match(index, /includes\("Tab safety:"\)\) throw err/);
 });
+
+test("switch_tab forwards a durable marked URL for stateless callers", () => {
+  const switchTabTool = index.slice(
+    index.indexOf('"safari_switch_tab"'),
+    index.indexOf("// ========== WAIT ==========", index.indexOf('"safari_switch_tab"'))
+  );
+  assert.match(
+    switchTabTool,
+    /url:\s*z\.string\(\)\.optional\(\)/,
+    "the public tool schema must accept the exact marked URL returned by list_tabs"
+  );
+  assert.match(switchTabTool, /async \(\{ index, url \}\) =>/);
+  assert.match(switchTabTool, /_isURLOwned\(url\)/);
+  assert.match(switchTabTool, /extensionOrFallback\(\s*"list_tabs"/);
+  assert.doesNotMatch(
+    switchTabTool,
+    /await safari\.listTabs\(\)/,
+    "named-profile switching must inspect tabs through the extension, not AppleScript"
+  );
+  assert.match(
+    switchTabTool,
+    /"switch_tab",\s*url \? \{ index, tabUrl: url \} : \{ index \}/,
+    "the durable receipt must reach the extension adoption guard"
+  );
+});

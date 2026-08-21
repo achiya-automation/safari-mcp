@@ -1550,14 +1550,29 @@ server.tool(
 
 server.tool(
   "safari_switch_tab",
-  "Switch to a specific tab by index (use safari_list_tabs to see indices). All subsequent commands (click, fill, evaluate, screenshot, scroll) will target this tab. If commands seem to run on the wrong tab, call switch_tab again to re-anchor.",
-  { index: z.coerce.number().describe("Tab index (starting from 1)") },
-  async ({ index }) => {
+  "Switch to a specific tab by index (use safari_list_tabs to see indices). After a daemon/session restart, also pass the exact marked URL returned by safari_list_tabs so the extension can safely recover ownership. All subsequent commands target this tab without activating Safari.",
+  {
+    index: z.coerce.number().describe("Tab index (starting from 1)"),
+    url: z.string().optional().describe("Exact MCP-owned tab URL, including its mcp-tab receipt, for stateless recovery"),
+  },
+  async ({ index, url }) => {
+    if (url) {
+      const hasDurableReceipt = /(?:[?#&])mcp-tab=[A-Za-z0-9_-]{12,}(?:[&#]|$)/.test(url);
+      if (!hasDurableReceipt || !_isURLOwned(url)) {
+        const msg = "⚠️ Tab safety: refusing switch_tab receipt — pass the exact marked URL returned by safari_list_tabs.";
+        console.error(`[Safari MCP] ${msg}`);
+        return errorResult(msg);
+      }
+    }
+
     // Tab ownership check: verify target tab is one we opened
     if (_ownedTabURLs.size > 0) {
       // Get target tab's URL via list_tabs before switching
       try {
-        const tabs = await safari.listTabs();
+        const tabs = await extensionOrFallback(
+          "list_tabs", {},
+          () => safari.listTabs()
+        );
         const parsed = typeof tabs === 'string' ? JSON.parse(tabs) : tabs;
         const target = parsed.find(t => t.index === index);
         if (target && target.url && !_isURLOwned(target.url)) {
@@ -1572,7 +1587,7 @@ server.tool(
       } catch {}
     }
     const result = await extensionOrFallback(
-      "switch_tab", { index },
+      "switch_tab", url ? { index, tabUrl: url } : { index },
       () => safari.switchTab(index)
     );
     // Sync safari.js state so AppleScript fallback targets the correct tab
