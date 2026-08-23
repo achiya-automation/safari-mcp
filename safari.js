@@ -4020,7 +4020,7 @@ function _validateFilePath(filePath) {
 
 // ========== UPLOAD FILE ==========
 
-export async function uploadFile({ selector, filePath }) {
+export async function uploadFile({ selector, filePath, forceNative = false, verifyPreview = false }) {
   _validateFilePath(filePath);
   // Read file in Node.js, send as base64 to Safari JS, create File + DataTransfer
   // NO file dialog, NO System Events, NO focus stealing
@@ -4096,10 +4096,10 @@ export async function uploadFile({ selector, filePath }) {
   const mime = mimeMap[ext] || "application/octet-stream";
   const safeName = fileName.replace(/'/g, "\\'");
 
-  // Send to Safari via runJSLarge (handles files >260KB via temp file).
-  // Fully synchronous IIFE — `do JavaScript` can't await a Promise, so an `async`
-  // wrapper would hand back "[object Promise]" before the body settled.
-  const result = await runJSLarge(
+  // forceNative: skip synthetic injection entirely. Attempting it first would leave a stray
+  // media item behind on sites that register the pickup in their UI without ingesting it
+  // (Google Business Profile), so the native dialog would then add a SECOND copy.
+  const result = forceNative ? '' : await runJSLarge(
     `(function(){
       // Deep query: main document → shadow DOM → iframes
       function deepQuery(sel) {
@@ -4129,13 +4129,35 @@ export async function uploadFile({ selector, filePath }) {
       var dt = new DataTransfer();
       dt.items.add(file);
 
+      // Counts the visual proof that a site actually ingested the file: object-URL previews
+      // it created for it. Ghost pickups (see Strategy 1) leave this at the pre-upload value.
+      function __mcpPreviewCount() {
+        try {
+          var n = document.querySelectorAll('img[src^="blob:"], img[src^="data:image"], video[src^="blob:"]').length;
+          var all = document.querySelectorAll('div,span,a,figure');
+          for (var i = 0; i < all.length; i++) {
+            var b = all[i].style && all[i].style.backgroundImage || '';
+            if (b.indexOf('blob:') > -1 || b.indexOf('data:image') > -1) n++;
+          }
+          return n;
+        } catch (_) { return -1; }
+      }
+
+      // Baseline BEFORE any dispatch — after the change event a site that works has already
+      // painted its preview, so sampling then makes an honest pickup look identical to a ghost.
+      var __mcpPreviewsBefore = __mcpPreviewCount();
+
       // Strategy 1: Direct files assignment (works on most inputs)
       try { el.files = dt.files; } catch(_) {}
 
       if (el.files && el.files.length > 0) {
         el.dispatchEvent(new Event('change', { bubbles: true }));
         el.dispatchEvent(new Event('input', { bubbles: true }));
-        return 'Uploaded: ${safeName} (' + Math.round(bytes.length / 1024) + ' KB, verified ' + el.files.length + ' file(s))';
+        // el.files being set proves the DOM accepted the handle — NOT that the site ingested it.
+        // Google Business Profile is the canonical liar: it flips its UI to "image attached"
+        // yet renders no preview and publishes the post with no image (2026-08-23). Report the
+        // preview count so the Node side can escalate when the caller asked to verify.
+        return 'Uploaded: ${safeName} (' + Math.round(bytes.length / 1024) + ' KB, verified ' + el.files.length + ' file(s)) [previews=' + __mcpPreviewsBefore + ']';
       }
 
       // Strategy 2: Drop event on the input or its container (works when files property is read-only)
@@ -4167,7 +4189,34 @@ export async function uploadFile({ selector, filePath }) {
   // to a REAL native file dialog: a CGEvent click opens the OS NSOpenPanel, then System Events
   // types the path. That is an isTrusted:true selection, which those handlers accept.
   let finalResult = result;
-  if (/verified 0 file|Upload attempted|el\.files is empty/i.test(result)) {
+
+  // verifyPreview: the caller states this upload must produce a visible preview (an image
+  // going into a composer). Strategy 1 can "succeed" while the site ingested nothing, so
+  // re-read the preview count after giving the page a beat to react; if it never moved, the
+  // pickup was a ghost and only a real (isTrusted) OS selection will do.
+  let ghostPickup = false;
+  if (verifyPreview && !forceNative && /verified [1-9]\d* file/i.test(result)) {
+    const before = Number((result.match(/\[previews=(-?\d+)\]/) || [])[1] ?? -1);
+    await new Promise((r) => setTimeout(r, 1400));
+    const after = Number(
+      await runJS(
+        `(function(){try{var n=document.querySelectorAll('img[src^="blob:"], img[src^="data:image"], video[src^="blob:"]').length;var all=document.querySelectorAll('div,span,a,figure');for(var i=0;i<all.length;i++){var b=all[i].style&&all[i].style.backgroundImage||'';if(b.indexOf('blob:')>-1||b.indexOf('data:image')>-1)n++;}return n;}catch(_){return -1;}})()`
+      ).catch(() => -1)
+    );
+    if (before >= 0 && after >= 0 && after <= before) {
+      ghostPickup = true;
+      console.error(`[Safari MCP] upload_file: ghost pickup on ${sel} (previews ${before}→${after}) — escalating to native dialog`);
+    }
+  }
+
+  if (forceNative || ghostPickup) {
+    try {
+      finalResult = await _nativeFileUpload(sel, resolvedPath, safeName);
+      if (ghostPickup) finalResult = `${finalResult} [escalated: synthetic pickup produced no preview]`;
+    } catch (nativeErr) {
+      finalResult = `${result} | Native file-dialog ${forceNative ? '(forced)' : '(ghost-pickup escalation)'} failed: ${nativeErr.message}`;
+    }
+  } else if (/verified 0 file|Upload attempted|el\.files is empty/i.test(result)) {
     try {
       finalResult = await _nativeFileUpload(sel, resolvedPath, safeName);
     } catch (nativeErr) {

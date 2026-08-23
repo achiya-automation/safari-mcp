@@ -12,14 +12,19 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { findOwnedMatch, pruneExpired } from "./ownership-match.js";
+import { findOwnedMatch, pruneExpired, hasDurableReceipt } from "./ownership-match.js";
 
 // MCP opens tabs, but a restart re-triggers "Tab safety: no tabs opened yet" errors forcing
 // a re-open of every tab. Persist the set to a JSON file with a TTL so tabs remain "owned"
 // across process restarts for up to OWNERSHIP_TTL_MS.
 export const OWNERSHIP_DIR = join(homedir(), ".safari-mcp");
 export const OWNERSHIP_FILE = join(OWNERSHIP_DIR, "owned-tabs.json");
-export const OWNERSHIP_TTL_MS = 30 * 60 * 1000; // 30 minutes
+export const OWNERSHIP_TTL_MS = 30 * 60 * 1000; // 30 minutes — plain URLs (can collide with a user tab)
+// Receipt-bearing tabs (#mcp-tab=<12+ opaque chars>) get a much longer window. The marker is
+// unguessable, so ageing never makes it match someone else's page; the short TTL only ever
+// broke long-running jobs mid-way (GBP publish, 2026-08-23: a tab opened at the start became
+// un-switchable ~35min in, while still carrying our own marker).
+export const RECEIPT_OWNERSHIP_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
 
 export function _loadOwnershipFile() {
   try {
@@ -27,9 +32,15 @@ export function _loadOwnershipFile() {
     const raw = readFileSync(OWNERSHIP_FILE, "utf8");
     const data = JSON.parse(raw);
     if (!Array.isArray(data)) return [];
-    const cutoff = Date.now() - OWNERSHIP_TTL_MS;
+    const now = Date.now();
+    const cutoff = now - OWNERSHIP_TTL_MS;
+    const receiptCutoff = now - RECEIPT_OWNERSHIP_TTL_MS;
+    // Same tiering as _pruneExpiredOwnership — otherwise a daemon restart (which reloads from
+    // disk) silently drops receipt-bearing tabs after 30min even though the in-memory path
+    // would have kept them, and every write tool on that tab starts failing.
     return data.filter(
-      (e) => e && typeof e.url === "string" && typeof e.ts === "number" && e.ts > cutoff
+      (e) => e && typeof e.url === "string" && typeof e.ts === "number" &&
+        e.ts > (hasDurableReceipt(e.url) ? receiptCutoff : cutoff)
     );
   } catch {
     return [];
@@ -95,7 +106,7 @@ export function _touchOwned(ownedKey) {
 }
 export function _pruneExpiredOwnership() {
   const before = new Set(_ownedTabURLs);
-  if (pruneExpired(_ownedTabURLs, _ownedTabTimestamps, OWNERSHIP_TTL_MS)) {
+  if (pruneExpired(_ownedTabURLs, _ownedTabTimestamps, OWNERSHIP_TTL_MS, Date.now(), RECEIPT_OWNERSHIP_TTL_MS)) {
     // Pass the pruned URLs as explicit removals so the merge-on-write in
     // _saveOwnershipFile doesn't resurrect them from the disk copy.
     const removed = [...before].filter((u) => !_ownedTabURLs.has(u));

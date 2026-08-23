@@ -3,7 +3,7 @@
 // touch the currently active tab. CI-safe: pure logic, no Safari required.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { normalizeURL, findOwnedMatch, pruneExpired } from "../ownership-match.js";
+import { normalizeURL, findOwnedMatch, pruneExpired, hasDurableReceipt } from "../ownership-match.js";
 
 const SENTINEL = "__mcp-blank-tab__";
 
@@ -93,4 +93,49 @@ test("touch-on-use pattern: refreshed timestamp survives the next prune", () => 
 test("normalizeURL strips query/fragment/trailing slashes only", () => {
   assert.equal(normalizeURL("https://e.com/a/?q=1#f"), "https://e.com/a");
   assert.equal(normalizeURL("https://e.com"), "https://e.com");
+});
+
+// --- tiered TTL: receipt-bearing tabs outlive the short default (regression: GBP publish
+// 2026-08-23, where a >30min job lost ownership of its own still-open, still-marked tab) ---
+
+test("hasDurableReceipt: only a 12+ char opaque mcp-tab marker counts", () => {
+  assert.equal(hasDurableReceipt("https://x.test/a?b=1#mcp-tab=gbppost20260823"), true);
+  assert.equal(hasDurableReceipt("https://x.test/a?mcp-tab=abcdefghijkl&z=1"), true);
+  assert.equal(hasDurableReceipt("https://x.test/a#mcp-tab=short"), false, "under 12 chars is not durable");
+  assert.equal(hasDurableReceipt("https://x.test/a"), false);
+  assert.equal(hasDurableReceipt(""), false);
+  assert.equal(hasDurableReceipt(undefined), false);
+});
+
+test("pruneExpired keeps a receipt-bearing entry past the plain TTL, drops the plain one", () => {
+  const now = 1_000_000;
+  const plain = "https://x.test/plain";
+  const marked = "https://x.test/job?hl=iw#mcp-tab=gbppost20260823";
+  const urls = new Set([plain, marked]);
+  const ts = new Map([[plain, now - 5000], [marked, now - 5000]]);
+  // plain TTL 1000 (both are stale by it), receipt TTL 10000 (marked still fresh)
+  assert.equal(pruneExpired(urls, ts, 1000, now, 10000), true);
+  assert.equal(urls.has(plain), false, "plain URL must expire on the short TTL");
+  assert.equal(urls.has(marked), true, "receipt URL must survive until its own TTL");
+  assert.equal(ts.has(plain), false);
+  assert.equal(ts.has(marked), true);
+});
+
+test("pruneExpired: a receipt entry past even the receipt TTL is still dropped", () => {
+  const now = 1_000_000;
+  const marked = "https://x.test/job#mcp-tab=gbppost20260823";
+  const urls = new Set([marked]);
+  const ts = new Map([[marked, now - 50_000]]);
+  assert.equal(pruneExpired(urls, ts, 1000, now, 10_000), true);
+  assert.equal(urls.has(marked), false, "receipts must not be immortal");
+});
+
+test("pruneExpired stays backward-compatible when no receipt TTL is passed", () => {
+  const now = 1_000_000;
+  const marked = "https://x.test/job#mcp-tab=gbppost20260823";
+  const urls = new Set([marked]);
+  const ts = new Map([[marked, now - 5000]]);
+  // 4-arg call: receiptTtlMs defaults to ttlMs, so old behaviour is preserved exactly
+  assert.equal(pruneExpired(urls, ts, 1000, now), true);
+  assert.equal(urls.has(marked), false);
 });

@@ -7,6 +7,16 @@
 //   • the blank-tab sentinel (not a parseable URL) never matches a real page
 // Keep this file dependency-free.
 
+/**
+ * True when the URL carries an mcp-tab receipt this server minted (12+ opaque chars).
+ * A receipt is effectively unguessable, so such an entry can never collide with a page
+ * the user opened themselves — which is why it may outlive the short default TTL.
+ * Kept in sync with the switch_tab/close_tab receipt check in index.js.
+ */
+export function hasDurableReceipt(url) {
+  return /(?:[?#&])mcp-tab=[A-Za-z0-9_-]{12,}(?:[&#]|$)/.test(url || "");
+}
+
 /** Strip query, fragment and trailing slashes. */
 export function normalizeURL(u) {
   return u.split("?")[0].split("#")[0].replace(/\/+$/, "");
@@ -54,11 +64,16 @@ export function findOwnedMatch(url, ownedUrls) {
  * @param {number} [now]
  * @returns {boolean} whether anything was removed
  */
-export function pruneExpired(ownedUrls, timestamps, ttlMs, now = Date.now()) {
+export function pruneExpired(ownedUrls, timestamps, ttlMs, now = Date.now(), receiptTtlMs = ttlMs) {
   const cutoff = now - ttlMs;
+  const receiptCutoff = now - receiptTtlMs;
   let changed = false;
   for (const [url, ts] of timestamps) {
-    if (ts <= cutoff) {
+    // A receipt-bearing entry is unguessable, so it cannot start matching a user's tab as
+    // it ages. Expiring it after 30min only broke long tasks: a tab opened at the start of
+    // an hour-long job became un-switchable halfway through, while still sitting there
+    // carrying our own marker. Plain URLs keep the short TTL — they CAN collide.
+    if (ts <= (hasDurableReceipt(url) ? receiptCutoff : cutoff)) {
       ownedUrls.delete(url);
       timestamps.delete(url);
       changed = true;

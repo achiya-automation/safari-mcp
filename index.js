@@ -1835,10 +1835,12 @@ server.tool(
 
 server.tool(
   "safari_upload_file",
-  "Upload a file to a <input type='file'> element via JavaScript DataTransfer — NO file dialog, NO UI interaction. IMPORTANT: Do NOT click the file input before calling this tool — just provide the selector and file path. If a file dialog is already open, this tool will close it first. NOTE: 'verified 0 files' may appear even on success if the site uses a custom upload handler — check visually with safari_snapshot.",
+  "Upload a file to a <input type='file'> element via JavaScript DataTransfer — NO file dialog, NO UI interaction. IMPORTANT: Do NOT click the file input before calling this tool — just provide the selector and file path. If a file dialog is already open, this tool will close it first. NOTE: 'verified 0 files' may appear even on success if the site uses a custom upload handler — check visually with safari_snapshot. For an IMAGE going into a composer/editor that should show a thumbnail, pass verifyPreview:true — some sites (Google Business Profile) accept the file handle and flip their UI to 'attached' while ingesting nothing, and the post then publishes with no image.",
   {
     selector: z.string().describe("CSS selector of the file input"),
     filePath: z.string().describe("Absolute path to the file to upload"),
+    verifyPreview: z.boolean().optional().describe("Require a visible preview (blob:/data: image) to appear; if none does, the synthetic pickup was a ghost and this escalates to a real OS file dialog. Use for images going into a composer."),
+    forceNative: z.boolean().optional().describe("Skip synthetic injection and go straight to the real OS file dialog (isTrusted). Needs an unlocked screen and briefly focuses Safari. Use when the site is known to reject synthetic uploads."),
   },
   async (args) => {
     _assertTabOwnership("upload_file");
