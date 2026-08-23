@@ -1,0 +1,106 @@
+#!/usr/bin/env node
+/**
+ * Regression coverage for several Claude sessions sharing one Safari profile.
+ *
+ * In HTTP daemon mode (SAFARI_MCP_HTTP=1) a single node process serves many MCP
+ * sessions against ONE Safari window. Two pieces of state were process-wide and
+ * silently shared, so sessions fought over the same tabs:
+ *
+ *   1. getTargetTab fell through to "active tab of the profile window (no session
+ *      bias)" — whatever another session (or the user) last fronted. Measured
+ *      23.8.26: commands landed on a parallel session's Telegram tab mid-run, and
+ *      the ownership guard then rejected them as "not opened by this MCP session".
+ *
+ *   2. _openedTabs backed the MAX_TABS cap. With N sessions the cap was the SUM of
+ *      everyone's tabs, and the "close the oldest" eviction closed whichever tab was
+ *      oldest overall — routinely a tab another session was still working in.
+ */
+import assert from "node:assert";
+import { test } from "node:test";
+import { readFileSync } from "node:fs";
+
+const index = readFileSync(new URL("../index.js", import.meta.url), "utf8");
+const background = readFileSync(new URL("../extension/background.js", import.meta.url), "utf8");
+const ownership = readFileSync(new URL("../ownership-state.js", import.meta.url), "utf8");
+
+test("a session with its own tabs never falls through to the active tab", () => {
+  const fn = background.slice(
+    background.indexOf("async function getTargetTab("),
+    background.indexOf("async function getActiveTab(")
+  );
+  const ownIdx = fn.indexOf("_sessionOwnedTabs.get(sessionId");
+  const activeIdx = fn.indexOf("// PRIORITY 3: Active tab");
+  assert.ok(ownIdx > 0, "must consult the session's own tabs");
+  assert.ok(
+    ownIdx < activeIdx,
+    "the session's own tabs must be preferred BEFORE the active-tab fallback"
+  );
+});
+
+test("the owned-tab lookup keeps the guards that make it safe", () => {
+  const fn = background.slice(
+    background.indexOf("// PRIORITY 2.5"),
+    background.indexOf("// PRIORITY 3: Active tab")
+  );
+  assert.ok(fn.includes("browser.tabs.get("), "a closed tab must not be returned");
+  assert.ok(fn.includes("_profileWindowId"), "must not cross out of the profile window");
+  assert.ok(/delete\(ownedId\)/.test(fn), "dead tab ids must be pruned, not retried forever");
+  assert.ok(fn.includes("reverse()"), "most recent tab first — that is the one in use");
+});
+
+test("a session that owns nothing still reaches the old fallback", () => {
+  // Sessions on their first command, and read-only helpers, must behave as before.
+  const fn = background.slice(
+    background.indexOf("// PRIORITY 2.5"),
+    background.indexOf("async function getActiveTab(")
+  );
+  assert.ok(
+    /if \(ownedIds && ownedIds\.size\)/.test(fn),
+    "the new branch must be conditional, not unconditional"
+  );
+  assert.ok(fn.includes("// PRIORITY 3: Active tab"), "the active-tab fallback must still exist below it");
+});
+
+test("the tab cap counts only the calling session's tabs", () => {
+  const near = index.slice(
+    index.indexOf("Enforce tab limit"),
+    index.indexOf("const rawResult = await extensionOrFallback")
+  );
+  assert.ok(
+    !/_openedTabs\.size >= MAX_TABS/.test(near),
+    "cap must not be measured against the process-wide map"
+  );
+  assert.ok(near.includes("myTabs"), "cap must be measured against this session's tabs");
+  assert.ok(
+    /filter\(.*info\.sessionId/s.test(near),
+    "the session's tabs must be selected by sessionId"
+  );
+});
+
+test("eviction can only close a tab the calling session opened", () => {
+  const near = index.slice(
+    index.indexOf("Enforce tab limit"),
+    index.indexOf("const rawResult = await extensionOrFallback")
+  );
+  const loop = near.slice(near.indexOf("for ("), near.indexOf("if (oldestIdx !== null)"));
+  assert.ok(
+    loop.includes("myTabs") && !loop.includes("_openedTabs"),
+    "the oldest-tab scan must iterate this session's tabs, not every tab"
+  );
+});
+
+test("every tab we open is stamped with its session", () => {
+  assert.ok(
+    /_trackTab\(tabIndex, url, sessionId = ""\)/.test(ownership),
+    "_trackTab must accept a session"
+  );
+  assert.ok(/openedAt: Date\.now\(\), sessionId/.test(ownership), "and record it");
+  const calls = [...index.matchAll(/_trackTab\(([^;]*?)\)\s*;/g)].map(m => m[1]);
+  assert.ok(calls.length >= 3, "expected every _trackTab call site to be covered");
+  for (const args of calls) {
+    assert.ok(
+      /mySession|currentSessionId\(\)/.test(args),
+      `_trackTab call without a session id would escape the per-session cap: ${args}`
+    );
+  }
+});

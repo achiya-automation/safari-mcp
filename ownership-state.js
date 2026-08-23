@@ -164,8 +164,12 @@ export function _removeOwnedURL(url) {
   }
 }
 
-export function _trackTab(tabIndex, url) {
-  _openedTabs.set(tabIndex, { url: url || "", openedAt: Date.now() });
+export function _trackTab(tabIndex, url, sessionId = "") {
+  // sessionId is what keeps the tab cap per-session. In HTTP daemon mode one process
+  // serves many Claude sessions, and this map is process-wide: without it, the cap is
+  // the SUM of every session's tabs, and the "close the oldest" eviction happily closed
+  // a tab another session was still working in.
+  _openedTabs.set(tabIndex, { url: url || "", openedAt: Date.now(), sessionId });
   _addOwnedURL(url);
 }
 

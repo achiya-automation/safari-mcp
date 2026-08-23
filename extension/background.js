@@ -2475,6 +2475,27 @@ async function getTargetTab(tabUrl, sessionId) {
       return match;
     }
   }
+  // PRIORITY 2.5: a tab this session actually owns.
+  // With several Claude sessions sharing one Safari profile, "the active tab" is
+  // whatever another session (or the user) last brought to the front — measured
+  // 23.8.26: commands landed on a parallel session's Telegram tab mid-run, and the
+  // ownership guard then rejected them. A session that owns tabs must never be handed
+  // someone else's page; prefer its own most recent live one. Sessions that own
+  // nothing still fall through to the active tab below, so first-command flows and
+  // read-only helpers behave exactly as before.
+  const ownedIds = _sessionOwnedTabs.get(sessionId || _DEFAULT_SESSION);
+  if (ownedIds && ownedIds.size) {
+    for (const ownedId of [...ownedIds].reverse()) {
+      let ownedTab = null;
+      try { ownedTab = await browser.tabs.get(ownedId); }
+      catch { ownedIds.delete(ownedId); continue; } // closed since — forget it
+      if (!ownedTab) { ownedIds.delete(ownedId); continue; }
+      if (_profileWindowId && ownedTab.windowId !== _profileWindowId) continue;
+      _setSessionTab(sessionId, ownedTab.id, ownedTab.url || "");
+      return ownedTab;
+    }
+  }
+
   // PRIORITY 3: Active tab of the profile window (no session bias)
   if (_profileWindowId) {
     const tabs = await browser.tabs.query({ active: true, windowId: _profileWindowId });
@@ -2503,9 +2524,17 @@ async function getActiveTab() {
 // Track which tabs already have the deep query helpers injected
 const _helpersInjected = new Set();
 // Clean up when tabs are removed or navigated
-browser.tabs.onRemoved.addListener((tabId) => { _helpersInjected.delete(tabId); });
+browser.tabs.onRemoved.addListener((tabId) => {
+  _helpersInjected.delete(tabId);
+  _injectionBlockedTabs.delete(tabId);
+});
 browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.status === "loading") _helpersInjected.delete(tabId);
+  if (changeInfo.status === "loading") {
+    _helpersInjected.delete(tabId);
+    // A new page may well allow injection — never keep a tab downgraded across
+    // navigations, or one hardened page would permanently slow that tab.
+    _injectionBlockedTabs.delete(tabId);
+  }
 });
 
 async function sendContentCommand(tabId, type, payload, timeoutMs = 1500) {
@@ -2590,9 +2619,16 @@ async function sendContentCommand(tabId, type, payload, timeoutMs = 1500) {
   }
 }
 
-// Well under the server's 30s command timeout, so the ISOLATED retry still has room
-// to run and answer instead of the caller giving up on us.
-const MAIN_WORLD_INJECT_MS = 8000;
+// Every probe plus the content bridge must fit inside the server's 30s command
+// timeout with room to spare: helpers 3 + MAIN 3 + ISOLATED 3 + bridge 10 ≈ 19s.
+// Earlier values (8s each) added up to ~29s and the caller gave up first, so the
+// bridge never got to answer and the tab was never marked as injection-blocked.
+const MAIN_WORLD_INJECT_MS = 3000;
+// Tabs where BOTH injection worlds stalled. Only the first command on such a page pays
+// the probing cost; afterwards we go straight to the content bridge, which keeps these
+// pages fast instead of merely working. Cleared when the tab navigates or closes, so a
+// page that stops blocking injection is re-probed rather than downgraded forever.
+const _injectionBlockedTabs = new Set();
 function _withInjectionDeadline(promise, ms = MAIN_WORLD_INJECT_MS) {
   let timer;
   return Promise.race([
@@ -2625,6 +2661,14 @@ async function execInTab(func, args = [], tabId = null) {
     // ponytail: page globals are not visible from ISOLATED; DOM reads (the vast
     // majority of evaluate calls) behave identically. A wrong-world answer beats none.
     let results;
+    if (_injectionBlockedTabs.has(id)) {
+      const known = await sendContentCommand(
+        id, "mcp-content-eval", { source: func.toString(), args }, 10000
+      );
+      if (known && known.ok === true) return known.value;
+      // The bridge failed too — the page may have changed. Re-probe injection below.
+      _injectionBlockedTabs.delete(id);
+    }
     try {
       results = await _withInjectionDeadline(
         browser.scripting.executeScript({ target: { tabId: id }, world: "MAIN", func, args })
@@ -2632,9 +2676,25 @@ async function execInTab(func, args = [], tabId = null) {
     } catch (mainErr) {
       if (!/injection stalled/.test(mainErr?.message || "")) throw mainErr;
       console.warn("Safari MCP: MAIN world stalled, retrying ISOLATED on tabId=" + id);
-      results = await browser.scripting.executeScript({
-        target: { tabId: id }, world: "ISOLATED", func, args,
-      });
+      try {
+        results = await _withInjectionDeadline(
+          browser.scripting.executeScript({ target: { tabId: id }, world: "ISOLATED", func, args })
+        );
+      } catch (isoErr) {
+        if (!/injection stalled/.test(isoErr?.message || "")) throw isoErr;
+        // Both worlds stalled — the page blocks injection outright. The content script
+        // is already in the page from document_start and keeps responding (clicks work
+        // on business.facebook.com throughout), so ask it to run this for us.
+        console.warn("Safari MCP: both worlds stalled, falling back to content bridge");
+        const relayed = await sendContentCommand(
+          id, "mcp-content-eval", { source: func.toString(), args }, 10000
+        );
+        if (!relayed || relayed.ok !== true) {
+          throw new Error(relayed?.error || "content bridge could not evaluate");
+        }
+        _injectionBlockedTabs.add(id); // skip the two dead probes next time
+        return relayed.value;
+      }
     }
     const first = results[0];
     // Safari can report an injection exception on the result item instead of

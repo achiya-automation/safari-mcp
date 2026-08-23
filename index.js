@@ -1522,14 +1522,20 @@ server.tool(
     // itself when the previous last window was closed.
     if (process.env.SAFARI_PROFILE) await _waitForVerifiedProfileExtension(30000);
 
-    // Enforce tab limit — close oldest MCP tab if at max
-    if (_openedTabs.size >= MAX_TABS) {
+    // Enforce tab limit — close this session's oldest MCP tab if at max.
+    // Scoped to the caller: in HTTP daemon mode _openedTabs is process-wide, so a
+    // global cap meant N concurrent sessions shared one budget and the eviction closed
+    // whichever tab was oldest overall — routinely another session's live page. Each
+    // session now gets its own MAX_TABS and can only evict its own.
+    const mySession = `${SESSION_ID}:${currentSessionId()}`;
+    const myTabs = [..._openedTabs].filter(([, info]) => (info.sessionId || "") === mySession);
+    if (myTabs.length >= MAX_TABS) {
       let oldestIdx = null, oldestTime = Infinity;
-      for (const [idx, info] of _openedTabs) {
+      for (const [idx, info] of myTabs) {
         if (info.openedAt < oldestTime) { oldestTime = info.openedAt; oldestIdx = idx; }
       }
       if (oldestIdx !== null) {
-        console.error(`[Safari MCP] Tab limit (${MAX_TABS}) reached — closing oldest tab #${oldestIdx}`);
+        console.error(`[Safari MCP] Tab limit (${MAX_TABS}) reached for this session — closing its oldest tab #${oldestIdx}`);
         try {
           await extensionOrFallback(
             "close_tab",
@@ -1553,7 +1559,7 @@ server.tool(
     // Sync safari.js tracking when extension handled new_tab
     if (result?.tabIndex) {
       safari.setActiveTabIndex(result.tabIndex);
-      _trackTab(result.tabIndex, url);
+      _trackTab(result.tabIndex, url, mySession);
     }
     if (result?.url || url) {
       // Prefer requested URL over about:blank for tracking (page hasn't loaded yet)
@@ -1721,7 +1727,7 @@ server.tool(
                 await extensionOrFallback("switch_tab", { index: resolved.index }, () => safari.switchTab(resolved.index));
                 safari.setActiveTabIndex(resolved.index);
                 safari.setActiveTabURL(resolved.url);
-                _trackTab(resolved.index, resolved.url);  // own the popup, else the next interaction trips the tab-safety guard
+                _trackTab(resolved.index, resolved.url, `${SESSION_ID}:${currentSessionId()}`);  // own the popup for THIS session, else the next interaction trips the tab-safety guard
                 return { content: [{ type: "text", text: `Found new tab: ${resolved.title} (${resolved.url})` }] };
               }
               continue;
@@ -1730,7 +1736,7 @@ server.tool(
             await extensionOrFallback("switch_tab", { index: tab.index }, () => safari.switchTab(tab.index));
             safari.setActiveTabIndex(tab.index);
             safari.setActiveTabURL(tab.url);
-            _trackTab(tab.index, tab.url);  // own the new tab, else the next interaction trips the tab-safety guard
+            _trackTab(tab.index, tab.url, `${SESSION_ID}:${currentSessionId()}`);  // own the new tab for THIS session, else the next interaction trips the tab-safety guard
             return { content: [{ type: "text", text: `Found new tab: ${tab.title} (${tab.url})` }] };
           }
         }

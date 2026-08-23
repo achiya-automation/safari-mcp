@@ -20,8 +20,39 @@ browser.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     sendResponse(handleFill(message.payload || {}));
     return true;
   }
+  // Last-resort path for evaluate. On hardened SPAs (business.facebook.com) BOTH
+  // scripting.executeScript worlds hang forever instead of rejecting, while this
+  // already-injected listener keeps answering — clicks kept working there the whole
+  // time. Nothing is injected here, so there is no injection to stall on.
+  if (message.type === "mcp-content-eval") {
+    // The relayed function is often async (the evaluate handler awaits inside it), so
+    // this must resolve before answering — returning the promise itself serialised to
+    // "{}" and silently produced an empty result.
+    handleEval(message.payload || {}).then(sendResponse);
+    return true;
+  }
   return false;
 });
+
+function handleEval(payload) {
+  let out;
+  try {
+    const fn = new Function("return (" + String(payload.source) + ")")();
+    out = fn.apply(null, payload.args || []);
+  } catch (err) {
+    return Promise.resolve({ ok: false, error: (err && err.message) || String(err) });
+  }
+  return Promise.resolve(out).then(
+    (value) => {
+      const v = value === undefined ? null : value;
+      // Only structured-cloneable values survive sendResponse; prove it here rather
+      // than failing opaquely on the way back.
+      try { JSON.stringify(v); } catch { return { ok: true, value: String(v) }; }
+      return { ok: true, value: v };
+    },
+    (err) => ({ ok: false, error: (err && err.message) || String(err) })
+  );
+}
 
 function handleFill(payload) {
   try {
