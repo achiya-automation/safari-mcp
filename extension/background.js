@@ -388,6 +388,27 @@ async function handleCommand(type, payload) {
       return targetTab.url;
     }
 
+    // Which WINDOW holds this session's tab, and where is the tab inside it. The
+    // AppleScript side picks "the first window whose name starts with the profile" —
+    // but a profile can hold several windows (measured: four "אוטומציות" at once), so
+    // native clicks computed coordinates against one window and delivered the event
+    // to another. The extension is the only party that actually knows the tab.
+    case "get_tab_locus": {
+      let tabsInWindow = [];
+      try { tabsInWindow = await browser.tabs.query({ windowId: targetTab.windowId }); } catch {}
+      const activeInWindow = tabsInWindow.find(t => t.active);
+      return {
+        tabId: targetTab.id,
+        windowId: targetTab.windowId,
+        index: targetTab.index + 1,           // AppleScript tab indices are 1-based
+        url: targetTab.url || "",
+        title: targetTab.title || "",
+        active: !!targetTab.active,
+        activeTabTitle: (activeInWindow && activeInWindow.title) || "",
+        windowTabCount: tabsInWindow.length,
+      };
+    }
+
     case "get_title": {
       return targetTab.title;
     }

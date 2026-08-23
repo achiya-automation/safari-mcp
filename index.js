@@ -1176,10 +1176,32 @@ server.tool(
     // Bypasses extensionOrFallback, so assert tab-ownership explicitly — an OS-level click
     // on the user's front window would otherwise slip past the safety guard.
     _assertTabOwnership("native_click");
-    const result = await safari.nativeClick(args);
+    // A profile can hold SEVERAL windows (measured: four "אוטומציות" at once), and the
+    // AppleScript side picks the first by name — so coordinates were computed against
+    // one window and the event delivered to another, a silent no-op. The extension is
+    // the only party that knows which window holds this session's tab; ask it, and pin
+    // both the geometry read and the click to that window. Falls back to the old
+    // behaviour when the extension is unavailable.
+    let locus = null;
+    try { locus = await _tabLocusFromExtension(); } catch (_e) { /* AppleScript-only mode */ }
+    const result = await safari.nativeClick({ ...args, locus });
     return textResult(result);
   }
 );
+
+// Resolve THIS session's tab window/index via the extension. Returns null when the
+// extension can't answer (disconnected, AppleScript-only session).
+async function _tabLocusFromExtension() {
+  if (!_extensionConnected && !_primaryHasExtension) return null;
+  // Deliberately NO tabUrl: an SPA rewrites its URL as you move through it, so passing
+  // the URL we happened to record earlier makes the extension's URL-based lookup miss
+  // and the whole pin silently degrade. Its per-session tab cache already knows which
+  // tab this is — that is the authoritative answer here.
+  const locus = await sendToExtension("get_tab_locus", {
+    sessionId: `${SESSION_ID}:${currentSessionId()}`,
+  }, 10000);
+  return locus && typeof locus === "object" && locus.windowId ? locus : null;
+}
 
 server.tool(
   "safari_native_hover",

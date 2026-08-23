@@ -1116,6 +1116,29 @@ function _helperGetFrontApp(timeout = 2000) {
 
 // Get Safari window bounds, toolbar height, and window ID for coordinate calculation
 async function _getSafariWindowGeometry() {
+  // A locus-pinned native click measures the window the session's tab actually lives
+  // in — not the first window matching the profile name, which with several profile
+  // windows open produced coordinates for one window and a click in another.
+  if (_pinnedWindowOverride) {
+    const windowRef = _pinnedWindowOverride.winRef;
+    const boundsResult = await osascriptFast(
+      `tell application "Safari"\n  set b to bounds of ${windowRef}\n  set wid to id of ${windowRef}\n  return (item 1 of b as text) & "," & (item 2 of b as text) & "," & (item 3 of b as text) & "," & (item 4 of b as text) & "," & (wid as text)\nend tell`
+    );
+    const parts = boundsResult.split(",").map(s => Number(s.trim()));
+    if (parts.length === 5 && !parts.some(isNaN)) {
+      let toolbarHeight = 74;
+      try {
+        const chromeStr = await runJS(`(window.outerHeight - window.innerHeight) + ''`);
+        const chrome = Number(chromeStr);
+        if (Number.isFinite(chrome) && chrome >= 50 && chrome <= 200) toolbarHeight = chrome;
+      } catch (_e) { /* keep fallback */ }
+      return {
+        windowX: parts[0], windowY: parts[1], windowRight: parts[2], windowBottom: parts[3],
+        toolbarHeight, windowId: parts[4],
+      };
+    }
+    // fall through to the name-based path if the pinned window vanished mid-call
+  }
   await refreshTargetWindow();
   const windowRef = getTargetWindowRef();
   // Get window bounds + window ID via the helper daemon. The daemon is TCC-granted
@@ -1918,9 +1941,115 @@ export async function nativeClick(args) {
   // isTrusted-gated handlers do accept — never got to fire.
   const needsLookup = !!(args?.ref || args?.selector || args?.text);
   if (needsLookup) await ensureHelpers();
+  // When the extension told us exactly which window+tab holds this session's page,
+  // pin everything to it. Otherwise fall back to the profile-name lookup — which
+  // picks the FIRST matching window and silently misses when the profile has several.
+  if (args?.locus) {
+    const pinned = await _pinWindowFromLocus(args.locus);
+    if (pinned) {
+      const out = await _withPinnedTabFronted(pinned, () => _nativeClickImpl(args));
+      return `${out} [pinned win ${pinned.winId} tab ${pinned.tabIndex}]`;
+    }
+    return `${await _withTargetTabFronted(() => _nativeClickImpl(args))} [locus unmatched: win ${args.locus.windowId} tab ${args.locus.index}]`;
+  }
   // The event is routed to the window's SELECTED tab, so ours has to be it. See _withTargetTabFronted.
   return await _withTargetTabFronted(() => _nativeClickImpl(args));
 }
+
+// Translate an extension locus ({windowId (extension-side), index, url, title}) into an
+// AppleScript window id. Extension window ids and AppleScript window ids are different
+// namespaces, so match by content: the window whose tab at `index` carries the locus URL
+// (or title). Returns {winRef, winId, tabIndex} or null when nothing matches.
+async function _pinWindowFromLocus(locus) {
+  const wanted = String(locus.url || "");
+  const wantedTitle = String(locus.title || "");
+  const idx = Number(locus.index);
+  if (!Number.isFinite(idx) || idx < 1) return null;
+  const wantCount = Number(locus.windowTabCount) || 0;
+  // Also carry the window's tab COUNT. URL and title both go stale on an SPA, and index
+  // alone is ambiguous across windows — but (index, tabCount) together pin one window in
+  // practice, and it is the only signal here that a page cannot rewrite.
+  const probe = `tell application "Safari"
+  set out to ""
+  repeat with w in every window
+    try
+      set c to (count of tabs of w)
+      if c >= ${idx} then
+        set t to tab ${idx} of w
+        set out to out & (id of w as text) & (ASCII character 31) & (URL of t as text) & (ASCII character 31) & (name of t as text) & (ASCII character 31) & (c as text) & (ASCII character 30)
+      end if
+    end try
+  end repeat
+  return out
+end tell`;
+  let raw;
+  try { raw = await osascriptFast(probe); } catch (_e) { return null; }
+  const rows = String(raw || "").split("\u001E").filter(Boolean).map(r => r.split("\u001F"));
+  if (!rows.length) return null;
+  // Match on URL, then title. An SPA rewrites its URL while you work, so neither is
+  // reliable on its own — but when only ONE window even HAS a tab at this index, that
+  // is the window and no content match is needed. That last case is the common one,
+  // and without it the whole pin failed and fell back to the first-window-by-name
+  // guess, which is exactly the bug this exists to fix.
+  const byCount = wantCount ? rows.filter(([, , , c]) => Number(c) === wantCount) : [];
+  let hit = rows.find(([, u]) => wanted && u === wanted)
+    || rows.find(([, u]) => wanted && wanted.length > 30 && u && u.startsWith(wanted.split("?")[0]))
+    || rows.find(([, , t]) => wantedTitle && t === wantedTitle)
+    || (byCount.length === 1 ? byCount[0] : null)
+    || (rows.length === 1 ? rows[0] : null);
+  if (!hit) return null;
+  return { winRef: `window id ${hit[0]}`, winId: Number(hit[0]), tabIndex: idx };
+}
+
+// Like _withTargetTabFronted, but for an explicit window+tab. Selects the session's tab
+// in ITS OWN window (not whichever window matched the profile name first), runs fn, and
+// restores the previous selection.
+async function _withPinnedTabFronted(pinned, fn) {
+  const { winRef, tabIndex } = pinned;
+  let prev = null;
+  try {
+    prev = Number(await osascriptFast(`tell application "Safari" to tell ${winRef} to return (index of current tab) as text`));
+  } catch (_e) { /* window may refuse — run anyway; the click itself will fail loudly */ }
+  const mustSwitch = Number.isFinite(prev) && prev !== tabIndex;
+  if (mustSwitch) {
+    await osascriptFast(`tell application "Safari" to tell ${winRef} to set current tab to tab ${tabIndex}`);
+    await new Promise((r) => setTimeout(r, NATIVE_TAB_SETTLE_MS));
+  }
+  // On macOS 26 a window-targeted CGEvent silently no-ops when the target window is
+  // NOT the frontmost Safari window (issue #29 — verified live: the math was right,
+  // the event was delivered, the checkbox never toggled; a front-window click landed).
+  // Raise the pinned window within Safari for the duration of the click. This does not
+  // steal app focus — Safari's window order changes, the active app does not.
+  let prevFrontWinId = null;
+  try {
+    prevFrontWinId = Number(await osascriptFast(`tell application "Safari" to return (id of front window) as text`));
+  } catch (_e) { /* leave as-is */ }
+  const mustRaise = Number.isFinite(prevFrontWinId) && prevFrontWinId !== pinned.winId;
+  if (mustRaise) {
+    await osascriptFast(`tell application "Safari" to tell ${winRef} to set index to 1`);
+    await new Promise((r) => setTimeout(r, NATIVE_TAB_SETTLE_MS));
+  }
+  // _nativeClickImpl reads geometry via _getSafariWindowGeometry(), which resolves the
+  // profile window by name. Override the resolution for the duration of this call so
+  // geometry, toolbar math, and the CGEvent all target the pinned window.
+  const prevOverride = _pinnedWindowOverride;
+  _pinnedWindowOverride = pinned;
+  try {
+    return await fn();
+  } finally {
+    _pinnedWindowOverride = prevOverride;
+    if (mustSwitch) {
+      try { await osascriptFast(`tell application "Safari" to tell ${winRef} to set current tab to tab ${prev}`); }
+      catch (_e) { /* restore is best-effort */ }
+    }
+    // Hand the previous front window back — the user (or another session) had it up.
+    if (mustRaise && Number.isFinite(prevFrontWinId)) {
+      try { await osascriptFast(`tell application "Safari" to tell window id ${prevFrontWinId} to set index to 1`); }
+      catch (_e) { /* restore is best-effort */ }
+    }
+  }
+}
+let _pinnedWindowOverride = null;
 
 async function _nativeClickImpl({ selector, text, x, y, ref, doubleClick = false }) {
 
