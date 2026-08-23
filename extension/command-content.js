@@ -34,24 +34,63 @@ browser.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   return false;
 });
 
+// We are in the ISOLATED world: we can talk to the background, but the PAGE's CSP
+// governs eval here, and a hardened page (business.facebook.com) forbids it — an
+// earlier attempt with new Function() died exactly there. content.js is already in
+// MAIN world from document_start and holds a grandfathered Trusted Types policy, so
+// hand the work to it over a CustomEvent and wait for its reply.
 function handleEval(payload) {
-  let out;
-  try {
-    const fn = new Function("return (" + String(payload.source) + ")")();
-    out = fn.apply(null, payload.args || []);
-  } catch (err) {
-    return Promise.resolve({ ok: false, error: (err && err.message) || String(err) });
-  }
-  return Promise.resolve(out).then(
-    (value) => {
-      const v = value === undefined ? null : value;
-      // Only structured-cloneable values survive sendResponse; prove it here rather
-      // than failing opaquely on the way back.
-      try { JSON.stringify(v); } catch { return { ok: true, value: String(v) }; }
-      return { ok: true, value: v };
-    },
-    (err) => ({ ok: false, error: (err && err.message) || String(err) })
-  );
+  return new Promise((resolve) => {
+    const id = "b" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      window.removeEventListener("message", onReply);
+      clearTimeout(timer);
+      resolve(result);
+    };
+    function onReply(ev) {
+      if (ev.source !== window) return;
+      const d = ev.data;
+      if (!d || d.__mcp !== "eval_res" || d.id !== id) return;
+      finish(d.result && typeof d.result === "object"
+        ? d.result
+        : { ok: false, error: "malformed bridge reply" });
+    }
+    // Bounded independently of the background's own deadline, so a page that never
+    // answers cannot hold the command open. If MAIN never replies (its listener failed
+    // to install, or the page tore it out), try here: a content script is governed by
+    // the PAGE's CSP, and the pages this bridge targets do allow 'unsafe-eval'.
+    const timer = setTimeout(() => {
+      let out;
+      try {
+        out = (0, eval)(String(payload.source || ""));
+      } catch (err) {
+        finish({ ok: false, error: "eval bridge did not answer; isolated retry: " + ((err && err.message) || err) });
+        return;
+      }
+      Promise.resolve(out).then(
+        (v) => {
+          if (v === undefined || v === null) return finish({ ok: true, value: null });
+          if (typeof v === "object") {
+            try { return finish({ ok: true, value: JSON.stringify(v) }); }
+            catch { return finish({ ok: true, value: String(v) }); }
+          }
+          finish({ ok: true, value: String(v) });
+        },
+        (err) => finish({ ok: false, error: (err && err.message) || String(err) })
+      );
+    }, 4000);
+    // postMessage, not CustomEvent: a CustomEvent's detail arrives as null in the MAIN
+    // world, so the listener there fired with nothing to run.
+    window.addEventListener("message", onReply);
+    try {
+      window.postMessage({ __mcp: "eval_req", id, source: String(payload.source || "") }, "*");
+    } catch (err) {
+      finish({ ok: false, error: (err && err.message) || String(err) });
+    }
+  });
 }
 
 function handleFill(payload) {

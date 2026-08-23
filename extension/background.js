@@ -398,6 +398,29 @@ async function handleCommand(type, payload) {
     // Strategy 1: indirect eval (fast, works when CSP allows unsafe-eval)
     // Strategy 2: script element injection (bypasses CSP in MAIN world context)
     case "evaluate": {
+      // Strategy 0: pages that stall injection outright. Every strategy below reaches
+      // the page through scripting.executeScript, which on business.facebook.com never
+      // resolves — so all three died on the caller's timeout and evaluate was simply
+      // unavailable there. The content-script bridge needs no injection at all, so try
+      // it FIRST once a tab is known to block injection, and fall back to it below
+      // when a fresh tab turns out to block it too.
+      const evalTabId = tabId || (await getActiveTab()).id;
+      const viaBridge = async () => {
+        const r = await sendContentCommand(
+          evalTabId, "mcp-content-eval", { source: payload.script }, 10000
+        );
+        if (!r || r.ok !== true) throw new Error((r && r.error) || "content bridge failed");
+        _injectionBlockedTabs.add(evalTabId);
+        return r.value;
+      };
+      if (_injectionBlockedTabs.has(evalTabId)) {
+        try { return await viaBridge(); }
+        catch (_e) { _injectionBlockedTabs.delete(evalTabId); } // page changed — re-probe
+      }
+
+      // First contact with a hardened page: every execInTab strategy below will stall.
+      // Catch that here so it costs one bounded probe, not the caller's whole timeout.
+      const evalStrategies = async () => {
       // Strategy 1: Direct eval via execInTab (fast, works when CSP allows unsafe-eval)
       const evalResult = await execInTab(async (script) => {
         try {
@@ -484,6 +507,17 @@ async function handleCommand(type, payload) {
 
       if (workerResult !== "__CSP_NEEDS_DOM__") return workerResult;
       return "Error: CSP blocked all strategies (script needs DOM). Falling back to AppleScript.";
+      };
+
+      try {
+        return await evalStrategies();
+      } catch (err) {
+        // "injection stalled" means the page refuses executeScript in both worlds, so
+        // none of the strategies above can ever reach it. The bridge does not inject.
+        if (!/injection stalled/.test(err?.message || "")) throw err;
+        console.warn("Safari MCP: injection blocked on this page, using content bridge");
+        return await viaBridge();
+      }
     }
 
     // --- Screenshot ---
@@ -2661,14 +2695,6 @@ async function execInTab(func, args = [], tabId = null) {
     // ponytail: page globals are not visible from ISOLATED; DOM reads (the vast
     // majority of evaluate calls) behave identically. A wrong-world answer beats none.
     let results;
-    if (_injectionBlockedTabs.has(id)) {
-      const known = await sendContentCommand(
-        id, "mcp-content-eval", { source: func.toString(), args }, 10000
-      );
-      if (known && known.ok === true) return known.value;
-      // The bridge failed too — the page may have changed. Re-probe injection below.
-      _injectionBlockedTabs.delete(id);
-    }
     try {
       results = await _withInjectionDeadline(
         browser.scripting.executeScript({ target: { tabId: id }, world: "MAIN", func, args })
@@ -2676,25 +2702,12 @@ async function execInTab(func, args = [], tabId = null) {
     } catch (mainErr) {
       if (!/injection stalled/.test(mainErr?.message || "")) throw mainErr;
       console.warn("Safari MCP: MAIN world stalled, retrying ISOLATED on tabId=" + id);
-      try {
-        results = await _withInjectionDeadline(
-          browser.scripting.executeScript({ target: { tabId: id }, world: "ISOLATED", func, args })
-        );
-      } catch (isoErr) {
-        if (!/injection stalled/.test(isoErr?.message || "")) throw isoErr;
-        // Both worlds stalled — the page blocks injection outright. The content script
-        // is already in the page from document_start and keeps responding (clicks work
-        // on business.facebook.com throughout), so ask it to run this for us.
-        console.warn("Safari MCP: both worlds stalled, falling back to content bridge");
-        const relayed = await sendContentCommand(
-          id, "mcp-content-eval", { source: func.toString(), args }, 10000
-        );
-        if (!relayed || relayed.ok !== true) {
-          throw new Error(relayed?.error || "content bridge could not evaluate");
-        }
-        _injectionBlockedTabs.add(id); // skip the two dead probes next time
-        return relayed.value;
-      }
+      results = await _withInjectionDeadline(
+        browser.scripting.executeScript({ target: { tabId: id }, world: "ISOLATED", func, args })
+      );
+      // If ISOLATED stalls too the page blocks injection outright, and there is nothing
+      // generic left to try — execInTab relays a FUNCTION, which the content bridge
+      // cannot accept. evaluate handles that case itself (Strategy 0) with raw source.
     }
     const first = results[0];
     // Safari can report an injection exception on the result item instead of
