@@ -209,3 +209,27 @@ test("native_click with explicit coordinates does not require injection", () => 
     "a lookup is exactly ref/selector/text — x/y needs nothing"
   );
 });
+
+test("a pinned native click uses the global tap, not postToPid", () => {
+  // Measured 23.8.26 on macOS 26: a window-targeted postToPid click reports success and
+  // never reaches the page. Proven on a plain <a> in example.com with a click listener
+  // armed — it never fired. Only the global tap (windowId 0, which moves the cursor and
+  // restores it) actually lands, and it needs Safari genuinely frontmost. That is what
+  // the pin buys: it raises Safari and its window, clicks for real, then hands both back.
+  const safari = readFileSync(new URL("../safari.js", import.meta.url), "utf8");
+  assert.ok(safari.includes("_pinnedForceGlobalTap"), "pinned clicks must select the tap explicitly");
+  assert.ok(
+    /_helperNativeClick\([^)]*_pinnedForceGlobalTap \? 0 : geo\.windowId\)/s.test(safari),
+    "windowId 0 (global tap) only when pinned; otherwise keep the targeted path"
+  );
+  const pinned = safari.slice(
+    safari.indexOf("async function _withPinnedTabFronted"),
+    safari.indexOf("let _pinnedWindowOverride")
+  );
+  assert.ok(pinned.includes('_helperActivateApp("com.apple.Safari")'), "must bring Safari to the front");
+  assert.ok(pinned.includes("restoreFocusIfStolen"), "and give the foreground back afterwards");
+  assert.ok(
+    pinned.indexOf("_pinnedForceGlobalTap = false") > pinned.indexOf("finally"),
+    "the flag must be cleared in finally, or it leaks into unpinned clicks"
+  );
+});

@@ -2029,6 +2029,25 @@ async function _withPinnedTabFronted(pinned, fn) {
     await osascriptFast(`tell application "Safari" to tell ${winRef} to set index to 1`);
     await new Promise((r) => setTimeout(r, NATIVE_TAB_SETTLE_MS));
   }
+  // A CGEvent goes to the FRONTMOST APPLICATION, not to the window id we aim at.
+  // Measured 23.8.26: WhatsApp was frontmost, so every "successful" native click was
+  // delivered to WhatsApp — the page never saw it. Raising Safari's own window (above)
+  // does not change which app is frontmost; Safari itself has to be activated.
+  // This is the one moment the tool legitimately needs the foreground, and the saved
+  // app is handed back in the finally below.
+  const savedApp = await saveFrontmostApp().catch(() => null);
+  const mustActivate = savedApp !== "com.apple.Safari";
+  if (mustActivate) {
+    await _helperActivateApp("com.apple.Safari").catch(() => {});
+    await new Promise((r) => setTimeout(r, 150)); // activate() is async at the OS level
+  }
+  // With Safari genuinely frontmost and the right window raised, use the GLOBAL event
+  // tap instead of postToPid. Verified 23.8.26 on macOS 26: a window-targeted
+  // postToPid click reports success and never reaches the page — proven on a plain
+  // <a> in example.com with a click listener armed, which never fired. The global tap
+  // moves the cursor, clicks, and restores it — the same path a person's click takes,
+  // and the only one that actually lands. This is why the pin has to raise Safari.
+  _pinnedForceGlobalTap = true;
   // _nativeClickImpl reads geometry via _getSafariWindowGeometry(), which resolves the
   // profile window by name. Override the resolution for the duration of this call so
   // geometry, toolbar math, and the CGEvent all target the pinned window.
@@ -2038,6 +2057,7 @@ async function _withPinnedTabFronted(pinned, fn) {
     return await fn();
   } finally {
     _pinnedWindowOverride = prevOverride;
+    _pinnedForceGlobalTap = false;
     if (mustSwitch) {
       try { await osascriptFast(`tell application "Safari" to tell ${winRef} to set current tab to tab ${prev}`); }
       catch (_e) { /* restore is best-effort */ }
@@ -2047,9 +2067,18 @@ async function _withPinnedTabFronted(pinned, fn) {
       try { await osascriptFast(`tell application "Safari" to tell window id ${prevFrontWinId} to set index to 1`); }
       catch (_e) { /* restore is best-effort */ }
     }
+    // And give the foreground back to whatever app had it. restoreFocusIfStolen keeps
+    // its own guard: if the user has been interacting, it leaves Safari alone rather
+    // than yanking the window out from under them.
+    if (mustActivate && savedApp) {
+      try { await restoreFocusIfStolen(savedApp); } catch (_e) { /* best-effort */ }
+    }
   }
 }
 let _pinnedWindowOverride = null;
+// Set only inside a pinned click, where Safari has been raised to the front. Tells the
+// click layer to use the global event tap (windowId 0) instead of postToPid.
+let _pinnedForceGlobalTap = false;
 
 async function _nativeClickImpl({ selector, text, x, y, ref, doubleClick = false }) {
 
@@ -2134,7 +2163,10 @@ async function _nativeClickImpl({ selector, text, x, y, ref, doubleClick = false
   // Step 4: Perform the native click via CGEvent (targeted to specific window — no mouse move, no focus steal)
   // MUST have windowId — legacy path (windowId=0) moves mouse and may steal focus
   if (!geo.windowId) throw new Error("Cannot native-click without Safari window ID — would move mouse and steal focus");
-  await _helperNativeClick(screenX, screenY, doubleClick, geo.windowId);
+  // windowId 0 selects the global tap. Only a pinned click may ask for it: that path
+  // has already raised Safari and its own window, so moving the cursor is expected and
+  // the focus is handed back afterwards.
+  await _helperNativeClick(screenX, screenY, doubleClick, _pinnedForceGlobalTap ? 0 : geo.windowId);
 
   const clickType = doubleClick ? 'Native double-clicked' : 'Native clicked';
   const label = viewportCoords.tag + (viewportCoords.text ? ` "${viewportCoords.text}"` : '');
