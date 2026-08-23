@@ -1911,7 +1911,13 @@ export async function rightClick({ selector, x, y }) {
 // Trade-off: this moves the physical mouse cursor and requires Safari to be visible.
 
 export async function nativeClick(args) {
-  await ensureHelpers();
+  // Helpers are only needed to LOCATE an element (ref/selector/text). With explicit
+  // x/y there is nothing to look up, and demanding injection anyway made native_click
+  // unusable on exactly the pages that need it: business.facebook.com stalls injection,
+  // so ensureHelpers threw INJECT_ERR and the OS-level click — the one thing React's
+  // isTrusted-gated handlers do accept — never got to fire.
+  const needsLookup = !!(args?.ref || args?.selector || args?.text);
+  if (needsLookup) await ensureHelpers();
   // The event is routed to the window's SELECTED tab, so ours has to be it. See _withTargetTabFronted.
   return await _withTargetTabFronted(() => _nativeClickImpl(args));
 }

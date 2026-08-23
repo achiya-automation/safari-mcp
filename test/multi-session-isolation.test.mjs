@@ -188,3 +188,24 @@ test("ownership survives a worker suspend on Safari", () => {
     "and by the live tab list, so a recycled tab id cannot inherit ownership"
   );
 });
+
+test("native_click with explicit coordinates does not require injection", () => {
+  // Helpers are only needed to LOCATE an element. Demanding injection even for x/y made
+  // native_click unusable on the pages that need it most: business.facebook.com stalls
+  // injection, so ensureHelpers threw INJECT_ERR and the OS-level click — the only kind
+  // React's isTrusted-gated handlers accept — never fired.
+  const safari = readFileSync(new URL("../safari.js", import.meta.url), "utf8");
+  const fn = safari.slice(
+    safari.indexOf("export async function nativeClick("),
+    safari.indexOf("async function _nativeClickImpl(")
+  );
+  assert.ok(/const needsLookup/.test(fn), "must decide whether a lookup is needed");
+  assert.ok(
+    /if \(needsLookup\) await ensureHelpers\(\)/.test(fn),
+    "ensureHelpers must be conditional, not unconditional"
+  );
+  assert.ok(
+    /args\?\.ref \|\| args\?\.selector \|\| args\?\.text/.test(fn),
+    "a lookup is exactly ref/selector/text — x/y needs nothing"
+  );
+});
