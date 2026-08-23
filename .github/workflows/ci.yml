@@ -66,4 +66,20 @@ jobs:
           node --check safari.js
           node --check mcp-helpers.js
 
+      # Gates on `no-undef` ONLY — the full lint run has a style backlog that predates
+      # linting. This narrow gate exists because v2.16.2 shipped a module-scope reference
+      # to a function-local `server`: a ReferenceError swallowed by a best-effort catch,
+      # so the startup banner printed nothing for three days and every test stayed green.
+      - name: No undefined references
+        run: |
+          npx eslint . -f json > eslint-report.json || true
+          node -e '
+            const r = JSON.parse(require("fs").readFileSync("eslint-report.json", "utf8"));
+            const bad = r.flatMap(f => f.messages
+              .filter(m => m.ruleId === "no-undef")
+              .map(m => `${f.filePath}:${m.line}:${m.column} ${m.message}`));
+            if (bad.length) { console.error("no-undef errors:\n" + bad.join("\n")); process.exit(1); }
+            console.log("no-undef: clean");
+          '
+
       - run: npm test

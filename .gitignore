@@ -26,3 +26,6 @@ claude-tcc-fixer.swift
 devto-draft-*.md
 meta-agent-il-*.html
 hero-*.png
+
+# eslint --format json output from the CI no-undef gate
+eslint-report.json

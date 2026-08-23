@@ -2533,13 +2533,23 @@ server.tool(
   }
 );
 
+  // HTTP mode builds one server per session; the daily state file keeps the banner
+  // to once a day anyway, and this flag keeps it to once a process.
+  if (!_bannerShown) { _bannerShown = true; _showStartupBanner(server); }
   return server;
 }
+let _bannerShown = false;
 
 // ========== START SERVER ==========
 
 // One-time-per-day startup banner — visible CTA without spamming MCP logs.
 // Stderr only (stdout is reserved for MCP protocol). Skipped if SAFARI_MCP_QUIET=1.
+//
+// Takes the server it should count tools from: `server` is a local of buildServer(),
+// so reading it at module scope threw a ReferenceError that this function's own
+// best-effort catch swallowed — the banner printed nothing at all from v2.16.2 until
+// this was fixed. Called from buildServer(), which is the first point an instance exists.
+function _showStartupBanner(server) {
 try {
   if (process.env.SAFARI_MCP_QUIET !== "1") {
     const bannerStateFile = join(homedir(), ".safari-mcp", "last-banner");
@@ -2562,6 +2572,7 @@ try {
     }
   }
 } catch { /* banner is best-effort, never block startup */ }
+}
 
 _startMemoryMonitor();
 

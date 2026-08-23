@@ -1,7 +1,9 @@
-// ESLint flat config. Advisory tooling — `npm run lint` is for local use; CI is not
-// gated on it (the codebase predates linting and has a backlog). Rules are tuned to
-// surface real bugs (undeclared vars, unreachable code, accidental globals) without
-// drowning in style noise — Prettier owns formatting.
+// ESLint flat config. Mostly advisory — `npm run lint` is for local use and the style
+// backlog predates linting, so CI is not gated on the full run. The ONE exception is
+// `no-undef`, which CI does gate (see ci.yml): a module-scope reference to a function-local
+// `server` shipped in v2.16.2 and killed the startup banner silently for three days, and
+// this rule had already flagged it. Rules are otherwise tuned to surface real bugs
+// (unreachable code, accidental globals) without drowning in style noise.
 import js from "@eslint/js";
 import globals from "globals";
 
@@ -25,6 +27,11 @@ export default [
     // mcp-helpers.js is browser-context DOM code (injected as a string).
     files: ["mcp-helpers.js"],
     languageOptions: { globals: { ...globals.browser } },
+  },
+  {
+    // The Xcode app's Safari extension resources run in a page context, not Node.
+    files: ["xcode/**/Resources/*.js"],
+    languageOptions: { globals: { ...globals.browser, browser: "readonly", webkit: "readonly" } },
   },
   {
     files: ["**/*.cjs"],
