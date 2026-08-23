@@ -185,7 +185,20 @@ async function pollForCommands() {
         // packet used to throw SyntaxError here, fall through to "server gone", and
         // trigger a multi-second reconnect backoff. Skip the bad packet and keep polling.
         const msg = await res.json().catch(() => null);
-        if (msg) await executeAndReply(msg);
+        // executeAndReply blocks this loop, so /poll goes silent for as long as the
+        // command runs. On a heavy DOM (facebook.com) that passes the server's 30s
+        // stale threshold and the server kills the connection — draining the very
+        // command still executing here. Beat while busy so it knows we are alive.
+        // NOT the same as _startHeartbeat(): that one pokes storage.local to stop Safari
+        // suspending the worker, and runs unconditionally. This one must fire ONLY while a
+        // command is in flight — an unconditional beat would refresh the server's stale
+        // clock forever and mask a genuinely dead worker.
+        if (msg) {
+          const beat = setInterval(() => {
+            fetch(`${HTTP_URL}/heartbeat`, { method: "POST" }).catch(() => {});
+          }, 5000);
+          try { await executeAndReply(msg); } finally { clearInterval(beat); }
+        }
       }
       // 204 = no command, loop immediately to keep connection active
     } catch (err) {
@@ -1921,7 +1934,16 @@ async function handleCommand(type, payload) {
 // Per-session tab cache: Map<sessionId, {tabId, tabUrl, time}>
 // Each MCP process has a unique sessionId — prevents sessions from overwriting each other's tab context
 const _sessionTabCache = new Map();
-const TAB_CACHE_MS = 3000; // Re-verify tab URL match every 3s
+// How long a session keeps pointing at the tab it opened/navigated.
+// This was 3s, which is shorter than the gap between two MCP calls in real use (the
+// model thinks, the user reads). Once it lapsed, getTargetTab fell through to
+// "PRIORITY 3: active tab of the profile window" — so a tab the user or a parallel
+// session brought to the front silently became the target, and the ownership guard
+// then rejected the command ("not opened by this MCP session") or, before that guard
+// existed, the command ran on the wrong page.
+// Expiry is not what keeps this safe: browser.tabs.get() below drops the cache when
+// the tab is gone, and the windowId check rejects a tab outside the profile window.
+const TAB_CACHE_MS = 900000; // 15 min — spans an interactive session, not one turn
 const _DEFAULT_SESSION = "__default__"; // Fallback for commands without sessionId
 const SESSION_MAX_AGE_MS = 5 * 60 * 1000; // 5 min — prune stale sessions
 const MAX_SESSIONS = 50; // Hard cap on session cache size

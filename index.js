@@ -416,6 +416,23 @@ try {
       return;
     }
 
+    // POST /heartbeat — extension is alive and mid-command (its poll loop is blocked
+    // by the running command, so /poll cannot be what proves liveness here).
+    if (req.method === "POST" && req.url === "/heartbeat") {
+      _extensionLastHeartbeat = Date.now();
+      _extensionLastPollTime = Date.now();
+      // Re-arm in-flight deadlines: the worker told us it is still on the command.
+      // hardDeadline inside armTimer keeps this from extending indefinitely.
+      for (const pending of _pendingRequests.values()) {
+        if (!pending.armTimer || Date.now() >= pending.hardDeadline) continue;
+        clearTimeout(pending.timer);
+        pending.timer = pending.armTimer();
+      }
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
     // POST /extension-verified — extension confirmed it's in the correct profile
     if (req.method === "POST" && req.url === "/extension-verified") {
       _profileExtensionVerified = true;
@@ -618,11 +635,20 @@ async function _proxyToExtension(type, payload, timeoutMs = 30000) {
 }
 
 let _extensionLastPollTime = 0;
+// Beats while the extension is busy executing a command, so a long command does not
+// look like a dead worker. See POST /heartbeat.
+let _extensionLastHeartbeat = 0;
 // Detect stale HTTP connection (no poll in 30s = disconnected)
 // Only applies to primary instance (extension host) — not proxy mode
 const _staleHttpTimer = setInterval(() => {
   if (_isExtensionHost && _extensionConnected && !_extensionWs && _extensionLastPollTime > 0) {
     if (Date.now() - _extensionLastPollTime > 30000) {
+      // The extension runs each command inside its own poll loop, so a command that
+      // outlives 30s (heavy DOM: facebook.com, business.facebook.com) starves /poll
+      // even though the worker is alive and still working on OUR command. Killing the
+      // connection here also drained the very request it was executing. Trust the
+      // per-command heartbeat instead, and only declare death when nothing is in flight.
+      if (_pendingRequests.size > 0 && Date.now() - _extensionLastHeartbeat < 30000) return;
       _extensionConnected = false;
       _drainOnDisconnect("HTTP poll timeout");
       console.error("[Safari MCP] Extension disconnected (HTTP poll timeout)");
@@ -677,15 +703,22 @@ function sendToExtension(type, payload = {}, timeoutMs = 30000) {
       return;
     }
     const id = randomUUID();
-    const timer = setTimeout(() => {
+    // A heavy DOM (facebook.com, business.facebook.com) can take well past 30s for a
+    // single read_page/snapshot. Rather than raise every timeout — which would make a
+    // genuinely stuck worker hang for just as long — let the extension's mid-command
+    // heartbeat re-arm this deadline. No heartbeat, no extension: it still fails fast.
+    // hardDeadline is the ceiling, so a worker that beats forever cannot hang us.
+    const hardDeadline = Date.now() + Math.max(timeoutMs * 4, 180000);
+    const expire = () => {
       _pendingRequests.delete(id);
       // Also drop it from the HTTP poll queue — otherwise the extension could poll this command
       // long after the caller gave up and run a stale navigate/click out of band.
       const qi = _commandQueue.findIndex(c => c.id === id);
       if (qi >= 0) _commandQueue.splice(qi, 1);
       reject(new Error(`Extension timeout after ${timeoutMs}ms`));
-    }, timeoutMs);
-    _pendingRequests.set(id, { resolve, reject, timer });
+    };
+    const armTimer = () => setTimeout(expire, Math.min(timeoutMs, Math.max(0, hardDeadline - Date.now())));
+    _pendingRequests.set(id, { resolve, reject, timer: armTimer(), armTimer, hardDeadline });
 
     const command = { id, type, payload };
 
