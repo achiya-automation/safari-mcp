@@ -767,6 +767,12 @@ const _RUNSCRIPT_OWNERSHIP_EXEMPT = new Set([
   "getLocalStorage", "getSessionStorage", "getCookies",
 ]);
 
+// Origin of a URL, or "" when it has none (about:blank, "missing value", junk).
+// An empty result must never compare equal to another empty result at a call site.
+function _originOf(url) {
+  try { return new URL(String(url || "")).origin; } catch { return ""; }
+}
+
 // Tab-ownership assertion — shared by extensionOrFallback AND the tools that bypass it
 // (safari_run_script, native_*). Throws if the operation would land on a tab this MCP
 // session didn't open. Read-only / tab-management ops (in _noOwnershipCheck) are exempt.
@@ -1578,7 +1584,19 @@ server.tool(
         if (target && target.url && !_isURLOwned(target.url)) {
           // about:blank / missing value tabs are owned if tracked in _openedTabs
           const isBlankOwned = (target.url === 'about:blank' || target.url === 'missing value') && (_openedTabs.has(index) || _ownedTabURLs.has(BLANK_TAB_SENTINEL));
-          if (!isBlankOwned) {
+          // A tab THIS session opened may have redirected away from the URL we
+          // registered (/dashboard -> /login, any 302), so the URL alone stops
+          // being proof and the tab became permanently un-switchable. But a
+          // tracked index is not proof either: `_openedTabs` is keyed by INDEX
+          // and Safari renumbers every index whenever any tab closes, so a stale
+          // key can point straight at a user's tab. Require BOTH — the index we
+          // opened AND the origin we opened it on. That is the same second factor
+          // the extension enforces in _canAdoptMarkedOwnedTab, so nothing that
+          // would survive the extension's check is lost here, and the AppleScript
+          // fallback (which has no ownership check of its own) stays guarded.
+          const trackedOrigin = _originOf(_openedTabs.get(index)?.url);
+          const isTrackedRedirect = !!trackedOrigin && trackedOrigin === _originOf(target.url);
+          if (!isBlankOwned && !isTrackedRedirect) {
             const msg = `⚠️ Tab safety: refusing switch_tab to index ${index} (${target.url}) — not opened by this MCP session. Use safari_new_tab to open your own tab.`;
             console.error(`[Safari MCP] ${msg}`);
             return errorResult(msg);
