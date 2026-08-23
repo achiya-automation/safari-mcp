@@ -10,7 +10,22 @@ let HTTP_URL = `http://127.0.0.1:${BRIDGE_PORTS[0]}`;
 let isConnected = false;
 let pollAbort = null;
 let _targetProfile = null;   // Profile name from server (e.g. "Automations")
-let _profileWindowId = null; // Discovered windowId for the profile
+let _profileWindowId = null; // Discovered windowId for the profile (shared default)
+// Per-session profile window. One Safari profile can hold SEVERAL windows once
+// parallel Claude sessions have been running for a while — measured 23.8.26: three
+// "אוטומציות" windows at once. With a single shared _profileWindowId, a session whose
+// tab lived in window B was told "a same-URL tab exists in another window — refusing
+// to cross windows" and could not reach its OWN tab. A session adopts a window only by
+// opening a tab in it, so this never widens reach beyond tabs the session created.
+const _sessionWindowIds = new Map();
+function _windowForSession(sessionId) {
+  const own = _sessionWindowIds.get(sessionId || _DEFAULT_SESSION);
+  return own || _profileWindowId;
+}
+function _adoptWindowForSession(sessionId, windowId) {
+  if (!windowId) return;
+  _sessionWindowIds.set(sessionId || _DEFAULT_SESSION, windowId);
+}
 let _enabled = true;         // Toggle from popup — when false, stops polling and rejects commands
 let _reconnectTimer = null;  // Single reconnect timer — prevents exponential growth
 let _reconnectDelay = 3000;  // Current backoff delay (resets on successful connect)
@@ -250,11 +265,24 @@ async function handleCommand(type, payload) {
   // Receipt-based targeting depends on durable ownership state, so hydrate it
   // before resolving the tab (not only before consulting the write guard).
   await _hydrateOwnedTabs();
-  const targetTab = await getTargetTab(payload.tabUrl, sessionId);
+  // new_tab CREATES its target, so a failure to resolve an existing one must not stop
+  // it. Once a profile holds several windows, resolution legitimately fails with
+  // "a same-URL tab exists in another window" — which used to make new_tab, the very
+  // command that recovers from that state, unusable.
+  let targetTab;
+  try {
+    targetTab = await getTargetTab(payload.tabUrl, sessionId);
+  } catch (resolveErr) {
+    if (type !== "new_tab") throw resolveErr;
+    targetTab = { id: null, windowId: null, url: "" };
+  }
   const tabId = targetTab.id;
 
-  // Safety: never operate on tabs outside the profile window
-  if (_profileWindowId && targetTab.windowId !== _profileWindowId) {
+  // Safety: never operate on tabs outside this session's profile window. Checked against
+  // the session's own window — with one shared id, a session working in a second window
+  // of the same profile was told its tab was "a different profile".
+  const sessionWindow = _windowForSession(sessionId);
+  if (tabId !== null && sessionWindow && targetTab.windowId !== sessionWindow) {
     throw new Error("Tab belongs to a different profile — refusing to operate on personal tabs");
   }
 
@@ -1249,6 +1277,10 @@ async function handleCommand(type, payload) {
       }
 
       _profileWindowId = profileWindow.id || newTab.windowId;
+      // Bind this session to the window it just opened a tab in. Once several windows
+      // of one profile exist, the shared _profileWindowId points at only one of them
+      // and every other session is locked out of its own tabs.
+      _adoptWindowForSession(sessionId, newTab.windowId || profileWindow.id);
       browser.storage.local.set({ mcpProfileWindowId: _profileWindowId }).catch(() => {});
       // CRITICAL: Set new tab as the target for this session's subsequent commands
       const trackUrl = payload.url || newTab.url || "about:blank";
@@ -1985,6 +2017,12 @@ const MAX_SESSIONS = 50; // Hard cap on session cache size
 // ========== TAB OWNERSHIP: track tabs opened by each MCP session ==========
 // Prevents operating on user's tabs — only tabs created via new_tab are "owned".
 const _sessionOwnedTabs = new Map(); // sessionId → Set<tabId>
+// Mirror of the above in storage.local. storage.session is absent on Safari, so it is
+// the only place ownership actually survives a worker suspend.
+const _OWNED_TABS_LOCAL_KEY = "mcpOwnedTabsLocal";
+// Long enough to span a working session, short enough that tab ids from a previous
+// browser run have expired rather than being reused by unrelated tabs.
+const _OWNED_TABS_TTL_MS = 6 * 60 * 60 * 1000;
 
 // Persist owned-tab IDs in storage.session: it survives the frequent MV3
 // service-worker terminations (but clears when Safari quits, matching tab-ID
@@ -2026,6 +2064,25 @@ async function _hydrateOwnedTabs() {
       }
     }
   } catch {} // storage.session may be unavailable on Safari
+
+  // Restore the ownership map from local storage when storage.session gave us nothing
+  // (always, on Safari). Bounded by age and by the live tab list so a recycled tab id
+  // from a previous browser run cannot inherit ownership.
+  try {
+    const localOwned = await browser.storage.local.get(_OWNED_TABS_LOCAL_KEY);
+    const rec = localOwned?.[_OWNED_TABS_LOCAL_KEY];
+    const fresh = rec && typeof rec.at === "number" && (Date.now() - rec.at) < _OWNED_TABS_TTL_MS;
+    if (fresh && rec.tabs) {
+      for (const [sid, ids] of Object.entries(rec.tabs)) {
+        if (!Array.isArray(ids)) continue;
+        if (!_sessionOwnedTabs.has(sid)) _sessionOwnedTabs.set(sid, new Set());
+        const set = _sessionOwnedTabs.get(sid);
+        for (const id of ids) {
+          if (typeof id === "number" && (!liveTabIds || liveTabIds.has(id))) set.add(id);
+        }
+      }
+    }
+  } catch {}
 
   // Safari versions that suspend/replace MV3 workers can lose storage.session.
   // Keep a second, cryptographically-bound receipt in local storage. It cannot
@@ -2072,6 +2129,12 @@ function _persistOwnedTabs() {
     try {
       localWrite = browser.storage.local.set({
         [_TAB_RECEIPTS_KEY]: receipts,
+        // storage.session does not exist on Safari, so the ownership map above was
+        // written into a void: every worker suspend wiped it and the session was told
+        // "not opened by this MCP session" about tabs it had just opened. Mirror it
+        // here, stamped, so a wake can restore it. Stale entries are dropped on read
+        // and dead tab ids are filtered against the live tab list.
+        [_OWNED_TABS_LOCAL_KEY]: { at: Date.now(), tabs: obj },
       }).catch(() => {});
     } catch {}
     return Promise.allSettled([sessionWrite, localWrite]);
@@ -2447,18 +2510,21 @@ async function _discoverProfileWindow() {
 
 async function getTargetTab(tabUrl, sessionId) {
   const cache = _getSessionCache(sessionId);
+  // Resolve against THIS session's window; falls back to the shared one when the
+  // session has not opened a tab yet, so first-command behaviour is unchanged.
+  const winId = _windowForSession(sessionId);
 
   // PRIORITY 1: This session's cached tab from new_tab/switch_tab/navigate
   if (cache.tabId && (Date.now() - cache.time) < TAB_CACHE_MS) {
     try {
       const cached = await browser.tabs.get(cache.tabId);
-      if (cached && (!_profileWindowId || cached.windowId === _profileWindowId)) return cached;
+      if (cached && (!winId || cached.windowId === winId)) return cached;
     } catch { cache.tabId = null; }
   }
 
   // PRIORITY 2: URL-based search (session-specific tabUrl)
   if (tabUrl) {
-    const searchScope = _profileWindowId ? { windowId: _profileWindowId } : {};
+    const searchScope = winId ? { windowId: winId } : {};
     let all = await browser.tabs.query(searchScope);
     // Prefer the durable high-entropy receipt over URL shape. SPAs legitimately
     // rewrite query/hash fragments, and login routers may strip the visible marker;
@@ -2475,7 +2541,7 @@ async function getTargetTab(tabUrl, sessionId) {
     // this session actually opened; picking the first same-URL tab makes the ownership
     // guard reject a legitimate command (or, worse, target another session's tab).
     match ||= matches.find(t => _isTabOwnedBySession(sessionId, t.id)) || matches[0];
-    if (!match && _profileWindowId) {
+    if (!match && winId) {
       all = await browser.tabs.query({});
       match = all.find(t => _canAdoptMarkedOwnedTab(t, tabUrl)) || null;
       if (!match) {
@@ -2491,9 +2557,9 @@ async function getTargetTab(tabUrl, sessionId) {
       // window — a URL collision with a tab in the user's personal window would
       // permanently redirect every subsequent command there. Adopt the match's
       // window only when the tracked profile window no longer exists.
-      if (_profileWindowId && match.windowId !== _profileWindowId) {
+      if (winId && match.windowId !== winId) {
         let profileWindowGone = false;
-        try { await browser.windows.get(_profileWindowId); }
+        try { await browser.windows.get(winId); }
         catch { profileWindowGone = true; }
         if (!profileWindowGone) {
           throw new Error("Tab not found in the MCP profile window (a same-URL tab exists in another window — refusing to cross windows). Use safari_new_tab.");
@@ -2501,8 +2567,9 @@ async function getTargetTab(tabUrl, sessionId) {
         console.log("Safari MCP: profile window gone — adopting", match.windowId);
       }
       _setSessionTab(sessionId, match.id, tabUrl);
-      if (!_profileWindowId || match.windowId !== _profileWindowId) {
+      if (!winId || match.windowId !== winId) {
         _profileWindowId = match.windowId;
+        _adoptWindowForSession(sessionId, match.windowId);
         browser.storage.local.set({ mcpProfileWindowId: _profileWindowId }).catch(() => {});
         console.log("Safari MCP: profile windowId =", _profileWindowId);
       }
@@ -2524,20 +2591,20 @@ async function getTargetTab(tabUrl, sessionId) {
       try { ownedTab = await browser.tabs.get(ownedId); }
       catch { ownedIds.delete(ownedId); continue; } // closed since — forget it
       if (!ownedTab) { ownedIds.delete(ownedId); continue; }
-      if (_profileWindowId && ownedTab.windowId !== _profileWindowId) continue;
+      if (winId && ownedTab.windowId !== winId) continue;
       _setSessionTab(sessionId, ownedTab.id, ownedTab.url || "");
       return ownedTab;
     }
   }
 
   // PRIORITY 3: Active tab of the profile window (no session bias)
-  if (_profileWindowId) {
-    const tabs = await browser.tabs.query({ active: true, windowId: _profileWindowId });
+  if (winId) {
+    const tabs = await browser.tabs.query({ active: true, windowId: winId });
     if (tabs[0]) return tabs[0];
     console.warn("Safari MCP: profile window has no active tab, re-discovering...");
     await _discoverProfileWindow();
-    if (_profileWindowId) {
-      const retryTabs = await browser.tabs.query({ active: true, windowId: _profileWindowId });
+    if (winId) {
+      const retryTabs = await browser.tabs.query({ active: true, windowId: winId });
       if (retryTabs[0]) return retryTabs[0];
     }
   }

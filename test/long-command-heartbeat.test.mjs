@@ -106,7 +106,9 @@ test("cache expiry is not what makes tab targeting safe", () => {
     background.indexOf("// PRIORITY 2")
   );
   assert.ok(p1.includes("browser.tabs.get("), "a closed tab must drop out of the cache");
-  assert.ok(p1.includes("_profileWindowId"), "a tab outside the profile window must be rejected");
+  // The window check now resolves per session (winId = _windowForSession(sessionId)),
+  // because one profile can hold several windows. The guard itself is unchanged.
+  assert.ok(/cached\.windowId === winId/.test(p1), "a tab outside the session's window must be rejected");
 });
 
 test("the proxy envelope outlives a heartbeat-extended command", () => {

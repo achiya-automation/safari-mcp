@@ -43,7 +43,7 @@ test("the owned-tab lookup keeps the guards that make it safe", () => {
     background.indexOf("// PRIORITY 3: Active tab")
   );
   assert.ok(fn.includes("browser.tabs.get("), "a closed tab must not be returned");
-  assert.ok(fn.includes("_profileWindowId"), "must not cross out of the profile window");
+  assert.ok(fn.includes("winId"), "must not cross out of the session's profile window");
   assert.ok(/delete\(ownedId\)/.test(fn), "dead tab ids must be pruned, not retried forever");
   assert.ok(fn.includes("reverse()"), "most recent tab first — that is the one in use");
 });
@@ -103,4 +103,88 @@ test("every tab we open is stamped with its session", () => {
       `_trackTab call without a session id would escape the per-session cap: ${args}`
     );
   }
+});
+
+test("each session tracks its own profile window", () => {
+  // One Safari profile can hold several windows once parallel sessions have run for a
+  // while — measured 23.8.26: three "אוטומציות" windows at once. A single shared
+  // _profileWindowId then locked every session but one out of its OWN tabs with
+  // "a same-URL tab exists in another window — refusing to cross windows".
+  assert.ok(background.includes("_sessionWindowIds"), "must keep a per-session window map");
+  assert.ok(background.includes("function _windowForSession"), "and resolve through it");
+
+  const fn = background.slice(
+    background.indexOf("async function getTargetTab("),
+    background.indexOf("async function getActiveTab(")
+  );
+  assert.ok(fn.includes("_windowForSession(sessionId)"), "getTargetTab must use the session's window");
+  assert.ok(
+    !/_profileWindowId &&/.test(fn),
+    "getTargetTab must not gate on the shared window id any more"
+  );
+
+  // Adoption happens only where the session actually opened a tab — never by guessing.
+  assert.ok(background.includes("_adoptWindowForSession(sessionId, newTab.windowId"),
+    "a session adopts a window by opening a tab in it");
+});
+
+test("falling back to the shared window keeps first-command behaviour", () => {
+  const resolver = background.slice(
+    background.indexOf("function _windowForSession"),
+    background.indexOf("function _adoptWindowForSession")
+  );
+  assert.ok(resolver.includes("|| _profileWindowId"),
+    "a session with no window of its own must still get the shared one");
+});
+
+test("new_tab survives a profile that already has several windows", () => {
+  // new_tab CREATES its target, so failing to resolve an existing one must not stop it.
+  // With several windows open, resolution legitimately throws "a same-URL tab exists in
+  // another window" — which made new_tab, the very command that recovers from that
+  // state, impossible to run.
+  const fn = background.slice(
+    background.indexOf("async function handleCommand("),
+    background.indexOf("TAB OWNERSHIP GUARD")
+  );
+  assert.ok(/catch \(resolveErr\)/.test(fn), "resolution failure must be catchable");
+  assert.ok(
+    /if \(type !== "new_tab"\) throw resolveErr/.test(fn),
+    "only new_tab may proceed past a resolution failure — everything else must still throw"
+  );
+});
+
+test("the cross-profile guard checks the session's window, not the shared one", () => {
+  const fn = background.slice(
+    background.indexOf("async function handleCommand("),
+    background.indexOf("TAB OWNERSHIP GUARD")
+  );
+  assert.ok(fn.includes("_windowForSession(sessionId)"), "guard must resolve per session");
+  assert.ok(
+    !/if \(_profileWindowId && targetTab\.windowId !== _profileWindowId\)/.test(fn),
+    "the old shared-window comparison must be gone"
+  );
+  assert.ok(fn.includes("tabId !== null"), "a not-yet-created tab must skip the guard");
+});
+
+test("ownership survives a worker suspend on Safari", () => {
+  // The ownership map was written only to storage.session — which does not exist on
+  // Safari, so the write went nowhere. Every worker suspend wiped it, and the session
+  // was then told "not opened by this MCP session" about tabs it had just opened.
+  const persist = background.slice(
+    background.indexOf("function _persistOwnedTabs"),
+    background.indexOf("function _extractMcpTabMarker")
+  );
+  assert.ok(persist.includes("_OWNED_TABS_LOCAL_KEY"), "the map must be mirrored to storage.local");
+  assert.ok(/at: Date\.now\(\)/.test(persist), "and stamped, so staleness can be judged");
+
+  const hydrate = background.slice(
+    background.indexOf("async function _hydrateOwnedTabs"),
+    background.indexOf("function _persistOwnedTabs")
+  );
+  assert.ok(hydrate.includes("_OWNED_TABS_LOCAL_KEY"), "and read back on wake");
+  assert.ok(hydrate.includes("_OWNED_TABS_TTL_MS"), "bounded by age");
+  assert.ok(
+    /liveTabIds\.has\(id\)/.test(hydrate),
+    "and by the live tab list, so a recycled tab id cannot inherit ownership"
+  );
 });
