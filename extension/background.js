@@ -2590,25 +2590,52 @@ async function sendContentCommand(tabId, type, payload, timeoutMs = 1500) {
   }
 }
 
+// Well under the server's 30s command timeout, so the ISOLATED retry still has room
+// to run and answer instead of the caller giving up on us.
+const MAIN_WORLD_INJECT_MS = 8000;
+function _withInjectionDeadline(promise, ms = MAIN_WORLD_INJECT_MS) {
+  let timer;
+  return Promise.race([
+    promise.finally(() => clearTimeout(timer)),
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("MAIN world injection stalled")), ms);
+    }),
+  ]);
+}
+
 async function execInTab(func, args = [], tabId = null) {
   const id = tabId || (await getActiveTab()).id;
   try {
     // Auto-inject deep query helpers — skip if already injected for this tab+page
     if (!_helpersInjected.has(id)) {
-      await browser.scripting.executeScript({
-        target: { tabId: id },
-        world: "MAIN",
-        func: _deepQueryScript,
-      }).catch(() => {});
+      // Same stall risk as the real injection below, and this one runs first — an
+      // unbounded await here would hang the command before it ever gets a chance to
+      // fall back. The helpers are optional, so a stall here is simply skipped.
+      await _withInjectionDeadline(
+        browser.scripting.executeScript({ target: { tabId: id }, world: "MAIN", func: _deepQueryScript })
+      ).catch(() => {});
       _helpersInjected.add(id);
     }
 
-    const results = await browser.scripting.executeScript({
-      target: { tabId: id },
-      world: "MAIN",
-      func,
-      args,
-    });
+    // business.facebook.com (and other hardened SPAs) can leave a MAIN-world injection
+    // pending forever instead of rejecting it — measured 23.8.26: identical evaluate
+    // returns instantly on a 16,845-node Wikipedia page but never resolves there. The
+    // command then died on the caller's 30s timeout with no usable error. Bound the
+    // MAIN attempt and fall back to the ISOLATED world, which shares the same DOM.
+    // ponytail: page globals are not visible from ISOLATED; DOM reads (the vast
+    // majority of evaluate calls) behave identically. A wrong-world answer beats none.
+    let results;
+    try {
+      results = await _withInjectionDeadline(
+        browser.scripting.executeScript({ target: { tabId: id }, world: "MAIN", func, args })
+      );
+    } catch (mainErr) {
+      if (!/injection stalled/.test(mainErr?.message || "")) throw mainErr;
+      console.warn("Safari MCP: MAIN world stalled, retrying ISOLATED on tabId=" + id);
+      results = await browser.scripting.executeScript({
+        target: { tabId: id }, world: "ISOLATED", func, args,
+      });
+    }
     const first = results[0];
     // Safari can report an injection exception on the result item instead of
     // rejecting executeScript(). Treating that as a successful `null` hid the
