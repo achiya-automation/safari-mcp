@@ -626,7 +626,13 @@ async function _proxyToExtension(type, payload, timeoutMs = 30000) {
     body: JSON.stringify({ type, payload, profile: process.env.SAFARI_PROFILE || "" }),
     // new_tab may first wait for a suspended profile worker to reconnect on the
     // host, so its proxy envelope must outlive the command timeout itself.
-    signal: AbortSignal.timeout(timeoutMs + (type === "new_tab" ? 35000 : 5000)),
+    // The host also re-arms a command's deadline on every extension heartbeat, up to
+    // the same ceiling sendToExtension uses. Without matching that here, a secondary
+    // instance abandoned a heavy-DOM command at ~35s while the host was still happily
+    // waiting for it — the exact failure this envelope is supposed to prevent.
+    signal: AbortSignal.timeout(
+      Math.max(timeoutMs * 4, 180000) + (type === "new_tab" ? 35000 : 5000)
+    ),
   });
   if (!res.ok) throw new Error(`Proxy error: ${res.status}`);
   const data = await res.json();

@@ -109,6 +109,22 @@ test("cache expiry is not what makes tab targeting safe", () => {
   assert.ok(p1.includes("_profileWindowId"), "a tab outside the profile window must be rejected");
 });
 
+test("the proxy envelope outlives a heartbeat-extended command", () => {
+  // A secondary instance reaches the extension through the host. The host extends a
+  // command's deadline on every beat, so a proxy envelope of timeoutMs+5s abandoned
+  // heavy-DOM commands at ~35s while the host was still waiting — the same visible
+  // failure ("Extension timeout") the heartbeat was added to remove.
+  const fn = index.slice(
+    index.indexOf("async function _proxyToExtension"),
+    index.indexOf("let _extensionLastPollTime")
+  );
+  assert.ok(fn.includes("AbortSignal.timeout"), "proxy must still bound the wait");
+  assert.ok(
+    /Math\.max\(timeoutMs \* 4, 180000\)/.test(fn),
+    "proxy envelope must use the same ceiling as sendToExtension, not timeoutMs"
+  );
+});
+
 test("a silent worker still fails fast", () => {
   // No beat means no re-arm: the original timeout stands and the caller is not left hanging.
   let clock = 0;
