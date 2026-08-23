@@ -1192,6 +1192,10 @@ server.tool(
 // Resolve THIS session's tab window/index via the extension. Returns null when the
 // extension can't answer (disconnected, AppleScript-only session).
 async function _tabLocusFromExtension() {
+  // Wait out a brief extension reconnect rather than silently falling back to the
+  // broken postToPid path — that intermittency is exactly what made pinned clicks
+  // land only sometimes. Bounded, so a genuinely absent extension still returns fast.
+  try { await _waitForVerifiedProfileExtension(4000); } catch (_e) {}
   if (!_extensionConnected && !_primaryHasExtension) return null;
   // Deliberately NO tabUrl: an SPA rewrites its URL as you move through it, so passing
   // the URL we happened to record earlier makes the extension's URL-based lookup miss

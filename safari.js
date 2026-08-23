@@ -1986,6 +1986,27 @@ end tell`;
   try { raw = await osascriptFast(probe); } catch (_e) { return null; }
   const rows = String(raw || "").split("\u001E").filter(Boolean).map(r => r.split("\u001F"));
   if (!rows.length) return null;
+  const sg = locus.screenGeom;
+  if (sg && Number.isFinite(sg.sx) && rows.length > 1) {
+    const boundsProbe = `tell application "Safari"
+  set out to ""
+  repeat with w in every window
+    try
+      set b to bounds of w
+      set out to out & (id of w as text) & (ASCII character 31) & (item 1 of b as text) & (ASCII character 31) & (item 2 of b as text) & (ASCII character 30)
+    end try
+  end repeat
+  return out
+end tell`;
+    try {
+      const braw = await osascriptFast(boundsProbe);
+      const brows = String(braw || "").split("\u001E").filter(Boolean).map(r => r.split("\u001F"));
+      const chrome = (sg.oh && sg.ih) ? (sg.oh - sg.ih) : 90;
+      const m = brows.find(([, bx, by]) =>
+        Math.abs(Number(bx) - sg.sx) <= 4 && Math.abs(Number(by) - (sg.sy - chrome)) <= 8);
+      if (m) return { winRef: `window id ${m[0]}`, winId: Number(m[0]), tabIndex: idx };
+    } catch (_e) { /* fall through to content matching */ }
+  }
   // Match on URL, then title. An SPA rewrites its URL while you work, so neither is
   // reliable on its own — but when only ONE window even HAS a tab at this index, that
   // is the window and no content match is needed. That last case is the common one,

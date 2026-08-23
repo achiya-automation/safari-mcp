@@ -397,6 +397,24 @@ async function handleCommand(type, payload) {
       let tabsInWindow = [];
       try { tabsInWindow = await browser.tabs.query({ windowId: targetTab.windowId }); } catch {}
       const activeInWindow = tabsInWindow.find(t => t.active);
+      // The window's on-screen origin, read from the page itself. This is what makes the
+      // native click robust: matching a Safari window by URL/title/index is fragile (an
+      // SPA rewrites its URL, parallel sessions change the tab count), but screenX/screenY
+      // + outer/inner give the exact pixel box, so the click needs no window-id mapping
+      // at all. Only meaningful for the active tab (a background tab has no live window).
+      let screenGeom = null;
+      try {
+        const r = await browser.scripting.executeScript({
+          target: { tabId: targetTab.id }, world: "MAIN",
+          func: () => ({
+            sx: window.screenX, sy: window.screenY,
+            ow: window.outerWidth, oh: window.outerHeight,
+            iw: window.innerWidth, ih: window.innerHeight,
+            dpr: window.devicePixelRatio,
+          }),
+        });
+        if (r && r[0] && r[0].result) screenGeom = r[0].result;
+      } catch {}
       return {
         tabId: targetTab.id,
         windowId: targetTab.windowId,
@@ -406,6 +424,7 @@ async function handleCommand(type, payload) {
         active: !!targetTab.active,
         activeTabTitle: (activeInWindow && activeInWindow.title) || "",
         windowTabCount: tabsInWindow.length,
+        screenGeom,
       };
     }
 
