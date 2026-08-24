@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`safari_doctor` reported a healthy machine as broken whenever the Mac was under load.** The daemon/Accessibility/Screen-Recording checks all hang off one 3-second preflight probe, so a helper that merely answered *late* — swap thrashing, a dozen concurrent MCP hosts — was recorded as "not responding", and the two permission checks that depend on it collapsed to "unknown". Doctor then printed 3/6 with instructions to reinstall safari-mcp and re-grant permissions that had never been revoked. The probe is now retried once with an 8-second window before the daemon is declared down; an immediate re-run of the same command returned 6/6, which is exactly the false alarm this removes.
+
 ## [2.16.3] - 2026-08-23
 
 ### Fixed

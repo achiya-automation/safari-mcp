@@ -5672,6 +5672,13 @@ export async function doctor() {
   // 3-5. Native helper daemon + Accessibility + Screen Recording (one preflight round-trip)
   let pf = null, pfErr = "";
   try { pf = await _helperPreflight(); } catch (e) { pfErr = e.message || String(e); }
+  // A single 3s probe is a load test, not a health test: under heavy system pressure (swap
+  // thrash, a dozen concurrent hosts) the helper answers late and doctor turns one slow reply
+  // into THREE hard failures telling the user to reinstall and re-grant permissions that were
+  // never revoked. Retry once with a wider window before believing the daemon is down.
+  if (!pf) {
+    try { pf = await _helperPreflight(8000); pfErr = ""; } catch (e) { pfErr = e.message || String(e); }
+  }
   add(!!pf, "Native helper daemon", pf ? "safari-helper responding" : `not responding: ${pfErr}`,
     "It auto-restarts; if this persists, reinstall safari-mcp.");
   add(!!pf && pf.accessibility === true, "Accessibility (native clicks)",
