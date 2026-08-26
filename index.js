@@ -19,7 +19,7 @@ import {
 } from "./ownership-state.js";
 import { WebSocketServer } from "ws";
 import { createServer } from "node:http";
-import { randomUUID, randomBytes } from "node:crypto";
+import { randomUUID, randomBytes, timingSafeEqual } from "node:crypto";
 import { execFile, execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -42,6 +42,17 @@ function _getProxyToken() {
   }
 }
 const PROXY_TOKEN = _getProxyToken();
+
+// Security: compare the local shared-secret in constant time. A plain `!==` returns as
+// soon as two bytes differ, so the reply latency leaks how many leading bytes matched —
+// a byte-at-a-time oracle that recovers the whole token over enough local requests.
+// A non-string header (absent, or sent twice so Node yields an array) fails closed.
+function _tokenMatches(given) {
+  if (typeof given !== "string") return false;
+  const a = Buffer.from(given, "utf8");
+  const b = Buffer.from(PROXY_TOKEN, "utf8");
+  return a.length === b.length && timingSafeEqual(a, b);
+}
 
 // ========== MULTI-INSTANCE: concurrent instances coexist (never kill siblings) ==========
 // This block previously SIGTERM'd every other safari-mcp instance running >10s to
@@ -520,7 +531,7 @@ try {
     // POST /proxy-command — secondary instances send commands through primary
     if (req.method === "POST" && req.url === "/proxy-command") {
       // Security: require the local shared-secret — blocks unrelated local processes
-      if (req.headers["x-local-token"] !== PROXY_TOKEN) {
+      if (!_tokenMatches(req.headers["x-local-token"])) {
         res.writeHead(403, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "Forbidden: invalid local token" }));
         return;

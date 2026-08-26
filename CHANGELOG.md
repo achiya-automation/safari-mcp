@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **The `/proxy-command` local-token gate compared the shared secret with `!==`.** That comparison returns as soon as two bytes differ, so reply latency leaked how many leading bytes matched — a byte-at-a-time oracle that recovers the whole token from an unprivileged local process, which is exactly the caller the gate exists to keep out (a hostile `postinstall`, say). The comparison now runs through `crypto.timingSafeEqual` behind a length check, and a non-string header — absent, or sent twice so Node yields an array — fails closed instead of throwing where `timingSafeEqual` rejects unequal lengths. Covered by two tests in `test/injection-safety.test.mjs`, verified to fail when the old comparison is put back.
+
+### Changed
+- **Dependencies brought fully current.** `ws` 8.21.1 → 8.21.3 (the only runtime dependency), and dev: `@types/node` 26.1.1 → 26.3.0, `eslint` 10.8.0 → 10.9.1, `globals` 17.8.0 → 17.11.0, and `jsdom` 29.1.1 → 30.0.1 across a major. `jsdom` backs the viewport, PWA, safe-area and WebKit-compat suites; all 135 tests pass on the new major, and `npm audit` reports no vulnerabilities with all 198 packages carrying verified registry signatures.
+
 ### Fixed
 - **`safari_doctor` reported a healthy machine as broken whenever the Mac was under load.** The daemon/Accessibility/Screen-Recording checks all hang off one 3-second preflight probe, so a helper that merely answered *late* — swap thrashing, a dozen concurrent MCP hosts — was recorded as "not responding", and the two permission checks that depend on it collapsed to "unknown". Doctor then printed 3/6 with instructions to reinstall safari-mcp and re-grant permissions that had never been revoked. The probe is now retried once with an 8-second window before the daemon is declared down; an immediate re-run of the same command returned 6/6, which is exactly the false alarm this removes.
 
