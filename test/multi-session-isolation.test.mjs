@@ -39,7 +39,7 @@ test("a session with its own tabs never falls through to the active tab", () => 
 
 test("the owned-tab lookup keeps the guards that make it safe", () => {
   const fn = background.slice(
-    background.indexOf("// PRIORITY 2.5"),
+    background.indexOf("// PRIORITY 2: a tab this session actually owns"),
     background.indexOf("// PRIORITY 3: Active tab")
   );
   assert.ok(fn.includes("browser.tabs.get("), "a closed tab must not be returned");
@@ -51,7 +51,7 @@ test("the owned-tab lookup keeps the guards that make it safe", () => {
 test("a session that owns nothing still reaches the old fallback", () => {
   // Sessions on their first command, and read-only helpers, must behave as before.
   const fn = background.slice(
-    background.indexOf("// PRIORITY 2.5"),
+    background.indexOf("// PRIORITY 2: a tab this session actually owns"),
     background.indexOf("async function getActiveTab(")
   );
   assert.ok(
@@ -124,7 +124,7 @@ test("each session tracks its own profile window", () => {
   );
 
   // Adoption happens only where the session actually opened a tab — never by guessing.
-  assert.ok(background.includes("_adoptWindowForSession(sessionId, newTab.windowId"),
+  assert.ok(background.includes("_adoptWindowForSession(sessionId, openedWindowId)"),
     "a session adopts a window by opening a tab in it");
 });
 
@@ -184,9 +184,215 @@ test("ownership survives a worker suspend on Safari", () => {
   assert.ok(hydrate.includes("_OWNED_TABS_LOCAL_KEY"), "and read back on wake");
   assert.ok(hydrate.includes("_OWNED_TABS_TTL_MS"), "bounded by age");
   assert.ok(
-    /liveTabIds\.has\(id\)/.test(hydrate),
-    "and by the live tab list, so a recycled tab id cannot inherit ownership"
+    hydrate.includes("_resolveHydratedReceiptTab("),
+    "hydration must require the exact same tab id plus one unambiguous URL digest"
   );
+});
+
+test("worker restart recovers each session's own window from live owned tabs", () => {
+  const helperStart = background.indexOf("function _recoverSessionWindowsFromOwnedTabs(");
+  const helperEnd = background.indexOf("\nasync function _hydrateOwnedTabs", helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart, "recovery helper must exist");
+  const helper = background.slice(helperStart, helperEnd);
+
+  const recovered = Function(`
+    const _DEFAULT_SESSION = "__default__";
+    const _sessionOwnedTabs = new Map([
+      ["session-a", new Set([11, 12, 99])],
+      ["session-b", new Set([21])],
+    ]);
+    const windows = new Map();
+    const tabs = new Map();
+    function _adoptWindowForSession(sessionId, windowId) {
+      windows.set(sessionId || _DEFAULT_SESSION, windowId);
+    }
+    function _setSessionTab(sessionId, tabId, url) {
+      tabs.set(sessionId || _DEFAULT_SESSION, { tabId, url });
+    }
+    ${helper}
+    _recoverSessionWindowsFromOwnedTabs(new Map([
+      [11, { id: 11, windowId: 101, url: "https://example.test/older" }],
+      [12, { id: 12, windowId: 101, url: "https://example.test/latest" }],
+      [21, { id: 21, windowId: 202, url: "https://example.test/b" }],
+    ]));
+    return { windows, tabs };
+  `)();
+
+  assert.equal(recovered.windows.get("session-a"), 101);
+  assert.equal(recovered.windows.get("session-b"), 202);
+  assert.deepEqual(recovered.tabs.get("session-a"), {
+    tabId: 12,
+    url: "https://example.test/latest",
+  });
+  assert.deepEqual(recovered.tabs.get("session-b"), {
+    tabId: 21,
+    url: "https://example.test/b",
+  });
+
+  const hydrate = background.slice(
+    background.indexOf("async function _hydrateOwnedTabs"),
+    background.indexOf("function _persistOwnedTabs")
+  );
+  const localRestore = hydrate.indexOf("browser.storage.local.get(_OWNED_TABS_LOCAL_KEY)");
+  const recoveryCall = hydrate.indexOf("_recoverSessionWindowsFromOwnedTabs(liveTabsById)");
+  assert.ok(localRestore >= 0, "hydrate must restore local ownership");
+  assert.ok(
+    recoveryCall > localRestore,
+    "window recovery must run after persisted ownership has been restored"
+  );
+});
+
+test("tab management stays inside each session's window, including last-tab protection", async () => {
+  const helperStart = background.indexOf("function _windowQuery(");
+  const helperEnd = background.indexOf("\nlet _enabled", helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart, "tab-management helpers must exist");
+  const helpers = background.slice(helperStart, helperEnd);
+
+  const sessionWindows = new Map([
+    ["session-a", 101],
+    ["session-b", 202],
+  ]);
+  const owned = new Map([
+    ["session-a", new Set([11, 12])],
+    ["session-b", new Set([21])],
+  ]);
+  const targets = new Map();
+  const removed = [];
+  const updated = [];
+  const created = [];
+  let nextTabId = 30;
+  const liveTabs = [
+    { id: 11, windowId: 101, index: 0, title: "A one", url: "https://a.test/one", active: true },
+    { id: 12, windowId: 101, index: 1, title: "A two", url: "https://a.test/two", active: false },
+    { id: 21, windowId: 202, index: 0, title: "B only", url: "https://b.test/only", active: true },
+  ];
+  const reindex = (windowId) => {
+    liveTabs.filter((tab) => tab.windowId === windowId)
+      .sort((a, b) => a.index - b.index)
+      .forEach((tab, index) => { tab.index = index; });
+  };
+  const browser = {
+    windows: {
+      get: async (windowId) => ({ id: windowId }),
+      getAll: async () => [{ id: 101 }, { id: 202 }],
+      create: async () => { throw new Error("unexpected window creation"); },
+    },
+    tabs: {
+      query: async (query) => {
+        const windowId = query.windowId || 101;
+        return liveTabs.filter((tab) => tab.windowId === windowId)
+          .sort((a, b) => a.index - b.index);
+      },
+      create: async ({ windowId, url }) => {
+        const tab = {
+          id: nextTabId++, windowId,
+          index: liveTabs.filter((candidate) => candidate.windowId === windowId).length,
+          title: "", url, active: false,
+        };
+        liveTabs.push(tab);
+        created.push(tab);
+        return tab;
+      },
+      update: async (tabId, patch) => {
+        const tab = liveTabs.find((candidate) => candidate.id === tabId);
+        if (!tab) throw new Error("missing tab " + tabId);
+        Object.assign(tab, patch);
+        updated.push({ tabId, patch });
+        return tab;
+      },
+      remove: async (tabId) => {
+        const index = liveTabs.findIndex((candidate) => candidate.id === tabId);
+        if (index < 0) throw new Error("missing tab " + tabId);
+        const [{ windowId }] = liveTabs.splice(index, 1);
+        removed.push(tabId);
+        reindex(windowId);
+      },
+    },
+    storage: { local: { set: async () => {} } },
+  };
+
+  const api = Function(
+    "browser",
+    "_windowForSession",
+    "_extractMcpTabMarker",
+    "_receiptForOwnedTab",
+    "_sessionWindowIds",
+    "_DEFAULT_SESSION",
+    "_profileWindowId",
+    "_adoptWindowForSession",
+    "_setSessionTab",
+    "_addOwnedTab",
+    "_issueTabReceipt",
+    "_isTabOwnedBySession",
+    "_removeOwnedTab",
+    `${helpers}
+     return {
+       list: _listTabsForSession,
+       open: _newTabForSession,
+       close: _closeTabForSession,
+       switchTo: _switchTabForSession,
+       sharedWindow: () => _profileWindowId,
+     };`
+  )(
+    browser,
+    (sessionId) => sessionWindows.get(sessionId) || 101,
+    () => "",
+    (sessionId, tab) => owned.get(sessionId)?.has(tab.id) ? `receipt:${tab.id}` : "",
+    sessionWindows,
+    "__default__",
+    101,
+    (sessionId, windowId) => sessionWindows.set(sessionId, windowId),
+    (sessionId, tabId, url) => targets.set(sessionId, { tabId, url }),
+    async (sessionId, tabId) => {
+      if (!owned.has(sessionId)) owned.set(sessionId, new Set());
+      owned.get(sessionId).add(tabId);
+    },
+    async (tab) => `Receipt_${String(tab.id).padEnd(24, "0")}`,
+    (sessionId, tabId) => owned.get(sessionId)?.has(tabId) || false,
+    async (sessionId, tabId) => owned.get(sessionId)?.delete(tabId),
+  );
+
+  assert.deepEqual((await api.list("session-a")).map((tab) => tab.title), ["A one", "A two"]);
+  assert.deepEqual((await api.list("session-b")).map((tab) => tab.title), ["B only"]);
+
+  const switched = await api.switchTo("session-b", liveTabs.find((tab) => tab.id === 21), { index: 1 });
+  assert.equal(switched.safeUrl, "https://b.test/only");
+  assert.equal(targets.get("session-b").tabId, 21, "session B must not switch to window A's index 1");
+
+  assert.equal(
+    await api.close("session-a", liveTabs.find((tab) => tab.id === 11), { index: 2 }),
+    "Tab closed"
+  );
+  assert.deepEqual(removed, [12], "session A's indexed close must remove only its own window's tab");
+
+  assert.match(
+    await api.close("session-b", liveTabs.find((tab) => tab.id === 21), {}),
+    /^Last remaining tab blanked/
+  );
+  assert.deepEqual(removed, [12], "session B's last tab must be blanked, never removed");
+  assert.ok(updated.some(({ tabId, patch }) => tabId === 21 && patch.url === "about:blank"));
+
+  const rawSignedUrl = "https://b.test/new?X-Amz-Signature=ab%2fCD%2Bef&dup=1&dup=2#/route?next=%2F";
+  const opened = await api.open("session-b", { url: rawSignedUrl });
+  assert.equal(created.at(-1).windowId, 202, "session B must create its next tab in window B");
+  assert.equal(opened.tabIndex, 2);
+  assert.equal(opened.safeUrl, "https://b.test/new");
+  assert.match(opened.receipt, /^[A-Za-z0-9_-]{24,}$/);
+  assert.ok(
+    updated.some(({ tabId, patch }) => tabId === created.at(-1).id && patch.url === rawSignedUrl),
+    "tabs.update must receive the caller's exact signed query and application hash byte-for-byte"
+  );
+  assert.equal(api.sharedWindow(), 101, "opening in window B must not move the shared default from A");
+
+  const managementCases = background.slice(
+    background.indexOf('case "list_tabs":'),
+    background.indexOf("// --- Scroll ---")
+  );
+  for (const helper of [
+    "_listTabsForSession", "_newTabForSession", "_closeTabForSession", "_switchTabForSession",
+  ]) {
+    assert.ok(managementCases.includes(helper), `handleCommand must delegate to ${helper}`);
+  }
 });
 
 test("native_click with explicit coordinates does not require injection", () => {

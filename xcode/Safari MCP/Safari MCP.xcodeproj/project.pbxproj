@@ -302,9 +302,10 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 81D8D8D42F6B75B900E1895F /* Build configuration list for PBXNativeTarget "Safari MCP Extension (iOS)" */;
 			buildPhases = (
-				81D8D8B02F6B75B900E1895F /* Sources */,
-				81D8D8B12F6B75B900E1895F /* Frameworks */,
-				81D8D8B22F6B75B900E1895F /* Resources */,
+					81D8D8B02F6B75B900E1895F /* Sources */,
+					81D8D8B12F6B75B900E1895F /* Frameworks */,
+					81D8D8B22F6B75B900E1895F /* Resources */,
+					A1B2C3D4E5F60718293A4B5C /* Embed Bridge Authentication */,
 			);
 			buildRules = (
 			);
@@ -321,9 +322,10 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 81D8D8DB2F6B75B900E1895F /* Build configuration list for PBXNativeTarget "Safari MCP Extension (macOS)" */;
 			buildPhases = (
-				81D8D8BA2F6B75B900E1895F /* Sources */,
-				81D8D8BB2F6B75B900E1895F /* Frameworks */,
-				81D8D8BC2F6B75B900E1895F /* Resources */,
+					81D8D8BA2F6B75B900E1895F /* Sources */,
+					81D8D8BB2F6B75B900E1895F /* Frameworks */,
+					81D8D8BC2F6B75B900E1895F /* Resources */,
+					A1B2C3D4E5F60718293A4B5D /* Embed Bridge Authentication */,
 			);
 			buildRules = (
 			);
@@ -437,6 +439,43 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		A1B2C3D4E5F60718293A4B5C /* Embed Bridge Authentication */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/../../scripts/embed-bridge-token.sh",
+			);
+			name = "Embed Bridge Authentication";
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/bridge-auth-token",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "/bin/sh \"${SRCROOT}/../../scripts/embed-bridge-token.sh\"";
+		};
+		A1B2C3D4E5F60718293A4B5D /* Embed Bridge Authentication */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/../../scripts/embed-bridge-token.sh",
+			);
+			name = "Embed Bridge Authentication";
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/bridge-auth-token",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "/bin/sh \"${SRCROOT}/../../scripts/embed-bridge-token.sh\"";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		81D8D8922F6B75B900E1895F /* Sources */ = {
@@ -643,8 +682,9 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
-				GENERATE_INFOPLIST_FILE = YES;
+					CURRENT_PROJECT_VERSION = 1;
+					ENABLE_USER_SCRIPT_SANDBOXING = NO;
+					GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "iOS (Extension)/Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = "Safari MCP Extension";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
@@ -676,8 +716,9 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
-				GENERATE_INFOPLIST_FILE = YES;
+					CURRENT_PROJECT_VERSION = 1;
+					ENABLE_USER_SCRIPT_SANDBOXING = NO;
+					GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "iOS (Extension)/Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = "Safari MCP Extension";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
@@ -794,8 +835,9 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = PQ7BWRHSYV;
 				ENABLE_APP_SANDBOX = YES;
-				ENABLE_HARDENED_RUNTIME = YES;
-				ENABLE_USER_SELECTED_FILES = readonly;
+					ENABLE_HARDENED_RUNTIME = YES;
+					ENABLE_USER_SCRIPT_SANDBOXING = NO;
+					ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "macOS (Extension)/Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = "Safari MCP Extension";
@@ -830,8 +872,9 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = PQ7BWRHSYV;
 				ENABLE_APP_SANDBOX = YES;
-				ENABLE_HARDENED_RUNTIME = YES;
-				ENABLE_USER_SELECTED_FILES = readonly;
+					ENABLE_HARDENED_RUNTIME = YES;
+					ENABLE_USER_SCRIPT_SANDBOXING = NO;
+					ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "macOS (Extension)/Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = "Safari MCP Extension";

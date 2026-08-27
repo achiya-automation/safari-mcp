@@ -39,7 +39,7 @@ test("extension beats while a command occupies the poll loop", () => {
 
 test("server exposes /heartbeat and treats it as liveness", () => {
   assert.ok(index.includes('req.url === "/heartbeat"'), "server must accept /heartbeat");
-  const route = index.slice(index.indexOf('req.url === "/heartbeat"'), index.indexOf('req.url === "/extension-verified"'));
+  const route = index.slice(index.indexOf("// POST /heartbeat"), index.indexOf("// POST /extension-verified"));
   assert.ok(route.includes("_extensionLastPollTime"), "beat must refresh the stale clock");
   assert.ok(route.includes("armTimer"), "beat must re-arm in-flight deadlines");
   assert.ok(route.includes("hardDeadline"), "re-arming must respect the ceiling");

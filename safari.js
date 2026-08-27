@@ -4891,11 +4891,17 @@ export async function runScript({ steps, onStep }) {
     try {
       // Map action names to safari.js functions
       const actions = {
-        navigate, click, doubleClick, rightClick, fill, clearField, typeText,
+        navigate: (a) => navigate(a.url),
+        reload: (a) => reload(a.hard ?? a.hardReload ?? false),
+        newTab: (a) => newTab(a.url || ""),
+        closeTab: (a) => closeTab(a.index),
+        switchTab: (a) => switchTab(a.index),
+        navigateAndRead: (a) => navigateAndRead(a.url, a),
+        click, doubleClick, rightClick, fill, clearField, typeText,
         pressKey, scroll, scrollTo, scrollToElement, readPage, getPageSource,
         screenshot, screenshotElement, evaluate, waitFor, waitForTime, hover,
-        selectOption, fillForm, fillAndSubmit, navigateAndRead, clickAndWait,
-        goBack, goForward, reload, newTab, closeTab, switchTab, listTabs,
+        selectOption, fillForm, fillAndSubmit, clickAndWait,
+        goBack, goForward, listTabs,
         getLocalStorage, setLocalStorage, deleteLocalStorage,
         getSessionStorage, setSessionStorage, deleteSessionStorage,
         getCookies, setCookie, deleteCookies, getElementInfo, querySelectorAll,

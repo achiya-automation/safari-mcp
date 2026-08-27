@@ -15,13 +15,13 @@ import { textResult, jsonResult, imageResult, errorResult } from "./response.js"
 import {
   OWNERSHIP_DIR, BLANK_TAB_SENTINEL,
   _openedTabs, _ownedTabURLs,
-  _isURLOwned, _isExactURLOwned, _markBlankTabOpened, _addOwnedURL, _removeOwnedURL, _trackTab, _untrackTab,
+  _isURLOwned, _markBlankTabOpened, _addOwnedURL, _removeOwnedURL, _trackTab, _untrackTab,
 } from "./ownership-state.js";
 import { WebSocketServer } from "ws";
 import { createServer } from "node:http";
 import { randomUUID, randomBytes, timingSafeEqual } from "node:crypto";
 import { execFile, execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
@@ -43,6 +43,38 @@ function _getProxyToken() {
 }
 const PROXY_TOKEN = _getProxyToken();
 
+// The Safari extension bridge uses a separate per-install secret. The signed
+// extension bundle receives the same value as a private resource at build time;
+// it never travels in a URL or page state. Keeping this separate from the proxy
+// token prevents a compromised extension transport from authenticating as a
+// secondary MCP process.
+const BRIDGE_TOKEN_FILE = join(homedir(), ".safari-mcp-bridge-token");
+function _getBridgeToken() {
+  try {
+    const existing = readFileSync(BRIDGE_TOKEN_FILE, "utf8").trim();
+    if (/^[0-9a-f]{64}$/.test(existing)) return existing;
+  } catch {}
+
+  const tok = randomBytes(32).toString("hex");
+  const temporaryFile = `${BRIDGE_TOKEN_FILE}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+  try {
+    writeFileSync(temporaryFile, tok, { mode: 0o600, flag: "wx" });
+    renameSync(temporaryFile, BRIDGE_TOKEN_FILE);
+    return tok;
+  } catch (err) {
+    try { unlinkSync(temporaryFile); } catch {}
+    // Another starting process may have repaired the file first. Accept only a
+    // complete valid value; otherwise refuse startup instead of authenticating
+    // an empty or partially written token.
+    try {
+      const repaired = readFileSync(BRIDGE_TOKEN_FILE, "utf8").trim();
+      if (/^[0-9a-f]{64}$/.test(repaired)) return repaired;
+    } catch {}
+    throw new Error(`Could not create a valid Safari MCP bridge token: ${err.message}`);
+  }
+}
+const BRIDGE_TOKEN = _getBridgeToken();
+
 // Security: compare the local shared-secret in constant time. A plain `!==` returns as
 // soon as two bytes differ, so the reply latency leaks how many leading bytes matched —
 // a byte-at-a-time oracle that recovers the whole token over enough local requests.
@@ -51,6 +83,13 @@ function _tokenMatches(given) {
   if (typeof given !== "string") return false;
   const a = Buffer.from(given, "utf8");
   const b = Buffer.from(PROXY_TOKEN, "utf8");
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function _bridgeTokenMatches(given) {
+  if (typeof given !== "string" || !/^[0-9a-f]{64}$/.test(given) || !/^[0-9a-f]{64}$/.test(BRIDGE_TOKEN)) return false;
+  const a = Buffer.from(given, "utf8");
+  const b = Buffer.from(BRIDGE_TOKEN, "utf8");
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
@@ -277,8 +316,88 @@ function _bridgePort(name, fallback) {
 }
 const HTTP_PORT = _bridgePort("SAFARI_MCP_BRIDGE_PORT", 9224);
 const WS_PORT = _bridgePort("SAFARI_MCP_BRIDGE_WS_PORT", HTTP_PORT - 1);
+function _isExtensionSchemeOrigin(origin) {
+  const value = String(origin || "");
+  return value.startsWith("safari-web-extension://") ||
+    value.startsWith("moz-extension://") ||
+    value.startsWith("chrome-extension://");
+}
+// Bearer receipts cross this socket, so an extension scheme is not enough: another
+// installed extension could claim the connection. WebSocket transport is disabled
+// until exact trusted origins are explicitly allowlisted. Safari uses HTTP polling.
+const _allowedWebSocketOrigins = new Set(
+  String(process.env.SAFARI_MCP_WS_ORIGINS || "")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter((origin) => _isExtensionSchemeOrigin(origin))
+);
+function _isAllowedWebSocketOrigin(origin) {
+  return _allowedWebSocketOrigins.has(String(origin || ""));
+}
 let _extensionWs = null;
 let _extensionConnected = false;
+let _activeHttpWorkerId = "";
+const _connectingHttpWorkers = new Map();
+const _HTTP_WORKER_TTL_MS = 60 * 1000;
+
+function _httpWorkerId(req) {
+  const value = req.headers["x-safari-mcp-worker"];
+  return typeof value === "string" && /^[0-9a-f]{32}$/.test(value) ? value : "";
+}
+
+function _rememberConnectingHttpWorker(workerId) {
+  const now = Date.now();
+  for (const [id, connectedAt] of _connectingHttpWorkers) {
+    if (now - connectedAt > _HTTP_WORKER_TTL_MS) _connectingHttpWorkers.delete(id);
+  }
+  _connectingHttpWorkers.set(workerId, now);
+}
+
+function _isConnectingHttpWorker(workerId) {
+  const connectedAt = _connectingHttpWorkers.get(workerId);
+  return typeof connectedAt === "number" && Date.now() - connectedAt <= _HTTP_WORKER_TTL_MS;
+}
+
+function _requireActiveHttpWorker(req, res) {
+  const workerId = _httpWorkerId(req);
+  if (!workerId) {
+    res.writeHead(401);
+    res.end("Worker authentication required");
+    return "";
+  }
+  if (!_activeHttpWorkerId) {
+    res.writeHead(409);
+    res.end("Worker reconnect required");
+    return "";
+  }
+  if (workerId !== _activeHttpWorkerId) {
+    // A previous Safari service worker can survive an extension reload. It must stop
+    // polling rather than consuming commands whose receipt state belongs to the newly
+    // verified worker.
+    res.writeHead(423);
+    res.end("Worker superseded");
+    return "";
+  }
+  return workerId;
+}
+// Monotonic proof that a worker completed a NEW verified connection.  A boolean is
+// insufficient for reload_extension: the old worker can still be marked connected
+// when its command response arrives, so callers used to return before the replacement
+// worker existed.
+let _extensionConnectionGeneration = 0;
+
+async function _waitForExtensionGeneration(previousGeneration, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (
+      _extensionConnectionGeneration > previousGeneration &&
+      _extensionConnected &&
+      (!_preferAppleScript || _profileExtensionVerified)
+    ) return true;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  return false;
+}
 
 // Pending requests: command sent to extension, waiting for result
 const _pendingRequests = new Map();
@@ -289,10 +408,15 @@ const _commandQueue = [];
 // ========== WEBSOCKET SERVER (for Chrome extensions / direct WebSocket) ==========
 let wss;
 try {
-  wss = new WebSocketServer({ host: "127.0.0.1", port: WS_PORT });
+  wss = new WebSocketServer({
+    host: "127.0.0.1",
+    port: WS_PORT,
+    verifyClient: ({ origin }) => _isAllowedWebSocketOrigin(origin),
+  });
   wss.on("connection", (ws) => {
     _extensionWs = ws;
     _extensionConnected = true;
+    _extensionConnectionGeneration += 1;
     console.error(`[Safari MCP] Extension connected via WebSocket`);
     _setupExtensionListener(ws);
     ws.on("close", () => {
@@ -324,7 +448,7 @@ try {
     // Safari extensions use moz-extension:// or safari-web-extension:// origins.
     // "*" was a security risk: any webpage could POST to the localhost bridge and execute MCP commands.
     const origin = req.headers.origin || "";
-    const isSafeOrigin = !origin || origin.startsWith("safari-web-extension://") || origin.startsWith("moz-extension://") || origin.startsWith("chrome-extension://");
+    const isSafeOrigin = !origin || _isExtensionSchemeOrigin(origin);
     if (isSafeOrigin) {
       res.setHeader("Access-Control-Allow-Origin", origin || "*");
     } else {
@@ -334,7 +458,7 @@ try {
       return;
     }
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Safari-MCP-Token, X-Safari-MCP-Worker");
 
     if (req.method === "OPTIONS") {
       res.writeHead(204);
@@ -342,8 +466,28 @@ try {
       return;
     }
 
+    // Every Safari-extension HTTP endpoint is authenticated in addition to its
+    // CORS check. Origin alone is not authority: another extension has its own
+    // extension-scheme origin, and a local process can forge or omit Origin.
+    const extensionBridgeEndpoint =
+      (req.method === "GET" && req.url === "/poll") ||
+      (req.method === "POST" && (
+        req.url === "/result" ||
+        req.url.startsWith("/connect") ||
+        req.url === "/heartbeat" ||
+        req.url === "/extension-verified" ||
+        req.url === "/verify-profile"
+      ));
+    if (extensionBridgeEndpoint && !_bridgeTokenMatches(req.headers["x-safari-mcp-token"])) {
+      res.writeHead(401);
+      res.end("Unauthorized");
+      return;
+    }
+
     // GET /poll — extension asks for next command (long-poll, up to 5s)
     if (req.method === "GET" && req.url === "/poll") {
+      const pollingWorkerId = _requireActiveHttpWorker(req, res);
+      if (!pollingWorkerId) return;
       // A profile-scoped server never releases queued commands until an extension has
       // proved it belongs to that profile. This keeps an old/wrong worker from draining
       // commands during reconnect races.
@@ -369,6 +513,13 @@ try {
         }, 5000);
 
         const checkInterval = setInterval(() => {
+          if (pollingWorkerId !== _activeHttpWorkerId) {
+            clearTimeout(timer);
+            clearInterval(checkInterval);
+            res.writeHead(423);
+            res.end("Worker superseded");
+            return;
+          }
           if (_commandQueue.length > 0) {
             clearTimeout(timer);
             clearInterval(checkInterval);
@@ -389,6 +540,7 @@ try {
 
     // POST /result — extension sends command result
     if (req.method === "POST" && req.url === "/result") {
+      if (!_requireActiveHttpWorker(req, res)) return;
       let body = "";
       let bodyTooLarge = false; // 'end' can still fire after destroy() — never parse/respond then
       req.on("data", (chunk) => { if (bodyTooLarge || res.headersSent) return; body += chunk; if (body.length > MAX_BODY_SIZE) { bodyTooLarge = true; res.writeHead(413); res.end("Payload too large"); req.destroy(); } });
@@ -406,6 +558,13 @@ try {
 
     // POST /connect — extension announces it's alive
     if (req.method === "POST" && req.url.startsWith("/connect")) {
+      const workerId = _httpWorkerId(req);
+      if (!workerId) {
+        res.writeHead(400);
+        res.end("Worker identity required");
+        return;
+      }
+      _rememberConnectingHttpWorker(workerId);
       const connectUrl = new URL(req.url, `http://127.0.0.1:${HTTP_PORT}`);
       // Safari can retain old per-profile workers after a development build is replaced.
       // Those workers use the legacy visible-tab verifier. Fail them closed before the
@@ -417,9 +576,17 @@ try {
       }
       // When SAFARI_PROFILE is set, don't mark as connected until profile is verified.
       // A personal-profile extension connecting first would incorrectly set the flag.
-      if (!process.env.SAFARI_PROFILE && !_extensionConnected) {
-        _extensionConnected = true;
-        console.error("[Safari MCP] Extension connected via HTTP polling");
+      if (!process.env.SAFARI_PROFILE) {
+        _activeHttpWorkerId = workerId;
+        _connectingHttpWorkers.delete(workerId);
+        // Count every accepted worker handshake, even while the old worker's boolean
+        // liveness has not gone stale yet. reload_extension depends on this generation
+        // changing before it reports success.
+        _extensionConnectionGeneration += 1;
+        if (!_extensionConnected) {
+          _extensionConnected = true;
+          console.error("[Safari MCP] Extension connected via HTTP polling");
+        }
       }
       _extensionLastPollTime = Date.now();
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -430,6 +597,7 @@ try {
     // POST /heartbeat — extension is alive and mid-command (its poll loop is blocked
     // by the running command, so /poll cannot be what proves liveness here).
     if (req.method === "POST" && req.url === "/heartbeat") {
+      if (!_requireActiveHttpWorker(req, res)) return;
       _extensionLastHeartbeat = Date.now();
       _extensionLastPollTime = Date.now();
       // Re-arm in-flight deadlines: the worker told us it is still on the command.
@@ -446,7 +614,16 @@ try {
 
     // POST /extension-verified — extension confirmed it's in the correct profile
     if (req.method === "POST" && req.url === "/extension-verified") {
+      const workerId = _httpWorkerId(req);
+      if (!workerId || !_isConnectingHttpWorker(workerId)) {
+        res.writeHead(401);
+        res.end("Unverified worker");
+        return;
+      }
+      _activeHttpWorkerId = workerId;
+      _connectingHttpWorkers.delete(workerId);
       _profileExtensionVerified = true;
+      _extensionConnectionGeneration += 1;
       if (!_extensionConnected) {
         _extensionConnected = true;
         console.error("[Safari MCP] Extension connected and profile-verified via HTTP polling");
@@ -459,6 +636,12 @@ try {
 
     // POST /verify-profile — extension asks server to check which profile has a nonce tab
     if (req.method === "POST" && req.url === "/verify-profile") {
+      const workerId = _httpWorkerId(req);
+      if (!workerId || !_isConnectingHttpWorker(workerId)) {
+        res.writeHead(401);
+        res.end("Worker must connect before profile verification");
+        return;
+      }
       let body = "";
       let bodyTooLarge = false; // 'end' can still fire after destroy() — never parse/respond then
       req.on("data", (chunk) => { if (bodyTooLarge || res.headersSent) return; body += chunk; if (body.length > MAX_BODY_SIZE) { bodyTooLarge = true; res.writeHead(413); res.end("Payload too large"); req.destroy(); } });
@@ -560,7 +743,16 @@ try {
             return;
           }
           const timeout = _commandTimeouts[type] || 30000;
-          const result = await sendToExtension(type, payload, timeout);
+          let result = await sendToExtension(type, payload, timeout);
+          if (type === "reload_extension") {
+            // The worker answers before scheduling runtime.reload(). Capture the
+            // baseline only now: a suspended OLD worker may have reconnected merely
+            // to receive this command, and that wake must not satisfy the barrier.
+            const reloadGeneration = _extensionConnectionGeneration;
+            const reconnected = await _waitForExtensionGeneration(reloadGeneration, 30000);
+            if (!reconnected) throw new Error("Extension reload did not produce a verified reconnect within 30000ms");
+            if (result && typeof result === "object") result = { ...result, reconnected: true };
+          }
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ result }));
         } catch (err) {
@@ -667,6 +859,8 @@ const _staleHttpTimer = setInterval(() => {
       // per-command heartbeat instead, and only declare death when nothing is in flight.
       if (_pendingRequests.size > 0 && Date.now() - _extensionLastHeartbeat < 30000) return;
       _extensionConnected = false;
+      _activeHttpWorkerId = "";
+      _connectingHttpWorkers.clear();
       _drainOnDisconnect("HTTP poll timeout");
       console.error("[Safari MCP] Extension disconnected (HTTP poll timeout)");
     }
@@ -823,13 +1017,319 @@ function _originOf(url) {
   try { return new URL(String(url || "")).origin; } catch { return ""; }
 }
 
+function _safeUrlForOutput(rawUrl) {
+  const raw = String(rawUrl || "");
+  if (!raw) return "unknown";
+  if (raw === "about:blank" || raw === "missing value") return raw;
+  try {
+    const parsed = new URL(raw);
+    if (/^https?:$/.test(parsed.protocol)) return parsed.origin + parsed.pathname;
+    return parsed.protocol ? parsed.protocol.replace(/:$/, "") + ":" : "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+function _receiptToken(value) {
+  const raw = String(value || "");
+  if (/^[A-Za-z0-9_-]{24,}$/.test(raw)) return raw;
+  const legacy = raw.match(/(?:[?#&])mcp-tab=([A-Za-z0-9_-]{24,})(?:[&#]|$)/);
+  return legacy ? legacy[1] : "";
+}
+
+const _activeReceipts = new Map();
+function _receiptSessionKey() {
+  return `${SESSION_ID}:${currentSessionId()}`;
+}
+function _getActiveReceipt() {
+  return _activeReceipts.get(_receiptSessionKey()) || "";
+}
+function _setActiveReceipt(receipt) {
+  const token = _receiptToken(receipt);
+  const key = _receiptSessionKey();
+  if (token) _activeReceipts.set(key, token);
+  else _activeReceipts.delete(key);
+}
+
+function _sanitizeTabResult(value) {
+  let normalized = value;
+  if (typeof normalized === "string") {
+    try { normalized = JSON.parse(normalized); } catch { return normalized; }
+  }
+  if (Array.isArray(normalized)) return normalized.map(_sanitizeTabResult);
+  if (!normalized || typeof normalized !== "object") return normalized;
+  const safeUrl = _safeUrlForOutput(normalized.safeUrl || normalized.url || normalized.requestedUrl || "");
+  const receipt = _receiptToken(normalized.receipt || normalized.receiptUrl || "");
+  return {
+    ...(normalized.index !== undefined ? { index: normalized.index } : {}),
+    ...(normalized.tabIndex !== undefined ? { tabIndex: normalized.tabIndex } : {}),
+    ...(normalized.title !== undefined ? { title: normalized.title } : {}),
+    ...(safeUrl !== "unknown" ? { safeUrl } : {}),
+    ...(receipt ? { receipt } : {}),
+    ...(normalized.active !== undefined ? { active: !!normalized.active } : {}),
+    ...(normalized.owned !== undefined ? { owned: !!normalized.owned } : {}),
+  };
+}
+
+function _isBatchSemanticFailure(result) {
+  if (Array.isArray(result)) return result.some(_isBatchSemanticFailure);
+  if (result && typeof result === "object") return result.ok === false;
+  if (typeof result !== "string") return false;
+  return /(?:^|\n)\s*(?:Element not found|Not found|Tab not found|TIMEOUT|No click target|Typed 0 chars)\b/i.test(result) ||
+    /(?:^|\n)\s*Selected:\s*(?:\(index -1\))?\s*$/im.test(result);
+}
+
+async function _runExtensionBatchAction(action, args = {}) {
+  const mySession = `${SESSION_ID}:${currentSessionId()}`;
+  const normalize = (value) => {
+    if (typeof value !== "string") return value;
+    try { return JSON.parse(value); } catch { return value; }
+  };
+  const syncResultUrl = (value, fallbackUrl = "") => {
+    const normalized = normalize(value);
+    const landedUrl = normalized && typeof normalized === "object" && normalized.url
+      ? normalized.url
+      : fallbackUrl;
+    if (landedUrl) {
+      safari.setActiveTabURL(landedUrl);
+      _addOwnedURL(landedUrl);
+    }
+    return normalized;
+  };
+
+  switch (action) {
+    case "newTab": {
+      const requestedUrl = String(args.url || "");
+      const raw = await extensionOrFallback(
+        "new_tab", { url: requestedUrl },
+        () => safari.newTab(requestedUrl)
+      );
+      const value = _sanitizeTabResult(normalize(raw));
+      if (value && typeof value === "object" && value.tabIndex) {
+        safari.setActiveTabIndex(value.tabIndex);
+        _trackTab(value.tabIndex, requestedUrl, mySession);
+      }
+      const trackUrl = requestedUrl || "about:blank";
+      if (trackUrl) {
+        safari.setActiveTabURL(trackUrl);
+        _addOwnedURL(trackUrl);
+      } else {
+        _markBlankTabOpened();
+      }
+      if (value?.receipt) _setActiveReceipt(value.receipt);
+      return value;
+    }
+
+    case "switchTab": {
+      const index = Number(args.index);
+      if (!Number.isInteger(index) || index < 1) throw new Error("switchTab requires a positive index");
+      const receipt = _receiptToken(args.receipt || args.receiptUrl || args.url || "");
+      if ((args.receipt || args.receiptUrl || args.url) && !receipt) {
+        throw new Error("Tab safety: switchTab requires an extension-issued receipt");
+      }
+      const raw = await extensionOrFallback(
+        "switch_tab",
+        receipt ? { index, receipt } : { index },
+        () => safari.switchTab(index)
+      );
+      const value = _sanitizeTabResult(raw);
+      safari.setActiveTabIndex(index);
+      if (value?.receipt || receipt) _setActiveReceipt(value?.receipt || receipt);
+      return value;
+    }
+
+    case "listTabs":
+      return _sanitizeTabResult(await extensionOrFallback("list_tabs", {}, () => safari.listTabs()));
+
+    case "getReceipt": {
+      const value = normalize(await extensionOrFallback(
+        "get_tab_receipt", {
+          ...(_receiptToken(args.receipt || "") ? { receipt: _receiptToken(args.receipt) } : {}),
+        },
+        () => { throw new Error("getReceipt requires the verified Safari extension"); }
+      ));
+      const safeValue = _sanitizeTabResult(value);
+      if (safeValue?.index) safari.setActiveTabIndex(safeValue.index);
+      if (safeValue?.receipt) _setActiveReceipt(safeValue.receipt);
+      return safeValue;
+    }
+
+    case "closeTab": {
+      const index = args.index === undefined ? undefined : Number(args.index);
+      const receipt = _receiptToken(args.receipt || args.receiptUrl || args.url || "") || _getActiveReceipt();
+      const raw = await extensionOrFallback(
+        "close_tab", { ...(index ? { index } : {}), ...(receipt ? { receipt } : {}) },
+        () => safari.closeTab(index)
+      );
+      const activeIndex = safari.getActiveTabIndex();
+      if (activeIndex !== null) _untrackTab(activeIndex);
+      safari.setActiveTabIndex(null);
+      safari.setActiveTabURL(null);
+      _setActiveReceipt("");
+      return normalize(raw);
+    }
+
+    case "navigate": {
+      const url = String(args.url || "");
+      if (!url) throw new Error("navigate requires url");
+      _addOwnedURL(url);
+      const raw = await extensionOrFallback(
+        "navigate", { url, timeout: args.timeout },
+        () => safari.navigate(url)
+      );
+      return syncResultUrl(raw, url);
+    }
+
+    case "navigateAndRead": {
+      const url = String(args.url || "");
+      if (!url) throw new Error("navigateAndRead requires url");
+      _addOwnedURL(url);
+      const raw = await extensionOrFallback(
+        "navigate_and_read", { url, maxLength: args.maxLength, timeout: args.timeout },
+        async () => { await safari.navigate(url); return safari.readPage({ maxLength: args.maxLength }); }
+      );
+      safari.setActiveTabURL(url);
+      return normalize(raw);
+    }
+
+    case "readPage":
+      return normalize(await extensionOrFallback(
+        "read_page", { selector: args.selector, maxLength: args.maxLength },
+        () => safari.readPage(args)
+      ));
+
+    case "snapshot": {
+      const gen = safari.getNextSnapshotGen();
+      return await extensionOrFallback(
+        "snapshot", { selector: args.selector, gen },
+        () => safari.takeSnapshot({ selector: args.selector, _gen: gen })
+      );
+    }
+
+    case "getElementInfo":
+      return normalize(await extensionOrFallback(
+        "get_element", { selector: args.selector },
+        () => safari.getElementInfo(args)
+      ));
+
+    case "querySelectorAll":
+      return normalize(await extensionOrFallback(
+        "query_all", { selector: args.selector, limit: args.limit },
+        () => safari.querySelectorAll(args)
+      ));
+
+    case "waitFor":
+      return await extensionOrFallback(
+        "wait_for", { selector: args.selector, text: args.text, timeout: args.timeout },
+        () => safari.waitFor(args)
+      );
+
+    case "waitForTime": {
+      const ms = Math.max(0, Math.min(Number(args.ms) || 0, 30000));
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      return `Waited ${ms}ms`;
+    }
+
+    case "click":
+      return await extensionOrFallback(
+        "click", { ref: args.ref, selector: args.selector, text: args.text, x: args.x, y: args.y },
+        () => safari.click(args)
+      );
+
+    case "fill":
+      return await extensionOrFallback(
+        "fill", { selector: args.ref ? `[data-mcp-ref="${args.ref}"]` : args.selector, value: args.value },
+        () => safari.fill(args)
+      );
+
+    case "fillForm":
+      return await extensionOrFallback(
+        "fill_form", { fields: args.fields },
+        () => safari.fillForm(args)
+      );
+
+    case "clearField":
+      return await extensionOrFallback(
+        "clear_field", { selector: args.selector },
+        () => safari.clearField(args)
+      );
+
+    case "typeText":
+      return await extensionOrFallback(
+        "type_text", { text: args.text, selector: args.ref ? `[data-mcp-ref="${args.ref}"]` : args.selector },
+        () => safari.typeText(args)
+      );
+
+    case "selectOption":
+      return await extensionOrFallback(
+        "select_option", { selector: args.ref ? `[data-mcp-ref="${args.ref}"]` : args.selector, value: args.value },
+        () => safari.selectOption(args)
+      );
+
+    case "pressKey":
+      return await extensionOrFallback(
+        "press_key", { key: args.key, modifiers: args.modifiers },
+        () => safari.pressKey(args)
+      );
+
+    case "scroll":
+      return await extensionOrFallback(
+        "scroll", { direction: args.direction, amount: args.amount },
+        () => safari.scroll(args)
+      );
+
+    case "scrollTo":
+      return await extensionOrFallback(
+        "scroll_to", { x: args.x, y: args.y },
+        () => safari.scrollTo(args)
+      );
+
+    case "scrollToElement":
+      return await extensionOrFallback(
+        "scroll_to_element", { selector: args.selector, text: args.text, block: args.block, timeout: args.timeout },
+        () => safari.scrollToElement(args)
+      );
+
+    case "hover":
+      return await extensionOrFallback(
+        "hover", { selector: args.ref ? `[data-mcp-ref="${args.ref}"]` : args.selector },
+        () => safari.hover(args)
+      );
+
+    case "evaluate":
+      return normalize(await extensionOrFallback(
+        "evaluate", { script: args.script },
+        () => safari.evaluate(args)
+      ));
+
+    case "reload":
+      return syncResultUrl(await extensionOrFallback(
+        "reload", { hard: args.hard },
+        () => safari.reload(args.hard)
+      ));
+
+    case "goBack":
+      return syncResultUrl(await extensionOrFallback("go_back", {}, () => safari.goBack()));
+
+    case "goForward":
+      return syncResultUrl(await extensionOrFallback("go_forward", {}, () => safari.goForward()));
+
+    default:
+      throw new Error(`Unsupported extension batch action: ${action}`);
+  }
+}
+
 // Tab-ownership assertion — shared by extensionOrFallback AND the tools that bypass it
 // (safari_run_script, native_*). Throws if the operation would land on a tab this MCP
 // session didn't open. Read-only / tab-management ops (in _noOwnershipCheck) are exempt.
 // Once any tab has been opened via new_tab, ALL subsequent page-mutating ops must target
 // an owned tab — this is what prevents navigating/clicking in the user's tabs.
-function _assertTabOwnership(opType) {
+function _assertTabOwnership(opType, extensionPayload = {}) {
   if (_noOwnershipCheck.has(opType)) return;
+  // In a named profile the extension is the authority. A bearer receipt may be
+  // presented after a stateless reconnect; only the extension can validate its exact
+  // tab binding, freshness, digest, and origin.
+  if (_preferAppleScript && _receiptToken(extensionPayload.receipt || _getActiveReceipt())) return;
   const currentUrl = safari.getActiveTabURL();
   if (_ownedTabURLs.size === 0 && _openedTabs.size === 0) {
     // No tabs opened yet — block everything except read-only ops
@@ -841,7 +1341,7 @@ function _assertTabOwnership(opType) {
     // about:blank tabs are owned if we have any tracked tabs (new_tab creates them at about:blank)
     const isBlankOwned = (currentUrl === 'about:blank' || currentUrl === 'missing value') && (_openedTabs.size > 0 || _ownedTabURLs.has(BLANK_TAB_SENTINEL));
     if (!isBlankOwned) {
-      const msg = `⚠️ Tab safety: refusing "${opType}" — current tab (${currentUrl}) was not opened by this MCP session. Use safari_new_tab or safari_switch_tab to target your own tab.`;
+      const msg = `⚠️ Tab safety: refusing "${opType}" — current tab (${_safeUrlForOutput(currentUrl)}) was not opened by this MCP session. Use safari_new_tab or safari_switch_tab to target your own tab.`;
       console.error(`[Safari MCP] ${msg}`);
       throw new Error(msg);
     }
@@ -852,7 +1352,7 @@ function _assertTabOwnership(opType) {
 // crossing to AppleScript would lose the extension's profile and tab-id proof.
 async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) {
   // Tab-ownership guard — extracted to _assertTabOwnership so run_script / native_* share it.
-  _assertTabOwnership(extensionType);
+  _assertTabOwnership(extensionType, extensionPayload);
 
   // Safari may terminate an otherwise healthy profile worker between two tool
   // calls. If no command has been sent yet, waiting for its verified reconnect is
@@ -874,17 +1374,16 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
     if (_extensionConnected && (!_preferAppleScript || _profileExtensionVerified)) {
       try {
         const t0 = Date.now();
-        const tabUrl = safari.getActiveTabURL();
+        const activeReceipt = _getActiveReceipt();
         // Composite id: SESSION_ID alone is process-wide, so in HTTP-daemon mode every
         // MCP client looked like ONE extension session and could target another client's
         // cached tab (#76). currentSessionId() alone would collapse all stdio processes
         // into "_default" — so both parts are needed.
-        // Callers that recover after a daemon/session restart may provide the exact
-        // marked URL explicitly (notably close_tab). Let that durable receipt override
-        // safari.js's process-global active URL, while the server-owned session id stays
-        // authoritative.
+        // A receipt is an opaque capability, not a URL. Keep it out of page state and
+        // attach it automatically only to commands that target the current logical tab.
+        const attachActiveReceipt = !["new_tab", "list_tabs", "switch_tab"].includes(extensionType);
         const payload = {
-          ...(tabUrl ? { tabUrl } : {}),
+          ...(attachActiveReceipt && activeReceipt ? { receipt: activeReceipt } : {}),
           ...extensionPayload,
           sessionId: `${SESSION_ID}:${currentSessionId()}`,
         };
@@ -892,13 +1391,24 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
         result = await sendToExtension(extensionType, payload, timeout);
         const isCspError = typeof result === 'string' && (result.includes('unsafe-eval') || result.includes('trusted-types') || result.includes('Trusted Type') || result.includes('Content Security Policy'));
         const isPermissionDenied = typeof result === 'string' && result.includes('__SCREENSHOT_PERMISSION_DENIED__');
-        const isFailed = result === null || (typeof result === 'string' && result.startsWith('Element not found'));
+        const isElementMiss = typeof result === 'string' && result.startsWith('Element not found');
+        const isFailed = result === null || isElementMiss;
         if (isPermissionDenied) {
           console.error(`[Safari MCP] ${extensionType} permission denied (${Date.now() - t0}ms) — falling back to AppleScript`);
         } else if (isCspError) {
           console.error(`[Safari MCP] ${extensionType} CSP blocked: ${result?.substring(0, 100)} (${Date.now() - t0}ms) — falling back to AppleScript`);
         } else if (isFailed && _nullMeansFailure.has(extensionType)) {
-          console.error(`[Safari MCP] ${extensionType} extension failed: ${result} (${Date.now() - t0}ms) — falling back to AppleScript`);
+          if (_preferAppleScript && isElementMiss) {
+            // In a profile-scoped session AppleScript is intentionally forbidden.  An
+            // exhaustive DOM lookup returning no element is a semantic miss from a
+            // healthy extension, not evidence that its backend disconnected. Preserve
+            // the exact result so callers can correct their selector instead of seeing
+            // the misleading generic "profile extension unavailable" error.
+            console.error(`[Safari MCP] ${extensionType} semantic miss via extension: ${result} (${Date.now() - t0}ms)`);
+            usedExtension = true;
+          } else {
+            console.error(`[Safari MCP] ${extensionType} extension failed: ${result} (${Date.now() - t0}ms) — falling back to AppleScript`);
+          }
         } else {
           console.error(`[Safari MCP] ${extensionType} via extension (${Date.now() - t0}ms)`);
           usedExtension = true;
@@ -1532,7 +2042,8 @@ server.tool(
       "list_tabs", {},
       () => safari.listTabs()
     );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result, null, 2) }] };
+    const safeResult = _sanitizeTabResult(result);
+    return { content: [{ type: "text", text: typeof safeResult === 'string' ? safeResult : JSON.stringify(safeResult, null, 2) }] };
   }
 );
 
@@ -1541,10 +2052,20 @@ server.tool(
   "Hot-reload the Safari MCP Bridge extension — forces it to reload its own code from disk without requiring manual Safari Preferences → Extensions → toggle. Use after editing extension/background.js or extension/content.js in the safari-mcp repo. The extension briefly disconnects during reload and auto-reconnects within ~2 seconds. NOTE: this tool itself requires the extension version already installed to support the `reload_extension` command (added in v2.9.1+). If your extension is older, trigger a manual reload once to pick up this feature.",
   {},
   async () => {
-    const result = await extensionOrFallback(
+    let result = await extensionOrFallback(
       "reload_extension", {},
       async () => "Extension fallback not available — this command requires the Safari MCP Bridge extension."
     );
+    // Proxy mode waits on the extension host inside /proxy-command. A host process
+    // performs the same generation barrier here before reporting success locally.
+    if (_isExtensionHost) {
+      // Baseline after the response, for the same suspended-old-worker reason as the
+      // proxy route above. The extension schedules runtime.reload() after responding.
+      const reloadGeneration = _extensionConnectionGeneration;
+      const reconnected = await _waitForExtensionGeneration(reloadGeneration, 30000);
+      if (!reconnected) throw new Error("Extension reload did not produce a verified reconnect within 30000ms");
+      if (result && typeof result === "object") result = { ...result, reconnected: true };
+    }
     return textResult(result);
   }
 );
@@ -1584,77 +2105,76 @@ server.tool(
       }
     }
 
+    const requestedUrl = String(url || "");
     const rawResult = await extensionOrFallback(
-      "new_tab", { url },
-      () => safari.newTab(url)
+      "new_tab", { url: requestedUrl },
+      () => safari.newTab(requestedUrl)
     );
     // AppleScript fallback returns a JSON string; extension returns an object — normalize
     let result = rawResult;
     if (typeof rawResult === 'string') {
       try { result = JSON.parse(rawResult); } catch {}
     }
-    // Sync safari.js tracking when extension handled new_tab
-    if (result?.tabIndex) {
-      safari.setActiveTabIndex(result.tabIndex);
-      _trackTab(result.tabIndex, url, mySession);
+    const safeResult = _sanitizeTabResult(result);
+    // Sync safari.js tracking when extension handled new_tab. The raw navigation URL
+    // remains internal and is never copied into the MCP response.
+    if (safeResult?.tabIndex) {
+      safari.setActiveTabIndex(safeResult.tabIndex);
+      _trackTab(safeResult.tabIndex, requestedUrl, mySession);
     }
-    if (result?.url || url) {
-      // Prefer requested URL over about:blank for tracking (page hasn't loaded yet)
-      const trackUrl = (!result?.url || result.url === 'about:blank') && url ? url : result.url;
+    if (requestedUrl) {
+      const trackUrl = requestedUrl;
       safari.setActiveTabURL(trackUrl);
-      // Also register actual URL (may differ from requested due to redirects)
       _addOwnedURL(trackUrl);
-      if (url && url !== trackUrl) _addOwnedURL(url);  // also own the requested URL (handles www redirects)
     }
-    // Blank tab (no URL requested): persist a restart-surviving ownership marker.
-    const _effectiveNewURL = (result?.url && result.url !== 'about:blank' && result.url !== 'missing value') ? result.url : url;
-    if (!_effectiveNewURL) _markBlankTabOpened();
-    return { content: [{ type: "text", text: typeof rawResult === 'string' ? rawResult : JSON.stringify(result) }] };
+    if (!requestedUrl) _markBlankTabOpened();
+    if (safeResult?.receipt) _setActiveReceipt(safeResult.receipt);
+    return { content: [{ type: "text", text: typeof safeResult === 'string' ? safeResult : JSON.stringify(safeResult) }] };
   }
 );
 
 server.tool(
   "safari_close_tab",
-  "Close the current tab. After a daemon/session restart, pass the exact marked URL returned by safari_list_tabs to recover and close only that MCP-owned tab.",
-  { url: z.string().optional().describe("Exact MCP-owned tab URL, including its mcp-tab receipt") },
-  async ({ url }) => {
+  "Close the current tab. After a daemon/session restart, pass the opaque receipt returned by safari_new_tab or safari_list_tabs.",
+  {
+    receipt: z.string().optional().describe("Opaque extension-issued tab receipt"),
+    url: z.string().optional().describe("Deprecated legacy receipt URL"),
+  },
+  async ({ receipt, url }) => {
     const activeIdx = safari.getActiveTabIndex();
-    const serverOwnedReceipt = !!url && /(?:[?#&])mcp-tab=[A-Za-z0-9_-]{12,}(?:[&#]|$)/.test(url) && _isExactURLOwned(url);
+    const supplied = receipt || url || "";
+    const token = _receiptToken(supplied) || _getActiveReceipt();
+    if (supplied && !token) return errorResult("Tab safety: invalid tab receipt");
     const result = await extensionOrFallback(
       "close_tab",
-      url ? { tabUrl: url, serverOwnedReceipt } : {},
+      token ? { receipt: token } : {},
       () => safari.closeTab()
     );
-    if (url) {
-      const tracked = [..._openedTabs.entries()].find(([, info]) => info?.url === url);
-      if (tracked) _untrackTab(tracked[0]);
-      _removeOwnedURL(url);
-    } else if (activeIdx !== null) {
-      _untrackTab(activeIdx);
-    }
+    if (activeIdx !== null) _untrackTab(activeIdx);
+    _setActiveReceipt("");
     return textResult(result);
   }
 );
 
 server.tool(
   "safari_switch_tab",
-  "Switch to a specific tab by index (use safari_list_tabs to see indices). After a daemon/session restart, also pass the exact marked URL returned by safari_list_tabs so the extension can safely recover ownership. All subsequent commands target this tab without activating Safari.",
+  "Switch to a specific tab by index. For stateless recovery, pass the opaque receipt returned by safari_new_tab or safari_list_tabs.",
   {
     index: z.coerce.number().describe("Tab index (starting from 1)"),
-    url: z.string().optional().describe("Exact MCP-owned tab URL, including its mcp-tab receipt, for stateless recovery"),
+    receipt: z.string().optional().describe("Opaque extension-issued tab receipt"),
+    url: z.string().optional().describe("Deprecated legacy receipt URL"),
   },
-  async ({ index, url }) => {
-    if (url) {
-      const hasDurableReceipt = /(?:[?#&])mcp-tab=[A-Za-z0-9_-]{12,}(?:[&#]|$)/.test(url);
-      if (!hasDurableReceipt || !_isURLOwned(url)) {
-        const msg = "⚠️ Tab safety: refusing switch_tab receipt — pass the exact marked URL returned by safari_list_tabs.";
-        console.error(`[Safari MCP] ${msg}`);
-        return errorResult(msg);
-      }
+  async ({ index, receipt, url }) => {
+    const supplied = receipt || url || "";
+    const token = _receiptToken(supplied);
+    if (supplied && !token) {
+      const msg = "⚠️ Tab safety: refusing switch_tab — invalid receipt.";
+      console.error(`[Safari MCP] ${msg}`);
+      return errorResult(msg);
     }
 
     // Tab ownership check: verify target tab is one we opened
-    if (_ownedTabURLs.size > 0) {
+    if (!process.env.SAFARI_PROFILE && _ownedTabURLs.size > 0) {
       // Get target tab's URL via list_tabs before switching
       try {
         const tabs = await extensionOrFallback(
@@ -1679,7 +2199,7 @@ server.tool(
           const trackedOrigin = _originOf(_openedTabs.get(index)?.url);
           const isTrackedRedirect = !!trackedOrigin && trackedOrigin === _originOf(target.url);
           if (!isBlankOwned && !isTrackedRedirect) {
-            const msg = `⚠️ Tab safety: refusing switch_tab to index ${index} (${target.url}) — not opened by this MCP session. Use safari_new_tab to open your own tab.`;
+            const msg = `⚠️ Tab safety: refusing switch_tab to index ${index} (${_safeUrlForOutput(target.url)}) — not opened by this MCP session. Use safari_new_tab to open your own tab.`;
             console.error(`[Safari MCP] ${msg}`);
             return errorResult(msg);
           }
@@ -1687,20 +2207,15 @@ server.tool(
       } catch {}
     }
     const result = await extensionOrFallback(
-      "switch_tab", url ? { index, tabUrl: url } : { index },
+      "switch_tab", token ? { index, receipt: token } : { index },
       () => safari.switchTab(index)
     );
+    const safeResult = _sanitizeTabResult(result);
     // Sync safari.js state so AppleScript fallback targets the correct tab
     safari.setActiveTabIndex(index);
-    if (result && typeof result === 'object' && result.url) {
-      safari.setActiveTabURL(result.url);
-      // The extension returns `owned: true` only after verifying the destination's
-      // concrete Safari tab id belongs to this MCP session. Redirects can change the
-      // URL after new_tab (for example /dashboard -> /login), so register that actual
-      // URL only from this ownership receipt — never from an AppleScript result.
-      if (result.owned === true) _addOwnedURL(result.url);
-    }
-    return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    if (safeResult?.safeUrl) safari.setActiveTabURL(safeResult.safeUrl);
+    if (safeResult?.receipt || token) _setActiveReceipt(safeResult?.receipt || token);
+    return { content: [{ type: "text", text: JSON.stringify(safeResult) }] };
   }
 );
 
@@ -2014,7 +2529,7 @@ server.tool(
 
 server.tool(
   "safari_run_script",
-  "Batch multiple Safari actions in ONE call. Steps: [{action, args}]. Actions match other safari_* tool names without prefix (e.g. 'navigate', 'click', 'fill', 'evaluate', 'readPage').",
+  "Batch Safari actions in one MCP session. Named profiles use the verified extension and support: newTab, switchTab, getReceipt, listTabs, closeTab, navigate, navigateAndRead, readPage, snapshot, getElementInfo, querySelectorAll, waitFor, waitForTime, click, fill, fillForm, clearField, typeText, selectOption, pressKey, scroll, scrollTo, scrollToElement, hover, evaluate, reload, goBack, goForward. Non-profile mode retains the legacy action set. Use getReceipt after a cross-origin redirect.",
   {
     steps: z.array(z.object({
       action: z.string().describe("Action name (e.g. 'navigate', 'click', 'fill')"),
@@ -2022,27 +2537,53 @@ server.tool(
     })).describe("Array of steps to execute sequentially"),
   },
   async ({ steps }) => {
-    // Ownership is enforced PER STEP as the batch runs (not just pre-flight): a batch
-    // can change the active tab mid-run (switchTab/navigate/closeTab), so each
-    // non-read-only step re-checks that the tab it will land on is owned by this
-    // session. Tab-opening steps register ownership exactly like their standalone
-    // tools (safari_navigate pre-registers its destination URL).
-    const onStep = (action, stepArgs) => {
-      if (action === "newTab") { _markBlankTabOpened(); return; }
-      if (action === "navigate" || action === "navigateAndRead") {
-        _assertTabOwnership(`run_script:${action}`);
-        const u = stepArgs && typeof stepArgs.url === "string" ? stepArgs.url : null;
-        if (u) {
-          _addOwnedURL(u);
-          // The engine normalizes scheme-less URLs to https:// — own the final form too.
-          if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(u)) _addOwnedURL("https://" + u);
+    // Preserve the full historical action surface for non-profile installations.
+    // Named-profile sessions cannot use it because safari.runScript drives Safari via
+    // AppleScript and loses the verified profile/tab-id boundary; they use the
+    // extension-only dispatcher below.
+    if (!process.env.SAFARI_PROFILE) {
+      const onStep = (action, stepArgs) => {
+        if (action === "newTab") { _markBlankTabOpened(); return; }
+        if (action === "navigate" || action === "navigateAndRead") {
+          _assertTabOwnership(`run_script:${action}`);
+          const url = stepArgs && typeof stepArgs.url === "string" ? stepArgs.url : null;
+          if (url) {
+            _addOwnedURL(url);
+            if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(url)) _addOwnedURL("https://" + url);
+          }
+          return;
         }
-        return;
+        if (!_RUNSCRIPT_OWNERSHIP_EXEMPT.has(action)) _assertTabOwnership(`run_script:${action}`);
+      };
+      return textResult(await safari.runScript({ steps, onStep }));
+    }
+
+    // Keep every step in one MCP request/session and route it through
+    // extensionOrFallback. In a named Safari profile this is extension-only; the old
+    // safari.runScript path invoked AppleScript directly and also passed object args to
+    // positional functions such as newTab(url), producing `u.split is not a function`.
+    const results = [];
+    const stopOnSemanticMiss = new Set([
+      "newTab", "switchTab", "closeTab", "navigate", "navigateAndRead", "waitFor",
+      "click", "fill", "fillForm", "clearField", "typeText", "selectOption",
+      "pressKey", "scroll", "scrollTo", "scrollToElement", "hover", "evaluate",
+      "reload", "goBack", "goForward",
+    ]);
+    for (const step of steps) {
+      try {
+        const result = await _runExtensionBatchAction(step.action, step.args || {});
+        const semanticFailure = _isBatchSemanticFailure(result);
+        if (semanticFailure && stopOnSemanticMiss.has(step.action)) {
+          results.push({ action: step.action, error: result });
+          break;
+        }
+        results.push({ action: step.action, result });
+      } catch (err) {
+        results.push({ action: step.action, error: err?.message || String(err) });
+        break;
       }
-      if (!_RUNSCRIPT_OWNERSHIP_EXEMPT.has(action)) _assertTabOwnership(`run_script:${action}`);
-    };
-    const result = await safari.runScript({ steps, onStep });
-    return textResult(result);
+    }
+    return textResult(JSON.stringify(results));
   }
 );
 

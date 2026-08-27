@@ -9,6 +9,39 @@ const BRIDGE_PORTS = [9224, 9228, 9232, 9236];
 let HTTP_URL = `http://127.0.0.1:${BRIDGE_PORTS[0]}`;
 let isConnected = false;
 let pollAbort = null;
+let _bridgeAuthTokenPromise = null;
+const _bridgeWorkerId = (() => {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+})();
+let _bridgeWorkerSuperseded = false;
+
+async function _bridgeAuthToken() {
+  if (!_bridgeAuthTokenPromise) {
+    _bridgeAuthTokenPromise = fetch(browser.runtime.getURL("bridge-auth-token"), {
+      cache: "no-store",
+    }).then(async (response) => {
+      if (!response.ok) throw new Error("Safari MCP bridge authentication resource is unavailable");
+      const token = (await response.text()).trim();
+      if (!/^[0-9a-f]{64}$/.test(token)) {
+        throw new Error("Safari MCP bridge authentication resource is invalid");
+      }
+      return token;
+    }).catch((error) => {
+      _bridgeAuthTokenPromise = null;
+      throw error;
+    });
+  }
+  return _bridgeAuthTokenPromise;
+}
+
+async function _bridgeFetch(url, init = {}) {
+  const headers = new Headers(init.headers || {});
+  headers.set("X-Safari-MCP-Token", await _bridgeAuthToken());
+  headers.set("X-Safari-MCP-Worker", _bridgeWorkerId);
+  return fetch(url, { ...init, headers });
+}
 let _targetProfile = null;   // Profile name from server (e.g. "Automations")
 let _profileWindowId = null; // Discovered windowId for the profile (shared default)
 // Per-session profile window. One Safari profile can hold SEVERAL windows once
@@ -25,6 +58,210 @@ function _windowForSession(sessionId) {
 function _adoptWindowForSession(sessionId, windowId) {
   if (!windowId) return;
   _sessionWindowIds.set(sessionId || _DEFAULT_SESSION, windowId);
+}
+
+function _windowQuery(windowId) {
+  return windowId ? { windowId } : { currentWindow: true };
+}
+
+function _safeTabUrl(rawUrl) {
+  const raw = String(rawUrl || "");
+  if (!raw) return "unknown";
+  if (raw === "about:blank") return raw;
+  try {
+    const parsed = new URL(raw);
+    if (/^https?:$/.test(parsed.protocol)) return parsed.origin + parsed.pathname;
+    return parsed.protocol ? parsed.protocol.replace(/:$/, "") + ":" : "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+function _receiptOrigin(rawUrl) {
+  const raw = String(rawUrl || "");
+  if (raw === "about:blank") return raw;
+  try {
+    const parsed = new URL(raw);
+    return /^https?:$/.test(parsed.protocol) ? parsed.origin : "";
+  } catch {
+    return "";
+  }
+}
+
+function _receiptTokenFromPayload(payload) {
+  const direct = String(payload?.receipt || "");
+  if (/^[A-Za-z0-9_-]{24,}$/.test(direct)) return direct;
+  // Backward-compatible input only. The synthetic URL is never navigated to and its
+  // origin/path are not authorization evidence; only the extension-minted token is.
+  return _extractMcpTabMarker(payload?.receiptUrl || payload?.url || payload?.tabUrl || "");
+}
+
+async function _listTabsForSession(sessionId) {
+  const tabs = await browser.tabs.query(_windowQuery(_windowForSession(sessionId)));
+  return tabs.map((tab) => {
+    const receipt = _receiptForOwnedTab(sessionId, tab);
+    return {
+      index: tab.index + 1,
+      title: tab.title,
+      safeUrl: _safeTabUrl(tab.url),
+      ...(receipt ? { receipt } : {}),
+      active: tab.active,
+    };
+  });
+}
+
+async function _newTabForSession(sessionId, payload) {
+  const sid = sessionId || _DEFAULT_SESSION;
+  const hadSessionWindow = _sessionWindowIds.has(sid);
+  const preferredWindowId = _windowForSession(sessionId);
+  let profileWindow = preferredWindowId
+    ? await browser.windows.get(preferredWindowId).catch(() => null)
+    : null;
+
+  if (!profileWindow) {
+    const existingWindows = await browser.windows.getAll();
+    profileWindow = existingWindows[0] || null;
+  }
+
+  let newTab;
+  if (!profileWindow) {
+    // The extension worker is scoped to this Safari profile, so a WebExtension
+    // window created here belongs to the verified profile. `focused: false`
+    // keeps the recovery entirely in the background and avoids UI scripting.
+    profileWindow = await browser.windows.create({ url: "about:blank", focused: false });
+    const bootstrapTabs = profileWindow.tabs?.length
+      ? profileWindow.tabs
+      : await browser.tabs.query({ windowId: profileWindow.id });
+    newTab = bootstrapTabs[0] || await browser.tabs.create({
+      url: "about:blank",
+      active: false,
+      windowId: profileWindow.id,
+    });
+  } else {
+    newTab = await browser.tabs.create({
+      url: "about:blank",
+      active: false,
+      windowId: profileWindow.id,
+    });
+  }
+
+  const openedWindowId = newTab.windowId || profileWindow.id;
+  // A session that already owns a window must not move the shared default for every
+  // other session merely because it opened another tab in its own window.
+  if (!_profileWindowId || !hadSessionWindow) {
+    _profileWindowId = openedWindowId;
+    browser.storage.local.set({ mcpProfileWindowId: _profileWindowId }).catch(() => {});
+  }
+  _adoptWindowForSession(sessionId, openedWindowId);
+
+  const rawNavigationUrl = String(payload.url || "");
+  const trackUrl = rawNavigationUrl || newTab.url || "about:blank";
+  _setSessionTab(sessionId, newTab.id, trackUrl);
+  await _addOwnedTab(sessionId, newTab.id);
+  // Ownership is durable before navigation starts. Do not await a slow navigation:
+  // Safari may otherwise hold this command past the bridge timeout. tabs.update itself
+  // resolves once Safari accepts the new URL; it does not wait for the page load. Minting
+  // before this point bound the receipt digest to about:blank, so the first real command
+  // could see the destination URL and reject its own freshly issued receipt as stale.
+  let receiptTab = newTab;
+  if (rawNavigationUrl && rawNavigationUrl !== "about:blank") {
+    // Pass the caller's exact string. Parsing is permitted for validation/output, but
+    // serializing it would corrupt signed query bytes and application fragments.
+    const acceptedTab = await browser.tabs.update(newTab.id, { url: rawNavigationUrl }).catch(() => {
+      console.warn("Safari MCP: new tab navigation failed");
+      return null;
+    });
+    if (acceptedTab) receiptTab = acceptedTab;
+  }
+  const receiptIdentity = receiptTab.url || rawNavigationUrl || "about:blank";
+  const receipt = await _issueTabReceipt(receiptTab, {
+    receiptOrigin: _receiptOrigin(receiptIdentity),
+    identityUrl: receiptIdentity,
+  });
+  return {
+    title: newTab.title || "",
+    safeUrl: _safeTabUrl(receiptIdentity),
+    ...(receipt ? { receipt } : {}),
+    tabIndex: newTab.index + 1,
+  };
+}
+
+async function _closeTabForSession(sessionId, targetTab, payload) {
+  const explicitIndex = Number.isInteger(Number(payload.index)) && Number(payload.index) > 0;
+  // An explicit index is local to the session's window. Without one, targetTab is
+  // already the concrete ownership-checked tab, so its own window is authoritative.
+  const closeWindowId = explicitIndex
+    ? (_windowForSession(sessionId) || targetTab?.windowId)
+    : (targetTab?.windowId || _windowForSession(sessionId));
+  const windowTabs = await browser.tabs.query(_windowQuery(closeWindowId));
+  const isLastTab = windowTabs.length <= 1;
+
+  if (explicitIndex) {
+    const requestedIndex = Number(payload.index);
+    const target = windowTabs.find((tab) => tab.index + 1 === requestedIndex)
+      || windowTabs[requestedIndex - 1];
+    if (!target) return "Tab not found at index " + requestedIndex;
+    if (payload._receiptTabId && target.id !== payload._receiptTabId) {
+      throw new Error("Tab safety: receipt and requested index identify different tabs");
+    }
+    if (payload._receiptTabId && !_isTabOwnedBySession(sessionId, target.id)) {
+      await _addOwnedTab(sessionId, target.id);
+    }
+    if (!_isTabOwnedBySession(sessionId, target.id)) {
+      throw new Error(`⚠️ Tab safety: refusing to close tab ${requestedIndex} (${_safeTabUrl(target.url)}) — not opened by this MCP session.`);
+    }
+    await _removeOwnedTab(sessionId, target.id);
+    if (isLastTab) {
+      await browser.tabs.update(target.id, { url: "about:blank" });
+      return "Last remaining tab blanked instead of closed (closing it would quit Safari)";
+    }
+    await browser.tabs.remove(target.id);
+    return "Tab closed";
+  }
+
+  if (payload._receiptTabId && !_isTabOwnedBySession(sessionId, targetTab.id)) {
+    await _addOwnedTab(sessionId, targetTab.id);
+  }
+  await _removeOwnedTab(sessionId, targetTab.id);
+  if (isLastTab) {
+    await browser.tabs.update(targetTab.id, { url: "about:blank" });
+    return "Last remaining tab blanked instead of closed (closing it would quit Safari)";
+  }
+  await browser.tabs.remove(targetTab.id);
+  return "Tab closed";
+}
+
+async function _switchTabForSession(sessionId, targetTab, payload) {
+  const requestedIndex = Number(payload.index);
+  const suppliedReceipt = _receiptTokenFromPayload(payload);
+  const switchWindowId = suppliedReceipt
+    ? targetTab?.windowId
+    : (_windowForSession(sessionId) || targetTab?.windowId);
+  const tabs = await browser.tabs.query(_windowQuery(switchWindowId));
+  const target = tabs.find((tab) => tab.index + 1 === requestedIndex)
+    || tabs[requestedIndex - 1];
+  if (!target) return "Tab not found at index " + requestedIndex;
+  if (suppliedReceipt && (!targetTab || target.id !== targetTab.id)) {
+    throw new Error("Tab safety: receipt and requested index identify different tabs");
+  }
+
+  if (!_isTabOwnedBySession(sessionId, target.id)) {
+    if (suppliedReceipt && targetTab && target.id === targetTab.id) {
+      await _addOwnedTab(sessionId, target.id);
+    } else {
+      throw new Error(`⚠️ Tab safety: refusing "switch_tab" to tab ${target.id} (${_safeTabUrl(target.url)}) — not opened by this MCP session. Use safari_new_tab first.`);
+    }
+  }
+  // Do not visually activate the tab. Extension APIs work on background tabs; only
+  // the session's logical target and window need to change.
+  _adoptWindowForSession(sessionId, target.windowId);
+  _setSessionTab(sessionId, target.id, target.url);
+  return {
+    title: target.title,
+    safeUrl: _safeTabUrl(target.url),
+    ...(_receiptForOwnedTab(sessionId, target) ? { receipt: _receiptForOwnedTab(sessionId, target) } : {}),
+    owned: true,
+  };
 }
 let _enabled = true;         // Toggle from popup — when false, stops polling and rejects commands
 let _reconnectTimer = null;  // Single reconnect timer — prevents exponential growth
@@ -102,7 +339,7 @@ function updateBadge(text) {
 
 let _connecting = false; // re-entrancy lock — the startup promise and the alarm can race into connect()
 async function connect() {
-  if (!_enabled) return;
+  if (!_enabled || _bridgeWorkerSuperseded) return;
   // One connect at a time: two near-simultaneous calls (cold start + alarm wake)
   // could each spawn a poll loop before the other assigned pollAbort.
   if (_connecting) return;
@@ -125,7 +362,7 @@ async function connect() {
       // Version the handshake in the URL so stale workers still cached by Safari are
       // rejected before they reach the legacy profile probe that creates a visible tab.
       // A query parameter keeps this a CORS-simple POST (a custom header would preflight).
-      const res = await fetch(`${HTTP_URL}/connect?verifier=existing-tab-v1`, {
+      const res = await _bridgeFetch(`${HTTP_URL}/connect?verifier=existing-tab-v1`, {
         method: "POST",
         signal: AbortSignal.timeout(1500),
       });
@@ -141,7 +378,7 @@ async function connect() {
           console.log(`Safari MCP: bridge ${candidate} wants profile "${data.profile}" — trying next bridge`);
           continue;
         }
-        await fetch(`${HTTP_URL}/extension-verified`, {
+        await _bridgeFetch(`${HTTP_URL}/extension-verified`, {
           method: "POST",
           signal: AbortSignal.timeout(1500),
         }).catch(() => {});
@@ -191,10 +428,24 @@ async function pollForCommands() {
       // This active fetch keeps the service worker alive in Safari
       // 90s safety timeout prevents stuck connections from blocking forever
       const timeout = setTimeout(() => pollAbort.abort(), 90000);
-      const res = await fetch(`${HTTP_URL}/poll`, {
+      const res = await _bridgeFetch(`${HTTP_URL}/poll`, {
         signal: pollAbort.signal,
       });
       clearTimeout(timeout);
+      if (res.status === 423) {
+        // A replacement worker completed profile verification. This stale worker must
+        // stay dormant until Safari reloads it; reconnecting would steal the lease back.
+        _bridgeWorkerSuperseded = true;
+        isConnected = false;
+        updateBadge("");
+        return;
+      }
+      if (res.status === 401 || res.status === 403 || res.status === 409) {
+        isConnected = false;
+        updateBadge("");
+        scheduleReconnect();
+        return;
+      }
       if (res.status === 200) {
         // A single malformed/truncated body must NOT tear down the poll loop — a bad
         // packet used to throw SyntaxError here, fall through to "server gone", and
@@ -210,7 +461,7 @@ async function pollForCommands() {
         // clock forever and mask a genuinely dead worker.
         if (msg) {
           const beat = setInterval(() => {
-            fetch(`${HTTP_URL}/heartbeat`, { method: "POST" }).catch(() => {});
+            _bridgeFetch(`${HTTP_URL}/heartbeat`, { method: "POST" }).catch(() => {});
           }, 5000);
           try { await executeAndReply(msg); } finally { clearInterval(beat); }
         }
@@ -247,7 +498,7 @@ async function executeAndReply(msg) {
   }
 
   try {
-    await fetch(`${HTTP_URL}/result`, {
+    await _bridgeFetch(`${HTTP_URL}/result`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(response),
@@ -265,18 +516,44 @@ async function handleCommand(type, payload) {
   // Receipt-based targeting depends on durable ownership state, so hydrate it
   // before resolving the tab (not only before consulting the write guard).
   await _hydrateOwnedTabs();
+  const suppliedReceipt = (type === "new_tab" || type === "list_tabs")
+    ? ""
+    : _receiptTokenFromPayload(payload);
+  const allowReceiptOriginChange = type === "get_tab_receipt";
+  let receiptResolved = false;
   // new_tab CREATES its target, so a failure to resolve an existing one must not stop
   // it. Once a profile holds several windows, resolution legitimately fails with
   // "a same-URL tab exists in another window" — which used to make new_tab, the very
   // command that recovers from that state, unusable.
   let targetTab;
   try {
-    targetTab = await getTargetTab(payload.tabUrl, sessionId);
+    if (suppliedReceipt) {
+      targetTab = await _resolveReceiptTab(suppliedReceipt, {
+        allowOriginChange: allowReceiptOriginChange,
+      });
+      if (!targetTab) {
+        throw new Error("Tab safety: receipt is forged, stale, ambiguous, or not valid for this origin");
+      }
+      receiptResolved = true;
+      payload._receiptTabId = targetTab.id;
+      // A valid receipt names one concrete tab. It may move a stateless session into
+      // that tab's extension-owned window, but never into an arbitrary window by URL.
+      _adoptWindowForSession(sessionId, targetTab.windowId);
+    } else {
+      targetTab = await getTargetTab(null, sessionId);
+    }
   } catch (resolveErr) {
     if (type !== "new_tab") throw resolveErr;
     targetTab = { id: null, windowId: null, url: "" };
   }
   const tabId = targetTab.id;
+
+  // getReceipt is a capability rotation, not an ownership bootstrap. A verified old
+  // receipt may follow its tab across an origin-changing redirect; without one, the
+  // caller must already own the concrete target tab in this exact MCP session.
+  if (type === "get_tab_receipt" && !_hasTabReceiptAuthority(sessionId, tabId, receiptResolved)) {
+    throw new Error("Tab safety: getReceipt requires an existing receipt or a tab already owned by this MCP session");
+  }
 
   // Safety: never operate on tabs outside this session's profile window. Checked against
   // the session's own window — with one shared id, a session working in a second window
@@ -293,16 +570,16 @@ async function handleCommand(type, payload) {
   // Guarding the generic pre-resolved tab here can reject the user's harmless active
   // tab after a service-worker wake, before we ever inspect the intended destination.
   if (type !== "new_tab" && type !== "switch_tab" && !_readOnlyCommands.has(type) && !_isTabOwnedBySession(sessionId, tabId)) {
-    // Some MCP hosts create a fresh protocol session for every tool call. Let that
-    // stateless caller resume only a tab that (a) the extension itself created,
-    // (b) carries the same durable high-entropy mcp-tab receipt, and (c) remains
-    // on the same origin. Ordinary user tabs stay isolated even after SPA routing.
-    if (_canAdoptMarkedOwnedTab(targetTab, payload.tabUrl) || _canAdoptServerOwnedReceipt(targetTab, payload)) {
-      await _addOwnedTab(sessionId, tabId, payload.tabUrl);
+    if (receiptResolved) {
+      // getReceipt may use an old origin-bound token only as a locator, then rotate it
+      // explicitly. switch/close verify their concrete index/target inside the helper.
+      if (type !== "get_tab_receipt" && type !== "close_tab") {
+        await _addOwnedTab(sessionId, tabId);
+      }
     } else {
       const anyOwned = _sessionOwnedTabs.has(sessionId) && _sessionOwnedTabs.get(sessionId).size > 0;
       if (anyOwned) {
-        throw new Error(`⚠️ Tab safety: refusing "${type}" on tab ${tabId} (${targetTab.url || 'unknown'}) — not opened by this MCP session. Use safari_new_tab first.`);
+        throw new Error(`⚠️ Tab safety: refusing "${type}" on tab ${tabId} (${_safeTabUrl(targetTab.url)}) — not opened by this MCP session. Use safari_new_tab first.`);
       }
       // No tabs owned yet → allow, for sessions that never call new_tab. That leniency is
       // survivable for a write (worst case: it edits the page the user is already on) but not
@@ -310,7 +587,7 @@ async function handleCommand(type, payload) {
       // after a transport drop, which reports owning nothing while its tab is still open —
       // the state in which close_tab destroyed a user's tab (#68).
       if (_destructiveTabCommands.has(type)) {
-        throw new Error(`⚠️ Tab safety: refusing "${type}" on tab ${tabId} (${targetTab.url || 'unknown'}) — this session owns no tabs, so it has none to close. Use safari_new_tab first.`);
+        throw new Error(`⚠️ Tab safety: refusing "${type}" on tab ${tabId} (${_safeTabUrl(targetTab.url)}) — this session owns no tabs, so it has none to close. Use safari_new_tab first.`);
       }
     }
   }
@@ -388,6 +665,29 @@ async function handleCommand(type, payload) {
       return targetTab.url;
     }
 
+    case "get_tab_receipt": {
+      // Rotate entirely in the extension worker. The old token can locate this exact
+      // tab after a redirect, but it cannot authorize any page mutation on the new
+      // origin. No MAIN-world injection and no page URL/history/hash mutation occurs.
+      const liveTab = await browser.tabs.get(tabId);
+      const origin = _receiptOrigin(liveTab.url);
+      if (!origin) {
+        throw new Error("Cannot issue a receipt for this tab URL");
+      }
+      const receipt = await _issueTabReceipt(liveTab, {
+        receiptOrigin: origin,
+        identityUrl: liveTab.url,
+      });
+      await _addOwnedTab(sessionId, tabId);
+      _adoptWindowForSession(sessionId, liveTab.windowId);
+      _setSessionTab(sessionId, tabId, liveTab.url);
+      return {
+        index: liveTab.index + 1,
+        safeUrl: _safeTabUrl(liveTab.url),
+        receipt,
+      };
+    }
+
     // Which WINDOW holds this session's tab, and where is the tab inside it. The
     // AppleScript side picks "the first window whose name starts with the profile" —
     // but a profile can hold several windows (measured: four "אוטומציות" at once), so
@@ -437,6 +737,10 @@ async function handleCommand(type, payload) {
     // bypassing the need for manual Safari → Preferences → Extensions → toggle.
     // The WebSocket will disconnect as a side effect; the extension auto-reconnects.
     case "reload_extension": {
+      // Checkpoint the current exact URL identity before the worker disappears. This
+      // does not move receiptOrigin across redirects; it only lets hydration prove
+      // which concrete live tab survived the reload.
+      await _refreshAllReceiptIdentities();
       // Respond BEFORE reload so the MCP server sees a success result.
       // Delay the actual reload by a tick so the response can flush over the wire.
       setTimeout(() => {
@@ -446,14 +750,23 @@ async function handleCommand(type, payload) {
     }
 
     case "read_page": {
-      return await execInTab((sel, maxLen) => {
+      const readPage = (sel, maxLen) => {
         if (sel) {
           const el = document.querySelector(sel);
-          if (!el) return "Element not found: " + sel;
+          if (!el) return null;
           return el.value !== undefined && el.value !== "" ? el.value.substring(0, maxLen) : (el.innerText || el.textContent || "").substring(0, maxLen);
         }
-        return JSON.stringify({ title: document.title, url: location.href, text: document.body.innerText.substring(0, maxLen) });
-      }, [payload.selector || null, payload.maxLength || 50000], tabId);
+        const bodyText = document.body?.innerText || document.body?.textContent || "";
+        return JSON.stringify({ title: document.title, url: location.href, text: bodyText.substring(0, maxLen) });
+      };
+      const args = [payload.selector || null, payload.maxLength || 50000];
+      if (payload.selector) {
+        const frameResult = await execInAllFrames(readPage, args, tabId);
+        return frameResult !== null && frameResult !== undefined
+          ? frameResult
+          : "Element not found: " + payload.selector;
+      }
+      return await execInTab(readPage, args, tabId);
     }
 
     case "get_source": {
@@ -886,10 +1199,47 @@ async function handleCommand(type, payload) {
 
       // Fallback: if element not found in main frame, try all frames (cross-origin iframes)
       if (result && (result.startsWith("Element not found") || result === "No click target")) {
-        const iframeResult = await execInAllFrames((selector, text) => {
+        const iframeArgs = [payload.selector, payload.text, payload.ref];
+        const iframeResult = await execInFirstMatchingFrameMutating((selector, text, ref) => {
+          const deepQuery = (query, root = document) => {
+            const direct = root.querySelector(query);
+            if (direct) return direct;
+            for (const host of root.querySelectorAll("*")) {
+              if (!host.shadowRoot) continue;
+              const nested = deepQuery(query, host.shadowRoot);
+              if (nested) return nested;
+            }
+            return null;
+          };
+          if (ref) {
+            const safeRef = String(ref).replace(/["\\]/g, "\\$&");
+            return !!deepQuery('[data-mcp-ref="' + safeRef + '"]');
+          }
+          if (selector) return !!deepQuery(selector);
+          if (!text) return false;
+          const candidates = document.querySelectorAll("button, a, [role='button'], input[type='submit']");
+          for (let i = 0; i < candidates.length; i++) {
+            const value = (candidates[i].innerText || candidates[i].textContent || "").trim();
+            if (value && (value === text || value.includes(text) || text.includes(value))) return true;
+          }
+          return false;
+        }, iframeArgs, (selector, text, ref) => {
+          const deepQuery = (query, root = document) => {
+            const direct = root.querySelector(query);
+            if (direct) return direct;
+            for (const host of root.querySelectorAll("*")) {
+              if (!host.shadowRoot) continue;
+              const nested = deepQuery(query, host.shadowRoot);
+              if (nested) return nested;
+            }
+            return null;
+          };
           let el = null;
-          if (selector) {
-            el = document.querySelector(selector);
+          if (ref) {
+            const safeRef = String(ref).replace(/["\\]/g, "\\$&");
+            el = deepQuery('[data-mcp-ref="' + safeRef + '"]');
+          } else if (selector) {
+            el = deepQuery(selector);
           } else if (text) {
             // Search interactive elements by text
             const candidates = document.querySelectorAll("button, a, [role='button'], input[type='submit']");
@@ -901,7 +1251,7 @@ async function handleCommand(type, payload) {
             if (!el) {
               for (let i = 0; i < candidates.length; i++) {
                 const t = (candidates[i].innerText || candidates[i].textContent || "").trim();
-                if (t.includes(text) || text.includes(t)) { el = candidates[i]; break; }
+                if (t && (t.includes(text) || text.includes(t))) { el = candidates[i]; break; }
               }
             }
           }
@@ -909,7 +1259,7 @@ async function handleCommand(type, payload) {
           el.scrollIntoView({ block: "center", behavior: "instant" });
           el.click();
           return "Clicked (iframe): " + el.tagName + (el.textContent ? ' "' + el.textContent.trim().substring(0, 50) + '"' : "");
-        }, [payload.selector, payload.text], tabId);
+        }, iframeArgs, tabId);
         if (iframeResult) return iframeResult;
       }
       return result;
@@ -958,7 +1308,17 @@ async function handleCommand(type, payload) {
         // Pages without the content bridge retain the framework-aware fallback below.
       }
       const fillFn = (selector, value) => {
-        const el = (window.__mcpDeepQuery || document.querySelector.bind(document))(selector);
+        const localDeepQuery = (query, root = document) => {
+          const direct = root.querySelector(query);
+          if (direct) return direct;
+          for (const host of root.querySelectorAll("*")) {
+            if (!host.shadowRoot) continue;
+            const nested = localDeepQuery(query, host.shadowRoot);
+            if (nested) return nested;
+          }
+          return null;
+        };
+        const el = window.__mcpDeepQuery ? window.__mcpDeepQuery(selector) : localDeepQuery(selector);
         if (!el) return "Element not found: " + selector;
         el.focus();
         if (el.isContentEditable) {
@@ -1118,7 +1478,25 @@ async function handleCommand(type, payload) {
       // Try main frame first, fall back to all frames (cross-origin iframes)
       const result = await execInTab(fillFn, [payload.selector, payload.value], tabId);
       if (result && result.startsWith("Element not found")) {
-        const iframeResult = await execInAllFrames(fillFn, [payload.selector, payload.value], tabId);
+        const iframeResult = await execInFirstMatchingFrameMutating(
+          (selector) => {
+            const deepQuery = (query, root = document) => {
+              const direct = root.querySelector(query);
+              if (direct) return direct;
+              for (const host of root.querySelectorAll("*")) {
+                if (!host.shadowRoot) continue;
+                const nested = deepQuery(query, host.shadowRoot);
+                if (nested) return nested;
+              }
+              return null;
+            };
+            return !!deepQuery(selector);
+          },
+          [payload.selector],
+          fillFn,
+          [payload.selector, payload.value],
+          tabId
+        );
         if (iframeResult && !iframeResult.startsWith("Element not found")) return iframeResult;
       }
       return result;
@@ -1126,7 +1504,11 @@ async function handleCommand(type, payload) {
 
     case "type_text": {
       const result = await execInTab((text, selector) => {
-        if (selector) { const el = (window.__mcpDeepQuery || document.querySelector.bind(document))(selector); if (el) el.focus(); }
+        if (selector) {
+          const el = (window.__mcpDeepQuery || document.querySelector.bind(document))(selector);
+          if (!el) return "Element not found: " + selector;
+          el.focus();
+        }
 
         // === Strategy 1: ProseMirror native API ===
         // ProseMirror stores the EditorView on .ProseMirror element via pmViewDesc
@@ -1220,10 +1602,37 @@ async function handleCommand(type, payload) {
       }, [payload.text, payload.selector], tabId);
 
       // Fallback: if typing failed in main frame, try all frames (cross-origin iframes)
-      if (result === "Typed 0 chars" || !result) {
-        const iframeResult = await execInAllFrames((text) => {
-          const el = document.activeElement;
+      if (result === "Typed 0 chars" || !result || result.startsWith("Element not found")) {
+        const iframeResult = await execInFirstMatchingFrameMutating((selector) => {
+          if (selector) {
+            const deepQuery = (query, root = document) => {
+              const direct = root.querySelector(query);
+              if (direct) return direct;
+              for (const host of root.querySelectorAll("*")) {
+                if (!host.shadowRoot) continue;
+                const nested = deepQuery(query, host.shadowRoot);
+                if (nested) return nested;
+              }
+              return null;
+            };
+            return !!deepQuery(selector);
+          }
+          const active = document.activeElement;
+          return !!active && active !== document.body;
+        }, [payload.selector], (text, selector) => {
+          const deepQuery = (query, root = document) => {
+            const direct = root.querySelector(query);
+            if (direct) return direct;
+            for (const host of root.querySelectorAll("*")) {
+              if (!host.shadowRoot) continue;
+              const nested = deepQuery(query, host.shadowRoot);
+              if (nested) return nested;
+            }
+            return null;
+          };
+          const el = selector ? deepQuery(selector) : document.activeElement;
           if (!el || el === document.body) return null;
+          if (selector) el.focus();
           // Try execCommand insert
           const ok = document.execCommand("insertText", false, text);
           if (ok) return "Typed " + text.length + " chars (iframe execCommand)";
@@ -1240,7 +1649,7 @@ async function handleCommand(type, payload) {
             return "Typed " + text.length + " chars (iframe input)";
           }
           return null;
-        }, [payload.text], tabId);
+        }, [payload.text, payload.selector], tabId);
         if (iframeResult) return iframeResult;
       }
       return result;
@@ -1274,10 +1683,7 @@ async function handleCommand(type, payload) {
 
     // --- Tab Management ---
     case "list_tabs": {
-      // Use profile window if known, otherwise currentWindow
-      const query = _profileWindowId ? { windowId: _profileWindowId } : { currentWindow: true };
-      const tabs = await browser.tabs.query(query);
-      return tabs.map(t => ({ index: t.index + 1, title: t.title, url: t.url, active: t.active }));
+      return await _listTabsForSession(sessionId);
     }
 
     case "new_tab": {
@@ -1285,56 +1691,7 @@ async function handleCommand(type, payload) {
       // On authenticated/slow apps, browser.tabs.create({url}) can wait for navigation
       // long enough to exceed the bridge timeout even though the tab was created. That
       // strands an unowned tab and makes the caller believe creation failed.
-      let profileWindow = null;
-      if (_profileWindowId) {
-        profileWindow = await browser.windows.get(_profileWindowId).catch(() => null);
-      }
-      if (!profileWindow) {
-        const existingWindows = await browser.windows.getAll();
-        profileWindow = existingWindows[0] || null;
-      }
-
-      let newTab;
-      if (!profileWindow) {
-        // The extension worker is scoped to this Safari profile, so a WebExtension
-        // window created here belongs to the verified profile. `focused: false`
-        // keeps the recovery entirely in the background and avoids UI scripting.
-        profileWindow = await browser.windows.create({ url: "about:blank", focused: false });
-        const bootstrapTabs = profileWindow.tabs?.length
-          ? profileWindow.tabs
-          : await browser.tabs.query({ windowId: profileWindow.id });
-        newTab = bootstrapTabs[0] || await browser.tabs.create({
-          url: "about:blank",
-          active: false,
-          windowId: profileWindow.id,
-        });
-      } else {
-        newTab = await browser.tabs.create({
-          url: "about:blank",
-          active: false,
-          windowId: profileWindow.id,
-        });
-      }
-
-      _profileWindowId = profileWindow.id || newTab.windowId;
-      // Bind this session to the window it just opened a tab in. Once several windows
-      // of one profile exist, the shared _profileWindowId points at only one of them
-      // and every other session is locked out of its own tabs.
-      _adoptWindowForSession(sessionId, newTab.windowId || profileWindow.id);
-      browser.storage.local.set({ mcpProfileWindowId: _profileWindowId }).catch(() => {});
-      // CRITICAL: Set new tab as the target for this session's subsequent commands
-      const trackUrl = payload.url || newTab.url || "about:blank";
-      _setSessionTab(sessionId, newTab.id, trackUrl);
-      // Register tab as owned by this session
-      await _addOwnedTab(sessionId, newTab.id, payload.url);
-      // Start navigation only after ownership is durable. Do not await it: Safari can
-      // hold the promise until a slow page finishes loading, recreating the timeout.
-      if (payload.url && payload.url !== "about:blank") {
-        browser.tabs.update(newTab.id, { url: payload.url }).catch((err) => {
-          console.warn("Safari MCP: new tab navigation failed:", err.message);
-        });
-      }
-      return { title: newTab.title || "", url: newTab.url || "about:blank", tabIndex: newTab.index + 1 };
+      return await _newTabForSession(sessionId, payload);
     }
 
     case "close_tab": {
@@ -1343,58 +1700,11 @@ async function handleCommand(type, payload) {
       // window vanish). Per-window, not global, so other-profile windows don't
       // mask it. If the target window is down to one tab, blank it instead.
       // Mirrors safari.js closeTab().
-      const _winQuery = _profileWindowId ? { windowId: _profileWindowId } : { currentWindow: true };
-      const _winTabs = await browser.tabs.query(_winQuery);
-      const _isLastTab = _winTabs.length <= 1;
-      if (payload.index) {
-        // Resolve the target from the SAME query as the last-tab count — a second
-        // query here was a TOCTOU window (a tab opened/closed between the two awaits
-        // could resolve the wrong tab or leave a stale last-tab verdict).
-        const target = _winTabs[payload.index - 1];
-        if (target) {
-          // The ownership guard above checked `tabId` — this branch closes a tab chosen by
-          // index instead, so it must be checked on its own or the guard is decorative.
-          if (!_isTabOwnedBySession(sessionId, target.id)) {
-            throw new Error(`⚠️ Tab safety: refusing to close tab ${payload.index} (${target.url || 'unknown'}) — not opened by this MCP session.`);
-          }
-          await _removeOwnedTab(sessionId, target.id);
-          if (_isLastTab) {
-            await browser.tabs.update(target.id, { url: "about:blank" });
-            return "Last remaining tab blanked instead of closed (closing it would quit Safari)";
-          }
-          await browser.tabs.remove(target.id);
-        }
-      } else {
-        await _removeOwnedTab(sessionId, tabId);
-        if (_isLastTab) {
-          await browser.tabs.update(tabId, { url: "about:blank" });
-          return "Last remaining tab blanked instead of closed (closing it would quit Safari)";
-        }
-        await browser.tabs.remove(tabId);
-      }
-      return "Tab closed";
+      return await _closeTabForSession(sessionId, targetTab, payload);
     }
 
     case "switch_tab": {
-      const query = _profileWindowId ? { windowId: _profileWindowId } : { currentWindow: true };
-      const tabs = await browser.tabs.query(query);
-      const target = tabs[payload.index - 1];
-      if (!target) return "Tab not found at index " + payload.index;
-      // The shared guard above validates the currently resolved tab, while switch_tab
-      // chooses a different destination by index. Verify that concrete destination as
-      // well so an index can never be used to jump into a user's tab.
-      if (!_isTabOwnedBySession(sessionId, target.id)) {
-        if (_canAdoptMarkedOwnedTab(target, payload.tabUrl)) {
-          await _addOwnedTab(sessionId, target.id, payload.tabUrl);
-        } else {
-          throw new Error(`⚠️ Tab safety: refusing "switch_tab" to tab ${target.id} (${target.url || 'unknown'}) — not opened by this MCP session. Use safari_new_tab first.`);
-        }
-      }
-      // Do NOT visually activate the tab — it brings Safari window to foreground.
-      // Just update the session cache so subsequent commands target this tab.
-      // Extension APIs (executeScript, etc.) work on background tabs without activation.
-      _setSessionTab(sessionId, target.id, target.url);
-      return { title: target.title, url: target.url, owned: true };
+      return await _switchTabForSession(sessionId, targetTab, payload);
     }
 
     // --- Scroll ---
@@ -1407,16 +1717,20 @@ async function handleCommand(type, payload) {
 
     // --- Wait ---
     case "wait_for": {
-      return await execInTab(async (selector, text, timeout) => {
-        const dq = window.__mcpDeepQuery || document.querySelector.bind(document);
-        const deadline = Date.now() + timeout;
-        while (Date.now() < deadline) {
+      const timeout = payload.timeout || 10000;
+      const deadline = Date.now() + timeout;
+      while (Date.now() < deadline) {
+        const found = await execInAllFrames((selector, text) => {
+          const dq = window.__mcpDeepQuery || document.querySelector.bind(document);
           if (selector && dq(selector)) return "Found: " + selector;
-          if (text && document.body?.innerText.includes(text)) return "Found text: " + text;
-          await new Promise(r => setTimeout(r, 200));
-        }
-        return "TIMEOUT after " + timeout + "ms waiting for " + (selector ? "selector: " + selector : "text: " + text);
-      }, [payload.selector, payload.text, payload.timeout || 10000], tabId);
+          const bodyText = document.body?.innerText || document.body?.textContent || "";
+          if (text && bodyText.includes(text)) return "Found text: " + text;
+          return null;
+        }, [payload.selector, payload.text], tabId);
+        if (found) return found;
+        await sleep(200);
+      }
+      return "TIMEOUT after " + timeout + "ms waiting for " + (payload.selector ? "selector: " + payload.selector : "text: " + payload.text);
     }
 
     // --- Hover ---
@@ -1468,7 +1782,7 @@ async function handleCommand(type, payload) {
 
     // --- Snapshot (accessibility tree with ref IDs) ---
     case "snapshot": {
-      return await execInTab((rootSelector, snapshotGen) => {
+      const result = await execTextAcrossFrames((rootSelector, snapshotGen) => {
         // Clean ALL stale data-mcp-ref attributes from previous snapshots.
         // Without this, old refs remain on DOM and findByRef/CSS selector can target WRONG elements.
         document.querySelectorAll("[data-mcp-ref]").forEach(function(el) { el.removeAttribute("data-mcp-ref"); });
@@ -1478,6 +1792,19 @@ async function handleCommand(type, payload) {
         const MAX_ELEMENTS = 800;
         const MAX_DEPTH = 20;
         const refs = {};
+        // Shared by both walk() and the child-frame wrapper below. Keeping this in
+        // walk() made every non-empty child frame throw when its URL was escaped.
+        const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        // Refs must be unique across child frames because click/fill later search all
+        // frames for the exact data attribute.  Keep the historical top-frame format
+        // and give each child document a stable per-document namespace.
+        let frameNamespace = "";
+        if (window !== top) {
+          if (!window.__mcpFrameRefNamespace) {
+            window.__mcpFrameRefNamespace = Math.random().toString(36).slice(2, 9);
+          }
+          frameNamespace = window.__mcpFrameRefNamespace + "_";
+        }
 
         function isVisible(el) {
           if (!el || el.nodeType !== 1) return false;
@@ -1518,7 +1845,7 @@ async function handleCommand(type, payload) {
 
           const interactive = isInteractive(el);
           const currentId = id++;
-          const refId = snapshotGen + "_" + currentId;
+          const refId = snapshotGen + "_" + frameNamespace + currentId;
 
           let attrs = "";
           if (interactive) {
@@ -1540,7 +1867,6 @@ async function handleCommand(type, payload) {
           // Escape page-controlled attribute values: a crafted aria-label/title/value with
           // a double-quote could otherwise break the pseudo-XML snapshot and inject a fake
           // ref=""/role="" that steers the agent into clicking the wrong element.
-          const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
           const role = el.getAttribute("role");
           if (role) attrs += ` role="${esc(role)}"`;
           if (el.id) attrs += ` id="${esc(el.id)}"`;
@@ -1662,14 +1988,9 @@ async function handleCommand(type, payload) {
 
         let tree = topLayerTree + walk(root, 0);
         // Shadow roots are now walked INLINE inside walk() — no separate walkShadows needed.
-        // Walk same-origin iframes
-        const iframes = document.querySelectorAll("iframe");
-        for (const iframe of iframes) {
-          try {
-            const doc = iframe.contentDocument;
-            if (doc && doc.body) tree += walk(doc.body, 1);
-          } catch (_) {}
-        }
+        // Cross-origin and same-origin child documents are collected independently by
+        // execTextAcrossFrames. Walking them again here would duplicate their content
+        // and race with the child frame's own unique ref namespace.
         // Store refs globally for ref-based click/fill, with generation timestamp
         window.__mcpRefs = refs;
         window.__mcpRefsTime = Date.now();
@@ -1677,8 +1998,21 @@ async function handleCommand(type, payload) {
         if (id >= MAX_ELEMENTS) {
           tree += "\n[WARNING: Snapshot truncated at " + MAX_ELEMENTS + " elements. Use selector parameter to focus on a specific section.]";
         }
+        if (window !== top && tree) {
+          // Never expose query/hash values from OAuth, payment, or partner frames.
+          // They commonly carry codes, signed state, and other credential-like data.
+          let frameLabel = "opaque-frame";
+          try {
+            const frameUrl = new URL(location.href);
+            frameLabel = /^https?:$/.test(frameUrl.protocol)
+              ? frameUrl.origin + frameUrl.pathname
+              : frameUrl.protocol + "frame";
+          } catch (_) {}
+          tree = "<iframe-context url=\"" + esc(frameLabel.substring(0, 160)) + "\">" + tree + "</iframe-context>";
+        }
         return tree;
       }, [payload.selector || null, payload.gen != null ? payload.gen : 0], tabId);
+      return result || (payload.selector ? "Element not found: " + payload.selector : "");
     }
 
     // --- Double Click ---
@@ -1975,20 +2309,21 @@ async function handleCommand(type, payload) {
 
     // --- Get Element Info ---
     case "get_element": {
-      return await execInTab((selector) => {
+      const result = await execInAllFrames((selector) => {
         const el = (window.__mcpDeepQuery || document.querySelector.bind(document))(selector);
-        if (!el) return "Element not found: " + selector;
+        if (!el) return null;
         const cs = window.getComputedStyle(el);
         const r = el.getBoundingClientRect();
         const attrs = {};
         for (const a of el.attributes) attrs[a.name] = a.value;
         return JSON.stringify({
-          tag: el.tagName, text: (el.innerText || "").substring(0, 200),
+          tag: el.tagName, text: (el.innerText || el.textContent || "").substring(0, 200),
           rect: { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) },
           visible: cs.display !== "none" && cs.visibility !== "hidden" && r.width > 0,
           attrs, value: el.value, checked: el.checked, disabled: el.disabled,
         });
       }, [payload.selector], tabId);
+      return result || "Element not found: " + payload.selector;
     }
 
     // --- Query All ---
@@ -2070,117 +2405,202 @@ const _OWNED_TABS_TTL_MS = 6 * 60 * 60 * 1000;
 // "no tabs owned yet" compatibility path then silently allowed write commands
 // on ANY tab, including the user's.
 const _OWNED_TABS_KEY = "mcpSessionOwnedTabs";
-const _TAB_MARKERS_KEY = "mcpOwnedTabMarkers";
-const _TAB_RECEIPTS_KEY = "mcpOwnedTabReceipts";
-const _tabOwnershipMarkers = new Map(); // tabId → high-entropy mcp-tab marker
-const _tabOwnershipOrigins = new Map(); // tabId → origin bound to that marker
-const _markerOwnershipOrigins = new Map(); // marker → origin, survives Safari tab-id renumbering
+const _TAB_RECEIPTS_KEY = "mcpOwnedTabReceiptsV2";
+const _TAB_RECEIPTS_VERSION = 2;
+// Receipts are bearer capabilities stored entirely out of band. They are never added
+// to a live page URL: doing so corrupts signed queries and application hash routers.
+const _receiptByToken = new Map(); // token → { tabId, windowId, receiptOrigin, identityDigest, issuedAt }
+const _tokenByTabId = new Map(); // concrete live tab id → token
+let _receiptMutationTail = Promise.resolve(); // serialize every mutation covered by the full persisted envelope
 let _ownedTabsHydrated = false;
+let _ownedTabsHydrationPromise = null;
+
+async function _digestTabUrl(rawUrl) {
+  const bytes = new TextEncoder().encode(String(rawUrl || ""));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function _isValidReceiptRecord(token, record) {
+  return /^[A-Za-z0-9_-]{24,}$/.test(String(token || "")) &&
+    record && Number.isInteger(Number(record.tabId)) &&
+    typeof record.identityDigest === "string" && /^[a-f0-9]{64}$/.test(record.identityDigest) &&
+    typeof record.receiptOrigin === "string" && !!record.receiptOrigin;
+}
+
+// Rebuild the per-session window map from concrete live tabs that the same persisted
+// session already owns. runtime.reload() clears in-memory window/cache state but Safari
+// keeps the tabs; without this recovery, a multi-window profile rejects a legitimate
+// owned tab as a cross-window target immediately after reload.
+function _recoverSessionWindowsFromOwnedTabs(liveTabsById) {
+  for (const [sid, ownedIds] of _sessionOwnedTabs) {
+    let latestOwnedTab = null;
+    for (const tabId of ownedIds) {
+      const liveTab = liveTabsById.get(tabId);
+      if (liveTab && Number.isInteger(liveTab.windowId)) latestOwnedTab = liveTab;
+    }
+    if (!latestOwnedTab) continue;
+    _adoptWindowForSession(sid, latestOwnedTab.windowId);
+    _setSessionTab(sid, latestOwnedTab.id, latestOwnedTab.url || "");
+  }
+}
+
+function _resolveHydratedReceiptTab(liveTabs, liveTabsById, liveDigests, claimedTabIds, record) {
+  const direct = liveTabsById.get(record.tabId);
+  // Worker reloads preserve Safari tab ids. If the recorded tab id disappeared, there
+  // is no stable in-tab marker that can distinguish the original from an unrelated tab
+  // at the same URL, so digest-only rebinding must fail closed.
+  if (!direct) return null;
+  // If the stored id still exists but now has a different byte-exact URL identity, it
+  // is evidence that the receipt is stale. Never jump from that tab to a different tab
+  // which happens to have the old URL.
+  if (liveDigests.get(direct.id) !== record.identityDigest) return null;
+
+  // Tab ids alone are not durable identity. Even a direct id+digest match is ambiguous
+  // when another live tab has the same exact URL digest, so require global uniqueness.
+  const candidates = liveTabs.filter((tab) =>
+    liveDigests.get(tab.id) === record.identityDigest
+  );
+  if (candidates.length !== 1 || candidates[0].id !== direct.id || claimedTabIds.has(direct.id)) return null;
+  return direct;
+}
+
 async function _hydrateOwnedTabs() {
   if (_ownedTabsHydrated) return;
-  _ownedTabsHydrated = true;
-  let liveTabIds = null;
-  try {
-    liveTabIds = new Set((await browser.tabs.query({})).map(tab => tab.id));
-  } catch {}
-  try {
-    const stored = await browser.storage.session.get([_OWNED_TABS_KEY, _TAB_MARKERS_KEY]);
-    const data = stored?.[_OWNED_TABS_KEY];
-    if (data) {
+  if (_ownedTabsHydrationPromise) return _ownedTabsHydrationPromise;
+  _ownedTabsHydrationPromise = (async () => {
+    let liveTabs;
+    try {
+      liveTabs = await browser.tabs.query({});
+    } catch {
+      throw new Error("Could not verify live tabs for ownership recovery");
+    }
+    const liveTabsById = new Map(liveTabs.map((tab) => [tab.id, tab]));
+    const liveDigests = new Map();
+    try {
+      await Promise.all(liveTabs.map(async (tab) => {
+        liveDigests.set(tab.id, await _digestTabUrl(tab.url || ""));
+      }));
+    } catch {
+      throw new Error("Could not verify live tab identities for ownership recovery");
+    }
+
+    // Load owner sets without trusting their tab ids yet. A set is restored only for
+    // a receipt whose cryptographic URL identity resolves to one unambiguous live tab.
+    const storedOwners = new Map();
+    const mergeOwners = (data) => {
+      if (!data || typeof data !== "object") return;
       for (const [sid, ids] of Object.entries(data)) {
-        if (!_sessionOwnedTabs.has(sid)) _sessionOwnedTabs.set(sid, new Set());
-        const set = _sessionOwnedTabs.get(sid);
-        for (const id of ids) {
-          if (!liveTabIds || liveTabIds.has(id)) set.add(id);
-        }
-      }
-    }
-    const markers = stored?.[_TAB_MARKERS_KEY];
-    if (markers) {
-      for (const [tabId, marker] of Object.entries(markers)) {
-        if ((!liveTabIds || liveTabIds.has(Number(tabId))) && /^[A-Za-z0-9_-]{12,}$/.test(String(marker))) {
-          _tabOwnershipMarkers.set(Number(tabId), String(marker));
-        }
-      }
-    }
-  } catch {} // storage.session may be unavailable on Safari
-
-  // Restore the ownership map from local storage when storage.session gave us nothing
-  // (always, on Safari). Bounded by age and by the live tab list so a recycled tab id
-  // from a previous browser run cannot inherit ownership.
-  try {
-    const localOwned = await browser.storage.local.get(_OWNED_TABS_LOCAL_KEY);
-    const rec = localOwned?.[_OWNED_TABS_LOCAL_KEY];
-    const fresh = rec && typeof rec.at === "number" && (Date.now() - rec.at) < _OWNED_TABS_TTL_MS;
-    if (fresh && rec.tabs) {
-      for (const [sid, ids] of Object.entries(rec.tabs)) {
         if (!Array.isArray(ids)) continue;
-        if (!_sessionOwnedTabs.has(sid)) _sessionOwnedTabs.set(sid, new Set());
-        const set = _sessionOwnedTabs.get(sid);
-        for (const id of ids) {
-          if (typeof id === "number" && (!liveTabIds || liveTabIds.has(id))) set.add(id);
-        }
+        if (!storedOwners.has(sid)) storedOwners.set(sid, new Set());
+        for (const id of ids) if (Number.isInteger(Number(id))) storedOwners.get(sid).add(Number(id));
       }
+    };
+    try {
+      const stored = await browser.storage.session.get(_OWNED_TABS_KEY);
+      mergeOwners(stored?.[_OWNED_TABS_KEY]);
+    } catch {} // storage.session may be unavailable on Safari
+    let localOwned;
+    try {
+      localOwned = await browser.storage.local.get(_OWNED_TABS_LOCAL_KEY);
+    } catch {
+      throw new Error("Could not load durable tab ownership");
     }
-  } catch {}
+    const ownerEnvelope = localOwned?.[_OWNED_TABS_LOCAL_KEY];
+    const ownersFresh = ownerEnvelope && typeof ownerEnvelope.at === "number" &&
+      (Date.now() - ownerEnvelope.at) < _OWNED_TABS_TTL_MS;
+    if (ownersFresh) mergeOwners(ownerEnvelope.tabs);
 
-  // Safari versions that suspend/replace MV3 workers can lose storage.session.
-  // Keep a second, cryptographically-bound receipt in local storage. It cannot
-  // authorize a reused tab id by itself: _canAdoptMarkedOwnedTab also requires
-  // the same marker to be visible in the live same-origin URL unless live
-  // session ownership survived.
-  try {
-    const local = await browser.storage.local.get(_TAB_RECEIPTS_KEY);
-    const receipts = local?.[_TAB_RECEIPTS_KEY];
-    if (receipts) {
-      for (const [tabId, receipt] of Object.entries(receipts)) {
-        const marker = String(receipt?.marker || "");
-        const origin = String(receipt?.origin || "");
-        if (/^[A-Za-z0-9_-]{12,}$/.test(marker) && /^https?:\/\//.test(origin)) {
-          _markerOwnershipOrigins.set(marker, origin);
-          if (!liveTabIds || liveTabIds.has(Number(tabId))) {
-            _tabOwnershipMarkers.set(Number(tabId), marker);
-            _tabOwnershipOrigins.set(Number(tabId), origin);
-          }
-        }
+    let receiptEnvelope = null;
+    try {
+      const local = await browser.storage.local.get(_TAB_RECEIPTS_KEY);
+      receiptEnvelope = local?.[_TAB_RECEIPTS_KEY] || null;
+    } catch {
+      throw new Error("Could not load durable tab receipts");
+    }
+    const receiptsFresh = receiptEnvelope && receiptEnvelope.version === _TAB_RECEIPTS_VERSION &&
+      typeof receiptEnvelope.at === "number" &&
+      (Date.now() - receiptEnvelope.at) < _OWNED_TABS_TTL_MS;
+    const records = receiptsFresh && Array.isArray(receiptEnvelope.records)
+      ? receiptEnvelope.records
+      : [];
+    const claimedTabIds = new Set();
+    const validatedIds = new Map();
+
+    for (const storedRecord of records) {
+      const token = String(storedRecord?.token || "");
+      const record = {
+        token,
+        tabId: Number(storedRecord?.tabId),
+        windowId: Number(storedRecord?.windowId),
+        receiptOrigin: String(storedRecord?.receiptOrigin || ""),
+        identityDigest: String(storedRecord?.identityDigest || ""),
+        issuedAt: Number(storedRecord?.issuedAt) || Date.now(),
+      };
+      if (!_isValidReceiptRecord(token, record)) continue;
+
+      const resolved = _resolveHydratedReceiptTab(
+        liveTabs, liveTabsById, liveDigests, claimedTabIds, record
+      );
+      if (!resolved) continue;
+
+      const oldTabId = record.tabId;
+      record.tabId = resolved.id;
+      record.windowId = resolved.windowId;
+      _receiptByToken.set(token, record);
+      _tokenByTabId.set(resolved.id, token);
+      claimedTabIds.add(resolved.id);
+      validatedIds.set(oldTabId, resolved.id);
+    }
+
+    for (const [sid, oldIds] of storedOwners) {
+      const restored = new Set();
+      for (const oldId of oldIds) {
+        const resolvedId = validatedIds.get(oldId);
+        if (resolvedId !== undefined) restored.add(resolvedId);
       }
+      if (restored.size) _sessionOwnedTabs.set(sid, restored);
     }
-  } catch {}
-}
-function _persistOwnedTabs() {
+
+    _recoverSessionWindowsFromOwnedTabs(liveTabsById);
+    _ownedTabsHydrated = true;
+  })();
   try {
-    const obj = {};
-    for (const [sid, set] of _sessionOwnedTabs) obj[sid] = [...set];
-    const markers = {};
-    for (const [tabId, marker] of _tabOwnershipMarkers) markers[tabId] = marker;
-    const receipts = {};
-    for (const [tabId, marker] of _tabOwnershipMarkers) {
-      const origin = _tabOwnershipOrigins.get(tabId);
-      if (origin) receipts[tabId] = { marker, origin };
-    }
-    let sessionWrite = Promise.resolve();
-    let localWrite = Promise.resolve();
-    try {
-      sessionWrite = browser.storage.session.set({
-        [_OWNED_TABS_KEY]: obj,
-        [_TAB_MARKERS_KEY]: markers,
-      }).catch(() => {});
-    } catch {}
-    try {
-      localWrite = browser.storage.local.set({
-        [_TAB_RECEIPTS_KEY]: receipts,
-        // storage.session does not exist on Safari, so the ownership map above was
-        // written into a void: every worker suspend wiped it and the session was told
-        // "not opened by this MCP session" about tabs it had just opened. Mirror it
-        // here, stamped, so a wake can restore it. Stale entries are dropped on read
-        // and dead tab ids are filtered against the live tab list.
-        [_OWNED_TABS_LOCAL_KEY]: { at: Date.now(), tabs: obj },
-      }).catch(() => {});
-    } catch {}
-    return Promise.allSettled([sessionWrite, localWrite]);
-  } catch {
-    return Promise.resolve();
+    await _ownedTabsHydrationPromise;
+  } finally {
+    _ownedTabsHydrationPromise = null;
   }
+}
+async function _persistOwnedTabs(requireDurableReceipt = false) {
+  const owners = {};
+  for (const [sid, set] of _sessionOwnedTabs) owners[sid] = [...set];
+  const receiptEnvelope = {
+    version: _TAB_RECEIPTS_VERSION,
+    at: Date.now(),
+    records: [..._receiptByToken.values()].map((record) => ({ ...record })),
+  };
+
+  let sessionWrite = Promise.resolve();
+  try {
+    sessionWrite = Promise.resolve(browser.storage.session.set({ [_OWNED_TABS_KEY]: owners }));
+  } catch {} // Safari may not implement storage.session
+
+  let localWrite;
+  try {
+    localWrite = Promise.resolve(browser.storage.local.set({
+      [_TAB_RECEIPTS_KEY]: receiptEnvelope,
+      [_OWNED_TABS_LOCAL_KEY]: { at: Date.now(), tabs: owners },
+    }));
+  } catch (error) {
+    if (requireDurableReceipt) throw new Error("Could not persist tab receipt");
+    localWrite = Promise.reject(error);
+  }
+
+  const results = await Promise.allSettled([sessionWrite, localWrite]);
+  if (requireDurableReceipt && results[1]?.status !== "fulfilled") {
+    throw new Error("Could not persist tab receipt");
+  }
+  return results;
 }
 
 function _extractMcpTabMarker(url) {
@@ -2188,35 +2608,195 @@ function _extractMcpTabMarker(url) {
   return match ? match[1] : "";
 }
 
-function _addOwnedTab(sessionId, tabId, markedUrl = "") {
-  const sid = sessionId || _DEFAULT_SESSION;
-  if (!_sessionOwnedTabs.has(sid)) _sessionOwnedTabs.set(sid, new Set());
-  _sessionOwnedTabs.get(sid).add(tabId);
-  const marker = _extractMcpTabMarker(markedUrl);
-  if (marker) {
-    _tabOwnershipMarkers.set(tabId, marker);
+function _receiptForOwnedTab(sessionId, tab) {
+  // A receipt is a capability to adopt and mutate this exact tab after a stateless
+  // reconnect. Never reveal session A's capability to session B via list_tabs.
+  if (!tab || !_isTabOwnedBySession(sessionId, tab.id)) return "";
+  const token = _tokenByTabId.get(tab.id) || "";
+  const record = _receiptByToken.get(token);
+  if (!record || record.tabId !== tab.id) return "";
+  return _receiptOrigin(tab.url) === record.receiptOrigin ? token : "";
+}
+
+function _mintMcpTabMarker() {
+  const bytes = new Uint8Array(18);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function _withReceiptMutationLock(operation) {
+  const previous = _receiptMutationTail;
+  const current = previous.catch(() => {}).then(operation);
+  const tail = current.then(() => undefined, () => undefined);
+  _receiptMutationTail = tail;
+  return current;
+}
+
+async function _issueTabReceipt(tab, options = {}) {
+  if (!tab || !Number.isInteger(Number(tab.id))) return "";
+  const tabId = Number(tab.id);
+  return _withReceiptMutationLock(async () => {
+    const receiptOrigin = String(options.receiptOrigin || _receiptOrigin(tab.url) || "");
+    if (!receiptOrigin) return "";
+    const identityDigest = await _digestTabUrl(options.identityUrl ?? tab.url ?? "");
+    const token = _mintMcpTabMarker();
+    const oldToken = _tokenByTabId.get(tabId) || "";
+    const oldRecord = oldToken ? _receiptByToken.get(oldToken) : null;
+    const record = {
+      token,
+      tabId,
+      windowId: Number(tab.windowId),
+      receiptOrigin,
+      identityDigest,
+      issuedAt: Date.now(),
+    };
+    if (oldToken) _receiptByToken.delete(oldToken);
+    _receiptByToken.set(token, record);
+    _tokenByTabId.set(record.tabId, token);
     try {
-      const origin = new URL(markedUrl).origin;
-      _tabOwnershipOrigins.set(tabId, origin);
-      _markerOwnershipOrigins.set(marker, origin);
-    } catch {}
-  }
-  return _persistOwnedTabs();
+      await _persistOwnedTabs(true);
+    } catch (error) {
+      _receiptByToken.delete(token);
+      // The global mutation queue makes this a CAS guard too: never restore over a newer token
+      // if this function is ever called outside the serialized path in the future.
+      if (_tokenByTabId.get(record.tabId) === token) {
+        if (oldToken && oldRecord) {
+          _receiptByToken.set(oldToken, oldRecord);
+          _tokenByTabId.set(record.tabId, oldToken);
+        } else {
+          _tokenByTabId.delete(record.tabId);
+        }
+      }
+      throw error;
+    }
+    return token;
+  });
+}
+
+async function _refreshTabReceiptIdentity(tab) {
+  return _withReceiptMutationLock(async () => {
+    const token = _tokenByTabId.get(tab?.id);
+    const record = token ? _receiptByToken.get(token) : null;
+    if (!record || !tab) return;
+    const nextIdentityDigest = await _digestTabUrl(tab.url || "");
+    const previousWindowId = record.windowId;
+    const previousIdentityDigest = record.identityDigest;
+    record.windowId = Number(tab.windowId);
+    record.identityDigest = nextIdentityDigest;
+    // Deliberately keep receiptOrigin unchanged. A redirect may update identity for
+    // locator-only getReceipt recovery, but never extends mutation authority.
+    try {
+      await _persistOwnedTabs(true);
+    } catch (error) {
+      record.windowId = previousWindowId;
+      record.identityDigest = previousIdentityDigest;
+      throw error;
+    }
+  });
+}
+
+async function _refreshAllReceiptIdentities() {
+  return _withReceiptMutationLock(async () => {
+    const updates = [];
+    for (const [tabId, token] of [..._tokenByTabId]) {
+      const record = _receiptByToken.get(token);
+      if (!record) continue;
+      const tab = await browser.tabs.get(tabId).catch(() => null);
+      if (!tab) continue;
+      updates.push({
+        record,
+        previousWindowId: record.windowId,
+        previousIdentityDigest: record.identityDigest,
+        nextWindowId: Number(tab.windowId),
+        nextIdentityDigest: await _digestTabUrl(tab.url || ""),
+      });
+    }
+    for (const update of updates) {
+      update.record.windowId = update.nextWindowId;
+      update.record.identityDigest = update.nextIdentityDigest;
+    }
+    try {
+      await _persistOwnedTabs(true);
+    } catch (error) {
+      for (const update of updates) {
+        update.record.windowId = update.previousWindowId;
+        update.record.identityDigest = update.previousIdentityDigest;
+      }
+      throw error;
+    }
+  });
+}
+
+async function _resolveReceiptTab(token, { allowOriginChange = false } = {}) {
+  return _withReceiptMutationLock(async () => {
+    const normalized = String(token || "");
+    if (!/^[A-Za-z0-9_-]{24,}$/.test(normalized)) return null;
+    const record = _receiptByToken.get(normalized);
+    if (!_isValidReceiptRecord(normalized, record)) return null;
+
+    const allTabs = await browser.tabs.query({});
+    const direct = allTabs.find((tab) => tab.id === record.tabId) || null;
+    if (!direct) return null;
+    const directDigest = await _digestTabUrl(direct.url || "");
+    if (directDigest === record.identityDigest ||
+      (_tokenByTabId.get(direct.id) === normalized && _isTabOwnedByAnySession(direct.id))) {
+      if (directDigest !== record.identityDigest) {
+        const previousWindowId = record.windowId;
+        const previousIdentityDigest = record.identityDigest;
+        record.identityDigest = directDigest;
+        record.windowId = direct.windowId;
+        try {
+          await _persistOwnedTabs(true);
+        } catch (error) {
+          record.windowId = previousWindowId;
+          record.identityDigest = previousIdentityDigest;
+          throw error;
+        }
+      }
+    } else {
+      return null;
+    }
+
+    const currentOrigin = _receiptOrigin(direct.url);
+    if (!allowOriginChange && currentOrigin !== record.receiptOrigin) return null;
+    return direct;
+  });
+}
+
+function _addOwnedTab(sessionId, tabId) {
+  return _withReceiptMutationLock(async () => {
+    const sid = sessionId || _DEFAULT_SESSION;
+    if (!_sessionOwnedTabs.has(sid)) _sessionOwnedTabs.set(sid, new Set());
+    _sessionOwnedTabs.get(sid).add(tabId);
+    return _persistOwnedTabs();
+  });
 }
 
 function _removeOwnedTab(sessionId, tabId) {
-  const sid = sessionId || _DEFAULT_SESSION;
-  const set = _sessionOwnedTabs.get(sid);
-  if (set) set.delete(tabId);
-  if (!_isTabOwnedByAnySession(tabId)) {
-    const marker = _tabOwnershipMarkers.get(tabId);
-    _tabOwnershipMarkers.delete(tabId);
-    _tabOwnershipOrigins.delete(tabId);
-    if (marker && ![..._tabOwnershipMarkers.values()].includes(marker)) {
-      _markerOwnershipOrigins.delete(marker);
+  return _withReceiptMutationLock(async () => {
+    const sid = sessionId || _DEFAULT_SESSION;
+    const set = _sessionOwnedTabs.get(sid);
+    const hadOwnership = !!set?.has(tabId);
+    const previousToken = _tokenByTabId.get(tabId);
+    const previousRecord = previousToken ? _receiptByToken.get(previousToken) : null;
+    if (set) set.delete(tabId);
+    let revokedReceipt = false;
+    if (!_isTabOwnedByAnySession(tabId)) {
+      _tokenByTabId.delete(tabId);
+      if (previousToken) _receiptByToken.delete(previousToken);
+      revokedReceipt = true;
     }
-  }
-  return _persistOwnedTabs();
+    try {
+      await _persistOwnedTabs(true);
+    } catch (error) {
+      if (set && hadOwnership) set.add(tabId);
+      if (revokedReceipt && previousToken) {
+        _tokenByTabId.set(tabId, previousToken);
+        if (previousRecord) _receiptByToken.set(previousToken, previousRecord);
+      }
+      throw error;
+    }
+  });
 }
 
 function _isTabOwnedBySession(sessionId, tabId) {
@@ -2232,76 +2812,8 @@ function _isTabOwnedByAnySession(tabId) {
   return false;
 }
 
-function _canAdoptMarkedOwnedTab(tab, requestedUrl) {
-  if (!tab) return false;
-  const actual = String(tab.url || "");
-  const requested = String(requestedUrl || "");
-  const requestedMarker = _extractMcpTabMarker(requested);
-  const actualMarker = _extractMcpTabMarker(actual);
-  const proofMarker = requestedMarker || actualMarker;
-  if (!proofMarker) return false;
-  let storedMarker = _tabOwnershipMarkers.get(tab.id) || "";
-  if (
-    !storedMarker &&
-    actualMarker &&
-    ![..._tabOwnershipMarkers.values()].includes(actualMarker) &&
-    _markerOwnershipOrigins.has(actualMarker)
-  ) {
-    // A full extension reload can renumber every Safari tab id. The live marker,
-    // plus its locally persisted origin receipt, safely rebinds the same tab. A
-    // duplicate live marker is rejected while an existing id mapping remains.
-    storedMarker = actualMarker;
-  }
-  if (!storedMarker || proofMarker !== storedMarker) return false;
-  // Some MCP hosts do not preserve their protocol session between tool calls and
-  // report only the route URL, without its receipt fragment. In that case the live
-  // high-entropy marker may supply the missing half of the proof, but only for the
-  // exact requested origin + pathname. This avoids selecting another owned tab on
-  // the same site when several automations are open concurrently.
-  if (!requestedMarker) {
-    try {
-      const requestedParsed = new URL(requested);
-      const actualParsed = new URL(actual);
-      if (requestedParsed.origin !== actualParsed.origin || requestedParsed.pathname !== actualParsed.pathname) {
-        return false;
-      }
-    } catch {
-      return false;
-    }
-  }
-  // If live storage.session ownership was lost, the visible URL marker is the
-  // second factor that proves this is not an unrelated tab id reused by Safari.
-  if (!_isTabOwnedByAnySession(tab.id) && actualMarker !== proofMarker) return false;
-  if (actualMarker && actualMarker !== proofMarker) return false;
-  // A route may change or strip the marker, but it must stay on the same origin
-  // as the URL that carried the receipt. External redirects never inherit close
-  // or write ownership.
-  try {
-    const requestedOrigin = new URL(requested).origin;
-    if (new URL(actual).origin !== requestedOrigin) return false;
-    const storedOrigin = _tabOwnershipOrigins.get(tab.id) || _markerOwnershipOrigins.get(proofMarker);
-    if (storedOrigin && storedOrigin !== requestedOrigin) return false;
-  } catch {
-    return false;
-  }
-  return true;
-}
-
-function _canAdoptServerOwnedReceipt(tab, payload) {
-  if (!tab || payload?.serverOwnedReceipt !== true) return false;
-  const actual = String(tab.url || "");
-  const requested = String(payload.tabUrl || "");
-  if (!requested || actual !== requested) return false;
-  const requestedMarker = _extractMcpTabMarker(requested);
-  const actualMarker = _extractMcpTabMarker(actual);
-  if (!requestedMarker || actualMarker !== requestedMarker) return false;
-  try {
-    const requestedUrl = new URL(requested);
-    const actualUrl = new URL(actual);
-    return /^https?:$/.test(requestedUrl.protocol) && requestedUrl.origin === actualUrl.origin;
-  } catch {
-    return false;
-  }
+function _hasTabReceiptAuthority(sessionId, tabId, receiptResolved) {
+  return receiptResolved === true || _isTabOwnedBySession(sessionId, tabId);
 }
 
 // Commands that destroy a tab rather than change a page. They get no "no tabs owned yet"
@@ -2369,24 +2881,38 @@ browser.tabs.onActivated.addListener(({ tabId, windowId }) => {
 });
 
 browser.tabs.onRemoved.addListener((tabId) => {
-  // Clean up any session that was tracking this tab
-  for (const [sid, cache] of _sessionTabCache) {
-    if (cache.tabId === tabId) {
-      cache.tabId = null;
-      cache.tabUrl = null;
+  _withReceiptMutationLock(async () => {
+    // A cold worker can receive tab events before its durable maps are hydrated. Never
+    // persist an empty in-memory state over valid receipts/ownership from the last worker.
+    await _hydrateOwnedTabs();
+    // Clean up any session that was tracking this tab
+    for (const [sid, cache] of _sessionTabCache) {
+      if (cache.tabId === tabId) {
+        cache.tabId = null;
+        cache.tabUrl = null;
+      }
     }
-  }
-  // Also remove from owned tabs — prevents stale ownership on externally closed tabs
-  for (const [sid, ownedSet] of _sessionOwnedTabs) {
-    ownedSet.delete(tabId);
-  }
-  const marker = _tabOwnershipMarkers.get(tabId);
-  _tabOwnershipMarkers.delete(tabId);
-  _tabOwnershipOrigins.delete(tabId);
-  if (marker && ![..._tabOwnershipMarkers.values()].includes(marker)) {
-    _markerOwnershipOrigins.delete(marker);
-  }
-  _persistOwnedTabs();
+    // Also remove from owned tabs — prevents stale ownership on externally closed tabs
+    for (const [sid, ownedSet] of _sessionOwnedTabs) {
+      ownedSet.delete(tabId);
+    }
+    const token = _tokenByTabId.get(tabId);
+    _tokenByTabId.delete(tabId);
+    if (token) _receiptByToken.delete(token);
+    await _persistOwnedTabs();
+  }).catch(() => {});
+});
+
+browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (!changeInfo.url) return;
+  _hydrateOwnedTabs().then(() => {
+    if (!_tokenByTabId.has(tabId)) return null;
+    return tab && tab.id === tabId
+      ? tab
+      : browser.tabs.get(tabId).catch(() => null);
+  }).then((resolved) => {
+    if (resolved) return _refreshTabReceiptIdentity(resolved);
+  }).catch(() => {});
 });
 
 // Verify this extension instance is running in the expected profile.
@@ -2461,7 +2987,7 @@ async function _verifyProfileMatch(expectedProfile) {
     // Ask the server to verify which profile has this nonce
     let verifyRes;
     try {
-      verifyRes = await fetch(`${HTTP_URL}/verify-profile`, {
+      verifyRes = await _bridgeFetch(`${HTTP_URL}/verify-profile`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ nonce, expectedProfile }),
@@ -2548,7 +3074,7 @@ async function _discoverProfileWindow() {
   }
 }
 
-async function getTargetTab(tabUrl, sessionId) {
+async function getTargetTab(_unusedReceipt, sessionId) {
   const cache = _getSessionCache(sessionId);
   // Resolve against THIS session's window; falls back to the shared one when the
   // session has not opened a tab yet, so first-command behaviour is unchanged.
@@ -2562,61 +3088,8 @@ async function getTargetTab(tabUrl, sessionId) {
     } catch { cache.tabId = null; }
   }
 
-  // PRIORITY 2: URL-based search (session-specific tabUrl)
-  if (tabUrl) {
-    const searchScope = winId ? { windowId: winId } : {};
-    let all = await browser.tabs.query(searchScope);
-    // Prefer the durable high-entropy receipt over URL shape. SPAs legitimately
-    // rewrite query/hash fragments, and login routers may strip the visible marker;
-    // the receipt remains bound to the concrete extension-created tab id.
-    let match = all.find(t => _canAdoptMarkedOwnedTab(t, tabUrl)) || null;
-    let matches = [];
-    if (!match) {
-      matches = all.filter(t => t.url === tabUrl);
-      if (matches.length === 0) {
-        matches = all.filter(t => t.url && (t.url.startsWith(tabUrl) || tabUrl.startsWith(t.url.split("?")[0])));
-      }
-    }
-    // Duplicate URLs are common during concurrent automation. Always prefer the tab
-    // this session actually opened; picking the first same-URL tab makes the ownership
-    // guard reject a legitimate command (or, worse, target another session's tab).
-    match ||= matches.find(t => _isTabOwnedBySession(sessionId, t.id)) || matches[0];
-    if (!match && winId) {
-      all = await browser.tabs.query({});
-      match = all.find(t => _canAdoptMarkedOwnedTab(t, tabUrl)) || null;
-      if (!match) {
-        matches = all.filter(t => t.url === tabUrl);
-        if (matches.length === 0) {
-          matches = all.filter(t => t.url && (t.url.startsWith(tabUrl) || tabUrl.startsWith(t.url.split("?")[0])));
-        }
-        match = matches.find(t => _isTabOwnedBySession(sessionId, t.id)) || matches[0];
-      }
-    }
-    if (match) {
-      // A URL match in a DIFFERENT window must not silently retarget the profile
-      // window — a URL collision with a tab in the user's personal window would
-      // permanently redirect every subsequent command there. Adopt the match's
-      // window only when the tracked profile window no longer exists.
-      if (winId && match.windowId !== winId) {
-        let profileWindowGone = false;
-        try { await browser.windows.get(winId); }
-        catch { profileWindowGone = true; }
-        if (!profileWindowGone) {
-          throw new Error("Tab not found in the MCP profile window (a same-URL tab exists in another window — refusing to cross windows). Use safari_new_tab.");
-        }
-        console.log("Safari MCP: profile window gone — adopting", match.windowId);
-      }
-      _setSessionTab(sessionId, match.id, tabUrl);
-      if (!winId || match.windowId !== winId) {
-        _profileWindowId = match.windowId;
-        _adoptWindowForSession(sessionId, match.windowId);
-        browser.storage.local.set({ mcpProfileWindowId: _profileWindowId }).catch(() => {});
-        console.log("Safari MCP: profile windowId =", _profileWindowId);
-      }
-      return match;
-    }
-  }
-  // PRIORITY 2.5: a tab this session actually owns.
+  // PRIORITY 2: a tab this session actually owns. URL matching is deliberately absent:
+  // duplicate/signed/redirected URLs are data, never an ownership capability.
   // With several Claude sessions sharing one Safari profile, "the active tab" is
   // whatever another session (or the user) last brought to the front — measured
   // 23.8.26: commands landed on a parallel session's Telegram tab mid-run, and the
@@ -2870,23 +3343,77 @@ async function execInTabIsolated(func, args = [], tabId = null) {
   }
 }
 
-// Execute in ALL frames (including cross-origin iframes) — for GBP, embedded editors etc.
-async function execInAllFrames(func, args = [], tabId = null) {
+// Execute one function in every document while keeping the same bounded MAIN →
+// ISOLATED recovery used by execInTab.  The previous unbounded MAIN-only path could
+// consume the entire 30s command timeout on one heavy iframe and make a healthy
+// extension look disconnected.
+async function _executeAllFrames(func, args = [], tabId = null) {
   const id = tabId || (await getActiveTab()).id;
+  const execute = (world) => _withInjectionDeadline(browser.scripting.executeScript({
+    target: { tabId: id, allFrames: true },
+    world,
+    func,
+    args,
+  }));
+
   try {
-    const results = await browser.scripting.executeScript({
-      target: { tabId: id, allFrames: true },
-      world: "MAIN",
+    return await execute("MAIN");
+  } catch (mainError) {
+    console.warn("Safari MCP: all-frame MAIN injection failed, retrying ISOLATED on tabId=" + id + ": " + (mainError?.message || String(mainError)));
+    try {
+      return await execute("ISOLATED");
+    } catch (isolatedError) {
+      throw new Error("all-frame injection failed: " + (isolatedError?.message || String(isolatedError)));
+    }
+  }
+}
+
+// Mutating fallbacks must never broadcast an action to every frame or retry it after
+// an ambiguous executeScript rejection. First locate one frame with a read-only probe,
+// then dispatch once to that concrete frame in ISOLATED world. If the one dispatch has
+// an unknown outcome, fail terminally so a caller can verify state before retrying.
+async function execInFirstMatchingFrameMutating(matchFunc, matchArgs, func, args, tabId = null) {
+  const id = tabId || (await getActiveTab()).id;
+  const matches = await _executeAllFrames(matchFunc, matchArgs, id);
+  const match = matches.find((entry) => !entry?.error && entry?.result === true);
+  if (!match) return null;
+  if (!Number.isInteger(match.frameId)) {
+    throw new Error("Matched frame has no stable frameId; refusing mutating iframe fallback");
+  }
+
+  try {
+    const results = await _withInjectionDeadline(browser.scripting.executeScript({
+      target: { tabId: id, frameIds: [match.frameId] },
+      world: "ISOLATED",
       func,
       args,
-    });
-    // Return first non-null result from any frame
+    }));
+    const first = results[0];
+    if (first?.error) throw new Error(first.error);
+    return first?.result;
+  } catch (error) {
+    throw new Error("Mutating iframe injection outcome is unknown; refusing automatic retry: " + (error?.message || String(error)));
+  }
+}
+
+function _isFrameMiss(value) {
+  return value === null || value === undefined ||
+    (typeof value === "string" && value.startsWith("Element not found"));
+}
+
+// Execute in ALL frames (including cross-origin iframes) and return the first real
+// match.  A top-frame `Element not found` is a semantic miss, not a result: allowing
+// it to win used to hide valid matches in every child frame behind it.
+async function execInAllFrames(func, args = [], tabId = null) {
+  try {
+    const results = await _executeAllFrames(func, args, tabId);
     for (const r of results) {
-      if (r.result !== null && r.result !== undefined) return r.result;
+      if (!r?.error && !_isFrameMiss(r?.result)) return r.result;
     }
     return null;
-  } catch (err) {
-    // allFrames may fail on some pages — fall back to main frame only
+  } catch (_err) {
+    // Some restricted pages reject allFrames entirely. Keep the historical safe
+    // fallback to the already-bounded main-frame executor.
     return execInTab(func, args, tabId);
   }
 }
@@ -2896,14 +3423,8 @@ async function execInAllFrames(func, args = [], tabId = null) {
 // frame nearly always returns "[]" — non-null — which would otherwise mask every
 // cross-origin frame behind it.
 async function execAcrossFrames(func, args = [], tabId = null) {
-  const id = tabId || (await getActiveTab()).id;
   try {
-    const results = await browser.scripting.executeScript({
-      target: { tabId: id, allFrames: true },
-      world: "MAIN",
-      func,
-      args,
-    });
+    const results = await _executeAllFrames(func, args, tabId);
     const merged = [];
     for (const r of results) {
       if (!r || r.result == null) continue;
@@ -2915,6 +3436,23 @@ async function execAcrossFrames(func, args = [], tabId = null) {
     return merged.length ? JSON.stringify(merged) : null;
   } catch {
     return null;
+  }
+}
+
+// Snapshot-like commands need content from every matching frame, not just the first.
+// Each frame is responsible for assigning collision-free refs before its text is
+// merged here, so the returned tree remains directly actionable.
+async function execTextAcrossFrames(func, args = [], tabId = null) {
+  try {
+    const results = await _executeAllFrames(func, args, tabId);
+    const chunks = [];
+    for (const r of results) {
+      if (r?.error || _isFrameMiss(r?.result)) continue;
+      if (typeof r.result === "string" && r.result.trim()) chunks.push(r.result);
+    }
+    return chunks.length ? chunks.join("\n") : null;
+  } catch (_err) {
+    return execInTab(func, args, tabId);
   }
 }
 
@@ -3109,7 +3647,7 @@ browser.alarms.create("keepalive", { periodInMinutes: 1 });
 browser.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "keepalive" || alarm.name === "reconnect") {
     // Only reconnect if disconnected, enabled, and no reconnect already scheduled
-    if (!isConnected && _enabled && !_reconnectTimer) {
+    if (!isConnected && _enabled && !_bridgeWorkerSuperseded && !_reconnectTimer) {
       scheduleReconnect();
     }
     // Restart heartbeat in case it was lost on worker restart

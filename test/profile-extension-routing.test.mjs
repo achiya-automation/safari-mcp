@@ -81,8 +81,8 @@ test("a verified profile extension may bypass denied Apple Events", () => {
 
 test("new_tab recreates a closed verified-profile window through WebExtension APIs", () => {
   const newTabCase = background.slice(
-    background.indexOf('case "new_tab":'),
-    background.indexOf('case "close_tab":')
+    background.indexOf("async function _newTabForSession("),
+    background.indexOf("async function _closeTabForSession(")
   );
   assert.match(newTabCase, /browser\.windows\.getAll\(\)/);
   assert.match(newTabCase, /browser\.windows\.create\(\{ url: "about:blank", focused: false \}\)/);
@@ -199,192 +199,291 @@ test("isolated tab commands retry only Safari's transient access denial", () => 
   );
 });
 
-test("duplicate URL resolution prefers the tab owned by the calling session", () => {
+test("target resolution never treats a URL as an ownership capability", () => {
   const resolver = background.slice(
     background.indexOf("async function getTargetTab("),
     background.indexOf("async function getActiveTab(")
   );
-  assert.match(
-    resolver,
-    /matches\.find\(t => _isTabOwnedBySession\(sessionId, t\.id\)\) \|\| matches\[0\]/
-  );
-  assert.match(resolver, /all\.find\(t => _canAdoptMarkedOwnedTab\(t, tabUrl\)\)/);
-  assert.match(resolver, /matches = all\.filter\(t => t\.url === tabUrl\)/);
+  assert.match(resolver, /const ownedIds = _sessionOwnedTabs\.get/);
+  assert.match(resolver, /browser\.tabs\.query\(\{ active: true, windowId: winId \}\)/);
+  assert.doesNotMatch(resolver, /tabUrl/);
+  assert.doesNotMatch(resolver, /\.url\s*===/);
+  assert.doesNotMatch(resolver, /Adopt|adopt.*Url|MarkedOwned/i);
+  assert.doesNotMatch(background, /function _canAdoptMarkedOwnedTab\(/);
 });
 
-test("stateless callers can resume a routed tab only with its durable marker receipt", () => {
-  const extractStart = background.indexOf("function _extractMcpTabMarker(");
-  const extractEnd = background.indexOf("\n}", extractStart);
-  const start = background.indexOf("function _canAdoptMarkedOwnedTab(");
-  const end = background.indexOf("\n}", start);
-  assert.ok(extractStart > 0 && extractEnd > extractStart, "marker extractor should exist");
-  assert.ok(start > 0 && end > start, "marked-tab adoption helper should exist");
-  const extractSource = background.slice(extractStart, extractEnd + 2);
-  const source = background.slice(start, end + 2);
-  const marker = "meta_appeal_A1B2C3D4";
-  const adopt = Function(
-    "_isTabOwnedByAnySession",
-    "_tabOwnershipMarkers",
-    "_tabOwnershipOrigins",
-    "_markerOwnershipOrigins",
-    `${extractSource}; ${source}; return _canAdoptMarkedOwnedTab;`
-  )(
-    (id) => id === 42,
-    new Map([[42, marker]]),
-    new Map([[42, "https://example.test"]]),
-    new Map([[marker, "https://example.test"]])
+test("opaque receipts resolve by token, digest, and original origin and fail closed", async () => {
+  const validStart = background.indexOf("function _isValidReceiptRecord(");
+  const validEnd = background.indexOf("\n}", validStart);
+  const resolveStart = background.indexOf("async function _resolveReceiptTab(");
+  const resolveEnd = background.indexOf("\n}\n\nfunction _addOwnedTab", resolveStart);
+  assert.ok(validStart > 0 && validEnd > validStart, "receipt record validator should exist");
+  assert.ok(resolveStart > 0 && resolveEnd > resolveStart, "receipt resolver should exist");
+  const validSource = background.slice(validStart, validEnd + 2);
+  const resolveSource = background.slice(resolveStart, resolveEnd + 2);
+
+  const token = "receipt_token_abcdefghijklmnopqrstuvwxyz";
+  const digest = "a".repeat(64);
+  const makeResolver = ({ tabs, tabId = 42, origin = "https://example.test", owned = false }) => {
+    const receiptByToken = new Map([[token, {
+      token,
+      tabId,
+      windowId: 7,
+      receiptOrigin: origin,
+      identityDigest: digest,
+      issuedAt: Date.now(),
+    }]]);
+    const tokenByTabId = new Map([[tabId, token]]);
+    let replacements = 0;
+    const resolve = Function(
+      "_receiptByToken",
+      "_isValidReceiptRecord",
+      "browser",
+      "_digestTabUrl",
+      "_tokenByTabId",
+      "_isTabOwnedByAnySession",
+      "_persistOwnedTabs",
+      "_receiptOrigin",
+      "_withReceiptMutationLock",
+      `${resolveSource}; return _resolveReceiptTab;`
+    )(
+      receiptByToken,
+      Function(`${validSource}; return _isValidReceiptRecord;`)(),
+      { tabs: { query: async () => tabs } },
+      async () => digest,
+      tokenByTabId,
+      () => owned,
+      async () => {},
+      (url) => new URL(url).origin,
+      (operation) => operation()
+    );
+    return { resolve, get replacements() { return replacements; } };
+  };
+
+  const ownedTab = {
+    id: 42,
+    windowId: 7,
+    url: "https://example.test/path?signature=synthetic#app/route",
+  };
+  const direct = makeResolver({ tabs: [ownedTab] });
+  assert.equal(await direct.resolve(token), ownedTab);
+  assert.equal(await direct.resolve("forged_receipt_abcdefghijklmnopqrstuvwxyz"), null);
+
+  const redirected = makeResolver({
+    tabs: [{ ...ownedTab, url: "https://other.test/redirected" }],
+  });
+  assert.equal(await redirected.resolve(token), null, "cross-origin mutation authority must fail");
+  assert.equal(
+    (await redirected.resolve(token, { allowOriginChange: true }))?.id,
+    42,
+    "origin changes are allowed only for the locator-only receipt rotation path"
   );
 
-  const marked = `https://example.test/path#mcp-tab=${marker}`;
-  assert.equal(adopt({ id: 42, url: marked }, marked), true);
-  assert.equal(
-    adopt({ id: 42, url: `https://example.test/next?view=1#mcp-tab=${marker}` }, marked),
-    true,
-    "same-origin SPA routing may change the visible URL"
-  );
-  assert.equal(
-    adopt({ id: 42, url: "https://example.test/next" }, marked),
-    true,
-    "a stored receipt survives routers that strip the marker"
-  );
-  const adoptAfterSessionLoss = Function(
-    "_isTabOwnedByAnySession",
-    "_tabOwnershipMarkers",
-    "_tabOwnershipOrigins",
-    "_markerOwnershipOrigins",
-    `${extractSource}; ${source}; return _canAdoptMarkedOwnedTab;`
-  )(
-    () => false,
-    new Map([[42, marker]]),
-    new Map([[42, "https://example.test"]]),
-    new Map([[marker, "https://example.test"]])
-  );
-  assert.equal(adoptAfterSessionLoss({ id: 42, url: marked }, marked), true);
-  assert.equal(
-    adoptAfterSessionLoss({ id: 42, url: marked }, "https://example.test/path"),
-    true,
-    "a stateless caller may recover the receipt from the live URL on the exact route"
-  );
-  assert.equal(
-    adoptAfterSessionLoss({ id: 42, url: marked }, "https://example.test/other"),
-    false,
-    "a live receipt cannot make a different same-origin route eligible"
-  );
-  assert.equal(
-    adoptAfterSessionLoss({ id: 42, url: "https://example.test/next" }, marked),
-    false,
-    "local-storage fallback alone cannot authorize a markerless reused tab id"
-  );
-  const adoptAfterExtensionReload = Function(
-    "_isTabOwnedByAnySession",
-    "_tabOwnershipMarkers",
-    "_tabOwnershipOrigins",
-    "_markerOwnershipOrigins",
-    `${extractSource}; ${source}; return _canAdoptMarkedOwnedTab;`
-  )(
-    () => false,
-    new Map(),
-    new Map(),
-    new Map([[marker, "https://example.test"]])
-  );
-  assert.equal(
-    adoptAfterExtensionReload({ id: 84, url: marked }, "https://example.test/path"),
-    true,
-    "a live receipt rebinds the tab after Safari renumbers ids during an extension reload"
-  );
-  assert.equal(
-    adoptAfterExtensionReload({ id: 84, url: "https://example.test/path" }, "https://example.test/path"),
-    false,
-    "tab-id recovery still requires the high-entropy marker in the live URL"
-  );
-  assert.equal(adopt({ id: 7, url: marked }, marked), false, "user tab is never adoptable");
-  assert.equal(
-    adopt({ id: 42, url: "https://example.test/path" }, "https://example.test/path"),
-    false
-  );
-  assert.equal(adopt({ id: 42, url: marked }, marked + "x"), false, "receipt must match exactly");
-  assert.equal(
-    adopt({ id: 42, url: "https://other.test/next" }, marked),
-    false,
-    "cross-origin redirects never inherit ownership"
-  );
-  assert.equal(
-    adopt(
-      { id: 42, url: "https://example.test/#mcp-tab=short" },
-      "https://example.test/#mcp-tab=short"
-    ),
-    false
-  );
+  const ambiguous = makeResolver({
+    tabs: [
+      { id: 84, windowId: 7, url: "https://example.test/same" },
+      { id: 85, windowId: 8, url: "https://example.test/same" },
+    ],
+  });
+  assert.equal(await ambiguous.resolve(token), null, "two digest matches must never be guessed");
+  assert.equal(ambiguous.replacements, 0, "ambiguous receipts must not rebind ownership");
 });
 
-test("tab marker receipts survive Safari service-worker restarts", () => {
-  assert.match(background, /const _TAB_MARKERS_KEY = "mcpOwnedTabMarkers"/);
-  assert.match(background, /browser\.storage\.session\.get\(\[_OWNED_TABS_KEY, _TAB_MARKERS_KEY\]\)/);
-  assert.match(background, /\[_TAB_MARKERS_KEY\]: markers/);
-  assert.match(background, /const _TAB_RECEIPTS_KEY = "mcpOwnedTabReceipts"/);
-  assert.match(background, /browser\.storage\.local\.get\(_TAB_RECEIPTS_KEY\)/);
-  assert.match(background, /\[_TAB_RECEIPTS_KEY\]: receipts/);
-  assert.match(background, /const _markerOwnershipOrigins = new Map\(\)/);
+test("V2 receipts persist locally and rehydrate only the same unambiguous tab id and URL digest", () => {
+  assert.match(background, /const _TAB_RECEIPTS_KEY = "mcpOwnedTabReceiptsV2"/);
+  assert.match(background, /const _TAB_RECEIPTS_VERSION = 2/);
+  const hydrate = background.slice(
+    background.indexOf("async function _hydrateOwnedTabs("),
+    background.indexOf("async function _persistOwnedTabs(")
+  );
+  assert.match(hydrate, /browser\.storage\.local\.get\(_TAB_RECEIPTS_KEY\)/);
+  assert.match(hydrate, /receiptEnvelope\.version === _TAB_RECEIPTS_VERSION/);
+  assert.match(hydrate, /_resolveHydratedReceiptTab\(/);
+  assert.match(hydrate, /if \(!resolved\) continue/);
+  assert.match(hydrate, /const claimedTabIds = new Set\(\)/);
+  assert.match(hydrate, /validatedIds\.get\(oldId\)/);
+
+  const persist = background.slice(
+    background.indexOf("async function _persistOwnedTabs("),
+    background.indexOf("function _extractMcpTabMarker(")
+  );
+  assert.match(persist, /version: _TAB_RECEIPTS_VERSION/);
+  assert.match(persist, /records: \[\.\.\._receiptByToken\.values\(\)\]/);
+  assert.match(persist, /browser\.storage\.local\.set\(\{/);
+  assert.match(persist, /\[_TAB_RECEIPTS_KEY\]: receiptEnvelope/);
+
   const handler = background.slice(
     background.indexOf("async function handleCommand("),
     background.indexOf("// ========== TAB OWNERSHIP GUARD")
   );
   assert.ok(
     handler.indexOf("await _hydrateOwnedTabs();") < handler.indexOf("await getTargetTab("),
-    "receipts must hydrate before target resolution"
+    "receipt records must hydrate before any target is selected"
   );
 });
 
-test("new_tab returns ownership before a slow page finishes loading", () => {
+test("new_tab navigates with the caller's exact raw URL and returns only safe metadata", async () => {
   const newTabCase = background.slice(
-    background.indexOf('case "new_tab":'),
-    background.indexOf('case "close_tab":')
+    background.indexOf("async function _newTabForSession("),
+    background.indexOf("async function _closeTabForSession(")
   );
   assert.doesNotMatch(newTabCase, /await waitForTabLoad\(newTab\.id/);
   assert.doesNotMatch(newTabCase, /await browser\.tabs\.get\(newTab\.id\)/);
-  assert.match(newTabCase, /url: "about:blank",\s+active: false/);
-  assert.match(newTabCase, /_addOwnedTab\(sessionId, newTab\.id, payload\.url\)/);
-  assert.match(newTabCase, /browser\.tabs\.update\(newTab\.id, \{ url: payload\.url \}\)\.catch/);
-  assert.doesNotMatch(newTabCase, /await browser\.tabs\.update/);
+  assert.match(newTabCase, /const rawNavigationUrl = String\(payload\.url \|\| ""\)/);
+  assert.match(newTabCase, /_issueTabReceipt\(receiptTab, \{/);
+  assert.match(newTabCase, /await browser\.tabs\.update\(newTab\.id, \{ url: rawNavigationUrl \}\)\.catch/);
+
+  let navigatedUrl = null;
+  let ownedTabId = null;
+  const issuedReceipt = "issued_receipt_abcdefghijklmnopqrstuvwxyz";
+  const newTabForSession = Function(
+    "_DEFAULT_SESSION",
+    "_sessionWindowIds",
+    "_windowForSession",
+    "browser",
+    "_profileWindowId",
+    "_adoptWindowForSession",
+    "_setSessionTab",
+    "_addOwnedTab",
+    "_issueTabReceipt",
+    "_receiptOrigin",
+    "_safeTabUrl",
+    `${newTabCase}; return _newTabForSession;`
+  )(
+    "default",
+    new Map([["session-a", 7]]),
+    () => 7,
+    {
+      windows: {
+        get: async () => ({ id: 7 }),
+        getAll: async () => [{ id: 7 }],
+        create: async () => { throw new Error("unexpected window creation"); },
+      },
+      tabs: {
+        create: async (options) => ({
+          id: 42,
+          index: 2,
+          windowId: options.windowId,
+          url: options.url,
+          title: "",
+        }),
+        update: async (_tabId, options) => {
+          navigatedUrl = options.url;
+          return { id: 42, index: 2, windowId: 7, url: options.url, title: "" };
+        },
+        query: async () => [],
+      },
+      storage: { local: { set: async () => {} } },
+    },
+    7,
+    () => {},
+    () => {},
+    async (_sessionId, tabId) => { ownedTabId = tabId; },
+    async () => issuedReceipt,
+    (url) => new URL(url).origin,
+    (url) => {
+      const parsed = new URL(url);
+      return parsed.origin + parsed.pathname;
+    }
+  );
+  const exactUrl = "https://example.test/p?X-Signature=ab%2fCD%2Bef&x=a%20b&dup=1&dup=2#/route?next=%2F";
+  const result = await newTabForSession("session-a", { url: exactUrl });
+  await Promise.resolve();
+  assert.equal(navigatedUrl, exactUrl, "signed query and application fragment bytes must be untouched");
+  assert.equal(ownedTabId, 42);
+  assert.deepEqual(result, {
+    title: "",
+    safeUrl: "https://example.test/p",
+    receipt: issuedReceipt,
+    tabIndex: 3,
+  });
+  assert.equal("url" in result, false);
+  assert.equal("requestedUrl" in result, false);
 });
 
-test("switch_tab proves the destination tab before registering a redirected URL", () => {
+test("switch_tab requires index and receipt to identify the same concrete tab", async () => {
   const switchTabCase = background.slice(
-    background.indexOf('case "switch_tab":'),
-    background.indexOf('// --- Scroll ---')
+    background.indexOf("async function _switchTabForSession("),
+    background.indexOf("let _enabled", background.indexOf("async function _switchTabForSession("))
   );
-  assert.match(switchTabCase, /_isTabOwnedBySession\(sessionId, target\.id\)/);
-  assert.match(switchTabCase, /_canAdoptMarkedOwnedTab\(target, payload\.tabUrl\)/);
-  assert.match(switchTabCase, /owned: true/);
-  assert.match(
-    background,
-    /type !== "new_tab" && type !== "switch_tab" && !_readOnlyCommands\.has\(type\)/
+  assert.match(switchTabCase, /target\.id !== targetTab\.id/);
+  assert.match(switchTabCase, /receipt and requested index identify different tabs/);
+  assert.match(switchTabCase, /await _addOwnedTab\(sessionId, target\.id\)/);
+  assert.match(switchTabCase, /safeUrl: _safeTabUrl\(target\.url\)/);
+  assert.doesNotMatch(switchTabCase, /\burl:\s*target\.url/);
+
+  const makeSwitch = (tabs, additions) => Function(
+    "_receiptTokenFromPayload",
+    "_windowForSession",
+    "_windowQuery",
+    "browser",
+    "_isTabOwnedBySession",
+    "_addOwnedTab",
+    "_safeTabUrl",
+    "_adoptWindowForSession",
+    "_setSessionTab",
+    "_receiptForOwnedTab",
+    `${switchTabCase}; return _switchTabForSession;`
+  )(
+    (payload) => payload.receipt || "",
+    () => 7,
+    (windowId) => ({ windowId }),
+    { tabs: { query: async () => tabs } },
+    () => false,
+    async (_sessionId, tabId) => additions.push(tabId),
+    (url) => {
+      const parsed = new URL(url);
+      return parsed.origin + parsed.pathname;
+    },
+    () => {},
+    () => {},
+    () => "rotated_receipt_abcdefghijklmnopqrstuvwxyz"
   );
-  assert.match(index, /if \(result\.owned === true\) _addOwnedURL\(result\.url\)/);
-  assert.match(index, /includes\("Tab safety:"\)\) throw err/);
+
+  const receiptTab = {
+    id: 42,
+    index: 0,
+    windowId: 9,
+    title: "Owned",
+    url: "https://example.test/path?private=value#app",
+  };
+  const additions = [];
+  const switchValid = makeSwitch([receiptTab], additions);
+  const result = await switchValid("session-a", receiptTab, {
+    index: 1,
+    receipt: "receipt_token_abcdefghijklmnopqrstuvwxyz",
+  });
+  assert.deepEqual(additions, [42]);
+  assert.deepEqual(result, {
+    title: "Owned",
+    safeUrl: "https://example.test/path",
+    receipt: "rotated_receipt_abcdefghijklmnopqrstuvwxyz",
+    owned: true,
+  });
+  assert.equal("url" in result, false);
+
+  const switchMismatch = makeSwitch(
+    [{ ...receiptTab, id: 99 }],
+    []
+  );
+  await assert.rejects(
+    switchMismatch("session-a", receiptTab, {
+      index: 1,
+      receipt: "receipt_token_abcdefghijklmnopqrstuvwxyz",
+    }),
+    /receipt and requested index identify different tabs/
+  );
 });
 
-test("switch_tab forwards a durable marked URL for stateless callers", () => {
+test("public switch_tab forwards an opaque receipt and sanitizes extension output", () => {
   const switchTabTool = index.slice(
     index.indexOf('"safari_switch_tab"'),
     index.indexOf("// ========== WAIT ==========", index.indexOf('"safari_switch_tab"'))
   );
-  assert.match(
-    switchTabTool,
-    /url:\s*z\.string\(\)\.optional\(\)/,
-    "the public tool schema must accept the exact marked URL returned by list_tabs"
-  );
-  assert.match(switchTabTool, /async \(\{ index, url \}\) =>/);
-  assert.match(switchTabTool, /_isURLOwned\(url\)/);
-  assert.match(switchTabTool, /extensionOrFallback\(\s*"list_tabs"/);
-  assert.doesNotMatch(
-    switchTabTool,
-    /await safari\.listTabs\(\)/,
-    "named-profile switching must inspect tabs through the extension, not AppleScript"
-  );
-  assert.match(
-    switchTabTool,
-    /"switch_tab",\s*url \? \{ index, tabUrl: url \} : \{ index \}/,
-    "the durable receipt must reach the extension adoption guard"
-  );
+  assert.match(switchTabTool, /receipt:\s*z\.string\(\)\.optional\(\)/);
+  assert.match(switchTabTool, /async \(\{ index, receipt, url \}\) =>/);
+  assert.match(switchTabTool, /const token = _receiptToken\(supplied\)/);
+  assert.match(switchTabTool, /"switch_tab", token \? \{ index, receipt: token \} : \{ index \}/);
+  assert.match(switchTabTool, /const safeResult = _sanitizeTabResult\(result\)/);
+  assert.doesNotMatch(switchTabTool, /tabUrl:/);
 });

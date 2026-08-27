@@ -121,3 +121,27 @@ test("_tokenMatches accepts only the exact token and fails closed on non-strings
     assert.equal(matches(bad), false, `non-string ${Object.prototype.toString.call(bad)} must be rejected`);
   }
 });
+
+test("the WebSocket bridge rejects web-page and originless clients by default", () => {
+  const start = indexSrc.indexOf("function _isExtensionSchemeOrigin(");
+  const end = indexSrc.indexOf("\n// Bearer receipts", start);
+  assert.ok(start >= 0 && end > start, "extension-origin helper must exist");
+  const source = indexSrc.slice(start, end);
+  const allowed = Function(`${source}; return _isExtensionSchemeOrigin;`)();
+
+  assert.equal(allowed("safari-web-extension://ABC123"), true);
+  assert.equal(allowed("moz-extension://12345678-abcd"), true);
+  assert.equal(allowed("chrome-extension://abcdefghijklmnop"), true);
+  assert.equal(allowed("https://evil.example"), false);
+  assert.equal(allowed("http://127.0.0.1:9223"), false);
+  assert.equal(allowed(""), false);
+
+  const wsBlock = indexSrc.slice(
+    indexSrc.indexOf("wss = new WebSocketServer"),
+    indexSrc.indexOf('wss.on("error"')
+  );
+  assert.ok(wsBlock.includes("verifyClient"), "WebSocket upgrade must authenticate its Origin");
+  assert.ok(wsBlock.includes("_isAllowedWebSocketOrigin(origin)"), "WebSocket must require an exact allowlisted origin");
+  assert.ok(indexSrc.includes("_allowedWebSocketOrigins.has"), "an extension-scheme prefix alone is not authority");
+  assert.ok(indexSrc.includes("SAFARI_MCP_WS_ORIGINS"), "trusted extension IDs must be configured explicitly");
+});

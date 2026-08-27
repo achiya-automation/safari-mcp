@@ -30,6 +30,49 @@ const safari = readFileSync(new URL("../safari.js", import.meta.url), "utf8");
 const index = readFileSync(new URL("../index.js", import.meta.url), "utf8");
 const background = readFileSync(new URL("../extension/background.js", import.meta.url), "utf8");
 
+function sourceBetween(source, startNeedle, endNeedle) {
+  const start = source.indexOf(startNeedle);
+  const end = source.indexOf(endNeedle, start + startNeedle.length);
+  assert.ok(start >= 0 && end > start, `could not extract ${startNeedle}`);
+  return source.slice(start, end).trim();
+}
+
+const resolveReceiptSource = sourceBetween(
+  background,
+  "async function _resolveReceiptTab(",
+  "\nfunction _addOwnedTab("
+);
+
+function makeReceiptResolver({ records = new Map(), tabs = [] } = {}) {
+  const tokenByTabId = new Map();
+  const ownedTabIds = new Set();
+  const resolveReceipt = new Function(
+    "_receiptByToken",
+    "_isValidReceiptRecord",
+    "browser",
+    "_digestTabUrl",
+    "_tokenByTabId",
+    "_isTabOwnedByAnySession",
+    "_persistOwnedTabs",
+    "_receiptOrigin",
+    "_withReceiptMutationLock",
+    `"use strict"; return (${resolveReceiptSource});`
+  )(
+    records,
+    (token, record) => !!record && record.token === token,
+    { tabs: { query: async () => tabs } },
+    async (url) => `digest:${url}`,
+    tokenByTabId,
+    (tabId) => ownedTabIds.has(tabId),
+    async () => {},
+    (url) => {
+      try { return new URL(url).origin; } catch { return ""; }
+    },
+    (operation) => operation()
+  );
+  return { resolveReceipt, tokenByTabId, ownedTabIds };
+}
+
 /** Comments discuss the fallback by name; only code may be asserted against. */
 const stripComments = (s) =>
   s
@@ -112,40 +155,191 @@ test("close_tab is not exempt from the shared tab-ownership assertion", () => {
   }
 });
 
-test("close_tab can recover an exact marked tab without trusting global active state", () => {
+test("public close accepts an opaque receipt and never treats a full URL as authority", () => {
   const start = index.indexOf('server.tool(\n  "safari_close_tab"');
   const end = index.indexOf('\n);', start);
   assert.ok(start > 0 && end > start, "safari_close_tab tool should exist");
   const tool = index.slice(start, end + 3);
-  assert.match(tool, /url: z\.string\(\)\.optional\(\)/);
-  assert.match(tool, /_isExactURLOwned\(url\)/);
-  assert.match(tool, /url \? \{ tabUrl: url, serverOwnedReceipt \} : \{\}/);
-  assert.match(tool, /_removeOwnedURL\(url\)/);
+  assert.match(tool, /receipt: z\.string\(\)\.optional\(\)/);
+  assert.match(tool, /const supplied = receipt \|\| url \|\| ""/);
+  assert.match(tool, /const token = _receiptToken\(supplied\) \|\| _getActiveReceipt\(\)/);
+  assert.match(tool, /if \(supplied && !token\) return errorResult\("Tab safety: invalid tab receipt"\)/);
+  assert.match(tool, /"close_tab",\s*token \? \{ receipt: token \} : \{\}/);
+  assert.match(tool, /_setActiveReceipt\(""\)/, "a closed tab's receipt must be forgotten");
+  assert.doesNotMatch(tool, /_isExactURLOwned|tabUrl|serverOwnedReceipt/);
 
   const routingStart = index.indexOf("async function extensionOrFallback(");
   const routingEnd = index.indexOf("// Read version from package.json", routingStart);
   const routing = index.slice(routingStart, routingEnd);
   assert.ok(
     routing.indexOf("...extensionPayload") < routing.indexOf("sessionId: `${SESSION_ID}:${currentSessionId()}`"),
-    "an explicit tabUrl may override global active state, but never the server-owned session id"
+    "an explicit receipt may select its exact tab, but never override the server-owned session id"
   );
 });
 
-test("extension restart recovery requires the server's exact marked-URL receipt", () => {
-  const start = background.indexOf("function _canAdoptServerOwnedReceipt(");
-  const end = background.indexOf("\n}", start);
-  assert.ok(start > 0 && end > start, "server receipt verifier should exist");
-  const source = background.slice(start, end + 2);
-  assert.match(source, /payload\?\.serverOwnedReceipt !== true/);
-  assert.match(source, /actual !== requested/);
-  assert.match(source, /actualMarker !== requestedMarker/);
-  assert.match(source, /requestedUrl\.origin === actualUrl\.origin/);
+test("extension resolves the opaque receipt to one concrete tab before close", () => {
+  const start = background.indexOf("async function handleCommand(");
+  const end = background.indexOf("// ========== TAB OWNERSHIP GUARD", start);
+  assert.ok(start > 0 && end > start, "handleCommand receipt preflight should exist");
+  const preflight = background.slice(start, end);
+  const resolveAt = preflight.indexOf("await _resolveReceiptTab(suppliedReceipt");
+  const rejectAt = preflight.indexOf("if (!targetTab)");
+  const bindAt = preflight.indexOf("payload._receiptTabId = targetTab.id");
+  assert.ok(resolveAt > 0, "receipt must be resolved by the extension's durable registry");
+  assert.ok(resolveAt < rejectAt && rejectAt < bindAt, "resolution must succeed before its tab id is trusted");
 
-  const guard = background.slice(
-    background.indexOf("TAB OWNERSHIP GUARD"),
-    background.indexOf("switch (type)")
+  const closeCase = background.slice(
+    background.indexOf('case "close_tab"'),
+    background.indexOf('case "switch_tab"')
   );
-  assert.match(guard, /_canAdoptServerOwnedReceipt\(targetTab, payload\)/);
+  assert.match(closeCase, /_closeTabForSession\(sessionId, targetTab, payload\)/);
+
+  const handler = background.slice(
+    background.indexOf("async function _closeTabForSession("),
+    background.indexOf("async function _switchTabForSession(")
+  );
+  assert.match(handler, /payload\._receiptTabId && target\.id !== payload\._receiptTabId/);
+  assert.match(handler, /browser\.tabs\.remove\(targetTab\.id\)/);
+  assert.doesNotMatch(handler, /targetTab\.url\s*===|searchParams|getAttribute\(['"]href/);
+});
+
+test("forged, stale, and cross-origin receipts fail closed", async () => {
+  const token = "opaque_receipt_token_1234567890";
+  const originalUrl = "https://owned.example/app?private=one#route";
+
+  const forged = makeReceiptResolver({
+    tabs: [{ id: 42, windowId: 3, url: originalUrl }],
+  });
+  assert.equal(await forged.resolveReceipt(token), null, "an unissued bearer token must prove nothing");
+
+  const stale = makeReceiptResolver({
+    records: new Map([[token, {
+      token,
+      tabId: 42,
+      receiptOrigin: "https://owned.example",
+      identityDigest: `digest:${originalUrl}`,
+    }]]),
+    tabs: [{ id: 42, windowId: 3, url: "https://owned.example/different?private=two#other" }],
+  });
+  assert.equal(await stale.resolveReceipt(token), null, "a receipt whose tab identity no longer matches must fail closed");
+
+  const crossOriginUrl = "https://other.example/app?private=three#route";
+  const crossOrigin = makeReceiptResolver({
+    records: new Map([[token, {
+      token,
+      tabId: 42,
+      receiptOrigin: "https://owned.example",
+      identityDigest: `digest:${crossOriginUrl}`,
+    }]]),
+    tabs: [{ id: 42, windowId: 3, url: crossOriginUrl }],
+  });
+  assert.equal(await crossOrigin.resolveReceipt(token), null, "a receipt must not authorize a different origin");
+
+  const preflight = background.slice(
+    background.indexOf("async function handleCommand("),
+    background.indexOf("// ========== TAB OWNERSHIP GUARD")
+  );
+  assert.match(
+    preflight,
+    /if \(!targetTab\)\s*\{\s*throw new Error\("Tab safety: receipt is forged, stale, ambiguous, or not valid for this origin"\)/,
+    "the command path must turn a failed lookup into a refusal"
+  );
+  assert.doesNotMatch(preflight, /\$\{suppliedReceipt\}/, "the refusal must not echo the bearer receipt");
+});
+
+test("receipt close removes only the resolved tab and returns no URL", async () => {
+  const safeUrlSource = sourceBetween(background, "function _safeTabUrl(", "\nfunction _receiptOrigin(");
+  const safeTabUrl = new Function(`"use strict"; return (${safeUrlSource});`)();
+  const closeSource = sourceBetween(
+    background,
+    "async function _closeTabForSession(",
+    "\nasync function _switchTabForSession("
+  );
+  const removed = [];
+  const ownershipEvents = [];
+  const owned = new Set();
+  const tabs = [
+    { id: 42, index: 0, windowId: 3, url: "https://owned.example/app?private=one#route" },
+    { id: 99, index: 1, windowId: 3, url: "https://user.example/work?draft=secret#cursor" },
+  ];
+  const close = new Function(
+    "_windowForSession",
+    "browser",
+    "_windowQuery",
+    "_isTabOwnedBySession",
+    "_addOwnedTab",
+    "_removeOwnedTab",
+    "_safeTabUrl",
+    `"use strict"; return (${closeSource});`
+  )(
+    () => 3,
+    {
+      tabs: {
+        query: async () => tabs,
+        remove: async (id) => { removed.push(id); },
+        update: async () => { throw new Error("unexpected last-tab blank"); },
+      },
+    },
+    (windowId) => ({ windowId }),
+    (_sessionId, id) => owned.has(id),
+    async (_sessionId, id) => { ownershipEvents.push(`adopt:${id}`); owned.add(id); },
+    async (_sessionId, id) => { ownershipEvents.push(`release:${id}`); owned.delete(id); },
+    safeTabUrl
+  );
+
+  const result = await close("fresh-session", tabs[0], { _receiptTabId: 42 });
+  assert.equal(result, "Tab closed");
+  assert.deepEqual(removed, [42], "the exact receipt-resolved tab, never the neighbouring user tab, is removed");
+  assert.deepEqual(ownershipEvents, ["adopt:42", "release:42"]);
+  assert.doesNotMatch(result, /[?#]|private=|draft=/, "close output must not expose URL query or fragment data");
+});
+
+test("close refusal redacts query and fragment data from its error", async () => {
+  const safeUrlSource = sourceBetween(background, "function _safeTabUrl(", "\nfunction _receiptOrigin(");
+  const safeTabUrl = new Function(`"use strict"; return (${safeUrlSource});`)();
+  const closeSource = sourceBetween(
+    background,
+    "async function _closeTabForSession(",
+    "\nasync function _switchTabForSession("
+  );
+  const sensitiveUrl = "https://user.example/work/item?draft=secret#cursor";
+  const tabs = [
+    { id: 42, index: 0, windowId: 3, url: "https://owned.example/app" },
+    { id: 99, index: 1, windowId: 3, url: sensitiveUrl },
+  ];
+  const close = new Function(
+    "_windowForSession",
+    "browser",
+    "_windowQuery",
+    "_isTabOwnedBySession",
+    "_addOwnedTab",
+    "_removeOwnedTab",
+    "_safeTabUrl",
+    `"use strict"; return (${closeSource});`
+  )(
+    () => 3,
+    {
+      tabs: {
+        query: async () => tabs,
+        remove: async () => { throw new Error("must not remove an unowned tab"); },
+        update: async () => { throw new Error("must not blank an unowned tab"); },
+      },
+    },
+    (windowId) => ({ windowId }),
+    () => false,
+    async () => {},
+    async () => {},
+    safeTabUrl
+  );
+
+  await assert.rejects(
+    () => close("fresh-session", tabs[0], { index: 2 }),
+    (error) => {
+      assert.match(error.message, /https:\/\/user\.example\/work\/item/);
+      assert.doesNotMatch(error.message, /[?#]|draft=|secret|cursor/);
+      return true;
+    }
+  );
 });
 
 test("internal cleanup names its tab instead of mutating shared active-tab state", () => {
@@ -175,8 +369,8 @@ test("the extension denies a close to a session that owns nothing", () => {
 
 test("the extension checks the tab it actually closes when given an index", () => {
   const handler = background.slice(
-    background.indexOf('case "close_tab"'),
-    background.indexOf('case "switch_tab"')
+    background.indexOf("async function _closeTabForSession("),
+    background.indexOf("async function _switchTabForSession(")
   );
   const removeAt = handler.indexOf("browser.tabs.remove(target.id)");
   const checkAt = handler.indexOf("_isTabOwnedBySession(sessionId, target.id)");
