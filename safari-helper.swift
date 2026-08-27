@@ -13,6 +13,7 @@ import Foundation
 import Darwin
 import CoreGraphics
 import AppKit
+import ApplicationServices
 
 // ========== Accessibility preflight (issue #29) ==========
 // Posting synthetic CGEvents requires Accessibility, and macOS 26 (Tahoe) tightened the
@@ -82,6 +83,298 @@ func performNativeHover(x: Double, y: Double, windowId: Int64 = 0, dwellMs: Int 
   return ["result": "hovered at (\(Int(x)),\(Int(y))) for \(ms)ms\(targetInfo)\(restoreMouse ? " (mouse restored)" : "")"]
 }
 
+
+// ========== Accessibility Press (macOS 26-safe "real" click) ==========
+// CGEvent clicks posted to a background window silently no-op on macOS 26 (issue #29).
+// The Accessibility press action does NOT go through the HID/CGEvent path — it asks the
+// app to activate the control directly, and WebKit turns it into an isTrusted DOM click.
+// This is what actually works on Tahoe where CGEvent is filtered. Coordinate is a global
+// top-left screen point (same space CGEvent uses).
+func axPressAtPoint(x: Double, y: Double) -> Bool {
+  let sysWide = AXUIElementCreateSystemWide()
+  var elementRef: AXUIElement?
+  let hit = AXUIElementCopyElementAtPosition(sysWide, Float(x), Float(y), &elementRef)
+  guard hit == .success, let hitEl = elementRef else { return false }
+
+  // Walk up from the hit element: the deepest element under the point may be a text/image
+  // leaf; the pressable control (AXButton / link) is often an ancestor.
+  var current: AXUIElement? = hitEl
+  var depth = 0
+  while let c = current, depth < 8 {
+    var actionsRef: CFArray?
+    if AXUIElementCopyActionNames(c, &actionsRef) == .success,
+       let actions = actionsRef as? [String], actions.contains(kAXPressAction as String) {
+      if AXUIElementPerformAction(c, kAXPressAction as CFString) == .success {
+        return true
+      }
+    }
+    var parentRef: CFTypeRef?
+    if AXUIElementCopyAttributeValue(c, kAXParentAttribute as CFString, &parentRef) == .success,
+       let parent = parentRef, CFGetTypeID(parent) == AXUIElementGetTypeID() {
+      current = (parent as! AXUIElement)
+    } else {
+      current = nil
+    }
+    depth += 1
+  }
+  return false
+}
+
+
+// ========== Accessibility Press by title (z-order & focus immune) ==========
+// Coordinate hit-testing returns whatever window is frontmost at the point, so on a
+// contended desktop it presses the wrong thing (or nothing). Searching Safari's own AX
+// tree for a button by its title/description finds the control regardless of window
+// stacking or focus, and pressing it produces an isTrusted DOM click that macOS 26 honors
+// where CGEvent is filtered. Returns true iff a matching, enabled, pressable element was
+// found and pressed.
+func axEnableEnhancedUI(_ app: AXUIElement) {
+  // Safari (and WebKit) only expose the full web-content AX tree to external clients when
+  // enhanced accessibility is on — the same flag VoiceOver sets. Without it, the app tree
+  // has windows but the web area's descendants (the actual buttons) are hidden, so a title
+  // search finds nothing. Turn it on before traversing.
+  AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+  AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+}
+
+func axChildText(_ el: AXUIElement) -> String? {
+  // A WebKit AXButton often carries no AXTitle — its label lives in a child AXStaticText.
+  var kidsRef: CFTypeRef?
+  guard AXUIElementCopyAttributeValue(el, kAXChildrenAttribute as CFString, &kidsRef) == .success,
+        let kids = kidsRef as? [AXUIElement] else { return nil }
+  for k in kids {
+    var v: CFTypeRef?
+    for name in [kAXValueAttribute as String, kAXTitleAttribute as String, kAXDescriptionAttribute as String] {
+      if AXUIElementCopyAttributeValue(k, name as CFString, &v) == .success, let val = v,
+         CFGetTypeID(val) == CFStringGetTypeID() {
+        let t = ((val as! CFString) as String).trimmingCharacters(in: .whitespacesAndNewlines)
+        if !t.isEmpty { return t }
+      }
+    }
+  }
+  return nil
+}
+
+func axPressByTitle(pid: pid_t, title: String, maxNodes: Int = 40000) -> Bool {
+  let app = AXUIElementCreateApplication(pid)
+  axEnableEnhancedUI(app)
+  usleep(150_000) // give WebKit a beat to build the tree
+  var queue: [(AXUIElement, Int)] = [(app, 0)]
+  var visited = 0
+  func attr(_ el: AXUIElement, _ name: String) -> String? {
+    var v: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(el, name as CFString, &v) == .success, let val = v else { return nil }
+    if CFGetTypeID(val) == CFStringGetTypeID() { return (val as! CFString) as String }
+    return nil
+  }
+  func hasPress(_ el: AXUIElement) -> Bool {
+    var a: CFArray?
+    if AXUIElementCopyActionNames(el, &a) == .success, let acts = a as? [String] {
+      return acts.contains(kAXPressAction as String)
+    }
+    return false
+  }
+  func matches(_ el: AXUIElement) -> Bool {
+    for name in [kAXTitleAttribute as String, kAXDescriptionAttribute as String, kAXValueAttribute as String] {
+      if let t = attr(el, name)?.trimmingCharacters(in: .whitespacesAndNewlines), t == title { return true }
+    }
+    if let ct = axChildText(el), ct == title { return true }
+    return false
+  }
+  while !queue.isEmpty && visited < maxNodes {
+    let (el, depth) = queue.removeFirst()
+    visited += 1
+    if matches(el) && hasPress(el) {
+      // Prefer enabled controls; if AXEnabled is explicitly false, skip.
+      var enabledRef: CFTypeRef?
+      if AXUIElementCopyAttributeValue(el, kAXEnabledAttribute as CFString, &enabledRef) == .success,
+         let e = enabledRef, CFGetTypeID(e) == CFBooleanGetTypeID(), (e as! CFBoolean) == kCFBooleanFalse {
+        // disabled — keep searching
+      } else if AXUIElementPerformAction(el, kAXPressAction as CFString) == .success {
+        return true
+      }
+    }
+    if depth < 40 {
+      var kidsRef: CFTypeRef?
+      if AXUIElementCopyAttributeValue(el, kAXChildrenAttribute as CFString, &kidsRef) == .success,
+         let kids = kidsRef as? [AXUIElement] {
+        for k in kids { queue.append((k, depth + 1)) }
+      }
+    }
+  }
+  return false
+}
+
+
+// ========== Accessibility Press inside a named window (fronts it first) ==========
+// AX (and coordinate clicks) only see the FOCUSED, visible tab's web content. When the
+// target tab is in a background window, its buttons aren't in the tree at all. So: find
+// the Safari window by title (isolation-safe — we target the automation window, not
+// "window 1"), raise it + activate Safari from inside the helper (NOT Bash osascript, so
+// the Safari-window guard hook does not apply), let WebKit build the tree, then press the
+// button by title. This is the macOS 26-safe "real click" that CGEvent can't deliver.
+func axPressInWindow(pid: pid_t, windowMatch: String, buttonTitle: String) -> (Bool, String) {
+  let app = AXUIElementCreateApplication(pid)
+  AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+  AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+
+  func str(_ el: AXUIElement, _ n: String) -> String? {
+    var v: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(el, n as CFString, &v) == .success, let val = v,
+          CFGetTypeID(val) == CFStringGetTypeID() else { return nil }
+    return (val as! CFString) as String
+  }
+  // Find the matching window
+  var winsRef: CFTypeRef?
+  guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &winsRef) == .success,
+        let windows = winsRef as? [AXUIElement] else { return (false, "no-windows") }
+  var target: AXUIElement?
+  for w in windows {
+    if let t = str(w, kAXTitleAttribute as String), t.contains(windowMatch) { target = w; break }
+  }
+  guard let win = target else { return (false, "window-not-found") }
+  // Raise + focus the window, activate the app — brings the tab's web view to visible/front
+  AXUIElementPerformAction(win, kAXRaiseAction as CFString)
+  AXUIElementSetAttributeValue(win, kAXMainAttribute as CFString, kCFBooleanTrue)
+  AXUIElementSetAttributeValue(win, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+  if let running = NSRunningApplication(processIdentifier: pid) {
+    running.activate(options: [.activateIgnoringOtherApps])
+  }
+  usleep(500_000) // let WebKit populate the AX tree for the now-visible tab
+
+  // Search this window's subtree for the pressable button by title / child text
+  var queue: [(AXUIElement, Int)] = [(win, 0)]
+  var visited = 0
+  while !queue.isEmpty && visited < 60000 {
+    let (el, depth) = queue.removeFirst(); visited += 1
+    if matchesTitle(el, buttonTitle) && elementHasPress(el) {
+      var enRef: CFTypeRef?
+      let disabled = (AXUIElementCopyAttributeValue(el, kAXEnabledAttribute as CFString, &enRef) == .success)
+        && (enRef != nil) && (CFGetTypeID(enRef!) == CFBooleanGetTypeID()) && ((enRef as! CFBoolean) == kCFBooleanFalse)
+      if !disabled && AXUIElementPerformAction(el, kAXPressAction as CFString) == .success {
+        return (true, "pressed after \(visited) nodes")
+      }
+    }
+    if depth < 60 {
+      var kidsRef: CFTypeRef?
+      if AXUIElementCopyAttributeValue(el, kAXChildrenAttribute as CFString, &kidsRef) == .success,
+         let kids = kidsRef as? [AXUIElement] {
+        for k in kids { queue.append((k, depth + 1)) }
+      }
+    }
+  }
+  return (false, "button-not-found-in-window (visited \(visited))")
+}
+
+// Shared matchers (used by both axPressByTitle and axPressInWindow)
+func elementHasPress(_ el: AXUIElement) -> Bool {
+  var a: CFArray?
+  if AXUIElementCopyActionNames(el, &a) == .success, let acts = a as? [String] {
+    return acts.contains(kAXPressAction as String)
+  }
+  return false
+}
+func matchesTitle(_ el: AXUIElement, _ title: String) -> Bool {
+  func str(_ n: String) -> String? {
+    var v: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(el, n as CFString, &v) == .success, let val = v,
+          CFGetTypeID(val) == CFStringGetTypeID() else { return nil }
+    return ((val as! CFString) as String).trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+  for n in [kAXTitleAttribute as String, kAXDescriptionAttribute as String, kAXValueAttribute as String] {
+    if str(n) == title { return true }
+  }
+  if let ct = axChildText(el)?.trimmingCharacters(in: .whitespacesAndNewlines), ct == title { return true }
+  return false
+}
+
+
+// ========== Front my tab (by URL) + AX press — atomic, beats tab-stealing ==========
+// Parallel sessions keep switching the automation window's active tab away from mine, so
+// the target's web content is never in the AX tree long enough. This does it in one shot:
+// an in-helper AppleScript makes the tab whose URL matches the current tab AND fronts its
+// window (targeted by URL, isolation-safe — never a generic "window 1"), then — without
+// yielding — enables enhanced AX and presses the button. Runs as NSAppleScript in-process,
+// so the Bash-level Safari-window guard hook does not apply.
+func frontTabByUrl(_ urlContains: String) -> Bool {
+  let src = """
+  tell application "Safari"
+    repeat with w in windows
+      repeat with t in tabs of w
+        try
+          if (URL of t) contains "\(urlContains)" then
+            set current tab of w to t
+            set index of w to 1
+            return "ok"
+          end if
+        end try
+      end repeat
+    end repeat
+    return "notfound"
+  end tell
+  """
+  guard let script = NSAppleScript(source: src) else { return false }
+  var err: NSDictionary?
+  let res = script.executeAndReturnError(&err)
+  return (res.stringValue ?? "") == "ok"
+}
+
+func axPressTab(pid: pid_t, urlContains: String, buttonTitle: String) -> (Bool, String) {
+  if !frontTabByUrl(urlContains) { return (false, "front-failed") }
+  let app = AXUIElementCreateApplication(pid)
+  AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+  AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+  if let running = NSRunningApplication(processIdentifier: pid) { running.activate(options: []) }
+  usleep(600_000) // WebKit builds the AX tree for the now-frontmost tab
+
+  // Press within the frontmost window (index 0 in AX windows is the frontmost/main one).
+  var winsRef: CFTypeRef?
+  guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &winsRef) == .success,
+        let windows = winsRef as? [AXUIElement], let front = windows.first else { return (false, "no-window") }
+  var queue: [(AXUIElement, Int)] = [(front, 0)]
+  var visited = 0
+  while !queue.isEmpty && visited < 80000 {
+    let (el, depth) = queue.removeFirst(); visited += 1
+    if matchesTitle(el, buttonTitle) && elementHasPress(el) {
+      var enRef: CFTypeRef?
+      let disabled = (AXUIElementCopyAttributeValue(el, kAXEnabledAttribute as CFString, &enRef) == .success)
+        && (enRef != nil) && (CFGetTypeID(enRef!) == CFBooleanGetTypeID()) && ((enRef as! CFBoolean) == kCFBooleanFalse)
+      if !disabled && AXUIElementPerformAction(el, kAXPressAction as CFString) == .success {
+        return (true, "pressed after \(visited) nodes")
+      }
+    }
+    if depth < 60 {
+      var kidsRef: CFTypeRef?
+      if AXUIElementCopyAttributeValue(el, kAXChildrenAttribute as CFString, &kidsRef) == .success,
+         let kids = kidsRef as? [AXUIElement] {
+        for k in kids { queue.append((k, depth + 1)) }
+      }
+    }
+  }
+  return (false, "button-not-found (visited \(visited))")
+}
+
+
+// A physical-equivalent click on the FRONTMOST window: warp the cursor there and post
+// down/up to the HID tap (kCGHIDEventTap) — the same path a trackpad tap takes. macOS 26
+// honors this where process-targeted (postToPid) events are filtered. Caller must ensure
+// the intended window is frontmost first (frontTabByUrl).
+func realClickAtPoint(x: Double, y: Double) {
+  let pt = CGPoint(x: x, y: y)
+  let src = CGEventSource(stateID: .hidSystemState)
+  CGWarpMouseCursorPosition(pt)
+  usleep(30_000)
+  if let mv = CGEvent(mouseEventSource: src, mouseType: .mouseMoved, mouseCursorPosition: pt, mouseButton: .left) { mv.post(tap: .cghidEventTap) }
+  usleep(20_000)
+  if let dn = CGEvent(mouseEventSource: src, mouseType: .leftMouseDown, mouseCursorPosition: pt, mouseButton: .left) {
+    dn.setIntegerValueField(.mouseEventClickState, value: 1); dn.post(tap: .cghidEventTap)
+  }
+  usleep(60_000)
+  if let up = CGEvent(mouseEventSource: src, mouseType: .leftMouseUp, mouseCursorPosition: pt, mouseButton: .left) {
+    up.setIntegerValueField(.mouseEventClickState, value: 1); up.post(tap: .cghidEventTap)
+  }
+}
+
 // ========== CGEvent Native Click ==========
 // Performs a REAL OS-level mouse click that produces isTrusted: true in the browser.
 // Requires Accessibility permissions (same as AppleScript automation).
@@ -89,6 +382,14 @@ func performNativeHover(x: Double, y: Double, windowId: Int64 = 0, dwellMs: Int 
 func performNativeClick(x: Double, y: Double, doubleClick: Bool = false, windowId: Int64 = 0) -> [String: Any] {
   if let denied = ensurePostEventAccess() { return denied }
   let point = CGPoint(x: x, y: y)
+
+  // macOS 26-safe path first: Accessibility press produces an isTrusted click even when
+  // CGEvent-to-background-window is filtered. Only for single clicks (AX has no double).
+  if !doubleClick {
+    if axPressAtPoint(x: x, y: y) {
+      return ["result": "clicked at (\(Int(x)),\(Int(y))) [axpress]"]
+    }
+  }
 
   // --- Window-targeted click ---
   // When windowId is provided, we set CGEventField.windowNumber on the event.
@@ -324,6 +625,139 @@ func handleLine(_ line: String) {
   guard let data = line.data(using: .utf8),
         let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
     respond(["error": "invalid input"])
+    return
+  }
+
+  // Debug: list pressable elements and their labels
+  // {"axdump": {}}
+  if json["axdump"] != nil {
+    var pid: pid_t = 0
+    for app in NSWorkspace.shared.runningApplications where app.bundleIdentifier == "com.apple.Safari" { pid = app.processIdentifier; break }
+    if pid == 0 { respond(["error": "Safari not found"]); return }
+    let app = AXUIElementCreateApplication(pid)
+    AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+    AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+    usleep(200_000)
+    var out: [String] = []
+    var queue: [(AXUIElement, Int)] = [(app, 0)]
+    var visited = 0
+    func a(_ el: AXUIElement, _ n: String) -> String {
+      var v: CFTypeRef?
+      if AXUIElementCopyAttributeValue(el, n as CFString, &v) == .success, let val = v, CFGetTypeID(val) == CFStringGetTypeID() { return (val as! CFString) as String }
+      return ""
+    }
+    while !queue.isEmpty && visited < 40000 && out.count < 60 {
+      let (el, depth) = queue.removeFirst(); visited += 1
+      var acts: CFArray?
+      let pressable = (AXUIElementCopyActionNames(el, &acts) == .success) && ((acts as? [String])?.contains(kAXPressAction as String) ?? false)
+      if pressable {
+        let role = a(el, kAXRoleAttribute as String)
+        let title = a(el, kAXTitleAttribute as String)
+        let desc = a(el, kAXDescriptionAttribute as String)
+        let ct = axChildText(el) ?? ""
+        let label = [title, desc, ct].first(where: { !$0.isEmpty }) ?? ""
+        if !label.isEmpty { out.append("\(role):\(label.prefix(30))") }
+      }
+      if depth < 40 {
+        var kidsRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(el, kAXChildrenAttribute as CFString, &kidsRef) == .success, let kids = kidsRef as? [AXUIElement] {
+          for k in kids { queue.append((k, depth + 1)) }
+        }
+      }
+    }
+    respond(["result": out.joined(separator: " | "), "visited": visited])
+    return
+  }
+
+  // Debug: list Safari window titles
+  if json["axwindows"] != nil {
+    var pid: pid_t = 0
+    for app in NSWorkspace.shared.runningApplications where app.bundleIdentifier == "com.apple.Safari" { pid = app.processIdentifier; break }
+    let app = AXUIElementCreateApplication(pid)
+    var winsRef: CFTypeRef?
+    var out: [String] = []
+    if AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &winsRef) == .success, let ws = winsRef as? [AXUIElement] {
+      for (i,w) in ws.enumerated() {
+        var v: CFTypeRef?
+        var title = "?"
+        if AXUIElementCopyAttributeValue(w, kAXTitleAttribute as CFString, &v) == .success, let val = v, CFGetTypeID(val)==CFStringGetTypeID() { title = (val as! CFString) as String }
+        out.append("[\(i)] \(title.prefix(50))")
+      }
+    }
+    respond(["result": out.joined(separator: " || ")])
+    return
+  }
+
+  // Diagnostic: front my tab by URL, report the resulting frontmost window title
+  if let fc = json["frontcheck"] as? [String: Any], let url = fc["url"] as? String {
+    let ok = frontTabByUrl(url)
+    var pid: pid_t = 0
+    for app in NSWorkspace.shared.runningApplications where app.bundleIdentifier == "com.apple.Safari" { pid = app.processIdentifier; break }
+    if let running = NSRunningApplication(processIdentifier: pid) { running.activate(options: []) }
+    usleep(500_000)
+    let app = AXUIElementCreateApplication(pid)
+    var winsRef: CFTypeRef?
+    var title = "?"
+    if AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &winsRef) == .success, let ws = winsRef as? [AXUIElement], let f = ws.first {
+      var v: CFTypeRef?
+      if AXUIElementCopyAttributeValue(f, kAXTitleAttribute as CFString, &v) == .success, let val = v, CFGetTypeID(val)==CFStringGetTypeID() { title = (val as! CFString) as String }
+    }
+    respond(["result": "front=\(ok) frontmostWindow=\(title.prefix(60))"])
+    return
+  }
+
+  // Front my tab by URL, then AX-press at exact coordinates (atomic; beats tab-stealing).
+  // Once the tab is frontmost, hit-testing returns the right element. {"clickTab":{"url":"..","x":..,"y":..}}
+  if let ct = json["clickTab"] as? [String: Any], let url = ct["url"] as? String,
+     let x = ct["x"] as? Double, let y = ct["y"] as? Double {
+    if let denied = ensurePostEventAccess() { respond(denied); return }
+    let fronted = frontTabByUrl(url)
+    var pid: pid_t = 0
+    for app in NSWorkspace.shared.runningApplications where app.bundleIdentifier == "com.apple.Safari" { pid = app.processIdentifier; break }
+    if let running = NSRunningApplication(processIdentifier: pid) { running.activate(options: []) }
+    usleep(500_000)
+    realClickAtPoint(x: x, y: y)
+    respond(["result": "clickTab fronted=\(fronted) realclick at (\(Int(x)),\(Int(y)))"])
+    return
+  }
+
+  // Front my tab by URL then AX-press a button by title (atomic)
+  // {"axpressTab": {"url": "use_cases", "title": "Save"}}
+  if let apt = json["axpressTab"] as? [String: Any],
+     let url = apt["url"] as? String, let title = apt["title"] as? String {
+    if let denied = ensurePostEventAccess() { respond(denied); return }
+    var pid: pid_t = 0
+    for app in NSWorkspace.shared.runningApplications where app.bundleIdentifier == "com.apple.Safari" { pid = app.processIdentifier; break }
+    if pid == 0 { respond(["error": "Safari not found"]); return }
+    let (ok, msg) = axPressTab(pid: pid, urlContains: url, buttonTitle: title)
+    respond(ok ? ["result": "axpressTab:\(title) (\(msg))"] : ["error": "axpressTab-failed:\(msg)"])
+    return
+  }
+
+  // Handle window-scoped AX press
+  // {"axpressWindow": {"window": "בננה בוק", "title": "Save"}}
+  if let apw = json["axpressWindow"] as? [String: Any],
+     let wm = apw["window"] as? String, let title = apw["title"] as? String {
+    if let denied = ensurePostEventAccess() { respond(denied); return }
+    var pid: pid_t = 0
+    for app in NSWorkspace.shared.runningApplications where app.bundleIdentifier == "com.apple.Safari" { pid = app.processIdentifier; break }
+    if pid == 0 { respond(["error": "Safari not found"]); return }
+    let (ok, msg) = axPressInWindow(pid: pid, windowMatch: wm, buttonTitle: title)
+    respond(ok ? ["result": "axpressWindow:\(title) (\(msg))"] : ["error": "axpressWindow-failed:\(msg)"])
+    return
+  }
+
+  // Handle Accessibility press-by-title command
+  // {"axpress": {"title": "Save"}}  — finds Safari's button by title and presses it (isTrusted)
+  if let ap = json["axpress"] as? [String: Any], let title = ap["title"] as? String {
+    if let denied = ensurePostEventAccess() { respond(denied); return }
+    var pid: pid_t = 0
+    for app in NSWorkspace.shared.runningApplications where app.bundleIdentifier == "com.apple.Safari" {
+      pid = app.processIdentifier; break
+    }
+    if pid == 0 { respond(["error": "Safari process not found"]); return }
+    let ok = axPressByTitle(pid: pid, title: title)
+    respond(ok ? ["result": "axpress:\(title)"] : ["error": "axpress-no-match:\(title)"])
     return
   }
 
