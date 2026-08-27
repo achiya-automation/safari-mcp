@@ -29,6 +29,7 @@ import { readFileSync } from "node:fs";
 const safari = readFileSync(new URL("../safari.js", import.meta.url), "utf8");
 const index = readFileSync(new URL("../index.js", import.meta.url), "utf8");
 const background = readFileSync(new URL("../extension/background.js", import.meta.url), "utf8");
+const BROWSER_EPOCH = "e".repeat(36);
 
 function sourceBetween(source, startNeedle, endNeedle) {
   const start = source.indexOf(startNeedle);
@@ -56,6 +57,7 @@ function makeReceiptResolver({ records = new Map(), tabs = [] } = {}) {
     "_persistOwnedTabs",
     "_receiptOrigin",
     "_withReceiptMutationLock",
+    "_ensureBrowserSessionEpoch",
     `"use strict"; return (${resolveReceiptSource});`
   )(
     records,
@@ -68,7 +70,8 @@ function makeReceiptResolver({ records = new Map(), tabs = [] } = {}) {
     (url) => {
       try { return new URL(url).origin; } catch { return ""; }
     },
-    (operation) => operation()
+    (operation) => operation(),
+    async () => BROWSER_EPOCH
   );
   return { resolveReceipt, tokenByTabId, ownedTabIds };
 }
@@ -216,6 +219,8 @@ test("forged, stale, and cross-origin receipts fail closed", async () => {
     records: new Map([[token, {
       token,
       tabId: 42,
+      windowId: 3,
+      browserEpoch: BROWSER_EPOCH,
       receiptOrigin: "https://owned.example",
       identityDigest: `digest:${originalUrl}`,
     }]]),
@@ -228,6 +233,8 @@ test("forged, stale, and cross-origin receipts fail closed", async () => {
     records: new Map([[token, {
       token,
       tabId: 42,
+      windowId: 3,
+      browserEpoch: BROWSER_EPOCH,
       receiptOrigin: "https://owned.example",
       identityDigest: `digest:${crossOriginUrl}`,
     }]]),
@@ -350,21 +357,17 @@ test("internal cleanup names its tab instead of mutating shared active-tab state
   );
 });
 
-test("the extension denies a close to a session that owns nothing", () => {
-  assert.match(
-    background,
-    /_destructiveTabCommands\s*=\s*new Set\(\["close_tab"\]\)/,
-    "close_tab must be marked destructive in the extension engine too"
-  );
+test("the extension denies every mutation to a session that owns nothing", () => {
   const guard = background.slice(
     background.indexOf("TAB OWNERSHIP GUARD"),
     background.indexOf("switch (type)")
   );
   assert.match(
     guard,
-    /_destructiveTabCommands\.has\(type\)[\s\S]{0,300}throw new Error/,
-    "the 'no tabs owned yet' leniency must not extend to a destructive close"
+    /if \(receiptResolved\)[\s\S]*else \{[\s\S]{0,350}throw new Error/,
+    "a session without ownership or a valid receipt must fail closed for every write"
   );
+  assert.doesNotMatch(guard, /No tabs owned yet|_destructiveTabCommands/);
 });
 
 test("the extension checks the tab it actually closes when given an index", () => {

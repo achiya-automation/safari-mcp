@@ -577,18 +577,9 @@ async function handleCommand(type, payload) {
         await _addOwnedTab(sessionId, tabId);
       }
     } else {
-      const anyOwned = _sessionOwnedTabs.has(sessionId) && _sessionOwnedTabs.get(sessionId).size > 0;
-      if (anyOwned) {
-        throw new Error(`⚠️ Tab safety: refusing "${type}" on tab ${tabId} (${_safeTabUrl(targetTab.url)}) — not opened by this MCP session. Use safari_new_tab first.`);
-      }
-      // No tabs owned yet → allow, for sessions that never call new_tab. That leniency is
-      // survivable for a write (worst case: it edits the page the user is already on) but not
-      // for a close, which throws their tab away. It also fires for a session re-initialised
-      // after a transport drop, which reports owning nothing while its tab is still open —
-      // the state in which close_tab destroyed a user's tab (#68).
-      if (_destructiveTabCommands.has(type)) {
-        throw new Error(`⚠️ Tab safety: refusing "${type}" on tab ${tabId} (${_safeTabUrl(targetTab.url)}) — this session owns no tabs, so it has none to close. Use safari_new_tab first.`);
-      }
+      // A cold or brand-new session has no authority to mutate the user's active tab.
+      // Stateless callers can present a receipt; otherwise they must create a tab first.
+      throw new Error(`⚠️ Tab safety: refusing "${type}" on tab ${tabId} (${_safeTabUrl(targetTab.url)}) — not opened by this MCP session. Use safari_new_tab first or provide its receipt.`);
     }
   }
 
@@ -2405,8 +2396,9 @@ const _OWNED_TABS_TTL_MS = 6 * 60 * 60 * 1000;
 // "no tabs owned yet" compatibility path then silently allowed write commands
 // on ANY tab, including the user's.
 const _OWNED_TABS_KEY = "mcpSessionOwnedTabs";
-const _TAB_RECEIPTS_KEY = "mcpOwnedTabReceiptsV2";
-const _TAB_RECEIPTS_VERSION = 2;
+const _TAB_RECEIPTS_KEY = "mcpOwnedTabReceiptsV3";
+const _TAB_RECEIPTS_VERSION = 3;
+const _BROWSER_SESSION_EPOCH_KEY = "mcpBrowserSessionEpochV1";
 // Receipts are bearer capabilities stored entirely out of band. They are never added
 // to a live page URL: doing so corrupts signed queries and application hash routers.
 const _receiptByToken = new Map(); // token → { tabId, windowId, receiptOrigin, identityDigest, issuedAt }
@@ -2414,6 +2406,12 @@ const _tokenByTabId = new Map(); // concrete live tab id → token
 let _receiptMutationTail = Promise.resolve(); // serialize every mutation covered by the full persisted envelope
 let _ownedTabsHydrated = false;
 let _ownedTabsHydrationPromise = null;
+let _browserSessionEpoch = "";
+let _browserStartupResetPromise = null;
+let _browserEpochInitializationPromise = null;
+let _browserEpochGeneration = 0;
+let _browserEpochStorageTail = Promise.resolve();
+const _browserStartupLifecycleAvailable = !!browser.runtime?.onStartup?.addListener;
 
 async function _digestTabUrl(rawUrl) {
   const bytes = new TextEncoder().encode(String(rawUrl || ""));
@@ -2424,6 +2422,8 @@ async function _digestTabUrl(rawUrl) {
 function _isValidReceiptRecord(token, record) {
   return /^[A-Za-z0-9_-]{24,}$/.test(String(token || "")) &&
     record && Number.isInteger(Number(record.tabId)) &&
+    Number.isInteger(Number(record.windowId)) &&
+    typeof record.browserEpoch === "string" && /^[a-f0-9]{36}$/.test(record.browserEpoch) &&
     typeof record.identityDigest === "string" && /^[a-f0-9]{64}$/.test(record.identityDigest) &&
     typeof record.receiptOrigin === "string" && !!record.receiptOrigin;
 }
@@ -2445,30 +2445,84 @@ function _recoverSessionWindowsFromOwnedTabs(liveTabsById) {
   }
 }
 
-function _resolveHydratedReceiptTab(liveTabs, liveTabsById, liveDigests, claimedTabIds, record) {
+function _resolveHydratedReceiptTab(liveTabsById, claimedTabIds, record, browserEpoch) {
+  if (record.browserEpoch !== browserEpoch) return null;
   const direct = liveTabsById.get(record.tabId);
-  // Worker reloads preserve Safari tab ids. If the recorded tab id disappeared, there
-  // is no stable in-tab marker that can distinguish the original from an unrelated tab
-  // at the same URL, so digest-only rebinding must fail closed.
+  // Worker suspension preserves Safari tab/window ids and the browser-session epoch.
+  // URL identity is deliberately not required here: SPAs mutate it without a full load,
+  // and redirects can happen while the worker sleeps. A full Safari restart rotates the
+  // epoch before any receipt can be hydrated, preventing tab-id reuse across runs.
   if (!direct) return null;
-  // If the stored id still exists but now has a different byte-exact URL identity, it
-  // is evidence that the receipt is stale. Never jump from that tab to a different tab
-  // which happens to have the old URL.
-  if (liveDigests.get(direct.id) !== record.identityDigest) return null;
-
-  // Tab ids alone are not durable identity. Even a direct id+digest match is ambiguous
-  // when another live tab has the same exact URL digest, so require global uniqueness.
-  const candidates = liveTabs.filter((tab) =>
-    liveDigests.get(tab.id) === record.identityDigest
-  );
-  if (candidates.length !== 1 || candidates[0].id !== direct.id || claimedTabIds.has(direct.id)) return null;
+  if (Number(record.windowId) !== Number(direct.windowId)) return null;
+  if (claimedTabIds.has(direct.id)) return null;
   return direct;
 }
 
+function _withBrowserEpochStorageLock(operation) {
+  const previous = _browserEpochStorageTail;
+  const current = previous.catch(() => {}).then(operation);
+  _browserEpochStorageTail = current.then(() => undefined, () => undefined);
+  return current;
+}
+
+async function _ensureBrowserSessionEpoch() {
+  if (!_browserStartupLifecycleAvailable) {
+    throw new Error("Browser startup lifecycle is unavailable; refusing durable tab authority");
+  }
+  if (_browserStartupResetPromise) await _browserStartupResetPromise;
+  if (/^[a-f0-9]{36}$/.test(_browserSessionEpoch)) return _browserSessionEpoch;
+  if (!_browserEpochInitializationPromise) {
+    const generation = _browserEpochGeneration;
+    _browserEpochInitializationPromise = _withBrowserEpochStorageLock(async () => {
+      if (generation !== _browserEpochGeneration) {
+        throw new Error("Browser-session identity changed during initialization");
+      }
+      let stored = null;
+      try {
+        stored = await browser.storage.local.get(_BROWSER_SESSION_EPOCH_KEY);
+      } catch {
+        throw new Error("Could not load browser-session identity");
+      }
+      const persisted = String(stored?.[_BROWSER_SESSION_EPOCH_KEY] || "");
+      if (/^[a-f0-9]{36}$/.test(persisted)) {
+        if (generation !== _browserEpochGeneration) {
+          throw new Error("Browser-session identity changed during initialization");
+        }
+        _browserSessionEpoch = persisted;
+        return persisted;
+      }
+      const epoch = _mintMcpTabMarker();
+      try {
+        await browser.storage.local.set({ [_BROWSER_SESSION_EPOCH_KEY]: epoch });
+      } catch {
+        throw new Error("Could not persist browser-session identity");
+      }
+      if (generation !== _browserEpochGeneration) {
+        throw new Error("Browser-session identity changed during initialization");
+      }
+      _browserSessionEpoch = epoch;
+      return epoch;
+    });
+  }
+  const initialization = _browserEpochInitializationPromise;
+  try {
+    return await initialization;
+  } finally {
+    if (_browserEpochInitializationPromise === initialization) {
+      _browserEpochInitializationPromise = null;
+    }
+  }
+}
+
 async function _hydrateOwnedTabs() {
+  // A startup reset must gate even an already-hydrated worker. If reset storage
+  // fails, no stale in-memory authority is allowed to bypass that failure.
+  if (_browserStartupResetPromise) await _browserStartupResetPromise;
   if (_ownedTabsHydrated) return;
   if (_ownedTabsHydrationPromise) return _ownedTabsHydrationPromise;
-  _ownedTabsHydrationPromise = (async () => {
+  const generation = _browserEpochGeneration;
+  const hydration = (async () => {
+    const browserEpoch = await _ensureBrowserSessionEpoch();
     let liveTabs;
     try {
       liveTabs = await browser.tabs.query({});
@@ -2486,7 +2540,7 @@ async function _hydrateOwnedTabs() {
     }
 
     // Load owner sets without trusting their tab ids yet. A set is restored only for
-    // a receipt whose cryptographic URL identity resolves to one unambiguous live tab.
+    // a receipt whose browser epoch and exact live tab/window identity both validate.
     const storedOwners = new Map();
     const mergeOwners = (data) => {
       if (!data || typeof data !== "object") return;
@@ -2507,7 +2561,8 @@ async function _hydrateOwnedTabs() {
       throw new Error("Could not load durable tab ownership");
     }
     const ownerEnvelope = localOwned?.[_OWNED_TABS_LOCAL_KEY];
-    const ownersFresh = ownerEnvelope && typeof ownerEnvelope.at === "number" &&
+    const ownersFresh = ownerEnvelope && ownerEnvelope.browserEpoch === browserEpoch &&
+      typeof ownerEnvelope.at === "number" &&
       (Date.now() - ownerEnvelope.at) < _OWNED_TABS_TTL_MS;
     if (ownersFresh) mergeOwners(ownerEnvelope.tabs);
 
@@ -2519,6 +2574,7 @@ async function _hydrateOwnedTabs() {
       throw new Error("Could not load durable tab receipts");
     }
     const receiptsFresh = receiptEnvelope && receiptEnvelope.version === _TAB_RECEIPTS_VERSION &&
+      receiptEnvelope.browserEpoch === browserEpoch &&
       typeof receiptEnvelope.at === "number" &&
       (Date.now() - receiptEnvelope.at) < _OWNED_TABS_TTL_MS;
     const records = receiptsFresh && Array.isArray(receiptEnvelope.records)
@@ -2526,6 +2582,9 @@ async function _hydrateOwnedTabs() {
       : [];
     const claimedTabIds = new Set();
     const validatedIds = new Map();
+    const recoveredReceipts = new Map();
+    const recoveredTokens = new Map();
+    const recoveredOwners = new Map();
 
     for (const storedRecord of records) {
       const token = String(storedRecord?.token || "");
@@ -2533,6 +2592,7 @@ async function _hydrateOwnedTabs() {
         token,
         tabId: Number(storedRecord?.tabId),
         windowId: Number(storedRecord?.windowId),
+        browserEpoch: String(storedRecord?.browserEpoch || ""),
         receiptOrigin: String(storedRecord?.receiptOrigin || ""),
         identityDigest: String(storedRecord?.identityDigest || ""),
         issuedAt: Number(storedRecord?.issuedAt) || Date.now(),
@@ -2540,15 +2600,16 @@ async function _hydrateOwnedTabs() {
       if (!_isValidReceiptRecord(token, record)) continue;
 
       const resolved = _resolveHydratedReceiptTab(
-        liveTabs, liveTabsById, liveDigests, claimedTabIds, record
+        liveTabsById, claimedTabIds, record, browserEpoch
       );
       if (!resolved) continue;
 
       const oldTabId = record.tabId;
       record.tabId = resolved.id;
       record.windowId = resolved.windowId;
-      _receiptByToken.set(token, record);
-      _tokenByTabId.set(resolved.id, token);
+      record.identityDigest = liveDigests.get(resolved.id);
+      recoveredReceipts.set(token, record);
+      recoveredTokens.set(resolved.id, token);
       claimedTabIds.add(resolved.id);
       validatedIds.set(oldTabId, resolved.id);
     }
@@ -2559,48 +2620,69 @@ async function _hydrateOwnedTabs() {
         const resolvedId = validatedIds.get(oldId);
         if (resolvedId !== undefined) restored.add(resolvedId);
       }
-      if (restored.size) _sessionOwnedTabs.set(sid, restored);
+      if (restored.size) recoveredOwners.set(sid, restored);
     }
 
+    if (generation !== _browserEpochGeneration || browserEpoch !== _browserSessionEpoch) {
+      throw new Error("Browser session changed during tab ownership recovery");
+    }
+    _receiptByToken.clear();
+    _tokenByTabId.clear();
+    _sessionOwnedTabs.clear();
+    for (const [token, record] of recoveredReceipts) _receiptByToken.set(token, record);
+    for (const [tabId, token] of recoveredTokens) _tokenByTabId.set(tabId, token);
+    for (const [sid, restored] of recoveredOwners) _sessionOwnedTabs.set(sid, restored);
     _recoverSessionWindowsFromOwnedTabs(liveTabsById);
     _ownedTabsHydrated = true;
   })();
+  _ownedTabsHydrationPromise = hydration;
   try {
-    await _ownedTabsHydrationPromise;
+    await hydration;
   } finally {
-    _ownedTabsHydrationPromise = null;
+    if (_ownedTabsHydrationPromise === hydration) _ownedTabsHydrationPromise = null;
   }
 }
 async function _persistOwnedTabs(requireDurableReceipt = false) {
+  const browserEpoch = await _ensureBrowserSessionEpoch();
+  const generation = _browserEpochGeneration;
   const owners = {};
   for (const [sid, set] of _sessionOwnedTabs) owners[sid] = [...set];
   const receiptEnvelope = {
     version: _TAB_RECEIPTS_VERSION,
+    browserEpoch,
     at: Date.now(),
     records: [..._receiptByToken.values()].map((record) => ({ ...record })),
   };
 
-  let sessionWrite = Promise.resolve();
-  try {
-    sessionWrite = Promise.resolve(browser.storage.session.set({ [_OWNED_TABS_KEY]: owners }));
-  } catch {} // Safari may not implement storage.session
+  return _withBrowserEpochStorageLock(async () => {
+    if (generation !== _browserEpochGeneration || browserEpoch !== _browserSessionEpoch) {
+      throw new Error("Browser session changed before tab authority could be persisted");
+    }
 
-  let localWrite;
-  try {
-    localWrite = Promise.resolve(browser.storage.local.set({
-      [_TAB_RECEIPTS_KEY]: receiptEnvelope,
-      [_OWNED_TABS_LOCAL_KEY]: { at: Date.now(), tabs: owners },
-    }));
-  } catch (error) {
-    if (requireDurableReceipt) throw new Error("Could not persist tab receipt");
-    localWrite = Promise.reject(error);
-  }
+    let sessionWrite = Promise.resolve();
+    try {
+      sessionWrite = Promise.resolve(browser.storage.session.set({ [_OWNED_TABS_KEY]: owners }));
+    } catch {} // Safari may not implement storage.session
 
-  const results = await Promise.allSettled([sessionWrite, localWrite]);
-  if (requireDurableReceipt && results[1]?.status !== "fulfilled") {
-    throw new Error("Could not persist tab receipt");
-  }
-  return results;
+    let localWrite;
+    try {
+      localWrite = Promise.resolve(browser.storage.local.set({
+        [_TAB_RECEIPTS_KEY]: receiptEnvelope,
+        [_OWNED_TABS_LOCAL_KEY]: { browserEpoch, at: Date.now(), tabs: owners },
+      }));
+    } catch (error) {
+      localWrite = Promise.reject(error);
+    }
+
+    const results = await Promise.allSettled([sessionWrite, localWrite]);
+    if (generation !== _browserEpochGeneration || browserEpoch !== _browserSessionEpoch) {
+      throw new Error("Browser session changed while tab authority was being persisted");
+    }
+    if (requireDurableReceipt && results[1]?.status !== "fulfilled") {
+      throw new Error("Could not persist tab receipt");
+    }
+    return results;
+  });
 }
 
 function _extractMcpTabMarker(url) {
@@ -2638,6 +2720,7 @@ async function _issueTabReceipt(tab, options = {}) {
   return _withReceiptMutationLock(async () => {
     const receiptOrigin = String(options.receiptOrigin || _receiptOrigin(tab.url) || "");
     if (!receiptOrigin) return "";
+    const browserEpoch = await _ensureBrowserSessionEpoch();
     const identityDigest = await _digestTabUrl(options.identityUrl ?? tab.url ?? "");
     const token = _mintMcpTabMarker();
     const oldToken = _tokenByTabId.get(tabId) || "";
@@ -2646,6 +2729,7 @@ async function _issueTabReceipt(tab, options = {}) {
       token,
       tabId,
       windowId: Number(tab.windowId),
+      browserEpoch,
       receiptOrigin,
       identityDigest,
       issuedAt: Date.now(),
@@ -2733,6 +2817,8 @@ async function _resolveReceiptTab(token, { allowOriginChange = false } = {}) {
     if (!/^[A-Za-z0-9_-]{24,}$/.test(normalized)) return null;
     const record = _receiptByToken.get(normalized);
     if (!_isValidReceiptRecord(normalized, record)) return null;
+    const browserEpoch = await _ensureBrowserSessionEpoch();
+    if (record.browserEpoch !== browserEpoch) return null;
 
     const allTabs = await browser.tabs.query({});
     const direct = allTabs.find((tab) => tab.id === record.tabId) || null;
@@ -2816,9 +2902,62 @@ function _hasTabReceiptAuthority(sessionId, tabId, receiptResolved) {
   return receiptResolved === true || _isTabOwnedBySession(sessionId, tabId);
 }
 
-// Commands that destroy a tab rather than change a page. They get no "no tabs owned yet"
-// leniency: a session that owns nothing has nothing to close (#68).
-const _destructiveTabCommands = new Set(["close_tab"]);
+// storage.local survives a full Safari restart, while tab ids do not have durable
+// meaning across browser runs. Rotate the epoch at browser startup and clear all
+// persisted authority before the first command can hydrate it. A mere MV3 worker
+// suspension does not fire onStartup, so receipts remain usable in that case.
+if (_browserStartupLifecycleAvailable) {
+  browser.runtime.onStartup.addListener(() => {
+    const generation = ++_browserEpochGeneration;
+    _browserSessionEpoch = "";
+    _browserEpochInitializationPromise = null;
+    _ownedTabsHydrated = false;
+    _ownedTabsHydrationPromise = null;
+    _sessionOwnedTabs.clear();
+    _receiptByToken.clear();
+    _tokenByTabId.clear();
+
+    // This queue is separate from receipt mutation. It lets any already-running old
+    // write finish (or fail its generation check), then guarantees the reset is the
+    // last authority state written for the new browser run without a lock cycle.
+    const resetPromise = _withBrowserEpochStorageLock(async () => {
+      const epoch = _mintMcpTabMarker();
+      if (generation !== _browserEpochGeneration) {
+        throw new Error("Browser session changed before startup reset");
+      }
+      try {
+        await browser.storage.session.remove(_OWNED_TABS_KEY);
+      } catch {} // Safari may not implement storage.session
+
+      await browser.storage.local.set({
+        [_BROWSER_SESSION_EPOCH_KEY]: epoch,
+        [_TAB_RECEIPTS_KEY]: {
+          version: _TAB_RECEIPTS_VERSION,
+          browserEpoch: epoch,
+          at: Date.now(),
+          records: [],
+        },
+        [_OWNED_TABS_LOCAL_KEY]: {
+          browserEpoch: epoch,
+          at: Date.now(),
+          tabs: {},
+        },
+      });
+      if (generation !== _browserEpochGeneration) {
+        throw new Error("Browser session changed during startup reset");
+      }
+      _browserSessionEpoch = epoch;
+      _ownedTabsHydrated = true;
+    });
+    _browserStartupResetPromise = resetPromise;
+    resetPromise.then(() => {
+      if (_browserStartupResetPromise === resetPromise) _browserStartupResetPromise = null;
+    }).catch(() => {
+      // Leave the rejected promise in place. Every later authority read will fail
+      // closed instead of falling back to stale receipts from the previous run.
+    });
+  });
+}
 
 // Read-only commands that don't modify the page — allowed on any tab
 const _readOnlyCommands = new Set([

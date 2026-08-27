@@ -12,6 +12,7 @@ import { readFileSync } from "node:fs";
 
 const index = readFileSync(new URL("../index.js", import.meta.url), "utf8");
 const background = readFileSync(new URL("../extension/background.js", import.meta.url), "utf8");
+const BROWSER_EPOCH = "e".repeat(36);
 const manifest = JSON.parse(
   readFileSync(new URL("../extension/manifest.json", import.meta.url), "utf8")
 );
@@ -229,6 +230,7 @@ test("opaque receipts resolve by token, digest, and original origin and fail clo
       token,
       tabId,
       windowId: 7,
+      browserEpoch: BROWSER_EPOCH,
       receiptOrigin: origin,
       identityDigest: digest,
       issuedAt: Date.now(),
@@ -245,6 +247,7 @@ test("opaque receipts resolve by token, digest, and original origin and fail clo
       "_persistOwnedTabs",
       "_receiptOrigin",
       "_withReceiptMutationLock",
+      "_ensureBrowserSessionEpoch",
       `${resolveSource}; return _resolveReceiptTab;`
     )(
       receiptByToken,
@@ -255,7 +258,8 @@ test("opaque receipts resolve by token, digest, and original origin and fail clo
       () => owned,
       async () => {},
       (url) => new URL(url).origin,
-      (operation) => operation()
+      (operation) => operation(),
+      async () => BROWSER_EPOCH
     );
     return { resolve, get replacements() { return replacements; } };
   };
@@ -289,15 +293,17 @@ test("opaque receipts resolve by token, digest, and original origin and fail clo
   assert.equal(ambiguous.replacements, 0, "ambiguous receipts must not rebind ownership");
 });
 
-test("V2 receipts persist locally and rehydrate only the same unambiguous tab id and URL digest", () => {
-  assert.match(background, /const _TAB_RECEIPTS_KEY = "mcpOwnedTabReceiptsV2"/);
-  assert.match(background, /const _TAB_RECEIPTS_VERSION = 2/);
+test("V3 receipts persist with a browser epoch and survive worker suspension safely", () => {
+  assert.match(background, /const _TAB_RECEIPTS_KEY = "mcpOwnedTabReceiptsV3"/);
+  assert.match(background, /const _TAB_RECEIPTS_VERSION = 3/);
+  assert.match(background, /const _BROWSER_SESSION_EPOCH_KEY = "mcpBrowserSessionEpochV1"/);
   const hydrate = background.slice(
     background.indexOf("async function _hydrateOwnedTabs("),
     background.indexOf("async function _persistOwnedTabs(")
   );
   assert.match(hydrate, /browser\.storage\.local\.get\(_TAB_RECEIPTS_KEY\)/);
   assert.match(hydrate, /receiptEnvelope\.version === _TAB_RECEIPTS_VERSION/);
+  assert.match(hydrate, /receiptEnvelope\.browserEpoch === browserEpoch/);
   assert.match(hydrate, /_resolveHydratedReceiptTab\(/);
   assert.match(hydrate, /if \(!resolved\) continue/);
   assert.match(hydrate, /const claimedTabIds = new Set\(\)/);
@@ -308,6 +314,7 @@ test("V2 receipts persist locally and rehydrate only the same unambiguous tab id
     background.indexOf("function _extractMcpTabMarker(")
   );
   assert.match(persist, /version: _TAB_RECEIPTS_VERSION/);
+  assert.match(persist, /browserEpoch/);
   assert.match(persist, /records: \[\.\.\._receiptByToken\.values\(\)\]/);
   assert.match(persist, /browser\.storage\.local\.set\(\{/);
   assert.match(persist, /\[_TAB_RECEIPTS_KEY\]: receiptEnvelope/);
@@ -320,6 +327,15 @@ test("V2 receipts persist locally and rehydrate only the same unambiguous tab id
     handler.indexOf("await _hydrateOwnedTabs();") < handler.indexOf("await getTargetTab("),
     "receipt records must hydrate before any target is selected"
   );
+
+  const startup = background.slice(
+    background.indexOf("if (_browserStartupLifecycleAvailable)"),
+    background.indexOf("// Read-only commands")
+  );
+  assert.match(startup, /_mintMcpTabMarker\(\)/);
+  assert.match(startup, /\[_BROWSER_SESSION_EPOCH_KEY\]: epoch/);
+  assert.match(startup, /records: \[\]/);
+  assert.match(startup, /tabs: \{\}/);
 });
 
 test("new_tab navigates with the caller's exact raw URL and returns only safe metadata", async () => {
