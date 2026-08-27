@@ -5620,9 +5620,11 @@ export async function checkWebKitCompat() {
 // ========== macOS NATIVE-INPUT COMPAT ==========
 // CGEvent.postToPid (native clicks/keys/hover) can silently no-op on macOS 26+ (Tahoe) even
 // with Accessibility granted — the events are accepted by the API but never cross into Safari's
-// WebContent process (issue #29). doctor() prints the OS version so a bug report carries the
-// single most relevant fact, and flags the known-risky range so users reach for safari_evaluate
-// or extension-based clicks on trust-gated forms instead of chasing a phantom permission grant.
+// WebContent process (issue #29). performNativeClick now works around this by pressing through
+// the Accessibility API first, so CLICKS are covered; native keyboard and hover still travel the
+// CGEvent path and stay affected. doctor() prints the OS version so a bug report carries the
+// single most relevant fact, and points at what is still risky rather than at a phantom
+// permission grant.
 // Pure (no I/O) so it's unit-tested directly — see test/macos-compat.test.mjs.
 export function macosCompatNote(productVersion) {
   const raw = String(productVersion ?? "").trim();
@@ -5637,7 +5639,7 @@ export function macosCompatNote(productVersion) {
   }
   const risky = major >= 26;
   const line = risky
-    ? `macOS ${raw} ⚠ CGEvent native clicks/keys may silently no-op on macOS 26+ even with Accessibility granted (issue #29) — for trust-gated forms prefer safari_evaluate or extension-based safari_click.`
+    ? `macOS ${raw} ⚠ raw CGEvent input is filtered on macOS 26+ (issue #29) — clicks are covered: safari_native_click presses via Accessibility first. Native keyboard/hover still ride CGEvent, so prefer safari_evaluate or safari_click for those on trust-gated forms.`
     : `macOS ${raw} — CGEvent native input supported.`;
   return { version: raw, major, risky, line };
 }
