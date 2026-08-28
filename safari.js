@@ -489,6 +489,10 @@ export async function saveFrontmostApp() {
   return app?.bundleId || null;
 }
 export async function restoreFocusIfStolen(savedBundleId) {
+  // Show-intent agents (SAFARI_MCP_RAISE_ON_NAVIGATE=1) WANT Safari to keep
+  // the foreground after their actions — restoring would undo the very raise
+  // they asked for. The background-operation posture is unchanged by default.
+  if (RAISE_ON_NAVIGATE) { _traceRestore(savedBundleId, "skip-show-intent"); return; }
   if (!savedBundleId || savedBundleId === "com.apple.Safari") return;
   let current = await _helperGetFrontApp();
   if (current?.bundleId !== "com.apple.Safari") return;
@@ -1457,8 +1461,21 @@ async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
 
 // ========== NAVIGATION ==========
 
+// Opt-in: agents whose intent is SHOWING a page (voice assistants, demos)
+// can ask navigation to bring the Safari window forward. Off by default —
+// the server's background-operation posture is unchanged.
+const RAISE_ON_NAVIGATE = process.env.SAFARI_MCP_RAISE_ON_NAVIGATE === "1";
+async function raiseWindowForShow() {
+  if (!RAISE_ON_NAVIGATE) return;
+  await osascript(
+    `tell application "Safari"\nactivate\ntry\nset index of front window to 1\nend try\nend tell`,
+    { timeout: 5000 }
+  ).catch(() => {});
+}
+
 export async function navigate(url) {
   await refreshTargetWindow();
+  await raiseWindowForShow();
   let targetUrl = url;
   if (!/^https?:\/\//i.test(targetUrl)) {
     targetUrl = "https://" + targetUrl;
@@ -1708,7 +1725,12 @@ export async function readPage({ selector, maxLength = 50000 } = {}) {
   // never been foregrounded — it can come back near-empty even though the DOM is
   // fully present. Detect that and fall back to a layout-independent TreeWalker
   // text extraction so reads work on a background tab without ever taking focus.
-  return runJS(
+  //
+  // And the TIME dimension: an SPA mid-render has nothing for either reader —
+  // innerText and the walker both see an empty body until the framework paints.
+  // Rather than report emptiness as truth, give the page up to ~2s to produce
+  // any text before returning the (honestly) empty read.
+  const readOnce = () => runJS(
     `(function(){
       var max=${Number(maxLength)};
       var t=document.body.innerText||'';
@@ -1728,6 +1750,14 @@ export async function readPage({ selector, maxLength = 50000 } = {}) {
       return JSON.stringify({title:document.title,url:location.href,text:t.substring(0,max)});
     })()`
   );
+  for (let i = 0; ; i++) {
+    const out = await readOnce();
+    try {
+      const parsed = JSON.parse(out);
+      if ((parsed.text || "").trim().length > 0 || i >= 3) return out;
+    } catch { return out; }
+    await new Promise((r) => setTimeout(r, 700));
+  }
 }
 
 export async function getPageSource({ maxLength = 200000 } = {}) {
@@ -5805,6 +5835,7 @@ export async function scrollToElement({ selector, text, block = "center", timeou
 
 // Navigate + wait + read — the most common 3-step workflow
 export async function navigateAndRead(url, { maxLength = 50000 } = {}) {
+  await raiseWindowForShow();
   await refreshTargetWindow();
   // Suppress onbeforeunload dialogs (same as navigate())
   await runJS("window.onbeforeunload=null", { timeout: 2000 }).catch(() => {});

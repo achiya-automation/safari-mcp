@@ -353,6 +353,19 @@ Prefer stdio (one process per agent) over a persistent daemon? That works too â€
 
 ---
 
+## Environment variables
+
+| Variable | Default | What it does |
+|----------|---------|--------------|
+| `SAFARI_MCP_HTTP` | off | Run one shared HTTP daemon instead of a process per client (see above). |
+| `SAFARI_MCP_HTTP_PORT` | `9225` | Port for that daemon. |
+| `SAFARI_PROFILE` | unset | Bind sessions to a named Safari profile. Unset = your ordinary windows. |
+| `SAFARI_MCP_RAISE_ON_NAVIGATE` | off | Let navigation bring Safari to the front, and stop the focus guard from putting your previous app back. |
+
+`SAFARI_MCP_RAISE_ON_NAVIGATE=1` is for agents whose whole point is *showing* you a page â€” a voice assistant answering "open YouTube", a demo driver. Everything else should leave it off: by default Safari MCP works in the background and hands focus back to whatever app you were using, so an agent can drive a page while you keep typing somewhere else.
+
+---
+
 ## Tools (97)
 
 <details>
