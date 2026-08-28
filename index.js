@@ -1123,19 +1123,25 @@ async function _runExtensionBatchAction(action, args = {}) {
     }
 
     case "switchTab": {
-      const index = Number(args.index);
-      if (!Number.isInteger(index) || index < 1) throw new Error("switchTab requires a positive index");
+      const index = args.index === undefined ? undefined : Number(args.index);
       const receipt = _receiptToken(args.receipt || args.receiptUrl || args.url || "");
       if ((args.receipt || args.receiptUrl || args.url) && !receipt) {
         throw new Error("Tab safety: switchTab requires an extension-issued receipt");
       }
+      if (!receipt && (!Number.isInteger(index) || index < 1)) {
+        throw new Error("switchTab requires a positive index or an extension-issued receipt");
+      }
+      if (index !== undefined && (!Number.isInteger(index) || index < 1)) {
+        throw new Error("switchTab index must be a positive integer when provided");
+      }
       const raw = await extensionOrFallback(
         "switch_tab",
-        receipt ? { index, receipt } : { index },
+        receipt ? { ...(index ? { index } : {}), receipt } : { index },
         () => safari.switchTab(index)
       );
       const value = _sanitizeTabResult(raw);
-      safari.setActiveTabIndex(index);
+      const resolvedIndex = value?.tabIndex || index;
+      if (resolvedIndex) safari.setActiveTabIndex(resolvedIndex);
       if (value?.receipt || receipt) _setActiveReceipt(value?.receipt || receipt);
       return value;
     }
@@ -2173,10 +2179,10 @@ server.tool(
 
 server.tool(
   "safari_switch_tab",
-  "Switch to a specific tab by index. For stateless recovery, pass the opaque receipt returned by safari_new_tab or safari_list_tabs.",
+  "Switch the MCP session's logical target without focusing Safari. Pass an index for the current session window, or an opaque receipt to recover the exact owned tab across Safari windows; a valid receipt takes precedence over any supplied index.",
   {
-    index: z.coerce.number().describe("Tab index (starting from 1)"),
-    receipt: z.string().optional().describe("Opaque extension-issued tab receipt"),
+    index: z.coerce.number().optional().describe("Tab index (starting from 1); optional when receipt is provided"),
+    receipt: z.string().optional().describe("Opaque extension-issued receipt for the exact owned tab"),
     url: z.string().optional().describe("Deprecated legacy receipt URL"),
   },
   async ({ index, receipt, url }) => {
@@ -2186,6 +2192,12 @@ server.tool(
       const msg = "⚠️ Tab safety: refusing switch_tab — invalid receipt.";
       console.error(`[Safari MCP] ${msg}`);
       return errorResult(msg);
+    }
+    if (!token && (!Number.isInteger(index) || index < 1)) {
+      return errorResult("Tab safety: switch_tab requires a positive index or a valid receipt");
+    }
+    if (index !== undefined && (!Number.isInteger(index) || index < 1)) {
+      return errorResult("Tab safety: switch_tab index must be a positive integer when provided");
     }
 
     // Tab ownership check: verify target tab is one we opened
@@ -2222,12 +2234,13 @@ server.tool(
       } catch {}
     }
     const result = await extensionOrFallback(
-      "switch_tab", token ? { index, receipt: token } : { index },
+      "switch_tab", token ? { ...(index ? { index } : {}), receipt: token } : { index },
       () => safari.switchTab(index)
     );
     const safeResult = _sanitizeTabResult(result);
     // Sync safari.js state so AppleScript fallback targets the correct tab
-    safari.setActiveTabIndex(index);
+    const resolvedIndex = safeResult?.tabIndex || index;
+    if (resolvedIndex) safari.setActiveTabIndex(resolvedIndex);
     if (safeResult?.safeUrl) safari.setActiveTabURL(safeResult.safeUrl);
     if (safeResult?.receipt || token) _setActiveReceipt(safeResult?.receipt || token);
     return { content: [{ type: "text", text: JSON.stringify(safeResult) }] };
@@ -2544,7 +2557,7 @@ server.tool(
 
 server.tool(
   "safari_run_script",
-  "Batch Safari actions in one MCP session. Named profiles use the verified extension and support: newTab, switchTab, getReceipt, listTabs, closeTab, navigate, navigateAndRead, readPage, snapshot, getElementInfo, querySelectorAll, waitFor, waitForTime, click, clickAndOpenPopup, fill, fillForm, clearField, typeText, selectOption, pressKey, scroll, scrollTo, scrollToElement, hover, evaluate, reload, goBack, goForward. clickAndOpenPopup takes exactly one selector or snapshot ref, targets one exact frame, performs one click, captures a blocked HTTP(S) window.open, and opens it as a background tab without focusing Safari; it refuses CAPTCHA/challenge targets and never returns URL query/hash data. Non-profile mode retains the legacy action set. Use getReceipt after a cross-origin redirect.",
+  "Batch Safari actions in one MCP session. Named profiles use the verified extension and support: newTab, switchTab, getReceipt, listTabs, closeTab, navigate, navigateAndRead, readPage, snapshot, getElementInfo, querySelectorAll, waitFor, waitForTime, click, clickAndOpenPopup, fill, fillForm, clearField, typeText, selectOption, pressKey, scroll, scrollTo, scrollToElement, hover, evaluate, reload, goBack, goForward. switchTab accepts an index or an opaque receipt; a valid receipt recovers the exact owned tab across Safari windows without focusing one. clickAndOpenPopup takes exactly one selector or snapshot ref, targets one exact frame, performs one click, captures a blocked HTTP(S) window.open, and opens it as a background tab without focusing Safari; it refuses CAPTCHA/challenge targets and never returns URL query/hash data. Non-profile mode retains the legacy action set. Use getReceipt after a cross-origin redirect.",
   {
     steps: z.array(z.object({
       action: z.string().describe("Action name (e.g. 'navigate', 'click', 'fill')"),

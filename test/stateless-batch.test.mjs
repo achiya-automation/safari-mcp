@@ -57,7 +57,9 @@ test("batch tab actions carry an opaque receipt, never a synthetic receipt URL",
   const receiptCase = extract(helper, 'case "getReceipt":', '\n\n    case "closeTab"');
 
   assert.ok(helper.includes('"new_tab", { url: requestedUrl }'));
-  assert.ok(switchCase.includes("receipt ? { index, receipt } : { index }"));
+  assert.ok(switchCase.includes("receipt ? { ...(index ? { index } : {}), receipt } : { index }"));
+  assert.ok(switchCase.includes("value?.tabIndex || index"));
+  assert.ok(switchCase.includes("positive index or an extension-issued receipt"));
   assert.ok(!switchCase.includes("tabUrl:"));
   assert.ok(receiptCase.includes('"get_tab_receipt"'));
   assert.ok(receiptCase.includes("_sanitizeTabResult"));

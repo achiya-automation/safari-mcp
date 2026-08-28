@@ -278,17 +278,28 @@ async function _closeTabForSession(sessionId, targetTab, payload) {
 }
 
 async function _switchTabForSession(sessionId, targetTab, payload) {
-  const requestedIndex = Number(payload.index);
   const suppliedReceipt = _receiptTokenFromPayload(payload);
-  const switchWindowId = suppliedReceipt
-    ? targetTab?.windowId
-    : (_windowForSession(sessionId) || targetTab?.windowId);
-  const tabs = await browser.tabs.query(_windowQuery(switchWindowId));
-  const target = tabs.find((tab) => tab.index + 1 === requestedIndex)
-    || tabs[requestedIndex - 1];
-  if (!target) return "Tab not found at index " + requestedIndex;
-  if (suppliedReceipt && (!targetTab || target.id !== targetTab.id)) {
-    throw new Error("Tab safety: receipt and requested index identify different tabs");
+  let target;
+
+  if (suppliedReceipt) {
+    // handleCommand resolves receipts against browser.tabs.query({}), so this is the
+    // exact global tab identity even when an OAuth popup moved the session's logical
+    // window elsewhere. The receipt is the authority; a stale/window-local index must
+    // never redirect the switch to a neighbouring tab.
+    if (!targetTab || !Number.isInteger(Number(targetTab.id))) {
+      throw new Error("Tab safety: receipt did not resolve to a live tab");
+    }
+    target = targetTab;
+  } else {
+    const requestedIndex = Number(payload.index);
+    if (!Number.isInteger(requestedIndex) || requestedIndex < 1) {
+      throw new Error("switch_tab requires a positive index or a valid receipt");
+    }
+    const switchWindowId = _windowForSession(sessionId) || targetTab?.windowId;
+    const tabs = await browser.tabs.query(_windowQuery(switchWindowId));
+    target = tabs.find((tab) => tab.index + 1 === requestedIndex)
+      || tabs[requestedIndex - 1];
+    if (!target) return "Tab not found at index " + requestedIndex;
   }
 
   if (!_isTabOwnedBySession(sessionId, target.id)) {
@@ -306,6 +317,7 @@ async function _switchTabForSession(sessionId, targetTab, payload) {
     title: target.title,
     safeUrl: _safeTabUrl(target.url),
     ...(_receiptForOwnedTab(sessionId, target) ? { receipt: _receiptForOwnedTab(sessionId, target) } : {}),
+    tabIndex: target.index + 1,
     owned: true,
   };
 }

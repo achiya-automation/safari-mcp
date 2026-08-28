@@ -417,18 +417,21 @@ test("new_tab navigates with the caller's exact raw URL and returns only safe me
   assert.equal("requestedUrl" in result, false);
 });
 
-test("switch_tab requires index and receipt to identify the same concrete tab", async () => {
+test("switch_tab resolves a valid receipt globally and ignores a stale window-local index", async () => {
   const switchTabCase = background.slice(
     background.indexOf("async function _switchTabForSession("),
     background.indexOf("let _enabled", background.indexOf("async function _switchTabForSession("))
   );
-  assert.match(switchTabCase, /target\.id !== targetTab\.id/);
-  assert.match(switchTabCase, /receipt and requested index identify different tabs/);
+  assert.match(switchTabCase, /target = targetTab/);
+  assert.match(switchTabCase, /receipt is the authority/);
   assert.match(switchTabCase, /await _addOwnedTab\(sessionId, target\.id\)/);
   assert.match(switchTabCase, /safeUrl: _safeTabUrl\(target\.url\)/);
+  assert.match(switchTabCase, /tabIndex: target\.index \+ 1/);
+  assert.doesNotMatch(switchTabCase, /browser\.tabs\.update|browser\.windows\.update/);
+  assert.doesNotMatch(switchTabCase, /_issueTabReceipt/);
   assert.doesNotMatch(switchTabCase, /\burl:\s*target\.url/);
 
-  const makeSwitch = (tabs, additions) => Function(
+  const makeSwitch = (tabs, additions, queries = []) => Function(
     "_receiptTokenFromPayload",
     "_windowForSession",
     "_windowQuery",
@@ -444,7 +447,7 @@ test("switch_tab requires index and receipt to identify the same concrete tab", 
     (payload) => payload.receipt || "",
     () => 7,
     (windowId) => ({ windowId }),
-    { tabs: { query: async () => tabs } },
+    { tabs: { query: async (query) => { queries.push(query); return tabs; } } },
     () => false,
     async (_sessionId, tabId) => additions.push(tabId),
     (url) => {
@@ -474,21 +477,19 @@ test("switch_tab requires index and receipt to identify the same concrete tab", 
     title: "Owned",
     safeUrl: "https://example.test/path",
     receipt: "rotated_receipt_abcdefghijklmnopqrstuvwxyz",
+    tabIndex: 1,
     owned: true,
   });
   assert.equal("url" in result, false);
 
-  const switchMismatch = makeSwitch(
-    [{ ...receiptTab, id: 99 }],
-    []
-  );
-  await assert.rejects(
-    switchMismatch("session-a", receiptTab, {
-      index: 1,
-      receipt: "receipt_token_abcdefghijklmnopqrstuvwxyz",
-    }),
-    /receipt and requested index identify different tabs/
-  );
+  const crossWindowQueries = [];
+  const switchAcrossWindows = makeSwitch([{ ...receiptTab, id: 99 }], [], crossWindowQueries);
+  const crossWindowResult = await switchAcrossWindows("session-a", receiptTab, {
+    index: 7,
+    receipt: "receipt_token_abcdefghijklmnopqrstuvwxyz",
+  });
+  assert.equal(crossWindowResult.safeUrl, "https://example.test/path");
+  assert.deepEqual(crossWindowQueries, [], "receipt switching must not reinterpret index in any window");
 });
 
 test("public switch_tab forwards an opaque receipt and sanitizes extension output", () => {
@@ -496,10 +497,12 @@ test("public switch_tab forwards an opaque receipt and sanitizes extension outpu
     index.indexOf('"safari_switch_tab"'),
     index.indexOf("// ========== WAIT ==========", index.indexOf('"safari_switch_tab"'))
   );
+  assert.match(switchTabTool, /index:\s*z\.coerce\.number\(\)\.optional\(\)/);
   assert.match(switchTabTool, /receipt:\s*z\.string\(\)\.optional\(\)/);
   assert.match(switchTabTool, /async \(\{ index, receipt, url \}\) =>/);
   assert.match(switchTabTool, /const token = _receiptToken\(supplied\)/);
-  assert.match(switchTabTool, /"switch_tab", token \? \{ index, receipt: token \} : \{ index \}/);
+  assert.match(switchTabTool, /"switch_tab", token \? \{ \.\.\.\(index \? \{ index \} : \{\}\), receipt: token \} : \{ index \}/);
   assert.match(switchTabTool, /const safeResult = _sanitizeTabResult\(result\)/);
+  assert.match(switchTabTool, /safeResult\?\.tabIndex \|\| index/);
   assert.doesNotMatch(switchTabTool, /tabUrl:/);
 });
