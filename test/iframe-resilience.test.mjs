@@ -63,7 +63,7 @@ test("mutating iframe fallbacks target one proven frame and never auto-retry", (
   }
 
   const start = background.indexOf("async function execInFirstMatchingFrameMutating(");
-  const end = background.indexOf("function _isFrameMiss(", start);
+  const end = background.indexOf("function _popupClickFrameAction(", start);
   assert.ok(start >= 0 && end > start, "single-frame mutating executor should exist");
   const source = background.slice(start, end);
   assert.match(source, /_executeAllFrames\(matchFunc/);

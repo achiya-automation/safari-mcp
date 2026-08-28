@@ -186,6 +186,52 @@ async function _newTabForSession(sessionId, payload) {
   };
 }
 
+async function _openPopupTabForSession(sessionId, sourceTab, rawPopupUrl) {
+  let parsed;
+  try {
+    parsed = new URL(String(rawPopupUrl || ""));
+  } catch {
+    throw new Error("Captured popup URL is invalid");
+  }
+  if (!/^https?:$/.test(parsed.protocol)) {
+    throw new Error("Captured popup URL must use HTTP(S)");
+  }
+
+  // The exact URL, including signed query bytes, stays inside the extension worker.
+  // Never stringify or log it. browser.tabs.create is profile-scoped here and
+  // `active:false` keeps Safari and the user's foreground application untouched.
+  let popupTab;
+  try {
+    popupTab = await browser.tabs.create({
+      url: String(rawPopupUrl),
+      active: false,
+      windowId: sourceTab.windowId,
+    });
+  } catch {
+    // Safari may create a tab and then reject the promise while navigation is still
+    // progressing. The click is deliberately one-shot, so never retry automatically.
+    throw new Error("Popup tab creation outcome is unknown; refusing automatic retry");
+  }
+
+  _adoptWindowForSession(sessionId, popupTab.windowId || sourceTab.windowId);
+  _setSessionTab(sessionId, popupTab.id, popupTab.url || String(rawPopupUrl));
+  await _addOwnedTab(sessionId, popupTab.id);
+
+  const identityUrl = popupTab.url || String(rawPopupUrl);
+  const receipt = await _issueTabReceipt(popupTab, {
+    receiptOrigin: _receiptOrigin(identityUrl),
+    identityUrl,
+  });
+  return {
+    clicked: true,
+    popupOpened: true,
+    title: popupTab.title || "",
+    safeUrl: _safeTabUrl(identityUrl),
+    ...(receipt ? { receipt } : {}),
+    tabIndex: popupTab.index + 1,
+  };
+}
+
 async function _closeTabForSession(sessionId, targetTab, payload) {
   const explicitIndex = Number.isInteger(Number(payload.index)) && Number(payload.index) > 0;
   // An explicit index is local to the session's window. Without one, targetTab is
@@ -1254,6 +1300,40 @@ async function handleCommand(type, payload) {
         if (iframeResult) return iframeResult;
       }
       return result;
+    }
+
+    // --- One-shot popup capture for OAuth buttons inside exact child frames ---
+    case "click_open_popup": {
+      const selector = typeof payload.selector === "string" && payload.selector ? payload.selector : "";
+      const ref = typeof payload.ref === "string" && payload.ref ? payload.ref : "";
+      if ((selector ? 1 : 0) + (ref ? 1 : 0) !== 1) {
+        throw new Error("clickAndOpenPopup requires exactly one of selector or ref");
+      }
+
+      const captured = await execInExactMatchingFrameMainOnce(
+        _popupClickFrameAction,
+        [selector, ref, "probe"],
+        _popupClickFrameAction,
+        [selector, ref, "capture"],
+        tabId
+      );
+      if (!captured) throw new Error("Element not found for clickAndOpenPopup");
+      if (!captured.ok) {
+        if (captured.code === "captcha_refused") {
+          throw new Error("Safety: clickAndOpenPopup refuses CAPTCHA or challenge targets");
+        }
+        if (captured.code === "no_popup") {
+          throw new Error("No HTTP(S) popup URL was captured; the one-shot click was not retried");
+        }
+        if (captured.code === "non_http_popup") {
+          throw new Error("Captured popup URL must use HTTP(S)");
+        }
+        throw new Error("One-shot popup click did not produce a safe popup URL");
+      }
+
+      // captured.popupUrl is intentionally never logged or returned. Only the newly
+      // created tab's origin+path and opaque ownership receipt leave this worker.
+      return await _openPopupTabForSession(sessionId, targetTab, captured.popupUrl);
     }
 
     // --- Click + Read (combo — saves 1 full MCP round-trip) ---
@@ -3532,6 +3612,229 @@ async function execInFirstMatchingFrameMutating(matchFunc, matchArgs, func, args
     return first?.result;
   } catch (error) {
     throw new Error("Mutating iframe injection outcome is unknown; refusing automatic retry: " + (error?.message || String(error)));
+  }
+}
+
+// Shared exact-frame probe and MAIN-world one-shot popup capture. It stays
+// self-contained because Safari serializes it into each frame; closure references
+// are unavailable there. Probe mode is read-only. Capture mode dispatches one click,
+// restores window.open in finally, and returns the exact URL only to this worker.
+function _popupClickFrameAction(selector, ref, mode) {
+  const isProbe = mode === "probe";
+  const query = ref
+    ? '[data-mcp-ref="' + String(ref).replace(/["\\]/g, "\\$&") + '"]'
+    : String(selector || "");
+  if (!query) return isProbe ? { count: 0 } : { ok: false, code: "missing_target" };
+
+  const found = [];
+  const seen = new Set();
+  const visit = (root) => {
+    let candidates;
+    try { candidates = root.querySelectorAll(query); }
+    catch { return false; }
+    for (const candidate of candidates) {
+      if (!seen.has(candidate)) {
+        seen.add(candidate);
+        found.push(candidate);
+      }
+    }
+    let all;
+    try { all = root.querySelectorAll("*"); } catch { all = []; }
+    for (const host of all) {
+      let shadow = null;
+      try {
+        shadow = window.__mcpGetShadowRoot
+          ? window.__mcpGetShadowRoot(host)
+          : host.shadowRoot;
+      } catch {}
+      if (shadow && visit(shadow) === false) return false;
+    }
+    return true;
+  };
+  if (visit(document) === false) {
+    return isProbe
+      ? { invalidSelector: true, count: 0 }
+      : { ok: false, code: "invalid_selector" };
+  }
+
+  const visible = found.filter((element) => {
+    const rect = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    return rect.width > 0 && rect.height > 0 &&
+      style.display !== "none" && style.visibility !== "hidden" &&
+      parseFloat(style.opacity || "1") !== 0;
+  });
+  if (isProbe) return { count: visible.length };
+  if (visible.length !== 1) {
+    return { ok: false, code: visible.length ? "ambiguous_target" : "missing_target" };
+  }
+
+  const element = visible[0];
+  if (element.disabled || element.getAttribute("aria-disabled") === "true") {
+    return { ok: false, code: "disabled_target" };
+  }
+
+  // This action is for ordinary OAuth/partner popups, never CAPTCHA automation.
+  const captchaPattern = /(?:^|[^a-z])(recaptcha|hcaptcha|turnstile|captcha|cf-chl|challenge-platform|challenges?\.cloudflare\.com)(?:[^a-z]|$)/i;
+  let safetySignal = location.hostname + " " + location.pathname;
+  for (let current = element, depth = 0; current && depth < 8; current = current.parentElement, depth += 1) {
+    safetySignal += " " + [
+      current.id,
+      current.className,
+      current.getAttribute && current.getAttribute("name"),
+      current.getAttribute && current.getAttribute("aria-label"),
+      current.getAttribute && current.getAttribute("title"),
+      current.getAttribute && current.getAttribute("data-sitekey"),
+    ].filter(Boolean).join(" ");
+  }
+  if (captchaPattern.test(String(safetySignal))) {
+    return { ok: false, code: "captcha_refused" };
+  }
+
+  let capturedUrl = "";
+  let sawNonHttp = false;
+  const capture = (candidate) => {
+    if (capturedUrl || candidate === undefined || candidate === null || String(candidate) === "") return;
+    try {
+      const rawCandidate = String(candidate);
+      const parsed = new URL(rawCandidate, location.href);
+      if (!/^https?:$/.test(parsed.protocol)) {
+        sawNonHttp = true;
+        return;
+      }
+      // Preserve an absolute caller string byte-for-byte. OAuth providers can sign
+      // query bytes, and URL reserialization is allowed only for a relative target.
+      capturedUrl = /^[a-z][a-z0-9+.-]*:\/\//i.test(rawCandidate)
+        ? rawCandidate
+        : parsed.href;
+    } catch {}
+  };
+
+  // OAuth helpers sometimes open about:blank first and set popup.location next.
+  // A tiny inert stand-in captures both forms without creating any real popup.
+  const locationStub = {
+    assign: capture,
+    replace: capture,
+    reload() {},
+    toString() { return ""; },
+  };
+  Object.defineProperty(locationStub, "href", {
+    configurable: true,
+    get() { return ""; },
+    set(value) { capture(value); },
+  });
+  const popupStub = {
+    closed: false,
+    close() { this.closed = true; },
+    focus() {},
+    blur() {},
+    postMessage() {},
+  };
+  Object.defineProperty(popupStub, "location", {
+    configurable: true,
+    get() { return locationStub; },
+    set(value) { capture(value); },
+  });
+
+  const originalDescriptor = Object.getOwnPropertyDescriptor(window, "open");
+  const hadOwnOpen = Object.prototype.hasOwnProperty.call(window, "open");
+  const originalOpen = window.open;
+  const interceptedOpen = function(url) {
+    capture(url);
+    return popupStub;
+  };
+
+  let installed = false;
+  let clickFailed = false;
+  try {
+    try {
+      Object.defineProperty(window, "open", {
+        configurable: true,
+        writable: true,
+        value: interceptedOpen,
+      });
+      installed = window.open === interceptedOpen;
+    } catch {}
+    if (!installed) {
+      try {
+        window.open = interceptedOpen;
+        installed = window.open === interceptedOpen;
+      } catch {}
+    }
+    if (!installed) return { ok: false, code: "capture_unavailable" };
+
+    element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    const rect = element.getBoundingClientRect();
+    const event = new MouseEvent("click", {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      view: window,
+      clientX: rect.left + rect.width / 2,
+      clientY: rect.top + rect.height / 2,
+      button: 0,
+      buttons: 0,
+      detail: 1,
+    });
+    // Exactly one event, no pointer prelude, no .click() fallback, no retry.
+    element.dispatchEvent(event);
+  } catch {
+    // A page may throw after window.open (for example while touching a property on
+    // the blocked popup). The captured URL remains authoritative; only fail if the
+    // handler threw before producing one.
+    clickFailed = true;
+  } finally {
+    try {
+      if (hadOwnOpen && originalDescriptor) {
+        Object.defineProperty(window, "open", originalDescriptor);
+      } else if (!hadOwnOpen) {
+        delete window.open;
+      } else {
+        window.open = originalOpen;
+      }
+    } catch {
+      try { window.open = originalOpen; } catch {}
+    }
+  }
+
+  if (!capturedUrl) {
+    return {
+      ok: false,
+      code: sawNonHttp ? "non_http_popup" : (clickFailed ? "click_failed" : "no_popup"),
+    };
+  }
+  return { ok: true, popupUrl: capturedUrl };
+}
+
+async function execInExactMatchingFrameMainOnce(matchFunc, matchArgs, func, args, tabId = null) {
+  const id = tabId || (await getActiveTab()).id;
+  const probes = await _executeAllFrames(matchFunc, matchArgs, id);
+  if (probes.some((entry) => !entry?.error && entry?.result?.invalidSelector)) {
+    throw new Error("clickAndOpenPopup received an invalid selector");
+  }
+
+  const matches = probes.filter((entry) =>
+    !entry?.error && Number.isInteger(entry?.frameId) && Number(entry?.result?.count) > 0
+  );
+  const targetCount = matches.reduce((total, entry) => total + Number(entry.result.count), 0);
+  if (targetCount === 0) return null;
+  if (targetCount !== 1 || matches.length !== 1) {
+    throw new Error("clickAndOpenPopup target is ambiguous across frames");
+  }
+
+  try {
+    const results = await _withInjectionDeadline(browser.scripting.executeScript({
+      target: { tabId: id, frameIds: [matches[0].frameId] },
+      world: "MAIN",
+      func,
+      args,
+    }));
+    const first = results[0];
+    if (first?.error) throw new Error(first.error);
+    return first?.result;
+  } catch {
+    // The MAIN-world click may already have run. Never auto-retry an ambiguous mutation.
+    throw new Error("One-shot popup click outcome is unknown; refusing automatic retry");
   }
 }
 

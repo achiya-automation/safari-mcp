@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`safari_run_script` can safely recover OAuth popups opened from cross-origin iframes.** The new `clickAndOpenPopup` action accepts one selector or snapshot ref, proves that it resolves to exactly one visible element across all frames, installs a one-shot `window.open` capture in that frame's MAIN world, dispatches one click, and opens the captured HTTP(S) destination through the profile-scoped WebExtension with `active: false`. CAPTCHA/challenge targets fail closed, ambiguous targets are never clicked, popup mutations are never retried, and the result exposes only origin+path plus the opaque tab receipt — never OAuth query or fragment data.
+
 ### Security
 - **The `/proxy-command` local-token gate compared the shared secret with `!==`.** That comparison returns as soon as two bytes differ, so reply latency leaked how many leading bytes matched — a byte-at-a-time oracle that recovers the whole token from an unprivileged local process, which is exactly the caller the gate exists to keep out (a hostile `postinstall`, say). The comparison now runs through `crypto.timingSafeEqual` behind a length check, and a non-string header — absent, or sent twice so Node yields an array — fails closed instead of throwing where `timingSafeEqual` rejects unequal lengths. Covered by two tests in `test/injection-safety.test.mjs`, verified to fail when the old comparison is put back.
 

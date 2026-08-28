@@ -950,7 +950,7 @@ const _commandTimeouts = {
   // be abandoned and then retried through AppleScript, which is both unreliable
   // and unsafe for clicks/typing. Keep every profile command above that wake-up
   // window; fast workers still return immediately.
-  click: 30000, fill: 30000, read_page: 30000, get_source: 30000, evaluate: 30000,
+  click: 30000, click_open_popup: 30000, fill: 30000, read_page: 30000, get_source: 30000, evaluate: 30000,
   type_text: 30000, press_key: 30000, scroll: 30000, scroll_to: 30000, scroll_to_element: 30000,
   hover: 30000, list_tabs: 30000, new_tab: 30000, close_tab: 30000, switch_tab: 30000,
   wait_for: 30000, navigate: 45000, navigate_and_read: 45000, go_back: 30000, go_forward: 30000,
@@ -1068,6 +1068,8 @@ function _sanitizeTabResult(value) {
     ...(receipt ? { receipt } : {}),
     ...(normalized.active !== undefined ? { active: !!normalized.active } : {}),
     ...(normalized.owned !== undefined ? { owned: !!normalized.owned } : {}),
+    ...(normalized.clicked !== undefined ? { clicked: !!normalized.clicked } : {}),
+    ...(normalized.popupOpened !== undefined ? { popupOpened: !!normalized.popupOpened } : {}),
   };
 }
 
@@ -1235,6 +1237,19 @@ async function _runExtensionBatchAction(action, args = {}) {
         "click", { ref: args.ref, selector: args.selector, text: args.text, x: args.x, y: args.y },
         () => safari.click(args)
       );
+
+    case "clickAndOpenPopup": {
+      const selector = typeof args.selector === "string" && args.selector ? args.selector : "";
+      const ref = typeof args.ref === "string" && args.ref ? args.ref : "";
+      if ((selector ? 1 : 0) + (ref ? 1 : 0) !== 1) {
+        throw new Error("clickAndOpenPopup requires exactly one of selector or ref");
+      }
+      const raw = await extensionOrFallback(
+        "click_open_popup", { ...(selector ? { selector } : { ref }) },
+        () => { throw new Error("clickAndOpenPopup requires a verified Safari profile extension"); }
+      );
+      return _sanitizeTabResult(normalize(raw));
+    }
 
     case "fill":
       return await extensionOrFallback(
@@ -2529,7 +2544,7 @@ server.tool(
 
 server.tool(
   "safari_run_script",
-  "Batch Safari actions in one MCP session. Named profiles use the verified extension and support: newTab, switchTab, getReceipt, listTabs, closeTab, navigate, navigateAndRead, readPage, snapshot, getElementInfo, querySelectorAll, waitFor, waitForTime, click, fill, fillForm, clearField, typeText, selectOption, pressKey, scroll, scrollTo, scrollToElement, hover, evaluate, reload, goBack, goForward. Non-profile mode retains the legacy action set. Use getReceipt after a cross-origin redirect.",
+  "Batch Safari actions in one MCP session. Named profiles use the verified extension and support: newTab, switchTab, getReceipt, listTabs, closeTab, navigate, navigateAndRead, readPage, snapshot, getElementInfo, querySelectorAll, waitFor, waitForTime, click, clickAndOpenPopup, fill, fillForm, clearField, typeText, selectOption, pressKey, scroll, scrollTo, scrollToElement, hover, evaluate, reload, goBack, goForward. clickAndOpenPopup takes exactly one selector or snapshot ref, targets one exact frame, performs one click, captures a blocked HTTP(S) window.open, and opens it as a background tab without focusing Safari; it refuses CAPTCHA/challenge targets and never returns URL query/hash data. Non-profile mode retains the legacy action set. Use getReceipt after a cross-origin redirect.",
   {
     steps: z.array(z.object({
       action: z.string().describe("Action name (e.g. 'navigate', 'click', 'fill')"),
@@ -2565,7 +2580,7 @@ server.tool(
     const results = [];
     const stopOnSemanticMiss = new Set([
       "newTab", "switchTab", "closeTab", "navigate", "navigateAndRead", "waitFor",
-      "click", "fill", "fillForm", "clearField", "typeText", "selectOption",
+      "click", "clickAndOpenPopup", "fill", "fillForm", "clearField", "typeText", "selectOption",
       "pressKey", "scroll", "scrollTo", "scrollToElement", "hover", "evaluate",
       "reload", "goBack", "goForward",
     ]);
