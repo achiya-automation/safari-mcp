@@ -105,6 +105,7 @@ test("a healthy HTTP worker keeps its lease unless reload grants an exact one-sh
     let _extensionLastPollTime = baseNow;
     let _extensionLastHeartbeat = 0;
     let _reloadHttpWorkerHandoff = null;
+    const _pendingRequests = new Map();
     const _HTTP_RELOAD_HANDOFF_TTL_MS = 30_000;
     ${helperSource}
     return {
@@ -114,18 +115,47 @@ test("a healthy HTTP worker keeps its lease unless reload grants an exact one-sh
       cancel: _cancelReloadHttpWorkerHandoff,
       now: baseNow,
       touch: (now) => { _extensionLastPollTime = now; },
+      expirePrepared: () => { _reloadHttpWorkerHandoff.expiresAt = baseNow - 1; },
+      track: (handoff) => _pendingRequests.set("reload", { reloadHandoff: handoff }),
+      untrack: () => _pendingRequests.clear(),
     };
   `)(() => ({ toString: () => "handoff_token_abcdefghijklmnop" }));
 
   assert.equal(harness.mayReplace("worker-b", "", harness.now + 1), false);
   const handoff = harness.prepare();
   assert.throws(() => harness.prepare(), /already in progress/, "concurrent reload must not replace the first token");
+  harness.track(handoff);
+  harness.expirePrepared();
+  assert.throws(
+    () => harness.prepare(),
+    /already in progress/,
+    "an in-flight command must keep the same handoff object even beyond the successor TTL"
+  );
+  assert.equal(
+    harness.mayReplace("worker-b", handoff.token, harness.now + 1),
+    false,
+    "a prepared handoff must pin the old worker through a transient liveness gap"
+  );
+  harness.untrack();
   assert.equal(harness.mayReplace("worker-b", handoff.token, harness.now + 2), false, "prepared is not armed");
   assert.equal(harness.arm(handoff), true);
   assert.equal(harness.mayReplace("worker-b", "wrong_token_abcdefghijklmnop", harness.now + 3), false);
   assert.equal(harness.mayReplace("worker-b", handoff.token, harness.now + 3), true);
-  harness.touch(handoff.expiresAt);
-  assert.equal(harness.mayReplace("worker-b", handoff.token, handoff.expiresAt + 1), false);
+  handoff.expiresAt = harness.now - 1;
+  assert.equal(harness.mayReplace("worker-a", handoff.token, harness.now + 1), true);
+  const retryHandoff = harness.prepare();
+  assert.notEqual(retryHandoff, handoff, "an expired armed handoff must not block a same-worker reload retry");
+  harness.cancel(retryHandoff);
+  const staleTimer = index.slice(
+    index.indexOf("const _staleHttpTimer = setInterval("),
+    index.indexOf("_staleHttpTimer.unref()")
+  );
+  assert.match(staleTimer, /pending\.reloadHandoff === _reloadHttpWorkerHandoff/);
+  assert.ok(
+    staleTimer.indexOf("pending.reloadHandoff === _reloadHttpWorkerHandoff") <
+      staleTimer.indexOf("_reloadHttpWorkerHandoff = null"),
+    "stale detection must not clear a handoff still owned by a pending reload"
+  );
 });
 
 test("reload occurs only after the host accepts the result acknowledgement", async () => {
@@ -134,21 +164,28 @@ test("reload occurs only after the host accepts the result acknowledgement", asy
     background.indexOf("// ========== COMMAND HANDLERS")
   );
   const events = [];
+  let reloadCallback;
   let releaseAck;
   const ack = new Promise((resolve) => { releaseAck = resolve; });
   const harness = Function(
     "handleCommand", "_bridgeFetch", "browser", "chrome", "setTimeout", "HTTP_URL", "console",
     "_stopHeartbeat", "scheduleReconnect",
-    `let isConnected = true; ${executeSource}; return {
+    `let isConnected = true;
+     let _bridgeWorkerRetiring = false;
+     let _pollLoopGeneration = 1;
+     const connect = () => events.push("connect");
+     ${executeSource}; return {
       execute: executeAndReply,
       connected: () => isConnected,
+      retiring: () => _bridgeWorkerRetiring,
+      generation: () => _pollLoopGeneration,
     };`
   )(
     async () => ({ reloaded: true }),
     async () => { events.push("result-posted"); return ack; },
     { runtime: { reload: () => events.push("reload") } },
     { runtime: { reload: () => events.push("chrome-reload") } },
-    (callback) => { events.push("reload-scheduled"); callback(); },
+    (callback) => { events.push("reload-scheduled"); reloadCallback = callback; },
     "http://127.0.0.1:9224",
     { warn: () => {} },
     () => events.push("heartbeat-stopped"),
@@ -162,6 +199,10 @@ test("reload occurs only after the host accepts the result acknowledgement", asy
   releaseAck({ ok: true, status: 200 });
   await pending;
   assert.equal(harness.connected(), false, "the poll loop must stop before runtime.reload yields");
+  assert.equal(harness.retiring(), true, "the old worker must reject reconnects during the reload handoff");
+  assert.equal(harness.generation(), 2, "reload retirement must invalidate any waiting connect generation");
+  assert.deepEqual(events, ["result-posted", "heartbeat-stopped", "reload-scheduled"]);
+  reloadCallback();
   assert.deepEqual(events, ["result-posted", "heartbeat-stopped", "reload-scheduled", "reload"]);
 });
 
@@ -241,7 +282,258 @@ test("lease-held workers retry, while only a poll-time takeover is terminal", ()
   );
   assert.match(polling, /res\.status === 423[\s\S]*_bridgeWorkerSuperseded = true/);
   assert.match(polling, /res\.status === 423[\s\S]*_stopHeartbeat\(\)/);
-  assert.match(background, /if \(_enabled && !_bridgeWorkerSuperseded && !_heartbeatTimer\) _startHeartbeat\(\)/);
+  assert.match(background, /if \(_enabled && !_bridgeWorkerSuperseded && !_bridgeWorkerRetiring && !_heartbeatTimer\) _startHeartbeat\(\)/);
+});
+
+test("reconnecting invalidates the old poll loop and clears its exact timeout", async () => {
+  const polling = background.slice(
+    background.indexOf("async function pollForCommands("),
+    background.indexOf("async function executeAndReply(")
+  );
+  const timers = new Set();
+  let timerSequence = 0;
+  let fetchCalls = 0;
+  const bridgeFetch = async (_url, { signal }) => {
+    fetchCalls += 1;
+    return await new Promise((_resolve, reject) => {
+      signal.addEventListener("abort", () => {
+        const error = new Error("aborted");
+        error.name = "AbortError";
+        reject(error);
+      }, { once: true });
+    });
+  };
+  const harness = Function(
+    "_bridgeFetch", "setTimeout", "clearTimeout", "setInterval", "clearInterval",
+    "updateBadge", "_stopHeartbeat", "scheduleReconnect", "executeAndReply", "console",
+    `let HTTP_URL = "http://127.0.0.1:9224";
+     let isConnected = true;
+     let _enabled = true;
+     let _bridgeWorkerSuperseded = false;
+     let _bridgeWorkerRetiring = false;
+     let pollAbort = null;
+     let _pollLoopGeneration = 1;
+     let _commandExecutionTail = Promise.resolve();
+     ${polling}
+     return {
+       run: pollForCommands,
+       replace: () => {
+         _pollLoopGeneration += 1;
+         isConnected = false;
+         const previous = pollAbort;
+         if (previous) previous.abort();
+         isConnected = true;
+         return _pollLoopGeneration;
+       },
+       stop: () => {
+         _pollLoopGeneration += 1;
+         isConnected = false;
+         if (pollAbort) pollAbort.abort();
+       },
+     };`
+  )(
+    bridgeFetch,
+    () => { const id = ++timerSequence; timers.add(id); return id; },
+    (id) => timers.delete(id),
+    () => 1,
+    () => {},
+    () => {},
+    () => {},
+    () => {},
+    async () => {},
+    { log: () => {} }
+  );
+
+  const oldLoop = harness.run(1);
+  while (fetchCalls < 1) await Promise.resolve();
+  const nextGeneration = harness.replace();
+  const newLoop = harness.run(nextGeneration);
+  await oldLoop;
+  while (fetchCalls < 2) await Promise.resolve();
+  assert.equal(fetchCalls, 2, "the intentional abort must not spawn another old-generation poll");
+  assert.equal(timers.size, 1, "only the current fetch may retain a safety timeout");
+  harness.stop();
+  await newLoop;
+  assert.equal(timers.size, 0, "stopping must clear the current fetch timeout too");
+});
+
+test("a dequeued command keeps one bridge endpoint and serial execution across generations", () => {
+  const polling = background.slice(
+    background.indexOf("async function pollForCommands("),
+    background.indexOf("async function executeAndReply(")
+  );
+  const execute = background.slice(
+    background.indexOf("async function executeAndReply("),
+    background.indexOf("// ========== COMMAND HANDLERS")
+  );
+  const connect = background.slice(
+    background.indexOf("async function connect("),
+    background.indexOf("function scheduleReconnect(")
+  );
+  assert.match(polling, /const bridgeUrl = HTTP_URL/);
+  assert.ok(
+    polling.indexOf("_commandExecutionTail = previousExecution") < polling.indexOf("await res.json()"),
+    "a 200 response must publish its execution claim before body parsing yields"
+  );
+  assert.match(polling, /`\$\{bridgeUrl\}\/heartbeat`/);
+  assert.match(polling, /executeAndReply\(msg, bridgeUrl\)/);
+  assert.match(polling, /_commandExecutionTail = previousExecution\.catch\(\(\) => \{\}\)\.then/);
+  assert.match(execute, /async function executeAndReply\(msg, bridgeUrl = HTTP_URL\)/);
+  assert.match(execute, /`\$\{bridgeUrl\}\/result`/);
+  assert.match(connect, /await _commandExecutionTail\.catch\(\(\) => \{\}\)/);
+  assert.match(connect, /_bridgeWorkerRetiring/);
+});
+
+test("a claimed 200 response blocks reconnect before its JSON body resolves", async () => {
+  const polling = background.slice(
+    background.indexOf("async function pollForCommands("),
+    background.indexOf("async function executeAndReply(")
+  );
+  let jsonStarted = false;
+  let releaseJson;
+  const harness = Function(
+    "_bridgeFetch", "setTimeout", "clearTimeout", "setInterval", "clearInterval",
+    "updateBadge", "_stopHeartbeat", "scheduleReconnect", "executeAndReply", "console", "_releaseJson",
+    `let HTTP_URL = "http://127.0.0.1:9224";
+     let isConnected = true;
+     let _enabled = true;
+     let _bridgeWorkerSuperseded = false;
+     let _bridgeWorkerRetiring = false;
+     let pollAbort = null;
+     let _pollLoopGeneration = 1;
+     let _commandExecutionTail = Promise.resolve();
+     ${polling}
+     return {
+       run: () => pollForCommands(1),
+       tail: () => _commandExecutionTail,
+       stopWith: (value) => { isConnected = false; _releaseJson(value); },
+     };`
+  )(
+    async () => ({
+      status: 200,
+      json: async () => {
+        jsonStarted = true;
+        return await new Promise((resolve) => { releaseJson = resolve; });
+      },
+    }),
+    () => 1,
+    () => {},
+    () => 1,
+    () => {},
+    () => {},
+    () => {},
+    () => {},
+    async () => {},
+    { log: () => {} },
+    (value) => releaseJson(value)
+  );
+  const loop = harness.run();
+  for (let attempt = 0; attempt < 20 && !jsonStarted; attempt += 1) await Promise.resolve();
+  assert.equal(jsonStarted, true);
+  const settledBeforeJson = await Promise.race([
+    harness.tail().then(() => true),
+    new Promise((resolve) => setImmediate(() => resolve(false))),
+  ]);
+  assert.equal(settledBeforeJson, false, "connect must observe a pending claim while JSON is unresolved");
+  harness.stopWith(null);
+  await loop;
+  await harness.tail();
+});
+
+test("OFF→ON during connect starts one fresh generation after prior command execution", async () => {
+  const connectSource = background.slice(
+    background.indexOf("let _connecting = false"),
+    background.indexOf("function scheduleReconnect(")
+  );
+  let releaseHandshake;
+  let releaseOldCommand;
+  let fetchCalls = 0;
+  const pollGenerations = [];
+  // Wall-clock deadline, not a fixed turn count: the successor's remaining steps are
+  // all microtasks, but a loaded parallel suite can starve this loop of scheduler turns
+  // long enough for a small fixed budget to expire before they run.
+  const waitUntil = async (predicate, message) => {
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      if (predicate()) return;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.fail(message);
+  };
+  const bridgeFetch = async () => {
+    fetchCalls += 1;
+    if (fetchCalls === 1) {
+      return await new Promise((resolve) => { releaseHandshake = resolve; });
+    }
+    return { ok: true, json: async () => ({ profile: null }) };
+  };
+  const harness = Function(
+    "_bridgeFetch", "browser", "_storedReloadHandoffToken", "_verifyProfileMatch",
+    "_discoverProfileWindow", "updateBadge", "_startHeartbeat", "_stopHeartbeat",
+    "scheduleReconnect", "pollForCommands", "AbortSignal",
+    `const BRIDGE_PORTS = [9224];
+     let HTTP_URL = "http://127.0.0.1:9224";
+     let _enabled = true;
+     let _bridgeWorkerSuperseded = false;
+     let _bridgeWorkerRetiring = false;
+     let pollAbort = null;
+     let _pollLoopGeneration = 0;
+     let isConnected = false;
+     let _targetProfile = null;
+     let _reconnectDelay = 3000;
+     const _BRIDGE_RELOAD_HANDOFF_KEY = "reload";
+     let _commandExecutionTail = new Promise((resolve) => { globalThis.__releaseOldCommand = resolve; });
+     ${connectSource}
+     return {
+       connect,
+       offOn: () => {
+         _enabled = false;
+         _pollLoopGeneration += 1;
+         isConnected = false;
+         _enabled = true;
+         connect();
+       },
+       state: () => ({ isConnected, generation: _pollLoopGeneration, connecting: _connecting, enabled: _enabled }),
+     };`
+  )(
+    bridgeFetch,
+    { storage: { local: {
+      get: async () => ({}),
+      remove: async () => {},
+      set: async () => {},
+    } } },
+    async () => "",
+    async () => true,
+    async () => {},
+    () => {},
+    () => {},
+    () => {},
+    () => {},
+    (generation) => pollGenerations.push(generation),
+    AbortSignal
+  );
+  releaseOldCommand = globalThis.__releaseOldCommand;
+  delete globalThis.__releaseOldCommand;
+
+  const first = harness.connect();
+  await waitUntil(() => !!releaseHandshake, "the first handshake must start");
+  harness.offOn();
+  releaseHandshake({ ok: true, json: async () => ({ profile: null }) });
+  await first;
+  await waitUntil(() => fetchCalls >= 2, "the invalidated attempt must start a fresh handshake");
+  assert.deepEqual(pollGenerations, [], "the successor must not poll while an old command still owns execution");
+  releaseOldCommand();
+  await waitUntil(
+    () => pollGenerations.length > 0,
+    `the successor must poll after old execution settles: ${JSON.stringify(harness.state())}`
+  );
+  assert.ok(
+    pollGenerations.length > 0,
+    `the successor must poll after old execution settles: ${JSON.stringify(harness.state())}`
+  );
+  assert.equal(fetchCalls, 2, "the dropped ON call must be replaced by one fresh handshake");
+  assert.equal(pollGenerations[0], harness.state().generation);
+  assert.equal(harness.state().isConnected, true);
 });
 
 test("extension reload bypasses all target-tab and receipt resolution", () => {
@@ -546,13 +838,15 @@ test("new_tab navigates with the caller's exact raw URL and returns only safe me
     background.indexOf("async function _closeTabForSession(")
   );
   assert.doesNotMatch(newTabCase, /await waitForTabLoad\(newTab\.id/);
-  assert.doesNotMatch(newTabCase, /await browser\.tabs\.get\(newTab\.id\)/);
+  assert.match(newTabCase, /await _waitForNavigatedTab\(newTab\.id\)/);
   assert.match(newTabCase, /const rawNavigationUrl = String\(payload\.url \|\| ""\)/);
   assert.match(newTabCase, /_issueTabReceipt\(receiptTab, \{/);
   assert.match(newTabCase, /await browser\.tabs\.update\(newTab\.id, \{ url: rawNavigationUrl \}\)\.catch/);
 
   let navigatedUrl = null;
   let ownedTabId = null;
+  let rejectNavigation = false;
+  let receiptCalls = 0;
   const issuedReceipt = "issued_receipt_abcdefghijklmnopqrstuvwxyz";
   const newTabForSession = Function(
     "_DEFAULT_SESSION",
@@ -564,6 +858,7 @@ test("new_tab navigates with the caller's exact raw URL and returns only safe me
     "_setSessionTab",
     "_addOwnedTab",
     "_issueTabReceipt",
+    "_waitForNavigatedTab",
     "_receiptOrigin",
     "_safeTabUrl",
     `${newTabCase}; return _newTabForSession;`
@@ -586,6 +881,7 @@ test("new_tab navigates with the caller's exact raw URL and returns only safe me
           title: "",
         }),
         update: async (_tabId, options) => {
+          if (rejectNavigation) throw new Error("navigation rejected");
           navigatedUrl = options.url;
           return { id: 42, index: 2, windowId: 7, url: options.url, title: "" };
         },
@@ -597,7 +893,8 @@ test("new_tab navigates with the caller's exact raw URL and returns only safe me
     () => {},
     () => {},
     async (_sessionId, tabId) => { ownedTabId = tabId; },
-    async () => issuedReceipt,
+    async () => { receiptCalls += 1; return issuedReceipt; },
+    async () => ({ id: 42, index: 2, windowId: 7, url: exactUrl, title: "" }),
     (url) => new URL(url).origin,
     (url) => {
       const parsed = new URL(url);
@@ -617,6 +914,40 @@ test("new_tab navigates with the caller's exact raw URL and returns only safe me
   });
   assert.equal("url" in result, false);
   assert.equal("requestedUrl" in result, false);
+  assert.equal(receiptCalls, 1);
+
+  rejectNavigation = true;
+  await assert.rejects(
+    newTabForSession("session-a", { url: "https://example.test/rejected" }),
+    /did not accept the new tab navigation/
+  );
+  assert.equal(receiptCalls, 1, "a rejected nonblank navigation must not publish an about:blank receipt");
+});
+
+test("new_tab waits out Safari's transient about:blank before minting a receipt", async () => {
+  const helperSource = background.slice(
+    background.indexOf("async function _waitForNavigatedTab("),
+    background.indexOf("async function _newTabForSession(")
+  );
+  const reads = [
+    { id: 42, windowId: 7, url: "about:blank" },
+    { id: 42, windowId: 7, url: "https://example.test/path?private=value" },
+  ];
+  const waitForNavigatedTab = Function(
+    "browser", "_receiptOrigin", "setTimeout",
+    `${helperSource}; return _waitForNavigatedTab;`
+  )(
+    { tabs: { get: async () => reads.shift() || null } },
+    (url) => {
+      if (url === "about:blank") return "about:blank";
+      try { return new URL(url).origin; } catch { return ""; }
+    },
+    (callback) => { callback(); return 1; }
+  );
+
+  const live = await waitForNavigatedTab(42, 100);
+  assert.equal(live.url, "https://example.test/path?private=value");
+  assert.equal(reads.length, 0, "a live read, not tabs.update's optimistic object, must bind the receipt");
 });
 
 test("switch_tab resolves a valid receipt globally and ignores a stale window-local index", async () => {

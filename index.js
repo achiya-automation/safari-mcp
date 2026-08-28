@@ -379,10 +379,21 @@ function _prepareReloadHttpWorkerHandoff() {
   if (!_activeHttpWorkerId) {
     throw new Error("Extension reload requires an active HTTP worker");
   }
-  if (_reloadHttpWorkerHandoff && _reloadHttpWorkerHandoff.expiresAt >= now) {
-    throw new Error("Extension reload is already in progress");
+  // A prepared handoff is attached by object identity to one pending reload command.
+  // Preserve it beyond the successor TTL only while that exact command is pending;
+  // otherwise an ACK lost after arming (or a failed runtime.reload) would block all
+  // future reloads forever on the still-healthy original worker.
+  if (_reloadHttpWorkerHandoff) {
+    const handoff = _reloadHttpWorkerHandoff;
+    const isPending = [..._pendingRequests.values()].some(
+      (pending) => pending.reloadHandoff === handoff
+    );
+    if (handoff.expiresAt < now && !isPending) {
+      _reloadHttpWorkerHandoff = null;
+    } else {
+      throw new Error("Extension reload is already in progress");
+    }
   }
-  _reloadHttpWorkerHandoff = null;
   const handoff = {
     fromWorkerId: _activeHttpWorkerId,
     token: randomBytes(18).toString("base64url"),
@@ -411,10 +422,19 @@ function _activeHttpWorkerIsFresh(now = Date.now()) {
 
 function _mayReplaceActiveHttpWorker(workerId, presentedToken, now = Date.now()) {
   if (!_activeHttpWorkerId || workerId === _activeHttpWorkerId) return true;
-  if (!_activeHttpWorkerIsFresh(now)) return true;
   const handoff = _reloadHttpWorkerHandoff;
-  return !!handoff && handoff.armed && handoff.fromWorkerId === _activeHttpWorkerId &&
-    handoff.expiresAt >= now && presentedToken === handoff.token;
+  if (handoff) {
+    // While the old worker is preparing a reload, no unrelated worker may use a
+    // momentary poll/heartbeat gap to clear the handoff before /result arms it.
+    if (!handoff.armed) return false;
+    if (handoff.expiresAt >= now) {
+      return handoff.fromWorkerId === _activeHttpWorkerId && presentedToken === handoff.token;
+    }
+    // An armed successor token is one-shot and short-lived. Once it expires, return
+    // to the ordinary healthy-worker lease instead of leaving a permanent blockade.
+    if (_reloadHttpWorkerHandoff === handoff) _reloadHttpWorkerHandoff = null;
+  }
+  return !_activeHttpWorkerIsFresh(now);
 }
 
 function _requireActiveHttpWorker(req, res) {
@@ -951,6 +971,12 @@ const _staleHttpTimer = setInterval(() => {
       // connection here also drained the very request it was executing. Trust the
       // per-command heartbeat instead, and only declare death when nothing is in flight.
       if (_pendingRequests.size > 0 && Date.now() - _extensionLastHeartbeat < 30000) return;
+      // A reload result must arm the exact object captured by its pending request.
+      // Let that request's own bounded timer cancel the prepared handoff; clearing it
+      // here creates an identity race when /result lands on the same timer tick.
+      if (_reloadHttpWorkerHandoff && [..._pendingRequests.values()].some(
+        (pending) => pending.reloadHandoff === _reloadHttpWorkerHandoff
+      )) return;
       _extensionConnected = false;
       _activeHttpWorkerId = "";
       _connectingHttpWorkers.clear();

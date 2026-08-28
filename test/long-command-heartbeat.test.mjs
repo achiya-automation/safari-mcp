@@ -29,11 +29,11 @@ test("extension beats while a command occupies the poll loop", () => {
   assert.match(loop, /setInterval\(/, "beat must repeat, not fire once");
   assert.match(
     loop,
-    /finally\s*\{\s*clearInterval/,
+    /finally\s*\{\s*if \(beat\) clearInterval/,
     "beat must stop even when the command throws, or it leaks forever"
   );
   const beatIdx = loop.indexOf("/heartbeat");
-  const execIdx = loop.indexOf("executeAndReply(msg)");
+  const execIdx = loop.indexOf("executeAndReply(msg, bridgeUrl)");
   assert.ok(beatIdx < execIdx, "beat must start before the blocking command, not after");
 });
 

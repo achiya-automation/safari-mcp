@@ -19,11 +19,13 @@ test("the Safari worker authenticates every localhost bridge request", () => {
   assert.match(worker, /browser\.runtime\.getURL\("bridge-auth-token"\)/);
   assert.match(worker, /headers\.set\("X-Safari-MCP-Token"/);
   assert.match(worker, /headers\.set\("X-Safari-MCP-Worker"/);
-  const bridgeRequestLines = worker.split("\n").filter((line) => line.includes("${HTTP_URL}/"));
+  const bridgeRequestLines = worker.split("\n").filter(
+    (line) => line.includes("${HTTP_URL}/") || line.includes("${bridgeUrl}/")
+  );
   assert.ok(bridgeRequestLines.length >= 6);
   assert.ok(bridgeRequestLines.every((line) => line.includes("_bridgeFetch(")));
-  assert.match(worker, /_bridgeFetch\(`\$\{HTTP_URL\}\/poll/);
-  assert.match(worker, /_bridgeFetch\(`\$\{HTTP_URL\}\/result/);
+  assert.match(worker, /_bridgeFetch\(`\$\{bridgeUrl\}\/poll/);
+  assert.match(worker, /_bridgeFetch\(`\$\{bridgeUrl\}\/result/);
 });
 
 test("only the profile-verified Safari worker can consume or answer commands", () => {
@@ -36,7 +38,7 @@ test("only the profile-verified Safari worker can consume or answer commands", (
   assert.match(server, /status: "worker_lease_held"/);
   assert.match(worker, /const _bridgeWorkerId/);
   assert.match(worker, /_bridgeWorkerSuperseded = true/);
-  assert.match(worker, /!_bridgeWorkerSuperseded && !_reconnectTimer/);
+  assert.match(worker, /!_bridgeWorkerSuperseded && !_bridgeWorkerRetiring && !_reconnectTimer/);
 });
 
 test("reload handoff is an exact ephemeral capability, never a general worker takeover", () => {

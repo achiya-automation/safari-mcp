@@ -9,6 +9,8 @@ const BRIDGE_PORTS = [9224, 9228, 9232, 9236];
 let HTTP_URL = `http://127.0.0.1:${BRIDGE_PORTS[0]}`;
 let isConnected = false;
 let pollAbort = null;
+let _pollLoopGeneration = 0;
+let _commandExecutionTail = Promise.resolve();
 let _bridgeAuthTokenPromise = null;
 const _bridgeWorkerId = (() => {
   const bytes = new Uint8Array(16);
@@ -16,6 +18,7 @@ const _bridgeWorkerId = (() => {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 })();
 let _bridgeWorkerSuperseded = false;
+let _bridgeWorkerRetiring = false;
 const _BRIDGE_RELOAD_HANDOFF_KEY = "mcpBridgeReloadHandoffV1";
 
 async function _storedReloadHandoffToken() {
@@ -126,6 +129,22 @@ async function _listTabsForSession(sessionId) {
   });
 }
 
+async function _waitForNavigatedTab(tabId, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    const liveTab = await browser.tabs.get(tabId).catch(() => null);
+    // Safari can resolve tabs.update() with the requested URL while tabs.get() still
+    // reports the bootstrap about:blank for a short interval. A receipt minted during
+    // that gap is unusable on the very next command. Any HTTP(S) URL on this freshly
+    // created, already-owned tab is either the accepted destination or its redirect.
+    const liveOrigin = _receiptOrigin(liveTab?.url);
+    if (/^https?:\/\//.test(liveOrigin)) return liveTab;
+    if (Date.now() >= deadline) break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  } while (true);
+  return null;
+}
+
 async function _newTabForSession(sessionId, payload) {
   const sid = sessionId || _DEFAULT_SESSION;
   const hadSessionWindow = _sessionWindowIds.has(sid);
@@ -187,7 +206,14 @@ async function _newTabForSession(sessionId, payload) {
       console.warn("Safari MCP: new tab navigation failed");
       return null;
     });
-    if (acceptedTab) receiptTab = acceptedTab;
+    if (!acceptedTab) {
+      throw new Error("Safari did not accept the new tab navigation");
+    }
+    const liveNavigatedTab = await _waitForNavigatedTab(newTab.id);
+    if (!liveNavigatedTab) {
+      throw new Error("Safari did not expose the new tab navigation before receipt issuance");
+    }
+    receiptTab = liveNavigatedTab;
   }
   const receiptIdentity = receiptTab.url || rawNavigationUrl || "about:blank";
   const receipt = await _issueTabReceipt(receiptTab, {
@@ -397,6 +423,7 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     _enabled = msg.enabled;
     if (!_enabled) {
       isConnected = false;
+      _pollLoopGeneration += 1;
       if (pollAbort) { try { pollAbort.abort(); } catch {} pollAbort = null; }
       if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
       _reconnectDelay = 3000;
@@ -431,13 +458,27 @@ function updateBadge(text) {
 // ========== HTTP LONG-POLLING TRANSPORT ==========
 
 let _connecting = false; // re-entrancy lock — the startup promise and the alarm can race into connect()
+function _restartInvalidatedConnect(pollGeneration) {
+  if (_enabled && !_bridgeWorkerRetiring && pollGeneration === _pollLoopGeneration) return false;
+  _connecting = false;
+  // OFF→ON can happen while /connect or profile verification is awaiting Safari. The
+  // ON call sees the lock and returns, so the invalidated attempt itself must hand off
+  // to a fresh generation after releasing that lock.
+  if (_enabled && !_bridgeWorkerSuperseded && !_bridgeWorkerRetiring) connect();
+  return true;
+}
+
 async function connect() {
-  if (!_enabled || _bridgeWorkerSuperseded) return;
+  if (!_enabled || _bridgeWorkerSuperseded || _bridgeWorkerRetiring) return;
   // One connect at a time: two near-simultaneous calls (cold start + alarm wake)
   // could each spawn a poll loop before the other assigned pollAbort.
   if (_connecting) return;
   _connecting = true;
-  // Cancel any existing poll
+  // Invalidate the previous loop before aborting it. An AbortError from an intentional
+  // reconnect must not see a still-true isConnected flag and continue alongside the
+  // successor loop.
+  const pollGeneration = ++_pollLoopGeneration;
+  isConnected = false;
   if (pollAbort) {
     try { pollAbort.abort(); } catch {}
     pollAbort = null;
@@ -465,6 +506,7 @@ async function connect() {
         headers: connectHeaders,
         signal: AbortSignal.timeout(1500),
       });
+      if (_restartInvalidatedConnect(pollGeneration)) return;
       if (!res.ok) continue;
 
       const data = await res.json().catch(() => ({}));
@@ -498,19 +540,26 @@ async function connect() {
         await _discoverProfileWindow();
       }
 
+      // A command already dequeued by the previous generation keeps sole execution
+      // ownership through its result POST. Starting the successor poll sooner could
+      // dequeue a second non-idempotent command in parallel.
+      await _commandExecutionTail.catch(() => {});
+      if (_restartInvalidatedConnect(pollGeneration)) return;
       await browser.storage.local.remove(_BRIDGE_RELOAD_HANDOFF_KEY).catch(() => {});
       await browser.storage.local.set({ mcpBridgeUrl: HTTP_URL }).catch(() => {});
+      if (_restartInvalidatedConnect(pollGeneration)) return;
       isConnected = true;
       _reconnectDelay = 3000; // Reset backoff on success
       updateBadge("ON");
       _startHeartbeat(); // Keep service worker alive between polls
       _connecting = false;
-      pollForCommands();
+      pollForCommands(pollGeneration);
       return;
     } catch {}
   }
 
   // No matching server available — retry with exponential backoff.
+  if (_restartInvalidatedConnect(pollGeneration)) return;
   isConnected = false;
   updateBadge("");
   scheduleReconnect();
@@ -518,7 +567,7 @@ async function connect() {
 }
 
 function scheduleReconnect() {
-  if (!_enabled || _bridgeWorkerSuperseded) return;
+  if (!_enabled || _bridgeWorkerSuperseded || _bridgeWorkerRetiring) return;
   // Cancel any existing reconnect to prevent exponential growth
   if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
 
@@ -535,18 +584,22 @@ function scheduleReconnect() {
   } catch {}
 }
 
-async function pollForCommands() {
-  while (isConnected && _enabled) {
+async function pollForCommands(pollGeneration) {
+  while (isConnected && _enabled && !_bridgeWorkerRetiring && pollGeneration === _pollLoopGeneration) {
+    let controller = null;
+    let timeout = null;
+    const bridgeUrl = HTTP_URL;
     try {
-      pollAbort = new AbortController();
+      controller = new AbortController();
+      pollAbort = controller;
       // Long-poll: server holds connection open until a command arrives or timeout
       // This active fetch keeps the service worker alive in Safari
       // 90s safety timeout prevents stuck connections from blocking forever
-      const timeout = setTimeout(() => pollAbort.abort(), 90000);
-      const res = await _bridgeFetch(`${HTTP_URL}/poll`, {
-        signal: pollAbort.signal,
+      timeout = setTimeout(() => controller.abort(), 90000);
+      const res = await _bridgeFetch(`${bridgeUrl}/poll`, {
+        signal: controller.signal,
       });
-      clearTimeout(timeout);
+      if (pollGeneration !== _pollLoopGeneration) return;
       if (res.status === 423) {
         // A replacement worker completed profile verification. This stale worker must
         // stay dormant until Safari reloads it; reconnecting would steal the lease back.
@@ -563,31 +616,41 @@ async function pollForCommands() {
         return;
       }
       if (res.status === 200) {
-        // A single malformed/truncated body must NOT tear down the poll loop — a bad
-        // packet used to throw SyntaxError here, fall through to "server gone", and
-        // trigger a multi-second reconnect backoff. Skip the bad packet and keep polling.
-        const msg = await res.json().catch(() => null);
-        // executeAndReply blocks this loop, so /poll goes silent for as long as the
-        // command runs. On a heavy DOM (facebook.com) that passes the server's 30s
-        // stale threshold and the server kills the connection — draining the very
-        // command still executing here. Beat while busy so it knows we are alive.
-        // NOT the same as _startHeartbeat(): that one pokes storage.local to stop Safari
-        // suspending the worker, and runs unconditionally. This one must fire ONLY while a
-        // command is in flight — an unconditional beat would refresh the server's stale
-        // clock forever and mask a genuinely dead worker.
-        if (msg) {
-          const beat = setInterval(() => {
-            _bridgeFetch(`${HTTP_URL}/heartbeat`, { method: "POST" }).catch(() => {});
-          }, 5000);
-          try { await executeAndReply(msg); } finally { clearInterval(beat); }
+        // Publish this claim before the first await. A reconnect that starts while
+        // Safari is still parsing the body must wait rather than dequeue a second
+        // non-idempotent command in parallel.
+        const previousExecution = _commandExecutionTail;
+        let releaseClaim;
+        const claim = new Promise((resolve) => { releaseClaim = resolve; });
+        _commandExecutionTail = previousExecution.catch(() => {}).then(() => claim);
+        let beat = null;
+        try {
+          // A single malformed/truncated body must NOT tear down the poll loop — a bad
+          // packet used to throw SyntaxError here, fall through to "server gone", and
+          // trigger a multi-second reconnect backoff. Skip the bad packet and keep polling.
+          const msg = await res.json().catch(() => null);
+          // executeAndReply blocks this loop, so /poll goes silent for as long as the
+          // command runs. Beat while busy so it knows we are alive, including while a
+          // previous generation finishes its already-claimed command.
+          if (msg) {
+            beat = setInterval(() => {
+              _bridgeFetch(`${bridgeUrl}/heartbeat`, { method: "POST" }).catch(() => {});
+            }, 5000);
+            await previousExecution.catch(() => {});
+            await executeAndReply(msg, bridgeUrl);
+          }
+        } finally {
+          if (beat) clearInterval(beat);
+          releaseClaim();
         }
       }
       // 204 = no command, loop immediately to keep connection active
     } catch (err) {
+      if (pollGeneration !== _pollLoopGeneration) return;
       if (err.name === "AbortError") {
         // 90s safety-timeout abort while still connected — continue the loop in place.
         // (Re-calling pollForCommands() here risked two overlapping loops posting dup results.)
-        if (isConnected && _enabled) continue;
+        if (isConnected && _enabled && !_bridgeWorkerRetiring) continue;
         return; // Intentional abort (disable/new connect)
       }
       // Server gone — reconnect via shared scheduler (prevents duplicate timers)
@@ -596,13 +659,19 @@ async function pollForCommands() {
       console.log("Safari MCP: poll failed, reconnecting...", err.message);
       scheduleReconnect();
       return;
+    } finally {
+      // An intentional abort used to leave this timer alive. Ninety seconds later it
+      // dereferenced the global pollAbort and killed a completely different, healthy
+      // poll. Keep both timeout and controller local to their exact fetch.
+      if (timeout) clearTimeout(timeout);
+      if (pollAbort === controller) pollAbort = null;
     }
   }
 }
 
 // ========== SHARED: Execute command and send response ==========
 
-async function executeAndReply(msg) {
+async function executeAndReply(msg, bridgeUrl = HTTP_URL) {
   if (!msg || !msg.id || !msg.type) return;
 
   let response;
@@ -614,7 +683,7 @@ async function executeAndReply(msg) {
   }
 
   try {
-    const resultAck = await _bridgeFetch(`${HTTP_URL}/result`, {
+    const resultAck = await _bridgeFetch(`${bridgeUrl}/result`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(response),
@@ -629,13 +698,23 @@ async function executeAndReply(msg) {
       // Stop the poll loop before yielding to the reload timer. Otherwise this worker
       // can fetch one more non-idempotent command during the short handoff window and
       // runtime.reload() would terminate it without a result.
+      _bridgeWorkerRetiring = true;
+      _pollLoopGeneration += 1;
       isConnected = false;
       _stopHeartbeat();
       setTimeout(() => {
         try {
           browser.runtime.reload();
         } catch (_) {
-          try { chrome.runtime.reload(); } catch (_) { scheduleReconnect(); }
+          try {
+            chrome.runtime.reload();
+          } catch (_) {
+            // Both reload APIs failed synchronously. This is the only path where the
+            // old worker may leave retirement and reconnect; a successful call must
+            // never poll during its 50ms handoff window.
+            _bridgeWorkerRetiring = false;
+            connect();
+          }
         }
       }, 50);
     }
@@ -4162,7 +4241,7 @@ async function waitForTabSettled(tabId, timeout = 3000) {
 // 3. browser.alarms (1 min minimum) re-wakes the worker if it was terminated
 let _heartbeatTimer = null;
 function _startHeartbeat() {
-  if (_heartbeatTimer || !_enabled || _bridgeWorkerSuperseded) return;
+  if (_heartbeatTimer || !_enabled || _bridgeWorkerSuperseded || _bridgeWorkerRetiring) return;
   _heartbeatTimer = setInterval(() => {
     if (_enabled) {
       browser.storage.local.set({ _heartbeat: Date.now() }).catch(() => {});
@@ -4177,11 +4256,11 @@ browser.alarms.create("keepalive", { periodInMinutes: 1 });
 browser.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "keepalive" || alarm.name === "reconnect") {
     // Only reconnect if disconnected, enabled, and no reconnect already scheduled
-    if (!isConnected && _enabled && !_bridgeWorkerSuperseded && !_reconnectTimer) {
+    if (!isConnected && _enabled && !_bridgeWorkerSuperseded && !_bridgeWorkerRetiring && !_reconnectTimer) {
       scheduleReconnect();
     }
     // Restart heartbeat in case it was lost on worker restart
-    if (_enabled && !_bridgeWorkerSuperseded && !_heartbeatTimer) _startHeartbeat();
+    if (_enabled && !_bridgeWorkerSuperseded && !_bridgeWorkerRetiring && !_heartbeatTimer) _startHeartbeat();
   }
 });
 

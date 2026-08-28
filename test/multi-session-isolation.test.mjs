@@ -278,6 +278,7 @@ test("tab management stays inside each session's window, including last-tab prot
       create: async () => { throw new Error("unexpected window creation"); },
     },
     tabs: {
+      get: async (tabId) => liveTabs.find((candidate) => candidate.id === tabId) || null,
       query: async (query) => {
         const windowId = query.windowId || 101;
         return liveTabs.filter((tab) => tab.windowId === windowId)
