@@ -316,6 +316,11 @@ function _bridgePort(name, fallback) {
 }
 const HTTP_PORT = _bridgePort("SAFARI_MCP_BRIDGE_PORT", 9224);
 const WS_PORT = _bridgePort("SAFARI_MCP_BRIDGE_WS_PORT", HTTP_PORT - 1);
+// A manifest version is not enough to distinguish two development builds: Safari can
+// keep an older service worker alive after a same-version appex is replaced. Require a
+// code-capability marker before a worker may enter profile verification, so a stale
+// worker can never displace the currently installed worker or consume its commands.
+const EXTENSION_BRIDGE_PROTOCOL = "popup-opener-v1";
 function _isExtensionSchemeOrigin(origin) {
   const value = String(origin || "");
   return value.startsWith("safari-web-extension://") ||
@@ -564,16 +569,22 @@ try {
         res.end("Worker identity required");
         return;
       }
-      _rememberConnectingHttpWorker(workerId);
       const connectUrl = new URL(req.url, `http://127.0.0.1:${HTTP_PORT}`);
       // Safari can retain old per-profile workers after a development build is replaced.
       // Those workers use the legacy visible-tab verifier. Fail them closed before the
       // server reveals a target profile, while current workers use the no-new-tab verifier.
-      if (process.env.SAFARI_PROFILE && connectUrl.searchParams.get("verifier") !== "existing-tab-v1") {
+      if (process.env.SAFARI_PROFILE && (
+        connectUrl.searchParams.get("verifier") !== "existing-tab-v1" ||
+        connectUrl.searchParams.get("protocol") !== EXTENSION_BRIDGE_PROTOCOL
+      )) {
         res.writeHead(426, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "upgrade_required" }));
         return;
       }
+      // Only an accepted code generation may proceed to /verify-profile and
+      // /extension-verified. Remembering rejected workers would let a stale process
+      // skip the protocol gate by posting the second handshake step directly.
+      _rememberConnectingHttpWorker(workerId);
       // When SAFARI_PROFILE is set, don't mark as connected until profile is verified.
       // A personal-profile extension connecting first would incorrectly set the flag.
       if (!process.env.SAFARI_PROFILE) {
@@ -1402,7 +1413,7 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
         // into "_default" — so both parts are needed.
         // A receipt is an opaque capability, not a URL. Keep it out of page state and
         // attach it automatically only to commands that target the current logical tab.
-        const attachActiveReceipt = !["new_tab", "list_tabs", "switch_tab"].includes(extensionType);
+        const attachActiveReceipt = !["new_tab", "list_tabs", "switch_tab", "reload_extension"].includes(extensionType);
         const payload = {
           ...(attachActiveReceipt && activeReceipt ? { receipt: activeReceipt } : {}),
           ...extensionPayload,

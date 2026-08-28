@@ -439,7 +439,7 @@ async function connect() {
       // Version the handshake in the URL so stale workers still cached by Safari are
       // rejected before they reach the legacy profile probe that creates a visible tab.
       // A query parameter keeps this a CORS-simple POST (a custom header would preflight).
-      const res = await _bridgeFetch(`${HTTP_URL}/connect?verifier=existing-tab-v1`, {
+      const res = await _bridgeFetch(`${HTTP_URL}/connect?verifier=existing-tab-v1&protocol=popup-opener-v1`, {
         method: "POST",
         signal: AbortSignal.timeout(1500),
       });
@@ -590,6 +590,19 @@ async function executeAndReply(msg) {
 
 async function handleCommand(type, payload) {
   const sessionId = payload.sessionId || _DEFAULT_SESSION;
+  // Worker maintenance is deliberately tab-independent. In particular, a stale
+  // active-tab receipt or an unrelated Safari window must never make the one command
+  // that can load newly installed code impossible to run.
+  if (type === "reload_extension") {
+    await _hydrateOwnedTabs();
+    // Checkpoint every already-authorized tab before the worker disappears. This does
+    // not grant ownership and does not move receiptOrigin across redirects.
+    await _refreshAllReceiptIdentities();
+    setTimeout(() => {
+      try { browser.runtime.reload(); } catch (_) { chrome.runtime.reload(); }
+    }, 50);
+    return { reloaded: true, version: browser.runtime.getManifest().version };
+  }
   // Receipt-based targeting depends on durable ownership state, so hydrate it
   // before resolving the tab (not only before consulting the write guard).
   await _hydrateOwnedTabs();
@@ -800,23 +813,6 @@ async function handleCommand(type, payload) {
 
     case "get_title": {
       return targetTab.title;
-    }
-
-    // --- Reload Extension (hot-reload after code changes) ---
-    // Allows the MCP server to trigger the extension to reload its own code from disk,
-    // bypassing the need for manual Safari → Preferences → Extensions → toggle.
-    // The WebSocket will disconnect as a side effect; the extension auto-reconnects.
-    case "reload_extension": {
-      // Checkpoint the current exact URL identity before the worker disappears. This
-      // does not move receiptOrigin across redirects; it only lets hydration prove
-      // which concrete live tab survived the reload.
-      await _refreshAllReceiptIdentities();
-      // Respond BEFORE reload so the MCP server sees a success result.
-      // Delay the actual reload by a tick so the response can flush over the wire.
-      setTimeout(() => {
-        try { browser.runtime.reload(); } catch (_) { chrome.runtime.reload(); }
-      }, 50);
-      return { reloaded: true, version: browser.runtime.getManifest().version };
     }
 
     case "read_page": {

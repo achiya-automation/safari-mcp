@@ -65,10 +65,39 @@ test("profile verification never creates or closes a temporary browser tab", () 
 });
 
 test("the server rejects stale workers before they can run the visible-tab verifier", () => {
-  assert.match(background, /connect\?verifier=existing-tab-v1/);
+  assert.match(background, /connect\?verifier=existing-tab-v1&protocol=popup-opener-v1/);
   assert.match(index, /searchParams\.get\("verifier"\) !== "existing-tab-v1"/);
+  assert.match(index, /searchParams\.get\("protocol"\) !== EXTENSION_BRIDGE_PROTOCOL/);
+  assert.match(index, /const EXTENSION_BRIDGE_PROTOCOL = "popup-opener-v1"/);
   assert.match(index, /res\.writeHead\(426/);
   assert.match(index, /status: "upgrade_required"/);
+  assert.ok(
+    index.indexOf("_rememberConnectingHttpWorker(workerId)", index.indexOf('req.method === "POST" && req.url.startsWith("/connect")')) >
+      index.indexOf('connectUrl.searchParams.get("protocol") !== EXTENSION_BRIDGE_PROTOCOL'),
+    "a rejected stale worker must not enter the profile-verification handshake"
+  );
+});
+
+test("extension reload bypasses all target-tab and receipt resolution", () => {
+  const handler = background.slice(
+    background.indexOf("async function handleCommand("),
+    background.indexOf("// ========== DOM HELPERS")
+  );
+  const reloadAt = handler.indexOf('if (type === "reload_extension")');
+  const receiptAt = handler.indexOf("const suppliedReceipt");
+  assert.ok(reloadAt >= 0 && receiptAt > reloadAt);
+  assert.match(handler.slice(reloadAt, receiptAt), /_refreshAllReceiptIdentities/);
+  assert.doesNotMatch(handler.slice(receiptAt), /case "reload_extension"/);
+
+  const routing = index.slice(
+    index.indexOf("async function extensionOrFallback("),
+    index.indexOf("// Read version from package.json")
+  );
+  assert.match(
+    routing,
+    /\["new_tab", "list_tabs", "switch_tab", "reload_extension"\]\.includes\(extensionType\)/,
+    "reload must never inherit a stale active-tab receipt"
+  );
 });
 
 test("a verified profile extension may bypass denied Apple Events", () => {
