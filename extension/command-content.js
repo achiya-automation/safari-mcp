@@ -10,6 +10,74 @@
 // boolean guard then falsely says the bridge is installed. sendContentCommand only
 // reinjects this file after a message failure, so duplicate live listeners are rare
 // and harmless (the first synchronous response wins).
+
+// Safari may unload an MV3 service worker even while it owns an HTTP long-poll. A
+// content script lives with the page, so use a narrow extension Port to generate a
+// real worker event comfortably inside Safari's roughly 30-second idle window. The
+// ping carries no page URL, DOM data, receipt, or other authority. If Safari drops the
+// worker, onDisconnect retries quickly; the normal interval remains the bounded
+// fallback if the extension was reloaded and this script's runtime became stale.
+const _MCP_KEEPALIVE_PORT_NAME = "mcp-content-keepalive-v1";
+const _MCP_KEEPALIVE_INTERVAL_MS = 10000;
+const _MCP_KEEPALIVE_RECONNECT_MS = 1500;
+let _mcpKeepalivePort = null;
+let _mcpKeepaliveReconnectTimer = null;
+let _mcpKeepaliveTickRunning = false;
+
+function _scheduleMcpKeepaliveReconnect() {
+  if (_mcpKeepaliveReconnectTimer) return;
+  _mcpKeepaliveReconnectTimer = setTimeout(() => {
+    _mcpKeepaliveReconnectTimer = null;
+    _mcpKeepaliveTick();
+  }, _MCP_KEEPALIVE_RECONNECT_MS);
+}
+
+function _openMcpKeepalivePort() {
+  if (_mcpKeepalivePort) return _mcpKeepalivePort;
+  try {
+    const port = browser.runtime.connect({ name: _MCP_KEEPALIVE_PORT_NAME });
+    _mcpKeepalivePort = port;
+    port.onDisconnect.addListener(() => {
+      if (_mcpKeepalivePort !== port) return;
+      _mcpKeepalivePort = null;
+      _scheduleMcpKeepaliveReconnect();
+    });
+    return port;
+  } catch (_) {
+    _scheduleMcpKeepaliveReconnect();
+    return null;
+  }
+}
+
+async function _mcpKeepaliveTick() {
+  if (_mcpKeepaliveTickRunning) return;
+  _mcpKeepaliveTickRunning = true;
+  try {
+    // Respect the popup's OFF state without waking the service worker merely to ask.
+    const stored = await browser.storage.local.get("mcpEnabled").catch(() => null);
+    if (!stored || stored.mcpEnabled === false) {
+      if (_mcpKeepalivePort) {
+        try { _mcpKeepalivePort.disconnect(); } catch (_) {}
+        _mcpKeepalivePort = null;
+      }
+      return;
+    }
+    const port = _openMcpKeepalivePort();
+    if (!port) return;
+    try {
+      port.postMessage({ type: "ping" });
+    } catch (_) {
+      if (_mcpKeepalivePort === port) _mcpKeepalivePort = null;
+      _scheduleMcpKeepaliveReconnect();
+    }
+  } finally {
+    _mcpKeepaliveTickRunning = false;
+  }
+}
+
+_mcpKeepaliveTick();
+setInterval(_mcpKeepaliveTick, _MCP_KEEPALIVE_INTERVAL_MS);
+
 browser.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!message) return false;
   if (message.type === "mcp-content-click") {

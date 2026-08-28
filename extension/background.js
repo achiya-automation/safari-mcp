@@ -443,6 +443,21 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   return false;
 });
 
+// A page-bound isolated content script sends an authority-free ping through this
+// Port every ten seconds. Receiving the Port message is itself the supported Safari
+// extension event that prevents (or wakes after) MV3 worker suspension. Do not turn
+// it into a command channel: accept only the exact name, require a real sender tab,
+// inspect only the fixed ping type, and never receive or return tab/session data.
+const _CONTENT_KEEPALIVE_PORT_NAME = "mcp-content-keepalive-v1";
+browser.runtime.onConnect.addListener((port) => {
+  if (port?.name !== _CONTENT_KEEPALIVE_PORT_NAME) return;
+  if (!Number.isInteger(port?.sender?.tab?.id)) return;
+  port.onMessage.addListener((message) => {
+    if (message?.type !== "ping") return;
+    // Intentionally empty: delivery of this event is the keepalive.
+  });
+});
+
 // ========== BADGE ==========
 
 function updateBadge(text) {
