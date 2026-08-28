@@ -428,6 +428,7 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
       _reconnectDelay = 3000;
       _stopHeartbeat();
+      _disconnectContentKeepalivePort();
       updateBadge("OFF");
     } else {
       updateBadge("");
@@ -449,9 +450,31 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // it into a command channel: accept only the exact name, require a real sender tab,
 // inspect only the fixed ping type, and never receive or return tab/session data.
 const _CONTENT_KEEPALIVE_PORT_NAME = "mcp-content-keepalive-v1";
+let _contentKeepalivePort = null;
+function _disconnectContentKeepalivePort() {
+  const port = _contentKeepalivePort;
+  _contentKeepalivePort = null;
+  if (port) {
+    try { port.disconnect(); } catch (_) {}
+  }
+}
 browser.runtime.onConnect.addListener((port) => {
   if (port?.name !== _CONTENT_KEEPALIVE_PORT_NAME) return;
   if (!Number.isInteger(port?.sender?.tab?.id)) return;
+  if (!_enabled || _bridgeWorkerSuperseded || _bridgeWorkerRetiring) {
+    try { port.disconnect(); } catch (_) {}
+    return;
+  }
+  // The content-side lease should already converge on one sender. Enforce the same
+  // invariant here so a brief storage-election race cannot leave many live Ports.
+  if (_contentKeepalivePort && _contentKeepalivePort !== port) {
+    try { port.disconnect(); } catch (_) {}
+    return;
+  }
+  _contentKeepalivePort = port;
+  port.onDisconnect.addListener(() => {
+    if (_contentKeepalivePort === port) _contentKeepalivePort = null;
+  });
   port.onMessage.addListener((message) => {
     if (message?.type !== "ping") return;
     // Intentionally empty: delivery of this event is the keepalive.
@@ -622,6 +645,7 @@ async function pollForCommands(pollGeneration) {
         isConnected = false;
         updateBadge("");
         _stopHeartbeat();
+        _disconnectContentKeepalivePort();
         return;
       }
       if (res.status === 401 || res.status === 403 || res.status === 409) {
