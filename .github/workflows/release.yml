@@ -88,5 +88,27 @@ jobs:
 
       - name: Publish to MCP Registry
         run: |
+          # The registry validates that the npm version already exists, and npm's public
+          # index lags its own publish by a few seconds — so a same-job publish races it
+          # and fails with a 404 on a version that is genuinely there (v2.17.0 hit this).
+          # Wait for npm to actually serve the version, then retry the publish itself.
+          VERSION="$(node -p "require('./package.json').version")"
+          for attempt in $(seq 1 30); do
+            if curl -sf "https://registry.npmjs.org/safari-mcp/${VERSION}" -o /dev/null; then
+              echo "npm is serving ${VERSION} (attempt ${attempt})"
+              break
+            fi
+            echo "npm has not indexed ${VERSION} yet (attempt ${attempt}) — waiting 10s"
+            sleep 10
+          done
+
           ./mcp-publisher login github-oidc
-          ./mcp-publisher publish
+          for attempt in 1 2 3; do
+            if ./mcp-publisher publish; then
+              exit 0
+            fi
+            echo "MCP Registry publish failed (attempt ${attempt}) — retrying in 20s"
+            sleep 20
+          done
+          echo "::error::MCP Registry publish failed after 3 attempts"
+          exit 1

@@ -2371,8 +2371,8 @@ server.tool(
           // tracked index is not proof either: `_openedTabs` is keyed by INDEX
           // and Safari renumbers every index whenever any tab closes, so a stale
           // key can point straight at a user's tab. Require BOTH — the index we
-          // opened AND the origin we opened it on. That is the same second factor
-          // the extension enforces in _canAdoptMarkedOwnedTab, so nothing that
+          // opened AND the origin we opened it on. That mirrors the origin
+          // boundary the extension keeps on its own receipts, so nothing that
           // would survive the extension's check is lost here, and the AppleScript
           // fallback (which has no ownership check of its own) stays guarded.
           const trackedOrigin = _originOf(_openedTabs.get(index)?.url);
