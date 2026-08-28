@@ -49,7 +49,7 @@ let _profileWindowId = null; // Discovered windowId for the profile (shared defa
 // "אוטומציות" windows at once. With a single shared _profileWindowId, a session whose
 // tab lived in window B was told "a same-URL tab exists in another window — refusing
 // to cross windows" and could not reach its OWN tab. A session adopts a window only by
-// opening a tab in it, so this never widens reach beyond tabs the session created.
+// opening a tab there or proving an exact tab it already owns, never by URL or focus.
 const _sessionWindowIds = new Map();
 function _windowForSession(sessionId) {
   const own = _sessionWindowIds.get(sessionId || _DEFAULT_SESSION);
@@ -196,22 +196,41 @@ async function _openPopupTabForSession(sessionId, sourceTab, rawPopupUrl) {
   if (!/^https?:$/.test(parsed.protocol)) {
     throw new Error("Captured popup URL must use HTTP(S)");
   }
+  const sourceTabId = Number(sourceTab?.id);
+  if (!Number.isInteger(sourceTabId)) {
+    throw new Error("Popup source tab identity is unavailable");
+  }
 
   // The exact URL, including signed query bytes, stays inside the extension worker.
   // Never stringify or log it. browser.tabs.create is profile-scoped here and
   // `active:false` keeps Safari and the user's foreground application untouched.
+  // openerTabId preserves the direct OAuth child relationship without a native click.
   let popupTab;
   try {
     popupTab = await browser.tabs.create({
       url: String(rawPopupUrl),
       active: false,
       windowId: sourceTab.windowId,
+      openerTabId: sourceTabId,
     });
   } catch {
     // Safari may create a tab and then reject the promise while navigation is still
     // progressing. The click is deliberately one-shot, so never retry automatically.
     throw new Error("Popup tab creation outcome is unknown; refusing automatic retry");
   }
+
+  // Safari 14+ supports openerTabId, but fail closed if this concrete tab does not
+  // report the direct relationship. Never adopt a nearby tab by URL or creation time.
+  const linkedPopup = Number(popupTab?.openerTabId) === sourceTabId
+    ? popupTab
+    : await browser.tabs.get(popupTab.id).catch(() => null);
+  if (!linkedPopup || Number(linkedPopup.openerTabId) !== sourceTabId) {
+    // This exact tab was created by the call above and has not been granted ownership.
+    // Remove the unusable OAuth child so it cannot be mistaken for a successful flow.
+    await browser.tabs.remove(popupTab.id).catch(() => {});
+    throw new Error("Safari did not preserve the direct OAuth opener; popup was closed");
+  }
+  popupTab = linkedPopup;
 
   _adoptWindowForSession(sessionId, popupTab.windowId || sourceTab.windowId);
   _setSessionTab(sessionId, popupTab.id, popupTab.url || String(rawPopupUrl));
@@ -598,7 +617,9 @@ async function handleCommand(type, payload) {
       // that tab's extension-owned window, but never into an arbitrary window by URL.
       _adoptWindowForSession(sessionId, targetTab.windowId);
     } else {
-      targetTab = await getTargetTab(null, sessionId);
+      targetTab = type === "get_tab_receipt"
+        ? await _getReceiptTargetTab(sessionId)
+        : await getTargetTab(null, sessionId);
     }
   } catch (resolveErr) {
     if (type !== "new_tab") throw resolveErr;
@@ -3303,6 +3324,46 @@ async function _discoverProfileWindow() {
   } catch (err) {
     console.warn("Safari MCP: _discoverProfileWindow error:", err.message);
   }
+}
+
+async function _getReceiptTargetTab(sessionId) {
+  const sid = sessionId || _DEFAULT_SESSION;
+  const cache = _getSessionCache(sid);
+
+  // getReceipt is the recovery point after an OAuth redirect invalidates the old
+  // origin-bound receipt. Prefer only a concrete tab this exact session already owns,
+  // even if the redirect took longer than TAB_CACHE_MS or the tab lives in another
+  // Safari window. This does not grant ownership or discover tabs by URL.
+  if (cache.tabId && _isTabOwnedBySession(sid, cache.tabId)) {
+    try {
+      const cached = await browser.tabs.get(cache.tabId);
+      if (cached) {
+        _adoptWindowForSession(sid, cached.windowId);
+        _setSessionTab(sid, cached.id, cached.url || "");
+        return cached;
+      }
+    } catch {
+      cache.tabId = null;
+      cache.tabUrl = null;
+    }
+  }
+
+  const ownedIds = _sessionOwnedTabs.get(sid);
+  if (ownedIds && ownedIds.size) {
+    for (const ownedId of [...ownedIds].reverse()) {
+      let ownedTab = null;
+      try { ownedTab = await browser.tabs.get(ownedId); }
+      catch { ownedIds.delete(ownedId); continue; }
+      if (!ownedTab || !_isTabOwnedBySession(sid, ownedTab.id)) continue;
+      _adoptWindowForSession(sid, ownedTab.windowId);
+      _setSessionTab(sid, ownedTab.id, ownedTab.url || "");
+      return ownedTab;
+    }
+  }
+
+  // Preserve first-command/read-only compatibility. The authority check in
+  // handleCommand still rejects getReceipt unless this fallback is already owned.
+  return getTargetTab(null, sid);
 }
 
 async function getTargetTab(_unusedReceipt, sessionId) {

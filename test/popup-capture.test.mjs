@@ -229,8 +229,17 @@ test("popup tab creation preserves the exact URL internally and returns only saf
       tabs: {
         create: async (options) => {
           created.push(options);
-          return { id: 88, index: 4, windowId: 7, url: options.url, title: "OAuth" };
+          return {
+            id: 88,
+            index: 4,
+            windowId: 7,
+            openerTabId: options.openerTabId,
+            url: options.url,
+            title: "OAuth",
+          };
         },
+        get: async () => { throw new Error("already linked"); },
+        remove: async () => { throw new Error("must not remove linked popup"); },
       },
     },
     () => {},
@@ -244,10 +253,15 @@ test("popup tab creation preserves the exact URL internally and returns only saf
     }
   );
 
-  const result = await openPopup("session-a", { windowId: 7 }, popupUrl);
+  const result = await openPopup("session-a", { id: 41, windowId: 7 }, popupUrl);
 
   assert.equal(created.length, 1);
-  assert.deepEqual(created[0], { url: popupUrl, active: false, windowId: 7 });
+  assert.deepEqual(created[0], {
+    url: popupUrl,
+    active: false,
+    windowId: 7,
+    openerTabId: 41,
+  });
   assert.deepEqual(result, {
     clicked: true,
     popupOpened: true,
@@ -259,6 +273,53 @@ test("popup tab creation preserves the exact URL internally and returns only saf
   assert.equal(JSON.stringify(result).includes("private-code"), false);
   assert.equal(JSON.stringify(result).includes("secret-state"), false);
   assert.equal(Object.hasOwn(result, "url"), false);
+});
+
+test("popup creation fails closed unless Safari preserves the exact direct opener", async () => {
+  const helperSource = extract(
+    background,
+    "async function _openPopupTabForSession(",
+    "\nasync function _closeTabForSession("
+  );
+  const removed = [];
+  let ownershipAdds = 0;
+  let receiptIssues = 0;
+  const openPopup = Function(
+    "browser",
+    "_adoptWindowForSession",
+    "_setSessionTab",
+    "_addOwnedTab",
+    "_issueTabReceipt",
+    "_receiptOrigin",
+    "_safeTabUrl",
+    `${helperSource}; return _openPopupTabForSession;`
+  )(
+    {
+      tabs: {
+        create: async (options) => ({ id: 88, index: 4, windowId: 7, url: options.url }),
+        get: async () => ({ id: 88, index: 4, windowId: 7 }),
+        remove: async (tabId) => removed.push(tabId),
+      },
+    },
+    () => {},
+    () => {},
+    async () => { ownershipAdds += 1; },
+    async () => { receiptIssues += 1; return "unexpected"; },
+    (url) => new URL(url).origin,
+    (url) => new URL(url).origin + new URL(url).pathname
+  );
+
+  await assert.rejects(
+    openPopup(
+      "session-a",
+      { id: 41, windowId: 7 },
+      "https://oauth.example.test/start?private=1"
+    ),
+    /did not preserve the direct OAuth opener/
+  );
+  assert.deepEqual(removed, [88], "only the exact just-created unusable popup may be removed");
+  assert.equal(ownershipAdds, 0, "an unlinked tab must never gain session ownership");
+  assert.equal(receiptIssues, 0, "an unlinked tab must never receive a receipt");
 });
 
 test("worker keeps the captured URL internal and never retries the click", () => {
@@ -283,4 +344,13 @@ test("worker keeps the captured URL internal and never retries the click", () =>
   assert.equal((exact.match(/browser\.scripting\.executeScript/g) || []).length, 1);
   assert.match(exact, /world: "MAIN"/);
   assert.match(exact, /refusing automatic retry/);
+
+  const openPopup = extract(
+    background,
+    "async function _openPopupTabForSession(",
+    "\nasync function _closeTabForSession("
+  );
+  assert.match(openPopup, /openerTabId: sourceTabId/);
+  assert.match(openPopup, /Number\(linkedPopup\.openerTabId\) !== sourceTabId/);
+  assert.doesNotMatch(openPopup, /tabs\.query|Date\.now/);
 });

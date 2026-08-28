@@ -492,6 +492,70 @@ test("switch_tab resolves a valid receipt globally and ignores a stale window-lo
   assert.deepEqual(crossWindowQueries, [], "receipt switching must not reinterpret index in any window");
 });
 
+test("getReceipt prefers the session's exact owned tab across windows after redirect", async () => {
+  const helper = background.slice(
+    background.indexOf("async function _getReceiptTargetTab("),
+    background.indexOf("async function getTargetTab(", background.indexOf("async function _getReceiptTargetTab("))
+  );
+  assert.match(helper, /_isTabOwnedBySession\(sid, cache\.tabId\)/);
+  assert.match(helper, /browser\.tabs\.get\(cache\.tabId\)/);
+  assert.match(helper, /_adoptWindowForSession\(sid, cached\.windowId\)/);
+  assert.doesNotMatch(helper, /_addOwnedTab|_issueTabReceipt|tabs\.query|url\s*===/);
+
+  const cache = {
+    tabId: 88,
+    tabUrl: "https://accounts.example.test/chooser",
+    time: 1,
+  };
+  const owned = new Set([11, 88]);
+  const adopted = [];
+  const targeted = [];
+  let fallbackCalls = 0;
+  const getReceiptTarget = Function(
+    "_DEFAULT_SESSION",
+    "_getSessionCache",
+    "_isTabOwnedBySession",
+    "browser",
+    "_adoptWindowForSession",
+    "_setSessionTab",
+    "_sessionOwnedTabs",
+    "getTargetTab",
+    `${helper}; return _getReceiptTargetTab;`
+  )(
+    "__default__",
+    () => cache,
+    (sessionId, tabId) => sessionId === "session-a" && owned.has(tabId),
+    {
+      tabs: {
+        get: async (tabId) => ({
+          id: tabId,
+          windowId: tabId === 88 ? 9 : 7,
+          url: tabId === 88
+            ? "https://affiliate.example.test/oauth/callback?private=1"
+            : "https://affiliate.example.test/form",
+        }),
+      },
+    },
+    (_sessionId, windowId) => adopted.push(windowId),
+    (_sessionId, tabId) => targeted.push(tabId),
+    new Map([["session-a", owned]]),
+    async () => { fallbackCalls += 1; return null; }
+  );
+
+  const result = await getReceiptTarget("session-a");
+  assert.equal(result.id, 88);
+  assert.equal(result.windowId, 9, "the already-owned OAuth tab may live outside the old window");
+  assert.deepEqual(adopted, [9]);
+  assert.deepEqual(targeted, [88]);
+  assert.equal(fallbackCalls, 0, "an owned session tab must win over current/active-window fallback");
+
+  const handle = background.slice(
+    background.indexOf("async function handleCommand("),
+    background.indexOf("// ========== HELPERS ==========", background.indexOf("async function handleCommand("))
+  );
+  assert.match(handle, /type === "get_tab_receipt"[\s\S]*_getReceiptTargetTab\(sessionId\)/);
+});
+
 test("public switch_tab forwards an opaque receipt and sanitizes extension output", () => {
   const switchTabTool = index.slice(
     index.indexOf('"safari_switch_tab"'),
