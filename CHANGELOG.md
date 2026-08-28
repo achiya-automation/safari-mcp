@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Clicks now reach controls inside nested open Shadow DOM.** The persistent content bridge previously searched only `document`, so text, selector, snapshot-ref, and coordinate clicks stopped at a custom-element host even though snapshots could see the real control. Click resolution and hit-testing now recurse through open shadow roots, with regression coverage for nested PartnerStack/Impact-style components.
+
 ## [2.17.0] - 2026-08-28
 
 ### Added

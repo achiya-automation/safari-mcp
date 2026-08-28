@@ -456,31 +456,31 @@ function handleClick(payload) {
     let el = null;
 
     if (ref) {
-      el = document.querySelector('[data-mcp-ref="' + cssString(ref) + '"]');
+      el = deepQuery('[data-mcp-ref="' + cssString(ref) + '"]');
     } else if (selector) {
-      try { el = document.querySelector(selector); } catch (_) {}
+      el = deepQuery(selector);
     } else if (text) {
-      const candidates = document.querySelectorAll(
-        "button,a,[role='button'],[role='link'],[role='tab'],[role='combobox'],input[type='submit'],input[type='button']"
+      el = deepFind(
+        "button,a,[role='button'],[role='link'],[role='tab'],[role='combobox'],input[type='submit'],input[type='button']",
+        (candidate) => isVisible(candidate) && (candidate.innerText || candidate.textContent || "").trim() === text
       );
-      for (const candidate of candidates) {
-        if (isVisible(candidate) && (candidate.innerText || candidate.textContent || "").trim() === text) {
-          el = candidate;
-          break;
-        }
-      }
       if (!el) {
-        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-        while (walker.nextNode()) {
-          const value = (walker.currentNode.textContent || "").trim();
-          if (value === text && isVisible(walker.currentNode.parentElement)) {
-            el = walker.currentNode.parentElement;
-            break;
+        for (const root of rootsIncludingOpenShadow()) {
+          const treeRoot = root === document ? document.body : root;
+          if (!treeRoot) continue;
+          const walker = document.createTreeWalker(treeRoot, NodeFilter.SHOW_TEXT);
+          while (walker.nextNode()) {
+            const value = (walker.currentNode.textContent || "").trim();
+            if (value === text && isVisible(walker.currentNode.parentElement)) {
+              el = walker.currentNode.parentElement;
+              break;
+            }
           }
+          if (el) break;
         }
       }
     } else if (x !== undefined && y !== undefined) {
-      el = document.elementFromPoint(Number(x), Number(y));
+      el = deepElementFromPoint(Number(x), Number(y));
     }
 
     if (!el) return { ok: false, result: "Element not found" };
@@ -493,7 +493,7 @@ function handleClick(payload) {
     const rect = el.getBoundingClientRect();
     const cx = rect.left + rect.width / 2;
     const cy = rect.top + rect.height / 2;
-    let from = document.elementFromPoint(cx, cy);
+    let from = deepElementFromPoint(cx, cy);
     if (!from || !(from === el || el.contains(from))) from = el;
 
     const anchor = el.closest ? el.closest("a[href]") : null;
@@ -552,6 +552,57 @@ function handleClick(payload) {
 
 function cssString(value) {
   return String(value).replace(/["\\]/g, "\\$&");
+}
+
+function rootsIncludingOpenShadow(root = document, roots = []) {
+  roots.push(root);
+  let descendants = [];
+  try { descendants = root.querySelectorAll("*"); } catch (_) {}
+  for (const descendant of descendants) {
+    let shadow = null;
+    try { shadow = descendant.shadowRoot; } catch (_) {}
+    if (shadow) rootsIncludingOpenShadow(shadow, roots);
+  }
+  return roots;
+}
+
+function deepQuery(selector) {
+  return deepFind(selector, () => true);
+}
+
+function deepFind(selector, predicate, root = document) {
+  let candidates;
+  try { candidates = root.querySelectorAll(selector); }
+  catch (_) { return null; }
+  for (const candidate of candidates) {
+    if (predicate(candidate)) return candidate;
+  }
+  let descendants = [];
+  try { descendants = root.querySelectorAll("*"); } catch (_) {}
+  for (const descendant of descendants) {
+    let shadow = null;
+    try { shadow = descendant.shadowRoot; } catch (_) {}
+    if (!shadow) continue;
+    const nested = deepFind(selector, predicate, shadow);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+function deepElementFromPoint(x, y) {
+  let root = document;
+  let deepest = null;
+  for (let depth = 0; depth < 32; depth += 1) {
+    let hit = null;
+    try { hit = root.elementFromPoint(x, y); } catch (_) {}
+    if (!hit || hit === deepest) break;
+    deepest = hit;
+    let shadow = null;
+    try { shadow = hit.shadowRoot; } catch (_) {}
+    if (!shadow || typeof shadow.elementFromPoint !== "function") break;
+    root = shadow;
+  }
+  return deepest;
 }
 
 function isVisible(el) {
