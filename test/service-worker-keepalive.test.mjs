@@ -18,7 +18,7 @@ function keepaliveSource() {
   return sourceBetween(
     content,
     "(() => {\n  const previousKeepaliveState = globalThis.__mcpKeepaliveState;",
-    "\n\nbrowser.runtime.onMessage.addListener"
+    "\n\n(() => {\n  const previousCommandState = globalThis.__mcpContentCommandState;"
   );
 }
 

@@ -7,9 +7,10 @@
 
 // Register on every execution. Safari can preserve the isolated-world globals while
 // invalidating the old runtime listener during an extension update; a persistent
-// boolean guard then falsely says the bridge is installed. sendContentCommand only
-// reinjects this file after a message failure, so duplicate live listeners are rare
-// and harmless (the first synchronous response wins).
+// boolean guard would then falsely say the bridge is installed. Hot reload can also
+// leave the old listener alive, so every listener belongs to a revocable generation:
+// only the newest generation may execute a command, even if removing the old runtime
+// listener fails because its extension runtime has already been invalidated.
 
 // Safari may unload an MV3 service worker even while it owns an HTTP long-poll. A
 // content script lives with the page, so elect ONE top-frame page to send a narrow
@@ -317,29 +318,51 @@ globalThis.__mcpKeepaliveState = {
 _initializeMcpKeepalive();
 })();
 
-browser.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (!message) return false;
-  if (message.type === "mcp-content-click") {
-    sendResponse(handleClick(message.payload || {}));
-    return true;
+(() => {
+  const previousCommandState = globalThis.__mcpContentCommandState;
+  const commandEvent = browser.runtime.onMessage;
+  const commandState = {
+    active: true,
+    event: commandEvent,
+    listener: null,
+    cleanup() {
+      this.active = false;
+      try { this.event.removeListener(this.listener); } catch (_) {}
+    },
+  };
+
+  const listener = (message, _sender, sendResponse) => {
+    if (!commandState.active || globalThis.__mcpContentCommandState !== commandState) return false;
+    if (!message) return false;
+    if (message.type === "mcp-content-click") {
+      sendResponse(handleClick(message.payload || {}));
+      return true;
+    }
+    if (message.type === "mcp-content-fill") {
+      sendResponse(handleFill(message.payload || {}));
+      return true;
+    }
+    // Last-resort path for evaluate. On hardened SPAs (business.facebook.com) BOTH
+    // scripting.executeScript worlds hang forever instead of rejecting, while this
+    // already-injected listener keeps answering — clicks kept working there the whole
+    // time. Nothing is injected here, so there is no injection to stall on.
+    if (message.type === "mcp-content-eval") {
+      // The relayed function is often async (the evaluate handler awaits inside it), so
+      // this must resolve before answering — returning the promise itself serialised to
+      // "{}" and silently produced an empty result.
+      handleEval(message.payload || {}).then(sendResponse);
+      return true;
+    }
+    return false;
+  };
+
+  commandState.listener = listener;
+  browser.runtime.onMessage.addListener(listener);
+  globalThis.__mcpContentCommandState = commandState;
+  if (previousCommandState && previousCommandState !== commandState) {
+    previousCommandState.cleanup?.();
   }
-  if (message.type === "mcp-content-fill") {
-    sendResponse(handleFill(message.payload || {}));
-    return true;
-  }
-  // Last-resort path for evaluate. On hardened SPAs (business.facebook.com) BOTH
-  // scripting.executeScript worlds hang forever instead of rejecting, while this
-  // already-injected listener keeps answering — clicks kept working there the whole
-  // time. Nothing is injected here, so there is no injection to stall on.
-  if (message.type === "mcp-content-eval") {
-    // The relayed function is often async (the evaluate handler awaits inside it), so
-    // this must resolve before answering — returning the promise itself serialised to
-    // "{}" and silently produced an empty result.
-    handleEval(message.payload || {}).then(sendResponse);
-    return true;
-  }
-  return false;
-});
+})();
 
 // We are in the ISOLATED world: we can talk to the background, but the PAGE's CSP
 // governs eval here, and a hardened page (business.facebook.com) forbids it — an

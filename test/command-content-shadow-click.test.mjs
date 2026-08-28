@@ -24,6 +24,7 @@ function clickHarness() {
     runScripts: "outside-only",
   });
   const { window } = dom;
+  const commandListeners = [];
 
   window.browser = {
     runtime: {
@@ -34,7 +35,15 @@ function clickHarness() {
           onDisconnect: { addListener() {} },
         };
       },
-      onMessage: { addListener() {} },
+      onMessage: {
+        addListener(listener) {
+          commandListeners.push(listener);
+        },
+        // Keep stale callbacks in the harness. Safari can invalidate the runtime
+        // object before removeListener can detach them, so correctness must come
+        // from the active-generation guard rather than successful removal.
+        removeListener() {},
+      },
     },
     storage: {
       local: {
@@ -79,7 +88,18 @@ function clickHarness() {
     window,
     button,
     get clicks() { return clicks; },
+    get commandListenerCount() { return commandListeners.length; },
+    dispatchContentCommand(message) {
+      const responses = [];
+      const returns = commandListeners.map((listener) => listener(
+        message,
+        {},
+        (response) => responses.push(response)
+      ));
+      return { responses, returns };
+    },
     close() {
+      try { window.__mcpContentCommandState?.cleanup?.(); } catch {}
       try { window.__mcpKeepaliveState?.cleanup?.(); } catch {}
       dom.window.close();
     },
@@ -103,6 +123,26 @@ test("persistent click bridge traverses nested open shadow roots for text, ref, 
     assert.equal(byCoordinates.ok, true);
     assert.notEqual(byCoordinates.result, "Clicked: ON-PS-SIGNUP-CONTROLLER");
     assert.equal(harness.clicks, 3, "coordinate hit-testing must penetrate both shadow hosts");
+  } finally {
+    harness.close();
+  }
+});
+
+test("reinjection leaves only one active command listener", () => {
+  const harness = clickHarness();
+  try {
+    harness.window.eval(COMMAND_CONTENT);
+    assert.equal(harness.commandListenerCount, 2, "both raw listener generations remain in the harness");
+
+    const dispatched = harness.dispatchContentCommand({
+      type: "mcp-content-click",
+      payload: { ref: "shadow-signin" },
+    });
+
+    assert.deepEqual(dispatched.returns, [false, true]);
+    assert.equal(dispatched.responses.length, 1, "only the active listener may answer");
+    assert.equal(dispatched.responses[0].ok, true);
+    assert.equal(harness.clicks, 1, "one safari_click must dispatch one DOM click after reinjection");
   } finally {
     harness.close();
   }
