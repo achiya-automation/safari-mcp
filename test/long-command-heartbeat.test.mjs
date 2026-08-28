@@ -118,7 +118,7 @@ test("the proxy envelope outlives a heartbeat-extended command", () => {
   // failure ("Extension timeout") the heartbeat was added to remove.
   const fn = index.slice(
     index.indexOf("async function _proxyToExtension"),
-    index.indexOf("let _extensionLastPollTime")
+    index.indexOf("// Beats while the extension is busy executing a command")
   );
   assert.ok(fn.includes("AbortSignal.timeout"), "proxy must still bound the wait");
   assert.ok(

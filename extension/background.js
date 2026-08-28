@@ -16,6 +16,22 @@ const _bridgeWorkerId = (() => {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 })();
 let _bridgeWorkerSuperseded = false;
+const _BRIDGE_RELOAD_HANDOFF_KEY = "mcpBridgeReloadHandoffV1";
+
+async function _storedReloadHandoffToken() {
+  let stored;
+  try {
+    stored = await browser.storage.local.get(_BRIDGE_RELOAD_HANDOFF_KEY);
+  } catch {
+    return "";
+  }
+  const record = stored?.[_BRIDGE_RELOAD_HANDOFF_KEY];
+  const token = String(record?.token || "");
+  const issuedAt = Number(record?.issuedAt) || 0;
+  return /^[A-Za-z0-9_-]{24,}$/.test(token) && Date.now() - issuedAt <= 30000
+    ? token
+    : "";
+}
 
 async function _bridgeAuthToken() {
   if (!_bridgeAuthTokenPromise) {
@@ -438,9 +454,15 @@ async function connect() {
       HTTP_URL = candidate;
       // Version the handshake in the URL so stale workers still cached by Safari are
       // rejected before they reach the legacy profile probe that creates a visible tab.
-      // A query parameter keeps this a CORS-simple POST (a custom header would preflight).
-      const res = await _bridgeFetch(`${HTTP_URL}/connect?verifier=existing-tab-v1&protocol=popup-opener-v1`, {
+      // The optional reload capability travels in a header and is never logged or put in
+      // a URL; the localhost bridge explicitly permits that one preflighted header.
+      const reloadHandoffToken = await _storedReloadHandoffToken();
+      const connectHeaders = reloadHandoffToken
+        ? { "X-Safari-MCP-Reload-Handoff": reloadHandoffToken }
+        : {};
+      const res = await _bridgeFetch(`${HTTP_URL}/connect?verifier=existing-tab-v1&protocol=popup-opener-lease-v2`, {
         method: "POST",
+        headers: connectHeaders,
         signal: AbortSignal.timeout(1500),
       });
       if (!res.ok) continue;
@@ -455,13 +477,28 @@ async function connect() {
           console.log(`Safari MCP: bridge ${candidate} wants profile "${data.profile}" — trying next bridge`);
           continue;
         }
-        await _bridgeFetch(`${HTTP_URL}/extension-verified`, {
+        const verifiedResponse = await _bridgeFetch(`${HTTP_URL}/extension-verified`, {
           method: "POST",
           signal: AbortSignal.timeout(1500),
-        }).catch(() => {});
+        }).catch(() => null);
+        if (!verifiedResponse?.ok) {
+          if (verifiedResponse?.status === 423) {
+            // The current lease holder is still healthy. This worker may be the valid
+            // successor after that holder exits, so back off and retry instead of
+            // permanently classifying itself as superseded.
+            isConnected = false;
+            updateBadge("");
+            _stopHeartbeat();
+            scheduleReconnect();
+            _connecting = false;
+            return;
+          }
+          continue;
+        }
         await _discoverProfileWindow();
       }
 
+      await browser.storage.local.remove(_BRIDGE_RELOAD_HANDOFF_KEY).catch(() => {});
       await browser.storage.local.set({ mcpBridgeUrl: HTTP_URL }).catch(() => {});
       isConnected = true;
       _reconnectDelay = 3000; // Reset backoff on success
@@ -481,6 +518,7 @@ async function connect() {
 }
 
 function scheduleReconnect() {
+  if (!_enabled || _bridgeWorkerSuperseded) return;
   // Cancel any existing reconnect to prevent exponential growth
   if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
 
@@ -515,6 +553,7 @@ async function pollForCommands() {
         _bridgeWorkerSuperseded = true;
         isConnected = false;
         updateBadge("");
+        _stopHeartbeat();
         return;
       }
       if (res.status === 401 || res.status === 403 || res.status === 409) {
@@ -575,12 +614,31 @@ async function executeAndReply(msg) {
   }
 
   try {
-    await _bridgeFetch(`${HTTP_URL}/result`, {
+    const resultAck = await _bridgeFetch(`${HTTP_URL}/result`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(response),
       signal: AbortSignal.timeout(5000),
     });
+    if (!resultAck.ok) {
+      throw new Error(`Result rejected with status ${resultAck.status}`);
+    }
+    // Reload only after the host acknowledges the result. For reload_extension that
+    // acknowledgement proves the one-use successor lease was armed first.
+    if (msg.type === "reload_extension" && !response.error) {
+      // Stop the poll loop before yielding to the reload timer. Otherwise this worker
+      // can fetch one more non-idempotent command during the short handoff window and
+      // runtime.reload() would terminate it without a result.
+      isConnected = false;
+      _stopHeartbeat();
+      setTimeout(() => {
+        try {
+          browser.runtime.reload();
+        } catch (_) {
+          try { chrome.runtime.reload(); } catch (_) { scheduleReconnect(); }
+        }
+      }, 50);
+    }
   } catch (err) {
     console.warn("Safari MCP Bridge: failed to send result to server:", err.message);
   }
@@ -594,13 +652,17 @@ async function handleCommand(type, payload) {
   // active-tab receipt or an unrelated Safari window must never make the one command
   // that can load newly installed code impossible to run.
   if (type === "reload_extension") {
+    const reloadHandoff = String(payload.reloadHandoff || "");
+    if (!/^[A-Za-z0-9_-]{24,}$/.test(reloadHandoff)) {
+      throw new Error("Reload handoff authority is unavailable");
+    }
     await _hydrateOwnedTabs();
     // Checkpoint every already-authorized tab before the worker disappears. This does
     // not grant ownership and does not move receiptOrigin across redirects.
     await _refreshAllReceiptIdentities();
-    setTimeout(() => {
-      try { browser.runtime.reload(); } catch (_) { chrome.runtime.reload(); }
-    }, 50);
+    await browser.storage.local.set({
+      [_BRIDGE_RELOAD_HANDOFF_KEY]: { token: reloadHandoff, issuedAt: Date.now() },
+    });
     return { reloaded: true, version: browser.runtime.getManifest().version };
   }
   // Receipt-based targeting depends on durable ownership state, so hydrate it
@@ -2516,11 +2578,12 @@ let _receiptMutationTail = Promise.resolve(); // serialize every mutation covere
 let _ownedTabsHydrated = false;
 let _ownedTabsHydrationPromise = null;
 let _browserSessionEpoch = "";
-let _browserStartupResetPromise = null;
 let _browserEpochInitializationPromise = null;
 let _browserEpochGeneration = 0;
 let _browserEpochStorageTail = Promise.resolve();
-const _browserStartupLifecycleAvailable = !!browser.runtime?.onStartup?.addListener;
+const _browserSessionStorageAvailable = !!browser.storage?.session &&
+  typeof browser.storage.session.get === "function" &&
+  typeof browser.storage.session.set === "function";
 
 async function _digestTabUrl(rawUrl) {
   const bytes = new TextEncoder().encode(String(rawUrl || ""));
@@ -2575,10 +2638,9 @@ function _withBrowserEpochStorageLock(operation) {
 }
 
 async function _ensureBrowserSessionEpoch() {
-  if (!_browserStartupLifecycleAvailable) {
-    throw new Error("Browser startup lifecycle is unavailable; refusing durable tab authority");
+  if (!_browserSessionStorageAvailable) {
+    throw new Error("Browser session storage is unavailable; refusing durable tab authority");
   }
-  if (_browserStartupResetPromise) await _browserStartupResetPromise;
   if (/^[a-f0-9]{36}$/.test(_browserSessionEpoch)) return _browserSessionEpoch;
   if (!_browserEpochInitializationPromise) {
     const generation = _browserEpochGeneration;
@@ -2588,7 +2650,7 @@ async function _ensureBrowserSessionEpoch() {
       }
       let stored = null;
       try {
-        stored = await browser.storage.local.get(_BROWSER_SESSION_EPOCH_KEY);
+        stored = await browser.storage.session.get(_BROWSER_SESSION_EPOCH_KEY);
       } catch {
         throw new Error("Could not load browser-session identity");
       }
@@ -2602,15 +2664,27 @@ async function _ensureBrowserSessionEpoch() {
       }
       const epoch = _mintMcpTabMarker();
       try {
-        await browser.storage.local.set({ [_BROWSER_SESSION_EPOCH_KEY]: epoch });
+        await browser.storage.session.set({ [_BROWSER_SESSION_EPOCH_KEY]: epoch });
       } catch {
         throw new Error("Could not persist browser-session identity");
+      }
+      // Read back the shared in-memory value. If two worker starts raced, only the
+      // value that actually remains in storage may authorize receipts.
+      let confirmed;
+      try {
+        confirmed = await browser.storage.session.get(_BROWSER_SESSION_EPOCH_KEY);
+      } catch {
+        throw new Error("Could not confirm browser-session identity");
+      }
+      const confirmedEpoch = String(confirmed?.[_BROWSER_SESSION_EPOCH_KEY] || "");
+      if (!/^[a-f0-9]{36}$/.test(confirmedEpoch)) {
+        throw new Error("Browser-session identity confirmation failed");
       }
       if (generation !== _browserEpochGeneration) {
         throw new Error("Browser-session identity changed during initialization");
       }
-      _browserSessionEpoch = epoch;
-      return epoch;
+      _browserSessionEpoch = confirmedEpoch;
+      return confirmedEpoch;
     });
   }
   const initialization = _browserEpochInitializationPromise;
@@ -2624,9 +2698,6 @@ async function _ensureBrowserSessionEpoch() {
 }
 
 async function _hydrateOwnedTabs() {
-  // A startup reset must gate even an already-hydrated worker. If reset storage
-  // fails, no stale in-memory authority is allowed to bypass that failure.
-  if (_browserStartupResetPromise) await _browserStartupResetPromise;
   if (_ownedTabsHydrated) return;
   if (_ownedTabsHydrationPromise) return _ownedTabsHydrationPromise;
   const generation = _browserEpochGeneration;
@@ -3011,62 +3082,10 @@ function _hasTabReceiptAuthority(sessionId, tabId, receiptResolved) {
   return receiptResolved === true || _isTabOwnedBySession(sessionId, tabId);
 }
 
-// storage.local survives a full Safari restart, while tab ids do not have durable
-// meaning across browser runs. Rotate the epoch at browser startup and clear all
-// persisted authority before the first command can hydrate it. A mere MV3 worker
-// suspension does not fire onStartup, so receipts remain usable in that case.
-if (_browserStartupLifecycleAvailable) {
-  browser.runtime.onStartup.addListener(() => {
-    const generation = ++_browserEpochGeneration;
-    _browserSessionEpoch = "";
-    _browserEpochInitializationPromise = null;
-    _ownedTabsHydrated = false;
-    _ownedTabsHydrationPromise = null;
-    _sessionOwnedTabs.clear();
-    _receiptByToken.clear();
-    _tokenByTabId.clear();
-
-    // This queue is separate from receipt mutation. It lets any already-running old
-    // write finish (or fail its generation check), then guarantees the reset is the
-    // last authority state written for the new browser run without a lock cycle.
-    const resetPromise = _withBrowserEpochStorageLock(async () => {
-      const epoch = _mintMcpTabMarker();
-      if (generation !== _browserEpochGeneration) {
-        throw new Error("Browser session changed before startup reset");
-      }
-      try {
-        await browser.storage.session.remove(_OWNED_TABS_KEY);
-      } catch {} // Safari may not implement storage.session
-
-      await browser.storage.local.set({
-        [_BROWSER_SESSION_EPOCH_KEY]: epoch,
-        [_TAB_RECEIPTS_KEY]: {
-          version: _TAB_RECEIPTS_VERSION,
-          browserEpoch: epoch,
-          at: Date.now(),
-          records: [],
-        },
-        [_OWNED_TABS_LOCAL_KEY]: {
-          browserEpoch: epoch,
-          at: Date.now(),
-          tabs: {},
-        },
-      });
-      if (generation !== _browserEpochGeneration) {
-        throw new Error("Browser session changed during startup reset");
-      }
-      _browserSessionEpoch = epoch;
-      _ownedTabsHydrated = true;
-    });
-    _browserStartupResetPromise = resetPromise;
-    resetPromise.then(() => {
-      if (_browserStartupResetPromise === resetPromise) _browserStartupResetPromise = null;
-    }).catch(() => {
-      // Leave the rejected promise in place. Every later authority read will fail
-      // closed instead of falling back to stale receipts from the previous run.
-    });
-  });
-}
+// The browser-run epoch lives only in storage.session. Safari clears that area at the
+// browser-session boundary, so old local receipt envelopes cannot become valid again
+// if tab ids are reused. Worker suspension keeps the session value; absence or API
+// failure is terminal for authority rather than falling back to storage.local.
 
 // Read-only commands that don't modify the page — allowed on any tab
 const _readOnlyCommands = new Set([
@@ -4143,7 +4162,7 @@ async function waitForTabSettled(tabId, timeout = 3000) {
 // 3. browser.alarms (1 min minimum) re-wakes the worker if it was terminated
 let _heartbeatTimer = null;
 function _startHeartbeat() {
-  if (_heartbeatTimer) return;
+  if (_heartbeatTimer || !_enabled || _bridgeWorkerSuperseded) return;
   _heartbeatTimer = setInterval(() => {
     if (_enabled) {
       browser.storage.local.set({ _heartbeat: Date.now() }).catch(() => {});
@@ -4162,7 +4181,7 @@ browser.alarms.onAlarm.addListener((alarm) => {
       scheduleReconnect();
     }
     // Restart heartbeat in case it was lost on worker restart
-    if (_enabled && !_heartbeatTimer) _startHeartbeat();
+    if (_enabled && !_bridgeWorkerSuperseded && !_heartbeatTimer) _startHeartbeat();
   }
 });
 

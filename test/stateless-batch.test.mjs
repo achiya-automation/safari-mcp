@@ -449,30 +449,30 @@ test("worker rehydration uses same-run tab identity across SPA URL changes and d
   assert.ok(hydrate.indexOf("_recoverSessionWindowsFromOwnedTabs(liveTabsById)") > hydrate.indexOf("for (const [sid, oldIds] of storedOwners)"));
 });
 
-test("browser epoch initialization is single-flight and fails closed without startup lifecycle", async () => {
+test("browser epoch initialization is single-flight and fails closed without storage.session", async () => {
   const source = extract(
     background,
     "function _withBrowserEpochStorageLock(",
     "\nasync function _hydrateOwnedTabs"
   );
-  const makeHarness = (startupAvailable) => {
+  const makeHarness = (sessionAvailable) => {
     let gets = 0;
     let sets = 0;
+    let sessionState = {};
     const ensure = Function("browser", "_mintMcpTabMarker", `
       let _browserEpochStorageTail = Promise.resolve();
-      let _browserStartupResetPromise = null;
       let _browserSessionEpoch = "";
       let _browserEpochInitializationPromise = null;
       let _browserEpochGeneration = 0;
-      const _browserStartupLifecycleAvailable = ${startupAvailable};
+      const _browserSessionStorageAvailable = ${sessionAvailable};
       const _BROWSER_SESSION_EPOCH_KEY = "browser-epoch";
       ${source}
       return _ensureBrowserSessionEpoch;
     `)({
       storage: {
-        local: {
-          get: async () => { gets += 1; return {}; },
-          set: async () => { sets += 1; },
+        session: {
+          get: async () => { gets += 1; return { ...sessionState }; },
+          set: async (value) => { sets += 1; sessionState = { ...sessionState, ...value }; },
         },
       },
     }, () => BROWSER_EPOCH);
@@ -483,83 +483,40 @@ test("browser epoch initialization is single-flight and fails closed without sta
   const [first, second] = await Promise.all([available.ensure(), available.ensure()]);
   assert.equal(first, BROWSER_EPOCH);
   assert.equal(second, BROWSER_EPOCH);
-  assert.deepEqual(available.counts(), { gets: 1, sets: 1 });
+  assert.deepEqual(available.counts(), { gets: 2, sets: 1 });
 
   const unavailable = makeHarness(false);
-  await assert.rejects(unavailable.ensure(), /startup lifecycle is unavailable/);
+  await assert.rejects(unavailable.ensure(), /session storage is unavailable/);
   assert.deepEqual(unavailable.counts(), { gets: 0, sets: 0 });
 });
 
-test("startup reset clears every authority store and publishes only the new epoch", async () => {
-  const lockSource = extract(
+test("browser restart invalidates local receipt envelopes through the session epoch", () => {
+  const epochSource = extract(
     background,
-    "function _withBrowserEpochStorageLock(",
-    "\nasync function _ensureBrowserSessionEpoch"
+    "async function _ensureBrowserSessionEpoch(",
+    "\nasync function _hydrateOwnedTabs"
   );
-  const startupSource = extract(
-    background,
-    "if (_browserStartupLifecycleAvailable) {",
-    "\n// Read-only commands"
-  );
-  let startupListener = null;
-  const localWrites = [];
-  const sessionRemovals = [];
-  const browser = {
-    runtime: { onStartup: { addListener: (listener) => { startupListener = listener; } } },
-    storage: {
-      session: { remove: async (key) => { sessionRemovals.push(key); } },
-      local: { set: async (value) => { localWrites.push(value); } },
-    },
-  };
-  const harness = Function("browser", "_mintMcpTabMarker", `
-    const _browserStartupLifecycleAvailable = true;
-    const _OWNED_TABS_KEY = "owners-session";
-    const _OWNED_TABS_LOCAL_KEY = "owners-local";
-    const _TAB_RECEIPTS_KEY = "receipts";
-    const _TAB_RECEIPTS_VERSION = 3;
-    const _BROWSER_SESSION_EPOCH_KEY = "browser-epoch";
-    let _browserEpochStorageTail = Promise.resolve();
-    let _browserEpochGeneration = 0;
-    let _browserSessionEpoch = "old";
-    let _browserEpochInitializationPromise = Promise.resolve("old");
-    let _ownedTabsHydrated = true;
-    let _ownedTabsHydrationPromise = Promise.resolve();
-    let _browserStartupResetPromise = null;
-    const _sessionOwnedTabs = new Map([["session-a", new Set([42])]]);
-    const _receiptByToken = new Map([["old-token", { tabId: 42 }]]);
-    const _tokenByTabId = new Map([[42, "old-token"]]);
-    ${lockSource}
-    ${startupSource}
-    return {
-      pending: () => _browserStartupResetPromise,
-      state: () => ({
-        epoch: _browserSessionEpoch,
-        generation: _browserEpochGeneration,
-        hydrated: _ownedTabsHydrated,
-        owners: _sessionOwnedTabs.size,
-        receipts: _receiptByToken.size,
-        tokens: _tokenByTabId.size,
-      }),
-    };
-  `)(browser, () => BROWSER_EPOCH);
+  assert.ok(epochSource.includes("browser.storage.session.get(_BROWSER_SESSION_EPOCH_KEY)"));
+  assert.ok(epochSource.includes("browser.storage.session.set({ [_BROWSER_SESSION_EPOCH_KEY]: epoch })"));
+  assert.ok(!epochSource.includes("browser.storage.local"));
+  assert.ok(!background.includes("runtime.onStartup.addListener"));
 
-  assert.ok(startupListener, "the startup listener must be registered");
-  startupListener();
-  assert.deepEqual(harness.state(), {
-    epoch: "", generation: 1, hydrated: false, owners: 0, receipts: 0, tokens: 0,
-  });
-  await harness.pending();
-  assert.deepEqual(harness.state(), {
-    epoch: BROWSER_EPOCH, generation: 1, hydrated: true, owners: 0, receipts: 0, tokens: 0,
-  });
-  assert.deepEqual(sessionRemovals, ["owners-session"]);
-  assert.equal(localWrites.length, 1);
-  assert.equal(localWrites[0]["browser-epoch"], BROWSER_EPOCH);
-  assert.deepEqual(localWrites[0].receipts.records, []);
-  assert.deepEqual(localWrites[0]["owners-local"].tabs, {});
+  const resolverSource = extract(
+    background,
+    "function _resolveHydratedReceiptTab(",
+    "\nasync function _hydrateOwnedTabs"
+  );
+  const resolver = Function(`${resolverSource}; return _resolveHydratedReceiptTab;`)();
+  const record = {
+    tabId: 42,
+    windowId: 7,
+    browserEpoch: BROWSER_EPOCH,
+  };
+  const live = new Map([[42, { id: 42, windowId: 7, url: "https://app.test" }]]);
+  assert.equal(resolver(live, new Set(), record, "f".repeat(36)), null);
 });
 
-test("a startup generation change prevents stale hydration from repopulating authority", async () => {
+test("a session epoch generation change prevents stale hydration from repopulating authority", async () => {
   const source = extract(background, "async function _hydrateOwnedTabs(", "\nasync function _persistOwnedTabs");
   let releaseReceiptRead;
   let markReceiptRead;
@@ -599,7 +556,6 @@ test("a startup generation change prevents stale hydration from repopulating aut
   const harness = Function("browser", `
     let _ownedTabsHydrated = false;
     let _ownedTabsHydrationPromise = null;
-    let _browserStartupResetPromise = null;
     let _browserEpochGeneration = 0;
     let _browserSessionEpoch = "${BROWSER_EPOCH}";
     const _OWNED_TABS_KEY = "owners-session";
@@ -646,16 +602,15 @@ test("a startup generation change prevents stale hydration from repopulating aut
   });
 });
 
-test("a failed startup reset blocks hydration even when old state said hydrated", async () => {
-  const source = extract(background, "async function _hydrateOwnedTabs(", "\nasync function _persistOwnedTabs");
-  const harness = Function(`
-    let _ownedTabsHydrated = true;
-    let _ownedTabsHydrationPromise = null;
-    let _browserStartupResetPromise = Promise.reject(new Error("startup reset failed"));
-    ${source}
-    return _hydrateOwnedTabs;
-  `)();
-  await assert.rejects(harness(), /startup reset failed/);
+test("receipt authority never falls back when session storage is unavailable", () => {
+  const ensure = extract(
+    background,
+    "async function _ensureBrowserSessionEpoch(",
+    "\nasync function _hydrateOwnedTabs"
+  );
+  assert.ok(ensure.includes("if (!_browserSessionStorageAvailable)"));
+  assert.ok(ensure.includes("refusing durable tab authority"));
+  assert.ok(!ensure.includes("storage.local.get(_BROWSER_SESSION_EPOCH_KEY)"));
 });
 
 test("worker hydration retries after live-tab or durable-storage read failures", async () => {
@@ -663,7 +618,6 @@ test("worker hydration retries after live-tab or durable-storage read failures",
   const makeHarness = (browser) => Function("browser", `
     let _ownedTabsHydrated = false;
     let _ownedTabsHydrationPromise = null;
-    let _browserStartupResetPromise = null;
     let _browserEpochGeneration = 0;
     const browserEpoch = "${BROWSER_EPOCH}";
     let _browserSessionEpoch = browserEpoch;
@@ -789,7 +743,7 @@ test("closing a tab durably revokes its receipt before the browser tab is remove
 });
 
 test("getReceipt requires a verified receipt or ownership in the exact session", () => {
-  const source = extract(background, "function _hasTabReceiptAuthority(", "\n// storage.local survives a full Safari restart");
+  const source = extract(background, "function _hasTabReceiptAuthority(", "\n// The browser-run epoch lives only in storage.session.");
   const authority = Function("_isTabOwnedBySession", `${source}; return _hasTabReceiptAuthority;`)(
     (sessionId, tabId) => sessionId === "session-a" && tabId === 42
   );

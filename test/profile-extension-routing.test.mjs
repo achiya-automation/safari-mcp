@@ -65,17 +65,183 @@ test("profile verification never creates or closes a temporary browser tab", () 
 });
 
 test("the server rejects stale workers before they can run the visible-tab verifier", () => {
-  assert.match(background, /connect\?verifier=existing-tab-v1&protocol=popup-opener-v1/);
+  assert.match(background, /connect\?verifier=existing-tab-v1&protocol=popup-opener-lease-v2/);
   assert.match(index, /searchParams\.get\("verifier"\) !== "existing-tab-v1"/);
   assert.match(index, /searchParams\.get\("protocol"\) !== EXTENSION_BRIDGE_PROTOCOL/);
-  assert.match(index, /const EXTENSION_BRIDGE_PROTOCOL = "popup-opener-v1"/);
+  assert.match(index, /const EXTENSION_BRIDGE_PROTOCOL = "popup-opener-lease-v2"/);
   assert.match(index, /res\.writeHead\(426/);
   assert.match(index, /status: "upgrade_required"/);
+  const connectRoute = index.slice(
+    index.indexOf('req.method === "POST" && req.url.startsWith("/connect")'),
+    index.indexOf('// POST /extension-verified')
+  );
   assert.ok(
-    index.indexOf("_rememberConnectingHttpWorker(workerId)", index.indexOf('req.method === "POST" && req.url.startsWith("/connect")')) >
-      index.indexOf('connectUrl.searchParams.get("protocol") !== EXTENSION_BRIDGE_PROTOCOL'),
+    connectRoute.indexOf("_rememberConnectingHttpWorker(workerId") >
+      connectRoute.indexOf('connectUrl.searchParams.get("protocol") !== EXTENSION_BRIDGE_PROTOCOL'),
     "a rejected stale worker must not enter the profile-verification handshake"
   );
+});
+
+test("the healthy-worker lease also protects an unscoped bridge", () => {
+  const connectRoute = index.slice(
+    index.indexOf('req.method === "POST" && req.url.startsWith("/connect")'),
+    index.indexOf('// POST /heartbeat')
+  );
+  const unscoped = connectRoute.slice(connectRoute.indexOf("if (!process.env.SAFARI_PROFILE)"));
+  assert.match(unscoped, /_mayReplaceActiveHttpWorker\(workerId, reloadHandoffToken\)/);
+  assert.match(unscoped, /status: "worker_lease_held"/);
+  assert.match(unscoped, /if \(workerChanged\) \{[\s\S]*_extensionConnectionGeneration \+= 1/);
+});
+
+test("a healthy HTTP worker keeps its lease unless reload grants an exact one-shot handoff", () => {
+  const helperSource = index.slice(
+    index.indexOf("function _prepareReloadHttpWorkerHandoff("),
+    index.indexOf("function _requireActiveHttpWorker(")
+  );
+  const harness = Function("randomBytes", `
+    const baseNow = Date.now();
+    let _activeHttpWorkerId = "worker-a";
+    let _extensionConnected = true;
+    let _extensionLastPollTime = baseNow;
+    let _extensionLastHeartbeat = 0;
+    let _reloadHttpWorkerHandoff = null;
+    const _HTTP_RELOAD_HANDOFF_TTL_MS = 30_000;
+    ${helperSource}
+    return {
+      mayReplace: (id, token, now) => _mayReplaceActiveHttpWorker(id, token, now),
+      prepare: _prepareReloadHttpWorkerHandoff,
+      arm: _armReloadHttpWorkerHandoff,
+      cancel: _cancelReloadHttpWorkerHandoff,
+      now: baseNow,
+      touch: (now) => { _extensionLastPollTime = now; },
+    };
+  `)(() => ({ toString: () => "handoff_token_abcdefghijklmnop" }));
+
+  assert.equal(harness.mayReplace("worker-b", "", harness.now + 1), false);
+  const handoff = harness.prepare();
+  assert.throws(() => harness.prepare(), /already in progress/, "concurrent reload must not replace the first token");
+  assert.equal(harness.mayReplace("worker-b", handoff.token, harness.now + 2), false, "prepared is not armed");
+  assert.equal(harness.arm(handoff), true);
+  assert.equal(harness.mayReplace("worker-b", "wrong_token_abcdefghijklmnop", harness.now + 3), false);
+  assert.equal(harness.mayReplace("worker-b", handoff.token, harness.now + 3), true);
+  harness.touch(handoff.expiresAt);
+  assert.equal(harness.mayReplace("worker-b", handoff.token, handoff.expiresAt + 1), false);
+});
+
+test("reload occurs only after the host accepts the result acknowledgement", async () => {
+  const executeSource = background.slice(
+    background.indexOf("async function executeAndReply("),
+    background.indexOf("// ========== COMMAND HANDLERS")
+  );
+  const events = [];
+  let releaseAck;
+  const ack = new Promise((resolve) => { releaseAck = resolve; });
+  const harness = Function(
+    "handleCommand", "_bridgeFetch", "browser", "chrome", "setTimeout", "HTTP_URL", "console",
+    "_stopHeartbeat", "scheduleReconnect",
+    `let isConnected = true; ${executeSource}; return {
+      execute: executeAndReply,
+      connected: () => isConnected,
+    };`
+  )(
+    async () => ({ reloaded: true }),
+    async () => { events.push("result-posted"); return ack; },
+    { runtime: { reload: () => events.push("reload") } },
+    { runtime: { reload: () => events.push("chrome-reload") } },
+    (callback) => { events.push("reload-scheduled"); callback(); },
+    "http://127.0.0.1:9224",
+    { warn: () => {} },
+    () => events.push("heartbeat-stopped"),
+    () => events.push("reconnect-scheduled")
+  );
+
+  const pending = harness.execute({ id: "command-1", type: "reload_extension", payload: {} });
+  while (!events.includes("result-posted")) await Promise.resolve();
+  assert.deepEqual(events, ["result-posted"], "runtime.reload must wait for the host ACK");
+  assert.equal(harness.connected(), true);
+  releaseAck({ ok: true, status: 200 });
+  await pending;
+  assert.equal(harness.connected(), false, "the poll loop must stop before runtime.reload yields");
+  assert.deepEqual(events, ["result-posted", "heartbeat-stopped", "reload-scheduled", "reload"]);
+});
+
+test("a rejected reload result never reloads the worker", async () => {
+  const executeSource = background.slice(
+    background.indexOf("async function executeAndReply("),
+    background.indexOf("// ========== COMMAND HANDLERS")
+  );
+  let reloads = 0;
+  const harness = Function(
+    "handleCommand", "_bridgeFetch", "browser", "chrome", "setTimeout", "HTTP_URL", "console",
+    "_stopHeartbeat", "scheduleReconnect",
+    `let isConnected = true; ${executeSource}; return {
+      execute: executeAndReply,
+      connected: () => isConnected,
+    };`
+  )(
+    async () => ({ reloaded: true }),
+    async () => ({ ok: false, status: 409 }),
+    { runtime: { reload: () => { reloads += 1; } } },
+    { runtime: { reload: () => { reloads += 1; } } },
+    (callback) => callback(),
+    "http://127.0.0.1:9224",
+    { warn: () => {} },
+    () => {},
+    () => {}
+  );
+  await harness.execute({ id: "command-2", type: "reload_extension", payload: {} });
+  assert.equal(reloads, 0);
+  assert.equal(harness.connected(), true, "a rejected ACK must leave the old worker polling");
+});
+
+test("the host arms a reload handoff before resolving and acknowledging its result", () => {
+  const handlerSource = index.slice(
+    index.indexOf("function _handleExtensionResponse("),
+    index.indexOf("// Send command to extension")
+  );
+  const events = [];
+  const pending = {
+    timer: null,
+    reloadHandoff: { token: "handoff" },
+    resolve: () => events.push("resolved"),
+    reject: () => events.push("rejected"),
+  };
+  const requests = new Map([["command-1", pending]]);
+  const handle = Function(
+    "_pendingRequests", "_armReloadHttpWorkerHandoff", "_cancelReloadHttpWorkerHandoff",
+    `${handlerSource}; return _handleExtensionResponse;`
+  )(
+    requests,
+    () => { events.push("armed"); return true; },
+    () => events.push("cancelled")
+  );
+
+  assert.equal(handle({ type: "response", id: "command-1", result: { reloaded: true } }), true);
+  assert.deepEqual(events, ["armed", "resolved"]);
+  assert.equal(requests.size, 0);
+  assert.match(index, /res\.writeHead\(accepted \? 200 : 409\)/);
+});
+
+test("lease-held workers retry, while only a poll-time takeover is terminal", () => {
+  const connect = background.slice(
+    background.indexOf("async function connect("),
+    background.indexOf("function scheduleReconnect(")
+  );
+  const leaseHeld = connect.slice(
+    connect.indexOf("verifiedResponse?.status === 423"),
+    connect.indexOf("continue;", connect.indexOf("verifiedResponse?.status === 423"))
+  );
+  assert.match(leaseHeld, /scheduleReconnect\(\)/);
+  assert.match(leaseHeld, /_stopHeartbeat\(\)/);
+  assert.doesNotMatch(leaseHeld, /_bridgeWorkerSuperseded = true/);
+
+  const polling = background.slice(
+    background.indexOf("async function pollForCommands("),
+    background.indexOf("async function executeAndReply(")
+  );
+  assert.match(polling, /res\.status === 423[\s\S]*_bridgeWorkerSuperseded = true/);
+  assert.match(polling, /res\.status === 423[\s\S]*_stopHeartbeat\(\)/);
+  assert.match(background, /if \(_enabled && !_bridgeWorkerSuperseded && !_heartbeatTimer\) _startHeartbeat\(\)/);
 });
 
 test("extension reload bypasses all target-tab and receipt resolution", () => {
@@ -87,6 +253,8 @@ test("extension reload bypasses all target-tab and receipt resolution", () => {
   const receiptAt = handler.indexOf("const suppliedReceipt");
   assert.ok(reloadAt >= 0 && receiptAt > reloadAt);
   assert.match(handler.slice(reloadAt, receiptAt), /_refreshAllReceiptIdentities/);
+  assert.match(handler.slice(reloadAt, receiptAt), /_BRIDGE_RELOAD_HANDOFF_KEY/);
+  assert.match(handler.slice(reloadAt, receiptAt), /browser\.storage\.local\.set/);
   assert.doesNotMatch(handler.slice(receiptAt), /case "reload_extension"/);
 
   const routing = index.slice(
@@ -106,7 +274,12 @@ test("a verified profile extension may bypass denied Apple Events", () => {
     /_extensionConnected && \(!_preferAppleScript \|\| _profileExtensionVerified\)/,
     "extension routing must unlock only after profile verification"
   );
-  assert.match(index, /_profileExtensionVerified = true;[\s\S]{0,180}profile-verified/);
+  const verificationRoute = index.slice(
+    index.indexOf('// POST /extension-verified'),
+    index.indexOf('// POST /verify-profile')
+  );
+  assert.match(verificationRoute, /_profileExtensionVerified = true/);
+  assert.match(verificationRoute, /profile-verified/);
 });
 
 test("new_tab recreates a closed verified-profile window through WebExtension APIs", () => {
@@ -132,7 +305,7 @@ test("a proxy new_tab also restores a closed profile window on the extension hos
     index.indexOf('res.writeHead(404)')
   );
   const recoveryAt = proxyHandler.indexOf('if (type === "new_tab") await _waitForVerifiedProfileExtension(30000);');
-  const sendAt = proxyHandler.indexOf('await sendToExtension(type, payload, timeout)');
+  const sendAt = proxyHandler.indexOf('await sendToExtension(type, commandPayload, timeout)');
   assert.ok(recoveryAt >= 0, "proxy handler must wait for the profile worker for new_tab");
   assert.ok(sendAt > recoveryAt, "profile worker recovery must happen before proxying new_tab");
 });
@@ -357,14 +530,14 @@ test("V3 receipts persist with a browser epoch and survive worker suspension saf
     "receipt records must hydrate before any target is selected"
   );
 
-  const startup = background.slice(
-    background.indexOf("if (_browserStartupLifecycleAvailable)"),
-    background.indexOf("// Read-only commands")
+  const ensureEpoch = background.slice(
+    background.indexOf("async function _ensureBrowserSessionEpoch("),
+    background.indexOf("async function _hydrateOwnedTabs(")
   );
-  assert.match(startup, /_mintMcpTabMarker\(\)/);
-  assert.match(startup, /\[_BROWSER_SESSION_EPOCH_KEY\]: epoch/);
-  assert.match(startup, /records: \[\]/);
-  assert.match(startup, /tabs: \{\}/);
+  assert.match(ensureEpoch, /browser\.storage\.session\.get\(_BROWSER_SESSION_EPOCH_KEY\)/);
+  assert.match(ensureEpoch, /browser\.storage\.session\.set\(\{ \[_BROWSER_SESSION_EPOCH_KEY\]: epoch \}\)/);
+  assert.doesNotMatch(ensureEpoch, /browser\.storage\.local/);
+  assert.doesNotMatch(background, /runtime\.onStartup\.addListener/);
 });
 
 test("new_tab navigates with the caller's exact raw URL and returns only safe metadata", async () => {

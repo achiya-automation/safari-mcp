@@ -140,7 +140,7 @@ test("reload waits for a newer verified extension generation", () => {
   assert.match(proxy, /type === "reload_extension"/);
   assert.match(proxy, /_waitForExtensionGeneration/);
   assert.ok(
-    proxy.indexOf("await sendToExtension(type, payload, timeout)") < proxy.indexOf("const reloadGeneration = _extensionConnectionGeneration"),
+    proxy.indexOf("await sendToExtension(type, commandPayload, timeout)") < proxy.indexOf("const reloadGeneration = _extensionConnectionGeneration"),
     "proxy reload baseline must be captured after the old worker replies"
   );
 

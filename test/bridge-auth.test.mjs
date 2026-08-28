@@ -30,11 +30,21 @@ test("only the profile-verified Safari worker can consume or answer commands", (
   assert.match(server, /function _requireActiveHttpWorker/);
   assert.match(server, /res\.writeHead\(423\)/);
   assert.match(server, /_activeHttpWorkerId = workerId/);
-  assert.match(server, /_isConnectingHttpWorker\(workerId\)/);
+  assert.match(server, /_connectingHttpWorker\(workerId\)/);
   assert.match(server, /pollingWorkerId !== _activeHttpWorkerId/);
+  assert.match(server, /_mayReplaceActiveHttpWorker\(workerId, connectingWorker\.reloadHandoffToken\)/);
+  assert.match(server, /status: "worker_lease_held"/);
   assert.match(worker, /const _bridgeWorkerId/);
   assert.match(worker, /_bridgeWorkerSuperseded = true/);
   assert.match(worker, /!_bridgeWorkerSuperseded && !_reconnectTimer/);
+});
+
+test("reload handoff is an exact ephemeral capability, never a general worker takeover", () => {
+  assert.match(server, /X-Safari-MCP-Reload-Handoff/);
+  assert.match(server, /randomBytes\(18\)\.toString\("base64url"\)/);
+  assert.match(worker, /const _BRIDGE_RELOAD_HANDOFF_KEY/);
+  assert.match(worker, /X-Safari-MCP-Reload-Handoff/);
+  assert.match(worker, /verifiedResponse\?\.status === 423/);
 });
 
 test("both signed extension targets embed a private per-install token resource", () => {

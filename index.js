@@ -320,7 +320,7 @@ const WS_PORT = _bridgePort("SAFARI_MCP_BRIDGE_WS_PORT", HTTP_PORT - 1);
 // keep an older service worker alive after a same-version appex is replaced. Require a
 // code-capability marker before a worker may enter profile verification, so a stale
 // worker can never displace the currently installed worker or consume its commands.
-const EXTENSION_BRIDGE_PROTOCOL = "popup-opener-v1";
+const EXTENSION_BRIDGE_PROTOCOL = "popup-opener-lease-v2";
 function _isExtensionSchemeOrigin(origin) {
   const value = String(origin || "");
   return value.startsWith("safari-web-extension://") ||
@@ -344,23 +344,77 @@ let _extensionConnected = false;
 let _activeHttpWorkerId = "";
 const _connectingHttpWorkers = new Map();
 const _HTTP_WORKER_TTL_MS = 60 * 1000;
+const _HTTP_RELOAD_HANDOFF_TTL_MS = 30 * 1000;
+let _extensionLastPollTime = 0;
+let _extensionLastHeartbeat = 0;
+let _reloadHttpWorkerHandoff = null;
 
 function _httpWorkerId(req) {
   const value = req.headers["x-safari-mcp-worker"];
   return typeof value === "string" && /^[0-9a-f]{32}$/.test(value) ? value : "";
 }
 
-function _rememberConnectingHttpWorker(workerId) {
-  const now = Date.now();
-  for (const [id, connectedAt] of _connectingHttpWorkers) {
-    if (now - connectedAt > _HTTP_WORKER_TTL_MS) _connectingHttpWorkers.delete(id);
-  }
-  _connectingHttpWorkers.set(workerId, now);
+function _reloadHandoffToken(req) {
+  const value = req.headers["x-safari-mcp-reload-handoff"];
+  return typeof value === "string" && /^[A-Za-z0-9_-]{24,}$/.test(value) ? value : "";
 }
 
-function _isConnectingHttpWorker(workerId) {
-  const connectedAt = _connectingHttpWorkers.get(workerId);
-  return typeof connectedAt === "number" && Date.now() - connectedAt <= _HTTP_WORKER_TTL_MS;
+function _rememberConnectingHttpWorker(workerId, reloadHandoffToken = "") {
+  const now = Date.now();
+  for (const [id, record] of _connectingHttpWorkers) {
+    if (now - record.connectedAt > _HTTP_WORKER_TTL_MS) _connectingHttpWorkers.delete(id);
+  }
+  _connectingHttpWorkers.set(workerId, { connectedAt: now, reloadHandoffToken });
+}
+
+function _connectingHttpWorker(workerId) {
+  const record = _connectingHttpWorkers.get(workerId);
+  return record && typeof record.connectedAt === "number" && Date.now() - record.connectedAt <= _HTTP_WORKER_TTL_MS
+    ? record
+    : null;
+}
+
+function _prepareReloadHttpWorkerHandoff() {
+  const now = Date.now();
+  if (!_activeHttpWorkerId) {
+    throw new Error("Extension reload requires an active HTTP worker");
+  }
+  if (_reloadHttpWorkerHandoff && _reloadHttpWorkerHandoff.expiresAt >= now) {
+    throw new Error("Extension reload is already in progress");
+  }
+  _reloadHttpWorkerHandoff = null;
+  const handoff = {
+    fromWorkerId: _activeHttpWorkerId,
+    token: randomBytes(18).toString("base64url"),
+    armed: false,
+    expiresAt: now + _HTTP_RELOAD_HANDOFF_TTL_MS,
+  };
+  _reloadHttpWorkerHandoff = handoff;
+  return handoff;
+}
+
+function _armReloadHttpWorkerHandoff(handoff) {
+  if (_reloadHttpWorkerHandoff !== handoff) return false;
+  handoff.armed = true;
+  handoff.expiresAt = Date.now() + _HTTP_RELOAD_HANDOFF_TTL_MS;
+  return true;
+}
+
+function _cancelReloadHttpWorkerHandoff(handoff) {
+  if (_reloadHttpWorkerHandoff === handoff) _reloadHttpWorkerHandoff = null;
+}
+
+function _activeHttpWorkerIsFresh(now = Date.now()) {
+  const lastActivity = Math.max(_extensionLastPollTime, _extensionLastHeartbeat);
+  return !!_activeHttpWorkerId && _extensionConnected && lastActivity > 0 && now - lastActivity <= 30000;
+}
+
+function _mayReplaceActiveHttpWorker(workerId, presentedToken, now = Date.now()) {
+  if (!_activeHttpWorkerId || workerId === _activeHttpWorkerId) return true;
+  if (!_activeHttpWorkerIsFresh(now)) return true;
+  const handoff = _reloadHttpWorkerHandoff;
+  return !!handoff && handoff.armed && handoff.fromWorkerId === _activeHttpWorkerId &&
+    handoff.expiresAt >= now && presentedToken === handoff.token;
 }
 
 function _requireActiveHttpWorker(req, res) {
@@ -463,7 +517,7 @@ try {
       return;
     }
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Safari-MCP-Token, X-Safari-MCP-Worker");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Safari-MCP-Token, X-Safari-MCP-Worker, X-Safari-MCP-Reload-Handoff");
 
     if (req.method === "OPTIONS") {
       res.writeHead(204);
@@ -551,12 +605,13 @@ try {
       req.on("data", (chunk) => { if (bodyTooLarge || res.headersSent) return; body += chunk; if (body.length > MAX_BODY_SIZE) { bodyTooLarge = true; res.writeHead(413); res.end("Payload too large"); req.destroy(); } });
       req.on("end", () => {
         if (bodyTooLarge) return;
+        let accepted = false;
         try {
           const msg = JSON.parse(body);
-          _handleExtensionResponse(msg);
+          accepted = _handleExtensionResponse(msg);
         } catch {}
-        res.writeHead(200);
-        res.end("ok");
+        res.writeHead(accepted ? 200 : 409);
+        res.end(accepted ? "ok" : "Result was not accepted");
       });
       return;
     }
@@ -584,22 +639,30 @@ try {
       // Only an accepted code generation may proceed to /verify-profile and
       // /extension-verified. Remembering rejected workers would let a stale process
       // skip the protocol gate by posting the second handshake step directly.
-      _rememberConnectingHttpWorker(workerId);
+      _rememberConnectingHttpWorker(workerId, _reloadHandoffToken(req));
       // When SAFARI_PROFILE is set, don't mark as connected until profile is verified.
       // A personal-profile extension connecting first would incorrectly set the flag.
       if (!process.env.SAFARI_PROFILE) {
+        const reloadHandoffToken = _reloadHandoffToken(req);
+        if (!_mayReplaceActiveHttpWorker(workerId, reloadHandoffToken)) {
+          _connectingHttpWorkers.delete(workerId);
+          res.writeHead(423, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "worker_lease_held" }));
+          return;
+        }
+        const workerChanged = workerId !== _activeHttpWorkerId;
         _activeHttpWorkerId = workerId;
         _connectingHttpWorkers.delete(workerId);
-        // Count every accepted worker handshake, even while the old worker's boolean
-        // liveness has not gone stale yet. reload_extension depends on this generation
-        // changing before it reports success.
-        _extensionConnectionGeneration += 1;
+        if (workerChanged) {
+          _reloadHttpWorkerHandoff = null;
+          _extensionConnectionGeneration += 1;
+        }
         if (!_extensionConnected) {
           _extensionConnected = true;
           console.error("[Safari MCP] Extension connected via HTTP polling");
         }
       }
-      _extensionLastPollTime = Date.now();
+      if (!process.env.SAFARI_PROFILE) _extensionLastPollTime = Date.now();
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "connected", profile: process.env.SAFARI_PROFILE || null }));
       return;
@@ -626,15 +689,24 @@ try {
     // POST /extension-verified — extension confirmed it's in the correct profile
     if (req.method === "POST" && req.url === "/extension-verified") {
       const workerId = _httpWorkerId(req);
-      if (!workerId || !_isConnectingHttpWorker(workerId)) {
+      const connectingWorker = workerId ? _connectingHttpWorker(workerId) : null;
+      if (!workerId || !connectingWorker) {
         res.writeHead(401);
         res.end("Unverified worker");
         return;
       }
+      if (!_mayReplaceActiveHttpWorker(workerId, connectingWorker.reloadHandoffToken)) {
+        _connectingHttpWorkers.delete(workerId);
+        res.writeHead(423, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "worker_lease_held" }));
+        return;
+      }
+      const workerChanged = workerId !== _activeHttpWorkerId;
       _activeHttpWorkerId = workerId;
       _connectingHttpWorkers.delete(workerId);
+      if (workerChanged) _reloadHttpWorkerHandoff = null;
       _profileExtensionVerified = true;
-      _extensionConnectionGeneration += 1;
+      if (workerChanged) _extensionConnectionGeneration += 1;
       if (!_extensionConnected) {
         _extensionConnected = true;
         console.error("[Safari MCP] Extension connected and profile-verified via HTTP polling");
@@ -648,7 +720,7 @@ try {
     // POST /verify-profile — extension asks server to check which profile has a nonce tab
     if (req.method === "POST" && req.url === "/verify-profile") {
       const workerId = _httpWorkerId(req);
-      if (!workerId || !_isConnectingHttpWorker(workerId)) {
+      if (!workerId || !_connectingHttpWorker(workerId)) {
         res.writeHead(401);
         res.end("Worker must connect before profile verification");
         return;
@@ -754,7 +826,19 @@ try {
             return;
           }
           const timeout = _commandTimeouts[type] || 30000;
-          let result = await sendToExtension(type, payload, timeout);
+          const reloadHandoff = type === "reload_extension"
+            ? _prepareReloadHttpWorkerHandoff()
+            : null;
+          const commandPayload = reloadHandoff
+            ? { ...payload, reloadHandoff: reloadHandoff.token }
+            : payload;
+          let result;
+          try {
+            result = await sendToExtension(type, commandPayload, timeout);
+          } catch (error) {
+            if (reloadHandoff) _cancelReloadHttpWorkerHandoff(reloadHandoff);
+            throw error;
+          }
           if (type === "reload_extension") {
             // The worker answers before scheduling runtime.reload(). Capture the
             // baseline only now: a suspended OLD worker may have reconnected merely
@@ -854,10 +938,8 @@ async function _proxyToExtension(type, payload, timeoutMs = 30000) {
   return data.result;
 }
 
-let _extensionLastPollTime = 0;
 // Beats while the extension is busy executing a command, so a long command does not
 // look like a dead worker. See POST /heartbeat.
-let _extensionLastHeartbeat = 0;
 // Detect stale HTTP connection (no poll in 30s = disconnected)
 // Only applies to primary instance (extension host) — not proxy mode
 const _staleHttpTimer = setInterval(() => {
@@ -872,6 +954,7 @@ const _staleHttpTimer = setInterval(() => {
       _extensionConnected = false;
       _activeHttpWorkerId = "";
       _connectingHttpWorkers.clear();
+      _reloadHttpWorkerHandoff = null;
       _drainOnDisconnect("HTTP poll timeout");
       console.error("[Safari MCP] Extension disconnected (HTTP poll timeout)");
     }
@@ -887,6 +970,7 @@ function _drainOnDisconnect(reason) {
   // Reject all in-flight requests immediately (instead of waiting for timeout)
   for (const [id, pending] of _pendingRequests) {
     clearTimeout(pending.timer);
+    if (pending.reloadHandoff) _cancelReloadHttpWorkerHandoff(pending.reloadHandoff);
     pending.reject(new Error(`Extension disconnected: ${reason}`));
   }
   _pendingRequests.clear();
@@ -895,21 +979,34 @@ function _drainOnDisconnect(reason) {
 }
 
 function _handleExtensionResponse(msg) {
-  if (msg.type === "keepalive") return;
+  if (msg.type === "keepalive") return true;
   if (msg.type === "connected") {
     if (!_extensionConnected) {
       _extensionConnected = true;
       console.error("[Safari MCP] Extension connected");
     }
-    return;
+    return true;
   }
-  if (msg.type !== "response" || !msg.id) return;
+  if (msg.type !== "response" || !msg.id) return false;
   const pending = _pendingRequests.get(msg.id);
-  if (!pending) return;
+  if (!pending) return false;
   clearTimeout(pending.timer);
   _pendingRequests.delete(msg.id);
-  if (msg.error) pending.reject(new Error(msg.error));
-  else pending.resolve(msg.result);
+  if (msg.error) {
+    if (pending.reloadHandoff) _cancelReloadHttpWorkerHandoff(pending.reloadHandoff);
+    pending.reject(new Error(msg.error));
+    return true;
+  }
+  // Arm the successor lease synchronously while handling /result. The HTTP ACK is
+  // sent only after this returns true, so the old worker cannot reload before the
+  // host is ready to accept the exact replacement token.
+  if (pending.reloadHandoff && !_armReloadHttpWorkerHandoff(pending.reloadHandoff)) {
+    _cancelReloadHttpWorkerHandoff(pending.reloadHandoff);
+    pending.reject(new Error("Extension reload handoff could not be armed"));
+    return false;
+  }
+  pending.resolve(msg.result);
+  return true;
 }
 
 // Send command to extension (via WebSocket, HTTP command queue, or proxy to primary)
@@ -924,6 +1021,14 @@ function sendToExtension(type, payload = {}, timeoutMs = 30000) {
       reject(new Error("Extension not connected"));
       return;
     }
+    const reloadHandoff = type === "reload_extension" &&
+      _reloadHttpWorkerHandoff?.token === payload.reloadHandoff
+      ? _reloadHttpWorkerHandoff
+      : null;
+    if (type === "reload_extension" && !reloadHandoff) {
+      reject(new Error("Extension reload handoff is unavailable"));
+      return;
+    }
     const id = randomUUID();
     // A heavy DOM (facebook.com, business.facebook.com) can take well past 30s for a
     // single read_page/snapshot. Rather than raise every timeout — which would make a
@@ -933,6 +1038,7 @@ function sendToExtension(type, payload = {}, timeoutMs = 30000) {
     const hardDeadline = Date.now() + Math.max(timeoutMs * 4, 180000);
     const expire = () => {
       _pendingRequests.delete(id);
+      if (reloadHandoff) _cancelReloadHttpWorkerHandoff(reloadHandoff);
       // Also drop it from the HTTP poll queue — otherwise the extension could poll this command
       // long after the caller gave up and run a stale navigate/click out of band.
       const qi = _commandQueue.findIndex(c => c.id === id);
@@ -940,7 +1046,7 @@ function sendToExtension(type, payload = {}, timeoutMs = 30000) {
       reject(new Error(`Extension timeout after ${timeoutMs}ms`));
     };
     const armTimer = () => setTimeout(expire, Math.min(timeoutMs, Math.max(0, hardDeadline - Date.now())));
-    _pendingRequests.set(id, { resolve, reject, timer: armTimer(), armTimer, hardDeadline });
+    _pendingRequests.set(id, { resolve, reject, timer: armTimer(), armTimer, hardDeadline, reloadHandoff });
 
     const command = { id, type, payload };
 
@@ -1414,13 +1520,22 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
         // A receipt is an opaque capability, not a URL. Keep it out of page state and
         // attach it automatically only to commands that target the current logical tab.
         const attachActiveReceipt = !["new_tab", "list_tabs", "switch_tab", "reload_extension"].includes(extensionType);
+        const reloadHandoff = extensionType === "reload_extension" && _isExtensionHost
+          ? _prepareReloadHttpWorkerHandoff()
+          : null;
         const payload = {
           ...(attachActiveReceipt && activeReceipt ? { receipt: activeReceipt } : {}),
           ...extensionPayload,
+          ...(reloadHandoff ? { reloadHandoff: reloadHandoff.token } : {}),
           sessionId: `${SESSION_ID}:${currentSessionId()}`,
         };
         const timeout = _commandTimeouts[extensionType] || 30000;
-        result = await sendToExtension(extensionType, payload, timeout);
+        try {
+          result = await sendToExtension(extensionType, payload, timeout);
+        } catch (error) {
+          if (reloadHandoff) _cancelReloadHttpWorkerHandoff(reloadHandoff);
+          throw error;
+        }
         const isCspError = typeof result === 'string' && (result.includes('unsafe-eval') || result.includes('trusted-types') || result.includes('Trusted Type') || result.includes('Content Security Policy'));
         const isPermissionDenied = typeof result === 'string' && result.includes('__SCREENSHOT_PERMISSION_DENIED__');
         const isElementMiss = typeof result === 'string' && result.startsWith('Element not found');
