@@ -32,6 +32,10 @@ const _MCP_KEEPALIVE_LEASE_MS = 26000;
 const _MCP_KEEPALIVE_RENEW_MS = 18000;
 const _MCP_KEEPALIVE_PING_MS = 8000;
 const _MCP_KEEPALIVE_RECONNECT_MS = 1500;
+const _MCP_CONTENT_WAKE_TOKEN_KEY = "mcpContentWakeTokenV1";
+const _MCP_CONTENT_WAKE_BRIDGE_KEY = "mcpBridgeUrl";
+const _MCP_CONTENT_WAKE_RETRY_MS = 1500;
+const _MCP_CONTENT_WAKE_PORTS = new Set(["9224", "9228", "9232", "9236"]);
 const _mcpKeepaliveInstanceId = inheritedKeepaliveId || (() => {
   const bytes = new Uint8Array(12);
   crypto.getRandomValues(bytes);
@@ -47,6 +51,11 @@ let _mcpKeepaliveEnabledRevision = 0;
 let _mcpKeepaliveLeader = false;
 let _mcpKeepaliveClaiming = false;
 let _mcpKeepaliveDisposed = false;
+let _mcpContentWakeToken = "";
+let _mcpContentWakeBridgeUrl = "";
+let _mcpContentWakeAbort = null;
+let _mcpContentWakeRetryTimer = null;
+let _mcpContentWakeGeneration = 0;
 
 function _isMcpKeepaliveTopFrame() {
   try { return window.top === window; } catch (_) { return false; }
@@ -134,9 +143,110 @@ function _clearMcpKeepalivePingTimer() {
   _mcpKeepalivePingTimer = null;
 }
 
+function _validMcpContentWakeToken(value) {
+  return /^[0-9a-f]{64}$/.test(String(value || "")) ? String(value) : "";
+}
+
+function _validMcpContentWakeBridgeUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    if (url.protocol !== "http:") return "";
+    if (url.hostname !== "127.0.0.1" && url.hostname !== "localhost") return "";
+    if (!_MCP_CONTENT_WAKE_PORTS.has(url.port)) return "";
+    if (url.pathname !== "/" || url.search || url.hash) return "";
+    return url.origin;
+  } catch (_) {
+    return "";
+  }
+}
+
+function _sendMcpRuntimeWake() {
+  try {
+    const wakeup = browser.runtime.sendMessage({ action: "mcpContentKeepalivePingV1" });
+    wakeup?.catch?.(() => {});
+  } catch (_) {}
+}
+
+function _stopMcpContentWakeLoop() {
+  _mcpContentWakeGeneration += 1;
+  if (_mcpContentWakeRetryTimer) clearTimeout(_mcpContentWakeRetryTimer);
+  _mcpContentWakeRetryTimer = null;
+  const controller = _mcpContentWakeAbort;
+  _mcpContentWakeAbort = null;
+  if (controller) {
+    try { controller.abort(); } catch (_) {}
+  }
+}
+
+function _startMcpContentWakeLoop() {
+  if (
+    _mcpKeepaliveDisposed ||
+    !_mcpKeepaliveLeader ||
+    !_mcpKeepaliveEnabled ||
+    !_mcpContentWakeToken ||
+    !_mcpContentWakeBridgeUrl ||
+    _mcpContentWakeAbort ||
+    _mcpContentWakeRetryTimer
+  )
+    return;
+  const generation = ++_mcpContentWakeGeneration;
+  void _runMcpContentWakePoll(generation);
+}
+
+async function _runMcpContentWakePoll(generation) {
+  if (
+    generation !== _mcpContentWakeGeneration ||
+    _mcpKeepaliveDisposed ||
+    !_mcpKeepaliveLeader ||
+    !_mcpKeepaliveEnabled ||
+    !_mcpContentWakeToken ||
+    !_mcpContentWakeBridgeUrl
+  )
+    return;
+  const controller = new AbortController();
+  _mcpContentWakeAbort = controller;
+  let succeeded = false;
+  try {
+    const response = await fetch(`${_mcpContentWakeBridgeUrl}/content-wakeup`, {
+      cache: "no-store",
+      credentials: "omit",
+      headers: { "X-Safari-MCP-Wakeup": _mcpContentWakeToken },
+      mode: "cors",
+      referrerPolicy: "no-referrer",
+      signal: controller.signal,
+    });
+    succeeded = response.status === 204;
+  } catch (_) {
+    succeeded = false;
+  } finally {
+    if (_mcpContentWakeAbort === controller) _mcpContentWakeAbort = null;
+  }
+  if (
+    generation !== _mcpContentWakeGeneration ||
+    _mcpKeepaliveDisposed ||
+    !_mcpKeepaliveLeader ||
+    !_mcpKeepaliveEnabled
+  )
+    return;
+  if (succeeded) {
+    _sendMcpRuntimeWake();
+    void _runMcpContentWakePoll(generation);
+    return;
+  }
+  _mcpContentWakeRetryTimer = setTimeout(() => {
+    _mcpContentWakeRetryTimer = null;
+    if (generation !== _mcpContentWakeGeneration) return;
+    void _runMcpContentWakePoll(generation);
+  }, _MCP_CONTENT_WAKE_RETRY_MS);
+}
+
 function _sendMcpKeepalivePing() {
   if (_mcpKeepaliveDisposed || !_mcpKeepaliveLeader || !_mcpKeepaliveEnabled) return;
   _clearMcpKeepalivePingTimer();
+  // A direct runtime message wakes Safari's MV3 worker. The Port remains useful as
+  // a low-overhead continuous lease, but real Safari can suspend the worker despite
+  // an open Port; using both paths avoids the observed 30-second poll gaps.
+  _sendMcpRuntimeWake();
   const port = _openMcpKeepalivePort();
   if (port) {
     try { port.postMessage({ type: "ping" }); }
@@ -155,6 +265,7 @@ function _stopMcpKeepaliveLeadership() {
   if (_mcpKeepaliveReconnectTimer) clearTimeout(_mcpKeepaliveReconnectTimer);
   _mcpKeepaliveReconnectTimer = null;
   _clearMcpKeepalivePingTimer();
+  _stopMcpContentWakeLoop();
   _closeMcpKeepalivePort();
 }
 
@@ -183,6 +294,7 @@ function _becomeMcpKeepaliveLeader() {
   if (_mcpKeepaliveDisposed || !_mcpKeepaliveEnabled || !_isMcpKeepaliveTopFrame()) return;
   _mcpKeepaliveLeader = true;
   _clearMcpKeepaliveLeaseTimer();
+  _startMcpContentWakeLoop();
   _renewMcpKeepaliveLeaseAndPing();
 }
 
@@ -270,9 +382,20 @@ async function _initializeMcpKeepalive() {
   document.addEventListener("visibilitychange", _onMcpKeepaliveVisibilityChange);
   browser.storage.onChanged.addListener(_onMcpKeepaliveStorageChanged);
   const enabledRevision = _mcpKeepaliveEnabledRevision;
-  const stored = await browser.storage.local.get(["mcpEnabled", _MCP_KEEPALIVE_LEASE_KEY]).catch(() => ({}));
+  const stored = await browser.storage.local
+    .get([
+      "mcpEnabled",
+      _MCP_KEEPALIVE_LEASE_KEY,
+      _MCP_CONTENT_WAKE_TOKEN_KEY,
+      _MCP_CONTENT_WAKE_BRIDGE_KEY,
+    ])
+    .catch(() => ({}));
   if (_mcpKeepaliveDisposed || enabledRevision !== _mcpKeepaliveEnabledRevision) return;
   _mcpKeepaliveEnabled = stored.mcpEnabled !== false;
+  _mcpContentWakeToken = _validMcpContentWakeToken(stored[_MCP_CONTENT_WAKE_TOKEN_KEY]);
+  _mcpContentWakeBridgeUrl = _validMcpContentWakeBridgeUrl(
+    stored[_MCP_CONTENT_WAKE_BRIDGE_KEY]
+  );
   if (_mcpKeepaliveEnabled) {
     _considerMcpKeepaliveLeadership(stored[_MCP_KEEPALIVE_LEASE_KEY]);
   }
@@ -280,6 +403,20 @@ async function _initializeMcpKeepalive() {
 
 async function _onMcpKeepaliveStorageChanged(changes, areaName) {
   if (_mcpKeepaliveDisposed || areaName !== "local") return;
+  if (changes[_MCP_CONTENT_WAKE_TOKEN_KEY] || changes[_MCP_CONTENT_WAKE_BRIDGE_KEY]) {
+    _stopMcpContentWakeLoop();
+    if (changes[_MCP_CONTENT_WAKE_TOKEN_KEY]) {
+      _mcpContentWakeToken = _validMcpContentWakeToken(
+        changes[_MCP_CONTENT_WAKE_TOKEN_KEY].newValue
+      );
+    }
+    if (changes[_MCP_CONTENT_WAKE_BRIDGE_KEY]) {
+      _mcpContentWakeBridgeUrl = _validMcpContentWakeBridgeUrl(
+        changes[_MCP_CONTENT_WAKE_BRIDGE_KEY].newValue
+      );
+    }
+    if (_mcpKeepaliveLeader) _startMcpContentWakeLoop();
+  }
   if (changes.mcpEnabled) {
     _mcpKeepaliveEnabledRevision += 1;
     _mcpKeepaliveEnabled = changes.mcpEnabled.newValue !== false;

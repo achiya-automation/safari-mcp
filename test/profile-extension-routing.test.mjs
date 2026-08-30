@@ -107,6 +107,7 @@ test("a healthy HTTP worker keeps its lease unless reload grants an exact one-sh
     let _reloadHttpWorkerHandoff = null;
     const _pendingRequests = new Map();
     const _HTTP_RELOAD_HANDOFF_TTL_MS = 30_000;
+    const _HTTP_WORKER_SUCCESSOR_GRACE_MS = 20_000;
     ${helperSource}
     return {
       mayReplace: (id, token, now) => _mayReplaceActiveHttpWorker(id, token, now),
@@ -117,6 +118,8 @@ test("a healthy HTTP worker keeps its lease unless reload grants an exact one-sh
       touch: (now) => { _extensionLastPollTime = now; },
       expirePrepared: () => { _reloadHttpWorkerHandoff.expiresAt = baseNow - 1; },
       track: (handoff) => _pendingRequests.set("reload", { reloadHandoff: handoff }),
+      trackQueued: () => _pendingRequests.set("queued", { dispatchedWorkerId: "" }),
+      trackDispatched: () => _pendingRequests.set("click", { dispatchedWorkerId: "worker-a" }),
       untrack: () => _pendingRequests.clear(),
     };
   `)(() => ({ toString: () => "handoff_token_abcdefghijklmnop" }));
@@ -146,9 +149,48 @@ test("a healthy HTTP worker keeps its lease unless reload grants an exact one-sh
   const retryHandoff = harness.prepare();
   assert.notEqual(retryHandoff, handoff, "an expired armed handoff must not block a same-worker reload retry");
   harness.cancel(retryHandoff);
+  harness.trackQueued();
+  assert.equal(
+    harness.mayReplace("worker-b", "", harness.now + 21_000),
+    true,
+    "an undispatched command may safely move to a verified successor"
+  );
+  harness.untrack();
+  harness.trackDispatched();
+  assert.equal(
+    harness.mayReplace("worker-b", "", harness.now + 21_000),
+    false,
+    "a delivered mutation must fence ordinary successor takeover"
+  );
+  assert.equal(harness.mayReplace("worker-b", "", harness.now + 600_000), false);
+  assert.equal(harness.mayReplace("worker-a", "", harness.now + 600_000), true);
+  harness.untrack();
+  assert.equal(harness.mayReplace("worker-b", "", harness.now + 21_000), true);
+
+  const armedHandoff = harness.prepare();
+  assert.equal(harness.arm(armedHandoff), true);
+  harness.trackDispatched();
+  assert.equal(
+    harness.mayReplace("worker-b", armedHandoff.token, harness.now + 600_000),
+    false,
+    "even the exact reload capability cannot bypass another dispatched mutation"
+  );
+  harness.untrack();
+  assert.equal(harness.mayReplace("worker-b", armedHandoff.token, harness.now + 1), true);
   const staleTimer = index.slice(
     index.indexOf("const _staleHttpTimer = setInterval("),
     index.indexOf("_staleHttpTimer.unref()")
+  );
+  assert.match(staleTimer, /_activeHttpWorkerHasDispatchedRequest\(\)/);
+  assert.ok(
+    staleTimer.indexOf("_activeHttpWorkerHasDispatchedRequest()") <
+      staleTimer.indexOf('_activeHttpWorkerId = ""'),
+    "stale cleanup must preserve a worker that may still finish a dispatched command"
+  );
+  assert.ok(
+    staleTimer.indexOf("_activeHttpWorkerHasDispatchedRequest()") <
+      staleTimer.indexOf('_drainOnDisconnect("HTTP poll timeout")'),
+    "stale cleanup must not drain a dispatched command"
   );
   assert.match(staleTimer, /pending\.reloadHandoff === _reloadHttpWorkerHandoff/);
   assert.ok(
@@ -156,6 +198,94 @@ test("a healthy HTTP worker keeps its lease unless reload grants an exact one-sh
       staleTimer.indexOf("_reloadHttpWorkerHandoff = null"),
     "stale detection must not clear a handoff still owned by a pending reload"
   );
+});
+
+test("HTTP command dispatch and results stay bound to exactly one worker", () => {
+  const dequeueSource = index.slice(
+    index.indexOf("function _dequeueHttpCommand("),
+    index.indexOf("// ========== WEBSOCKET SERVER")
+  );
+  const responseSource = index.slice(
+    index.indexOf("function _handleExtensionResponse("),
+    index.indexOf("// Send command to extension")
+  );
+  const events = [];
+  const harness = Function(
+    "clearTimeout", "_armReloadHttpWorkerHandoff", "_cancelReloadHttpWorkerHandoff", "events",
+    `const _pendingRequests = new Map();
+     const _commandQueue = [];
+     ${dequeueSource}
+     ${responseSource}
+     return {
+       add: (cmd) => {
+         _pendingRequests.set(cmd.id, {
+           dispatchedWorkerId: "",
+           timer: 1,
+           reloadHandoff: null,
+           resolve: (value) => events.push(["resolved", cmd.id, value]),
+           reject: (error) => events.push(["rejected", cmd.id, error.message]),
+         });
+         _commandQueue.push(cmd);
+       },
+       addWebSocket: (cmd) => {
+         _pendingRequests.set(cmd.id, {
+           dispatchedWorkerId: "",
+           timer: 1,
+           reloadHandoff: null,
+           resolve: (value) => events.push(["resolved", cmd.id, value]),
+           reject: (error) => events.push(["rejected", cmd.id, error.message]),
+         });
+       },
+       addOrphan: (cmd) => _commandQueue.push(cmd),
+       dequeue: _dequeueHttpCommand,
+       respond: _handleExtensionResponse,
+       pending: (id) => _pendingRequests.get(id),
+       pendingCount: () => _pendingRequests.size,
+     };`
+  )(
+    () => {},
+    () => true,
+    () => {},
+    events
+  );
+
+  harness.addOrphan({ id: "expired", type: "click" });
+  harness.add({ id: "click-1", type: "click" });
+  const command = harness.dequeue("worker-a");
+  assert.equal(command.id, "click-1");
+  assert.equal(harness.pending("click-1").dispatchedWorkerId, "worker-a");
+  assert.equal(harness.dequeue("worker-b"), null, "the same click must never be delivered twice");
+
+  assert.equal(
+    harness.respond({ type: "response", id: "click-1", result: "wrong" }, "worker-b"),
+    false
+  );
+  assert.equal(harness.pendingCount(), 1, "a mismatched result must leave the real worker's request intact");
+  assert.equal(
+    harness.respond({ type: "response", id: "click-1", result: "ok" }, "worker-a"),
+    true
+  );
+  assert.deepEqual(events, [["resolved", "click-1", "ok"]]);
+  assert.equal(harness.pendingCount(), 0);
+  assert.equal(
+    harness.respond({ type: "response", id: "click-1", result: "late" }, "worker-a"),
+    false,
+    "a late duplicate result must not resolve twice"
+  );
+  harness.addWebSocket({ id: "ws-1" });
+  assert.equal(harness.respond({ type: "response", id: "ws-1", result: "ws-ok" }), true);
+  assert.deepEqual(events.at(-1), ["resolved", "ws-1", "ws-ok"]);
+
+  const resultRoute = index.slice(
+    index.indexOf('// POST /result'),
+    index.indexOf('// POST /connect')
+  );
+  const heartbeatRoute = index.slice(
+    index.indexOf('// POST /heartbeat'),
+    index.indexOf('// POST /extension-verified')
+  );
+  assert.match(resultRoute, /_handleExtensionResponse\(msg, respondingWorkerId\)/);
+  assert.match(heartbeatRoute, /pending\.dispatchedWorkerId !== heartbeatingWorkerId/);
 });
 
 test("reload occurs only after the host accepts the result acknowledgement", async () => {
@@ -272,7 +402,7 @@ test("lease-held workers retry, while only a poll-time takeover is terminal", ()
     connect.indexOf("verifiedResponse?.status === 423"),
     connect.indexOf("continue;", connect.indexOf("verifiedResponse?.status === 423"))
   );
-  assert.match(leaseHeld, /scheduleReconnect\(\)/);
+  assert.match(leaseHeld, /scheduleReconnect\(3000\)/);
   assert.match(leaseHeld, /_stopHeartbeat\(\)/);
   assert.doesNotMatch(leaseHeld, /_bridgeWorkerSuperseded = true/);
 
@@ -283,6 +413,27 @@ test("lease-held workers retry, while only a poll-time takeover is terminal", ()
   assert.match(polling, /res\.status === 423[\s\S]*_bridgeWorkerSuperseded = true/);
   assert.match(polling, /res\.status === 423[\s\S]*_stopHeartbeat\(\)/);
   assert.match(background, /if \(_enabled && !_bridgeWorkerSuperseded && !_bridgeWorkerRetiring && !_heartbeatTimer\) _startHeartbeat\(\)/);
+});
+
+test("a verified successor has a fixed retry window before idle disconnect", () => {
+  const successor = Number(
+    index.match(/const _HTTP_WORKER_SUCCESSOR_GRACE_MS = (\d+) \* 1000/)?.[1]
+  ) * 1000;
+  const disconnect = Number(
+    index.match(/const _HTTP_WORKER_DISCONNECT_MS = (\d+) \* 1000/)?.[1]
+  ) * 1000;
+  assert.equal(successor, 20000);
+  assert.equal(disconnect, 30000);
+  assert.ok(successor + 3000 < disconnect);
+  assert.match(index, /now - lastActivity <= _HTTP_WORKER_SUCCESSOR_GRACE_MS/);
+  assert.match(index, /Date\.now\(\) - _extensionLastPollTime > _HTTP_WORKER_DISCONNECT_MS/);
+
+  const scheduler = background.slice(
+    background.indexOf("function scheduleReconnect("),
+    background.indexOf("async function pollForCommands(")
+  );
+  assert.match(scheduler, /Number\.isFinite\(delayOverrideMs\)/);
+  assert.match(scheduler, /if \(!Number\.isFinite\(delayOverrideMs\)\)/);
 });
 
 test("reconnecting invalidates the old poll loop and clears its exact timeout", async () => {

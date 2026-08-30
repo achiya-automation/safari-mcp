@@ -19,7 +19,7 @@ import {
 } from "./ownership-state.js";
 import { WebSocketServer } from "ws";
 import { createServer } from "node:http";
-import { randomUUID, randomBytes, timingSafeEqual } from "node:crypto";
+import { randomUUID, randomBytes, timingSafeEqual, createHmac } from "node:crypto";
 import { execFile, execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -74,6 +74,10 @@ function _getBridgeToken() {
   }
 }
 const BRIDGE_TOKEN = _getBridgeToken();
+const CONTENT_WAKE_LABEL = "safari-mcp-content-wakeup-v1";
+const CONTENT_WAKE_TOKEN = createHmac("sha256", BRIDGE_TOKEN)
+  .update(CONTENT_WAKE_LABEL)
+  .digest("hex");
 
 // Security: compare the local shared-secret in constant time. A plain `!==` returns as
 // soon as two bytes differ, so the reply latency leaks how many leading bytes matched —
@@ -90,6 +94,13 @@ function _bridgeTokenMatches(given) {
   if (typeof given !== "string" || !/^[0-9a-f]{64}$/.test(given) || !/^[0-9a-f]{64}$/.test(BRIDGE_TOKEN)) return false;
   const a = Buffer.from(given, "utf8");
   const b = Buffer.from(BRIDGE_TOKEN, "utf8");
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function _contentWakeTokenMatches(given) {
+  if (typeof given !== "string" || !/^[0-9a-f]{64}$/.test(given) || !/^[0-9a-f]{64}$/.test(CONTENT_WAKE_TOKEN)) return false;
+  const a = Buffer.from(given, "utf8");
+  const b = Buffer.from(CONTENT_WAKE_TOKEN, "utf8");
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
@@ -345,6 +356,8 @@ let _activeHttpWorkerId = "";
 const _connectingHttpWorkers = new Map();
 const _HTTP_WORKER_TTL_MS = 60 * 1000;
 const _HTTP_RELOAD_HANDOFF_TTL_MS = 30 * 1000;
+const _HTTP_WORKER_SUCCESSOR_GRACE_MS = 20 * 1000;
+const _HTTP_WORKER_DISCONNECT_MS = 30 * 1000;
 let _extensionLastPollTime = 0;
 let _extensionLastHeartbeat = 0;
 let _reloadHttpWorkerHandoff = null;
@@ -417,11 +430,21 @@ function _cancelReloadHttpWorkerHandoff(handoff) {
 
 function _activeHttpWorkerIsFresh(now = Date.now()) {
   const lastActivity = Math.max(_extensionLastPollTime, _extensionLastHeartbeat);
-  return !!_activeHttpWorkerId && _extensionConnected && lastActivity > 0 && now - lastActivity <= 30000;
+  return !!_activeHttpWorkerId && _extensionConnected && lastActivity > 0 && now - lastActivity <= _HTTP_WORKER_SUCCESSOR_GRACE_MS;
+}
+
+function _activeHttpWorkerHasDispatchedRequest() {
+  return !!_activeHttpWorkerId && [..._pendingRequests.values()].some(
+    (pending) => pending.dispatchedWorkerId === _activeHttpWorkerId
+  );
 }
 
 function _mayReplaceActiveHttpWorker(workerId, presentedToken, now = Date.now()) {
   if (!_activeHttpWorkerId || workerId === _activeHttpWorkerId) return true;
+  // No successor capability may bypass a mutation already delivered to the
+  // active worker. A reload result removes its pending fence before arming the
+  // exact handoff, so the intended reload path remains available.
+  if (_activeHttpWorkerHasDispatchedRequest()) return false;
   const handoff = _reloadHttpWorkerHandoff;
   if (handoff) {
     // While the old worker is preparing a reload, no unrelated worker may use a
@@ -484,6 +507,19 @@ const _pendingRequests = new Map();
 // Command queue: commands waiting to be picked up by HTTP-polling extension
 const _commandQueue = [];
 
+function _dequeueHttpCommand(workerId) {
+  while (_commandQueue.length > 0) {
+    const cmd = _commandQueue.shift();
+    const pending = _pendingRequests.get(cmd.id);
+    // A request timer can expire while its command is at the head of the queue.
+    // Never deliver an orphaned or already-claimed mutation out of band.
+    if (!pending || pending.dispatchedWorkerId) continue;
+    pending.dispatchedWorkerId = workerId;
+    return cmd;
+  }
+  return null;
+}
+
 // ========== WEBSOCKET SERVER (for Chrome extensions / direct WebSocket) ==========
 let wss;
 try {
@@ -521,8 +557,110 @@ function _setupExtensionListener(ws) {
 }
 
 // ========== HTTP POLLING SERVER (for Safari extensions — WebSocket blocked) ==========
+const _contentWakePolls = new Set();
+function _releaseContentWakePolls() {
+  for (const finish of [..._contentWakePolls]) finish();
+}
+
+function _setContentWakeCors(req, res) {
+  const origin = typeof req.headers.origin === "string" ? req.headers.origin : "";
+  res.setHeader("Access-Control-Allow-Origin", origin || "*");
+  if (origin) res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "X-Safari-MCP-Wakeup");
+  res.setHeader("Cache-Control", "no-store");
+}
+
+function _isAllowedContentWakeOrigin(origin) {
+  if (!origin) return true;
+  if (_isExtensionSchemeOrigin(origin)) return true;
+  try {
+    const parsed = new URL(origin);
+    return (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+      parsed.origin === origin;
+  } catch {
+    return false;
+  }
+}
+
+function _handleContentWakeRequest(req, res) {
+  if (req.url !== "/content-wakeup") return false;
+
+  const origin = typeof req.headers.origin === "string" ? req.headers.origin : "";
+  if (!_isAllowedContentWakeOrigin(origin)) {
+    res.writeHead(403);
+    res.end("Forbidden origin");
+    return true;
+  }
+
+  // Safari gives a content-script fetch the webpage's Origin. Permit only this
+  // narrow, authority-free wake route before the extension-only CORS gate below.
+  // The actual GET still needs the independent derived HMAC capability.
+  if (req.method === "OPTIONS") {
+    const requestedMethod = String(req.headers["access-control-request-method"] || "").toUpperCase();
+    const requestedHeaders = String(req.headers["access-control-request-headers"] || "")
+      .split(",")
+      .map((header) => header.trim().toLowerCase())
+      .filter(Boolean);
+    if (requestedMethod !== "GET" ||
+        requestedHeaders.length !== 1 ||
+        requestedHeaders[0] !== "x-safari-mcp-wakeup") {
+      res.writeHead(403);
+      res.end("Forbidden preflight");
+      return true;
+    }
+    _setContentWakeCors(req, res);
+    res.writeHead(204);
+    res.end();
+    return true;
+  }
+
+  if (req.method !== "GET") {
+    res.writeHead(405, { Allow: "GET, OPTIONS" });
+    res.end("Method not allowed");
+    return true;
+  }
+
+  _setContentWakeCors(req, res);
+  if (!_contentWakeTokenMatches(req.headers["x-safari-mcp-wakeup"])) {
+    res.writeHead(401);
+    res.end("Unauthorized");
+    return true;
+  }
+
+  if (_contentWakePolls.size >= 4) {
+    res.writeHead(429, { "Retry-After": "1" });
+    res.end("Too many wake polls");
+    return true;
+  }
+
+  let settled = false;
+  let timer = null;
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    if (timer) clearTimeout(timer);
+    _contentWakePolls.delete(finish);
+    if (!res.writableEnded) {
+      res.writeHead(204);
+      res.end();
+    }
+  };
+  _contentWakePolls.add(finish);
+  timer = setTimeout(finish, 8000);
+  req.on("close", () => {
+    if (settled) return;
+    settled = true;
+    if (timer) clearTimeout(timer);
+    _contentWakePolls.delete(finish);
+  });
+  return true;
+}
+
 try {
   const httpServer = createServer((req, res) => {
+    if (_handleContentWakeRequest(req, res)) return;
+
     // CORS headers — restricted to browser extension origin only.
     // Safari extensions use moz-extension:// or safari-web-extension:// origins.
     // "*" was a security risk: any webpage could POST to the localhost bridge and execute MCP commands.
@@ -580,10 +718,10 @@ try {
         _extensionConnected = true;
         console.error("[Safari MCP] Extension reconnected via poll");
       }
-      if (_commandQueue.length > 0) {
-        const cmd = _commandQueue.shift();
+      const queuedCommand = _dequeueHttpCommand(pollingWorkerId);
+      if (queuedCommand) {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(cmd));
+        res.end(JSON.stringify(queuedCommand));
       } else {
         // Long-poll: wait up to 5 seconds for a command
         const timer = setTimeout(() => {
@@ -599,10 +737,10 @@ try {
             res.end("Worker superseded");
             return;
           }
-          if (_commandQueue.length > 0) {
+          const cmd = _dequeueHttpCommand(pollingWorkerId);
+          if (cmd) {
             clearTimeout(timer);
             clearInterval(checkInterval);
-            const cmd = _commandQueue.shift();
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify(cmd));
           }
@@ -619,7 +757,8 @@ try {
 
     // POST /result — extension sends command result
     if (req.method === "POST" && req.url === "/result") {
-      if (!_requireActiveHttpWorker(req, res)) return;
+      const respondingWorkerId = _requireActiveHttpWorker(req, res);
+      if (!respondingWorkerId) return;
       let body = "";
       let bodyTooLarge = false; // 'end' can still fire after destroy() — never parse/respond then
       req.on("data", (chunk) => { if (bodyTooLarge || res.headersSent) return; body += chunk; if (body.length > MAX_BODY_SIZE) { bodyTooLarge = true; res.writeHead(413); res.end("Payload too large"); req.destroy(); } });
@@ -628,7 +767,7 @@ try {
         let accepted = false;
         try {
           const msg = JSON.parse(body);
-          accepted = _handleExtensionResponse(msg);
+          accepted = _handleExtensionResponse(msg, respondingWorkerId);
         } catch {}
         res.writeHead(accepted ? 200 : 409);
         res.end(accepted ? "ok" : "Result was not accepted");
@@ -691,12 +830,14 @@ try {
     // POST /heartbeat — extension is alive and mid-command (its poll loop is blocked
     // by the running command, so /poll cannot be what proves liveness here).
     if (req.method === "POST" && req.url === "/heartbeat") {
-      if (!_requireActiveHttpWorker(req, res)) return;
+      const heartbeatingWorkerId = _requireActiveHttpWorker(req, res);
+      if (!heartbeatingWorkerId) return;
       _extensionLastHeartbeat = Date.now();
       _extensionLastPollTime = Date.now();
       // Re-arm in-flight deadlines: the worker told us it is still on the command.
       // hardDeadline inside armTimer keeps this from extending indefinitely.
       for (const pending of _pendingRequests.values()) {
+        if (pending.dispatchedWorkerId !== heartbeatingWorkerId) continue;
         if (!pending.armTimer || Date.now() >= pending.hardDeadline) continue;
         clearTimeout(pending.timer);
         pending.timer = pending.armTimer();
@@ -964,7 +1105,11 @@ async function _proxyToExtension(type, payload, timeoutMs = 30000) {
 // Only applies to primary instance (extension host) — not proxy mode
 const _staleHttpTimer = setInterval(() => {
   if (_isExtensionHost && _extensionConnected && !_extensionWs && _extensionLastPollTime > 0) {
-    if (Date.now() - _extensionLastPollTime > 30000) {
+    if (Date.now() - _extensionLastPollTime > _HTTP_WORKER_DISCONNECT_MS) {
+      // A command already delivered to this worker is an at-most-once fence.
+      // Its own bounded request timer releases the fence; disconnect cleanup must
+      // not make an ordinary successor eligible while the old worker may finish it.
+      if (_activeHttpWorkerHasDispatchedRequest()) return;
       // The extension runs each command inside its own poll loop, so a command that
       // outlives 30s (heavy DOM: facebook.com, business.facebook.com) starves /poll
       // even though the worker is alive and still working on OUR command. Killing the
@@ -1004,7 +1149,7 @@ function _drainOnDisconnect(reason) {
   _commandQueue.length = 0;
 }
 
-function _handleExtensionResponse(msg) {
+function _handleExtensionResponse(msg, respondingWorkerId = "") {
   if (msg.type === "keepalive") return true;
   if (msg.type === "connected") {
     if (!_extensionConnected) {
@@ -1016,6 +1161,7 @@ function _handleExtensionResponse(msg) {
   if (msg.type !== "response" || !msg.id) return false;
   const pending = _pendingRequests.get(msg.id);
   if (!pending) return false;
+  if ((pending.dispatchedWorkerId || "") !== respondingWorkerId) return false;
   clearTimeout(pending.timer);
   _pendingRequests.delete(msg.id);
   if (msg.error) {
@@ -1072,7 +1218,15 @@ function sendToExtension(type, payload = {}, timeoutMs = 30000) {
       reject(new Error(`Extension timeout after ${timeoutMs}ms`));
     };
     const armTimer = () => setTimeout(expire, Math.min(timeoutMs, Math.max(0, hardDeadline - Date.now())));
-    _pendingRequests.set(id, { resolve, reject, timer: armTimer(), armTimer, hardDeadline, reloadHandoff });
+    _pendingRequests.set(id, {
+      resolve,
+      reject,
+      timer: armTimer(),
+      armTimer,
+      hardDeadline,
+      reloadHandoff,
+      dispatchedWorkerId: "",
+    });
 
     const command = { id, type, payload };
 
@@ -1082,6 +1236,7 @@ function sendToExtension(type, payload = {}, timeoutMs = 30000) {
     } else {
       // Otherwise, queue for HTTP polling
       _commandQueue.push(command);
+      _releaseContentWakePolls();
     }
   });
 }

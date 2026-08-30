@@ -5,6 +5,9 @@ import { readFileSync } from "node:fs";
 
 const content = readFileSync(new URL("../extension/command-content.js", import.meta.url), "utf8");
 const background = readFileSync(new URL("../extension/background.js", import.meta.url), "utf8");
+const manifest = JSON.parse(
+  readFileSync(new URL("../extension/manifest.json", import.meta.url), "utf8")
+);
 
 function sourceBetween(source, startMarker, endMarker) {
   const start = source.indexOf(startMarker);
@@ -22,17 +25,31 @@ function keepaliveSource() {
   );
 }
 
+test("Safari uses a wakeable nonpersistent background page", () => {
+  assert.deepEqual(manifest.background, {
+    scripts: ["background.js"],
+    persistent: false,
+  });
+  assert.equal(Object.hasOwn(manifest.background, "service_worker"), false);
+});
+
 function createContentHarness({
   visibility = "hidden",
   lease = null,
   enabled = true,
   deferFirstGet = false,
+  runtimeMessageMode = "resolve",
+  wakeToken = "",
+  bridgeUrl = "",
 } = {}) {
   let now = 1_000_000;
   let timerId = 0;
   let randomByte = 0;
   const timers = new Map();
   const ports = [];
+  const runtimeMessages = [];
+  const wakeRequests = [];
+  const wakeResolvers = [];
   const documentListeners = new Set();
   const storageListeners = new Set();
   let deferredGetUsed = false;
@@ -40,6 +57,8 @@ function createContentHarness({
   const store = {
     mcpEnabled: enabled,
     ...(lease ? { mcpContentKeepaliveLeaseV1: lease } : {}),
+    ...(wakeToken ? { mcpContentWakeTokenV1: wakeToken } : {}),
+    ...(bridgeUrl ? { mcpBridgeUrl: bridgeUrl } : {}),
   };
   const document = {
     visibilityState: visibility,
@@ -105,7 +124,15 @@ function createContentHarness({
   math.random = () => 0;
   const context = vm.createContext({
     browser: {
-      runtime: { connect: () => makePort() },
+      runtime: {
+        connect: () => makePort(),
+        sendMessage(message) {
+          runtimeMessages.push(message);
+          if (runtimeMessageMode === "throw") throw new Error("runtime invalidated");
+          if (runtimeMessageMode === "reject") return Promise.reject(new Error("tab unavailable"));
+          return Promise.resolve({ ok: true });
+        },
+      },
       storage: {
         local: {
           get: storageGet,
@@ -147,6 +174,12 @@ function createContentHarness({
     Math: math,
     Date: { now: () => now },
     Promise,
+    URL,
+    AbortController,
+    fetch(url, init) {
+      wakeRequests.push({ url, init });
+      return new Promise((resolve) => wakeResolvers.push(resolve));
+    },
     document,
     window,
     setTimeout(fn, delay) {
@@ -180,9 +213,16 @@ function createContentHarness({
     storageListeners,
     store,
     ports,
+    runtimeMessages,
+    wakeRequests,
     timers,
     runNextTimer,
     flush,
+    resolveWake(status = 204) {
+      const resolve = wakeResolvers.shift();
+      assert.ok(resolve, "expected a pending content wake request");
+      resolve({ status });
+    },
     resolveDeferredGet() {
       assert.ok(resolveDeferredGet, "expected a deferred storage read");
       const resolve = resolveDeferredGet;
@@ -210,6 +250,10 @@ test("keepalive uses one authority-free Port inside Safari's idle window", () =>
   assert.match(keepalive, /document\.visibilityState === "visible"/);
   assert.match(keepalive, /browser\.runtime\.connect\(\{ name: _MCP_KEEPALIVE_PORT_NAME \}\)/);
   assert.match(keepalive, /port\.postMessage\(\{ type: "ping" \}\)/);
+  assert.match(
+    keepalive,
+    /browser\.runtime\.sendMessage\(\{ action: "mcpContentKeepalivePingV1" \}\)/
+  );
   assert.doesNotMatch(keepalive, /location\.|receiptUrl|sessionId|tabId/);
 });
 
@@ -231,6 +275,11 @@ test("a hidden non-leader opens no Port, then visible safely preempts a hidden l
 
   assert.equal(harness.ports.length, 1);
   assert.equal(JSON.stringify(harness.ports[0].messages), JSON.stringify([{ type: "ping" }]));
+  assert.equal(
+    JSON.stringify(harness.runtimeMessages),
+    JSON.stringify([{ action: "mcpContentKeepalivePingV1" }]),
+    "the elected page must also wake Safari's worker with an authority-free message"
+  );
   assert.equal(harness.store.mcpContentKeepaliveLeaseV1.visible, true);
 
   harness.ports[0].drop();
@@ -269,6 +318,7 @@ test("same-context reinjection replaces keepalive state instead of duplicating i
   harness.runNextTimer();
   await harness.flush();
   assert.equal(harness.ports.length, 1, "only the replacement leader may own a Port");
+  assert.equal(harness.runtimeMessages.length, 1, "only the replacement leader may send a wakeup");
   const successorLease = JSON.stringify(harness.store.mcpContentKeepaliveLeaseV1);
 
   // The first execution's startup read resolves only after cleanup and after the
@@ -279,6 +329,53 @@ test("same-context reinjection replaces keepalive state instead of duplicating i
   assert.equal(harness.storageListeners.size, 1);
   assert.equal(harness.ports.length, 1);
   assert.equal(JSON.stringify(harness.store.mcpContentKeepaliveLeaseV1), successorLease);
+});
+
+for (const runtimeMessageMode of ["throw", "reject"]) {
+  test(`runtime wakeup ${runtimeMessageMode} does not stop Port ping or scheduling`, async () => {
+    const harness = createContentHarness({ visibility: "visible", runtimeMessageMode });
+    vm.runInContext(keepaliveSource(), harness.context);
+    await harness.flush();
+    harness.runNextTimer();
+    await harness.flush();
+    harness.runNextTimer();
+    await harness.flush();
+
+    assert.equal(harness.runtimeMessages.length, 1);
+    assert.equal(harness.ports.length, 1);
+    assert.equal(JSON.stringify(harness.ports[0].messages), JSON.stringify([{ type: "ping" }]));
+    assert.equal(
+      [...harness.timers.values()].filter(({ delay }) => delay === 8000).length,
+      1,
+      "one future runtime/Port ping must remain scheduled"
+    );
+  });
+}
+
+test("the elected page holds one authenticated network wake poll without URL authority", async () => {
+  const wakeToken = "b".repeat(64);
+  const harness = createContentHarness({
+    visibility: "visible",
+    wakeToken,
+    bridgeUrl: "http://127.0.0.1:9224",
+  });
+  vm.runInContext(keepaliveSource(), harness.context);
+  await harness.flush();
+  harness.runNextTimer();
+  await harness.flush();
+  harness.runNextTimer();
+  await harness.flush();
+
+  assert.equal(harness.wakeRequests.length, 1);
+  assert.equal(harness.wakeRequests[0].url, "http://127.0.0.1:9224/content-wakeup");
+  assert.equal(harness.wakeRequests[0].init.headers["X-Safari-MCP-Wakeup"], wakeToken);
+  assert.equal(harness.wakeRequests[0].init.method, undefined);
+  assert.equal(harness.runtimeMessages.length, 1, "the initial leader ping is still singular");
+
+  harness.resolveWake();
+  await harness.flush();
+  assert.equal(harness.runtimeMessages.length, 2, "network completion wakes the background");
+  assert.equal(harness.wakeRequests.length, 2, "the next long poll starts without a page timer");
 });
 
 test("background accepts one exact named content-script Port and no authority", () => {
@@ -365,6 +462,65 @@ test("background accepts one exact named content-script Port and no authority", 
   onConnect(whileOff);
   assert.equal(whileOff.disconnected, true);
   assert.equal(whileOff.messageListeners.length, 0);
+});
+
+test("background accepts only a page-bound authority-free keepalive message", () => {
+  const listenerSource = sourceBetween(
+    background,
+    "// Listen for messages from popup",
+    "// A page-bound isolated content script sends an authority-free ping"
+  );
+  let onMessage;
+  const context = {
+    browser: {
+      runtime: {
+        onMessage: {
+          addListener(listener) {
+            onMessage = listener;
+          },
+        },
+      },
+    },
+    Number,
+    _enabled: true,
+    _bridgeWorkerSuperseded: false,
+    _bridgeWorkerRetiring: false,
+  };
+  vm.runInNewContext(listenerSource, context);
+
+  let reply = null;
+  const returned = onMessage(
+    { action: "mcpContentKeepalivePingV1" },
+    { tab: { id: 42 } },
+    (value) => {
+      reply = value;
+    }
+  );
+  assert.equal(returned, false);
+  assert.equal(JSON.stringify(reply), JSON.stringify({ ok: true }));
+
+  reply = null;
+  onMessage(
+    { action: "mcpContentKeepalivePingV1", receipt: "forbidden" },
+    { tab: { id: 42 } },
+    (value) => {
+      reply = value;
+    }
+  );
+  assert.equal(reply, null, "keepalive messages with extra fields must be rejected");
+
+  reply = null;
+  onMessage({ action: "mcpContentKeepalivePingV1" }, {}, (value) => {
+    reply = value;
+  });
+  assert.equal(reply, null, "extension pages must not use the page-bound keepalive path");
+
+  context._bridgeWorkerRetiring = true;
+  reply = null;
+  onMessage({ action: "mcpContentKeepalivePingV1" }, { tab: { id: 42 } }, (value) => {
+    reply = value;
+  });
+  assert.equal(reply, null, "retiring workers must reject keepalive messages");
 });
 
 test("a 423 superseded worker releases its content keepalive Port", () => {

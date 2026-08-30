@@ -61,6 +61,30 @@ async function _bridgeFetch(url, init = {}) {
   headers.set("X-Safari-MCP-Worker", _bridgeWorkerId);
   return fetch(url, { ...init, headers });
 }
+const _CONTENT_WAKE_TOKEN_STORAGE_KEY = "mcpContentWakeTokenV1";
+const _CONTENT_WAKE_LABEL = "safari-mcp-content-wakeup-v1";
+async function _publishContentWakeToken() {
+  try {
+    const bridgeToken = await _bridgeAuthToken();
+    const encoder = new TextEncoder();
+    const key = await crypto.subtle.importKey(
+      "raw",
+      encoder.encode(bridgeToken),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"]
+    );
+    const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(_CONTENT_WAKE_LABEL));
+    const wakeToken = Array.from(new Uint8Array(signature), (byte) =>
+      byte.toString(16).padStart(2, "0")
+    ).join("");
+    if (!/^[0-9a-f]{64}$/.test(wakeToken)) throw new Error("invalid content wake token");
+    await browser.storage.local.set({ [_CONTENT_WAKE_TOKEN_STORAGE_KEY]: wakeToken });
+  } catch (error) {
+    await browser.storage.local.remove(_CONTENT_WAKE_TOKEN_STORAGE_KEY).catch(() => {});
+    throw error;
+  }
+}
 let _targetProfile = null;   // Profile name from server (e.g. "Automations")
 let _profileWindowId = null; // Discovered windowId for the profile (shared default)
 // Per-session profile window. One Safari profile can hold SEVERAL windows once
@@ -419,6 +443,18 @@ let _startupReady = browser.storage.local.get("mcpEnabled").then(data => {
 
 // Listen for messages from popup
 browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // Safari can suspend an MV3 worker even while a content-script Port exists. A
+  // leader page therefore sends this fixed, authority-free message as a second
+  // keepalive signal. runtime.sendMessage is an extension event, so it wakes the
+  // worker on Safari versions where Port traffic alone does not. Never accept tab,
+  // URL, receipt, session, or command data through this path.
+  if (msg?.action === "mcpContentKeepalivePingV1") {
+    if (Object.keys(msg).length !== 1) return false;
+    if (!Number.isInteger(sender?.tab?.id)) return false;
+    if (!_enabled || _bridgeWorkerSuperseded || _bridgeWorkerRetiring) return false;
+    sendResponse({ ok: true });
+    return false;
+  }
   if (msg.action === "setEnabled") {
     _enabled = msg.enabled;
     if (!_enabled) {
@@ -545,6 +581,14 @@ async function connect() {
         signal: AbortSignal.timeout(1500),
       });
       if (_restartInvalidatedConnect(pollGeneration)) return;
+      if (res.status === 423) {
+        isConnected = false;
+        updateBadge("");
+        _stopHeartbeat();
+        scheduleReconnect(3000);
+        _connecting = false;
+        return;
+      }
       if (!res.ok) continue;
 
       const data = await res.json().catch(() => ({}));
@@ -569,7 +613,7 @@ async function connect() {
             isConnected = false;
             updateBadge("");
             _stopHeartbeat();
-            scheduleReconnect();
+            scheduleReconnect(3000);
             _connecting = false;
             return;
           }
@@ -604,17 +648,22 @@ async function connect() {
   _connecting = false;
 }
 
-function scheduleReconnect() {
+function scheduleReconnect(delayOverrideMs = null) {
   if (!_enabled || _bridgeWorkerSuperseded || _bridgeWorkerRetiring) return;
   // Cancel any existing reconnect to prevent exponential growth
   if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
 
   // Single timer with exponential backoff (3s → 6s → 12s → ... → 60s max)
+  const delay = Number.isFinite(delayOverrideMs)
+    ? Math.max(0, Number(delayOverrideMs))
+    : _reconnectDelay;
   _reconnectTimer = setTimeout(() => {
     _reconnectTimer = null;
     connect();
-  }, _reconnectDelay);
-  _reconnectDelay = Math.min(_reconnectDelay * 2, _RECONNECT_MAX);
+  }, delay);
+  if (!Number.isFinite(delayOverrideMs)) {
+    _reconnectDelay = Math.min(_reconnectDelay * 2, _RECONNECT_MAX);
+  }
 
   // Alarm as backup — wakes terminated service worker (Safari minimum 1 minute)
   try {
@@ -4308,6 +4357,7 @@ console.log("Safari MCP Bridge: service worker started");
 updateBadge("");
 // Wait for storage to load before connecting (prevents race condition with _enabled)
 _startupReady.then(() => {
+  _publishContentWakeToken().catch(() => {});
   if (_enabled) connect();
   else updateBadge("OFF");
 }).catch(() => connect());
