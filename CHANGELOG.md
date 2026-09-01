@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.17.1] - 2026-09-01
+
 ### Fixed
 - **Clicks now reach controls inside nested open Shadow DOM.** The persistent content bridge previously searched only `document`, so text, selector, snapshot-ref, and coordinate clicks stopped at a custom-element host even though snapshots could see the real control. Click resolution and hit-testing now recurse through open shadow roots, with regression coverage for nested PartnerStack/Impact-style components.
 - **A hot-reloaded content bridge can no longer dispatch the same click twice.** Safari may retain an older message listener while installing the updated content script; both listeners used to execute the DOM mutation even though only the first response was returned. Listener generations are now revocable, so exactly one active bridge may handle a click, fill, or evaluation command.
