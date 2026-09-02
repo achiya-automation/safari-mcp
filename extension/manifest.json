@@ -2,28 +2,43 @@
   "manifest_version": 3,
   "name": "Safari MCP Bridge",
   "description": "Connects AI agents to Safari — fast JS execution, screenshots, clicks with your real cookies/logins",
-  "version": "2.10.4",
+  "version": "2.10.6",
   "icons": {
     "48": "images/icon-48.png",
     "96": "images/icon-96.png",
     "128": "images/icon-128.png"
   },
   "background": {
-    "scripts": ["background.js"],
+    "scripts": [
+      "background.js"
+    ],
     "persistent": false
   },
   "action": {
     "default_popup": "popup/popup.html",
-    "default_icon": { "16": "images/icon-48.png", "32": "images/icon-48.png" }
+    "default_icon": {
+      "16": "images/icon-48.png",
+      "32": "images/icon-48.png"
+    }
   },
   "content_security_policy": {
     "extension_pages": "script-src 'self'; connect-src 'self' http://localhost:9224 http://127.0.0.1:9224 http://localhost:9228 http://127.0.0.1:9228 http://localhost:9232 http://127.0.0.1:9232 http://localhost:9236 http://127.0.0.1:9236"
   },
-  "permissions": ["activeTab", "scripting", "tabs", "alarms", "storage"],
-  "host_permissions": ["<all_urls>"],
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "tabs",
+    "alarms",
+    "storage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
+      "matches": [
+        "<all_urls>"
+      ],
       "exclude_matches": [
         "*://*.linkedin.com/*",
         "*://*.x.com/*",
@@ -34,13 +49,19 @@
         "*://chat.google.com/*",
         "*://meet.google.com/*"
       ],
-      "js": ["content.js"],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_start",
       "world": "MAIN"
     },
     {
-      "matches": ["<all_urls>"],
-      "js": ["command-content.js"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "command-content.js"
+      ],
       "run_at": "document_start"
     }
   ]
