@@ -307,6 +307,26 @@ process.on("exit", () => {
 // backend that still works when macOS temporarily denies Apple Events (-1743).
 const _preferAppleScript = !!process.env.SAFARI_PROFILE;
 let _profileExtensionVerified = !process.env.SAFARI_PROFILE;
+// A same-version .appex replacement leaves Safari running the OLD service worker,
+// which this server refuses by design (see EXTENSION_BRIDGE_PROTOCOL). The refusal is
+// silent: workers keep POSTing /connect forever and every tool call fails with the
+// generic "profile extension unavailable". Count distinct never-verified workers so
+// the operator is told the one thing that fixes it instead of debugging the bridge.
+const _unverifiedWorkerIds = new Set();
+let _staleWorkerAdviceShown = false;
+function _noteUnverifiedWorker(workerId) {
+  if (!process.env.SAFARI_PROFILE || _profileExtensionVerified || !workerId) return;
+  _unverifiedWorkerIds.add(workerId);
+  if (_staleWorkerAdviceShown || _unverifiedWorkerIds.size < 3) return;
+  _staleWorkerAdviceShown = true;
+  console.error(
+    `[Safari MCP] ⚠️ ${_unverifiedWorkerIds.size} extension workers connected but none proved profile ` +
+    `"${process.env.SAFARI_PROFILE}". This is the signature of a same-version .appex replacement: ` +
+    `Safari is still running the previous service worker, which this server refuses by design. ` +
+    `Fix: Safari → Settings → Extensions → toggle "Safari MCP Bridge" off and on (or restart Safari). ` +
+    `Restarting this server does NOT help — the stale worker lives inside Safari.`
+  );
+}
 
 // A named profile is driven only by its verified WebExtension worker. The worker
 // can create a background window through browser.windows.create() when the last
@@ -799,6 +819,7 @@ try {
       // /extension-verified. Remembering rejected workers would let a stale process
       // skip the protocol gate by posting the second handshake step directly.
       _rememberConnectingHttpWorker(workerId, _reloadHandoffToken(req));
+      _noteUnverifiedWorker(workerId);
       // When SAFARI_PROFILE is set, don't mark as connected until profile is verified.
       // A personal-profile extension connecting first would incorrectly set the flag.
       if (!process.env.SAFARI_PROFILE) {
