@@ -321,10 +321,14 @@ function _noteUnverifiedWorker(workerId) {
   _staleWorkerAdviceShown = true;
   console.error(
     `[Safari MCP] ⚠️ ${_unverifiedWorkerIds.size} extension workers connected but none proved profile ` +
-    `"${process.env.SAFARI_PROFILE}". This is the signature of a same-version .appex replacement: ` +
-    `Safari is still running the previous service worker, which this server refuses by design. ` +
-    `Fix: Safari → Settings → Extensions → toggle "Safari MCP Bridge" off and on (or restart Safari). ` +
-    `Restarting this server does NOT help — the stale worker lives inside Safari.`
+    `"${process.env.SAFARI_PROFILE}". The usual cause is a poisoned identity in that profile's extension ` +
+    `storage: mcpVerifiedProfile holds "<profile> — mcp-profile-check-<nonce>" instead of the bare ` +
+    `profile name, so _verifyProfileMatch rejects it forever. Fix (Safari must be quit first, and read ` +
+    `the DB together with its -wal or you will see a stale value): sqlite3 on ` +
+    `~/Library/Containers/com.apple.Safari/Data/Library/WebKit/WebExtensions/<uuid>/` +
+    `"com.achiya-automation.safari-mcp.Extension (...)"/LocalStorage.db — ` +
+    `UPDATE extension_storage SET value='"<profile>"' WHERE key='mcpVerifiedProfile'; then reopen Safari. ` +
+    `Restarting this server, rebuilding the app, or bumping its version do NOT help.`
   );
 }
 
