@@ -114,7 +114,28 @@ function _contentWakeTokenMatches(given) {
 // by their own MCP client on shutdown, so no cross-instance cleanup is needed here.
 
 // ========== SESSION ID (unique per MCP process — enables per-session tab tracking) ==========
-const SESSION_ID = randomUUID().slice(0, 8);
+// In HTTP-daemon mode currentSessionId() already isolates each MCP client (see
+// session-context.js), so the random half adds no isolation there — it only means a
+// daemon restart (launchd KeepAlive fires on every SIGTERM) invalidates every active
+// receipt and every tab-ownership record mid-task. Persist it so restarts are
+// survivable. Stdio mode keeps the per-process random id: there currentSessionId()
+// collapses to "_default", so SESSION_ID is the only thing separating processes.
+const SESSION_ID = _daemonSessionId();
+
+function _daemonSessionId() {
+  if (!process.env.SAFARI_MCP_HTTP) return randomUUID().slice(0, 8);
+  const file = join(OWNERSHIP_DIR, "daemon-session-id");
+  try {
+    const existing = readFileSync(file, "utf8").trim();
+    if (/^[0-9a-f]{8}$/.test(existing)) return existing;
+  } catch { /* first run, or unreadable — fall through and mint one */ }
+  const minted = randomUUID().slice(0, 8);
+  try {
+    if (!existsSync(OWNERSHIP_DIR)) mkdirSync(OWNERSHIP_DIR, { recursive: true });
+    writeFileSync(file, minted, { mode: 0o600 });
+  } catch { /* unwritable state dir: fall back to per-process id */ }
+  return minted;
+}
 
 // Persistent tab-ownership state + its helpers now live in ownership-state.js
 // (OWNERSHIP_* consts, _ownedTabURLs/_ownedTabTimestamps, _loadOwnershipFile,
@@ -292,7 +313,14 @@ async function _shutdown() {
 }
 
 for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
-  process.on(sig, _shutdown);
+  process.on(sig, () => {
+    // In HTTP-daemon mode this process is shared by every Claude Code session, and
+    // launchd KeepAlive restarts it — which silently drops each client's tab ownership
+    // mid-task. Name the signal so the cause of a restart is visible in the log
+    // instead of appearing as a bare "Cleanup:" line.
+    console.error(`[Safari MCP] Shutdown on ${sig} (ppid=${process.ppid}, uptime=${Math.round(process.uptime())}s)`);
+    _shutdown();
+  });
 }
 process.on("exit", () => {
   if (_openedTabs.size > 0) {
@@ -1360,6 +1388,19 @@ function _receiptToken(value) {
   return legacy ? legacy[1] : "";
 }
 
+// A caller-supplied receipt is the documented way for a stateless caller to name its
+// own tab ("Stateless callers can present a receipt" — extension/background.js). Only
+// switch_tab and get_tab_receipt exposed it, so after an MCP reconnect — which mints a
+// fresh session id and empties _activeReceipts — every other tool silently fell back to
+// the user's front tab and tripped the ownership guard. Accepting it here restores that
+// path, and adopting it as the session's active receipt keeps later calls working too.
+function _explicitReceipt(args) {
+  const token = _receiptToken(args?.receipt || "");
+  if (!token) return {};
+  _setActiveReceipt(token);
+  return { receipt: token };
+}
+
 const _activeReceipts = new Map();
 function _receiptSessionKey() {
   return `${SESSION_ID}:${currentSessionId()}`;
@@ -1874,12 +1915,13 @@ server.tool(
   "safari_read_page",
   "Read page text content (title, URL, body text). Use for reading article text or page content. For interacting with elements, prefer safari_snapshot (gives ref IDs). Use selector to read specific element. Use maxLength to limit output.",
   {
+    receipt: z.string().optional().describe("Opaque extension-issued tab receipt — keeps targeting that tab after an MCP reconnect"),
     selector: z.string().optional().describe("CSS selector to read specific element"),
     maxLength: z.coerce.number().optional().describe("Max chars to return (default: 50000)"),
   },
-  async ({ selector, maxLength }) => {
+  async ({ selector, maxLength, receipt }) => {
     const result = await extensionOrFallback(
-      "read_page", { selector, maxLength },
+      "read_page", { selector, maxLength, ..._explicitReceipt({ receipt }) },
       () => safari.readPage({ selector, maxLength })
     );
     return textResult(result);
@@ -1908,7 +1950,7 @@ server.tool(
   async (args) => {
     const gen = safari.getNextSnapshotGen();
     const result = await extensionOrFallback(
-      "snapshot", { selector: args.selector, gen },
+      "snapshot", { selector: args.selector, gen, ..._explicitReceipt(args) },
       () => safari.takeSnapshot({ ...args, _gen: gen })
     );
     return textResult(result);
@@ -1919,6 +1961,7 @@ server.tool(
   "safari_navigate_and_read",
   "Navigate to a URL and return the page content in one step — saves 1 full round-trip vs navigate+read_page. Use instead of safari_navigate + safari_read_page.",
   {
+    receipt: z.string().optional().describe("Opaque extension-issued tab receipt — keeps targeting that tab after an MCP reconnect"),
     url: z.string().describe("URL to navigate to"),
     maxLength: z.coerce.number().optional().describe("Max chars to return (default: 50000)"),
     timeout: z.coerce.number().optional().describe("Load timeout in ms (default: 30000)"),
@@ -1946,6 +1989,7 @@ server.tool(
   "safari_click",
   "Click element. Use ref (from snapshot), selector, text, or x/y. Works on React/Airtable/virtual DOM apps via full PointerEvent+MouseEvent sequence + React Fiber fallback. Pure JS — never touches user's mouse. When using ref, always take a FRESH safari_snapshot first — refs expire after each new snapshot.",
   {
+    receipt: z.string().optional().describe("Opaque extension-issued tab receipt — keeps targeting that tab after an MCP reconnect"),
     ref: z.string().optional().describe("Ref ID from safari_snapshot (e.g. '0_5')"),
     selector: z.string().optional().describe("CSS selector"),
     text: z.string().optional().describe("Visible text to find and click"),
@@ -1954,7 +1998,7 @@ server.tool(
   },
   async (args) => {
     const result = await extensionOrFallback(
-      "click", { ref: args.ref, selector: args.selector, text: args.text, x: args.x, y: args.y },
+      "click", { ref: args.ref, selector: args.selector, text: args.text, x: args.x, y: args.y, ..._explicitReceipt(args) },
       () => safari.click(args)
     );
     return textResult(result);
@@ -2002,13 +2046,14 @@ server.tool(
   "safari_double_click",
   "Double-click an element by CSS selector or x/y coordinates (e.g. to select a word in text)",
   {
+    receipt: z.string().optional().describe("Opaque extension-issued tab receipt — keeps targeting that tab after an MCP reconnect"),
     selector: z.string().optional().describe("CSS selector"),
     x: z.coerce.number().optional().describe("X coordinate"),
     y: z.coerce.number().optional().describe("Y coordinate"),
   },
   async (args) => {
     const result = await extensionOrFallback(
-      "double_click", { selector: args.selector, x: args.x, y: args.y },
+      "double_click", { selector: args.selector, x: args.x, y: args.y, ..._explicitReceipt(args) },
       () => safari.doubleClick(args)
     );
     return textResult(result);
@@ -2135,6 +2180,7 @@ server.tool(
   "safari_fill",
   "Fill/replace value in an input, textarea, select, OR contenteditable (rich text). Handles React controlled inputs, ProseMirror, Draft.js, and Google Closure editors automatically. Use for SETTING a value (replaces existing). For code editors (Monaco/CodeMirror/Ace), use safari_replace_editor instead. For character-by-character typing in search boxes, use safari_type_text. IMPORTANT: When using ref, always take a FRESH safari_snapshot first — refs expire after each new snapshot (prefix changes: 5_xx → 6_xx).",
   {
+    receipt: z.string().optional().describe("Opaque extension-issued tab receipt — keeps targeting that tab after an MCP reconnect"),
     ref: z.string().optional().describe("Ref ID from safari_snapshot"),
     selector: z.string().optional().describe("CSS selector"),
     value: z.string().describe("Value to fill"),
@@ -2142,7 +2188,7 @@ server.tool(
   async (args) => {
     const selector = args.ref ? `[data-mcp-ref="${args.ref}"]` : args.selector;
     const result = await extensionOrFallback(
-      "fill", { selector, value: args.value },
+      "fill", { selector, value: args.value, ..._explicitReceipt(args) },
       () => safari.fill(args)
     );
     return textResult(result);
@@ -2155,7 +2201,7 @@ server.tool(
   { selector: z.string().describe("CSS selector of the input") },
   async (args) => {
     const result = await extensionOrFallback(
-      "clear_field", { selector: args.selector },
+      "clear_field", { selector: args.selector, ..._explicitReceipt(args) },
       () => safari.clearField(args)
     );
     return textResult(result);
@@ -2166,6 +2212,7 @@ server.tool(
   "safari_verify_state",
   "Verify the framework-level state of an editor/input matches the expected value. Returns JSON {match, mode, actual, expected, hint?}. Modern editors (ProseMirror, Lexical, Closure, React-controlled inputs) maintain state separately from the DOM — `.value` or `.textContent` may show new text while the internal store still holds old data, so a Submit click sends stale data. Call this AFTER safari_fill and BEFORE clicking Submit on critical forms (Featured.com, LinkedIn share, Medium, Reddit).",
   {
+    receipt: z.string().optional().describe("Opaque extension-issued tab receipt — keeps targeting that tab after an MCP reconnect"),
     selector: z.string().describe("CSS selector of the editor/input to verify"),
     expected: z.string().describe("Expected value or text fragment that should appear in framework state"),
   },
@@ -2179,6 +2226,7 @@ server.tool(
   "safari_select_option",
   "Select an option in a native <select> dropdown. Sets .value and dispatches change event. Pass `ref` (from safari_snapshot) for a select inside an iframe or shadow DOM — a plain `selector` only reaches the top document. For custom dropdowns (React/LinkedIn), use safari_click on the dropdown trigger, then safari_click on the option instead.",
   {
+    receipt: z.string().optional().describe("Opaque extension-issued tab receipt — keeps targeting that tab after an MCP reconnect"),
     selector: z.string().optional().describe("CSS selector of the select (top document only)"),
     ref: z.string().optional().describe("Ref ID from safari_snapshot — required for selects inside iframes/shadow DOM"),
     value: z.string().describe("Option value or visible label to select"),
@@ -2193,7 +2241,7 @@ server.tool(
       return { content: [{ type: "text", text: typeof refResult === 'string' ? refResult : JSON.stringify(refResult) }] };
     }
     let result = await extensionOrFallback(
-      "select_option", { selector: args.selector, value: args.value },
+      "select_option", { selector: args.selector, value: args.value, ..._explicitReceipt(args) },
       () => safari.selectOption(args)
     );
     // If extension returned "Selected: " with empty/default value, fuzzy match may have failed.
@@ -2258,12 +2306,13 @@ server.tool(
   "safari_press_key",
   "Press a keyboard key (enter, tab, escape, arrows, etc). Supports modifiers (cmd, shift, alt, ctrl).",
   {
+    receipt: z.string().optional().describe("Opaque extension-issued tab receipt — keeps targeting that tab after an MCP reconnect"),
     key: z.string().describe("Key name: enter, tab, escape, space, delete, up, down, left, right, or a single character"),
     modifiers: z.array(z.string()).optional().describe("Modifier keys: cmd, shift, alt, ctrl"),
   },
   async (args) => {
     const result = await extensionOrFallback(
-      "press_key", { key: args.key, modifiers: args.modifiers },
+      "press_key", { key: args.key, modifiers: args.modifiers, ..._explicitReceipt(args) },
       () => safari.pressKey(args)
     );
     return textResult(result);
@@ -2274,13 +2323,14 @@ server.tool(
   "safari_type_text",
   "Type text character-by-character with realistic key events. Best for: search boxes (triggers autocomplete), chat inputs, and fields that react to each keystroke. For rich text editors (Medium, HackerNoon, LinkedIn), use safari_fill instead — it uses framework-native APIs. For code editors (Monaco/CodeMirror), use safari_replace_editor. When using ref, always take a FRESH safari_snapshot first — refs expire after each new snapshot.",
   {
+    receipt: z.string().optional().describe("Opaque extension-issued tab receipt — keeps targeting that tab after an MCP reconnect"),
     text: z.string().describe("Text to type"),
     ref: z.string().optional().describe("Ref ID from safari_snapshot"),
     selector: z.string().optional().describe("CSS selector to focus"),
   },
   async (args) => {
     const result = await extensionOrFallback(
-      "type_text", { text: args.text, selector: args.ref ? `[data-mcp-ref="${args.ref}"]` : args.selector },
+      "type_text", { text: args.text, selector: args.ref ? `[data-mcp-ref="${args.ref}"]` : args.selector, ..._explicitReceipt(args) },
       () => safari.typeText(args)
     );
     return textResult(result);
@@ -2310,13 +2360,14 @@ server.tool(
   "safari_screenshot",
   "Take a visual screenshot (base64 JPEG). EXPENSIVE — use safari_snapshot instead for most tasks. Only use screenshot when you need to verify visual layout, styling, images, or colors that snapshot can't show.",
   {
+    receipt: z.string().optional().describe("Opaque extension-issued tab receipt — keeps targeting that tab after an MCP reconnect"),
     fullPage: z.boolean().optional().describe("Capture full page (not just viewport)"),
   },
-  async ({ fullPage }) => {
+  async ({ fullPage, receipt }) => {
     let base64;
     try {
       base64 = await extensionOrFallback(
-        "screenshot", { fullPage },
+        "screenshot", { fullPage, ..._explicitReceipt({ receipt }) },
         () => safari.screenshot({ fullPage })
       );
     } catch (err) {
@@ -2356,12 +2407,13 @@ server.tool(
   "safari_scroll",
   "Scroll the page up or down by a specified amount",
   {
+    receipt: z.string().optional().describe("Opaque extension-issued tab receipt — keeps targeting that tab after an MCP reconnect"),
     direction: z.enum(["up", "down"]).optional().describe("Scroll direction (default: down)"),
     amount: z.coerce.number().optional().describe("Pixels to scroll (default: 500)"),
   },
   async (args) => {
     const result = await extensionOrFallback(
-      "scroll", { direction: args.direction, amount: args.amount },
+      "scroll", { direction: args.direction, amount: args.amount, ..._explicitReceipt(args) },
       () => safari.scroll(args)
     );
     return textResult(result);
@@ -2585,13 +2637,14 @@ server.tool(
   "safari_wait_for",
   "Wait for an element or text to appear on the page",
   {
+    receipt: z.string().optional().describe("Opaque extension-issued tab receipt — keeps targeting that tab after an MCP reconnect"),
     selector: z.string().optional().describe("CSS selector to wait for"),
     text: z.string().optional().describe("Text to wait for"),
     timeout: z.coerce.number().optional().describe("Timeout in ms (default: 10000)"),
   },
   async (args) => {
     const result = await extensionOrFallback(
-      "wait_for", { selector: args.selector, text: args.text, timeout: args.timeout },
+      "wait_for", { selector: args.selector, text: args.text, timeout: args.timeout, ..._explicitReceipt(args) },
       () => safari.waitFor(args)
     );
     return textResult(result);
@@ -2663,10 +2716,13 @@ server.tool(
 server.tool(
   "safari_evaluate",
   "Execute JavaScript in the current page. Automatically falls back to AppleScript when CSP blocks execution (e.g. Google Search Console, LinkedIn). For reading data, prefer safari_read_page or safari_snapshot. For interactions, prefer safari_click/fill with refs.",
-  { script: z.string().describe("JavaScript code to execute") },
+  {
+    script: z.string().describe("JavaScript code to execute"),
+    receipt: z.string().optional().describe("Opaque extension-issued tab receipt — pass the one safari_new_tab returned to keep targeting that tab after an MCP reconnect"),
+  },
   async (args) => {
     const result = await extensionOrFallback(
-      "evaluate", { script: args.script },
+      "evaluate", { script: args.script, ..._explicitReceipt(args) },
       () => safari.evaluate(args)
     );
     return { content: [{ type: "text", text: (typeof result === 'string' ? result : JSON.stringify(result)) || "(no return value)" }] };
@@ -2721,6 +2777,7 @@ server.tool(
   "safari_hover",
   "Hover over element. Use ref, selector, or x/y",
   {
+    receipt: z.string().optional().describe("Opaque extension-issued tab receipt — keeps targeting that tab after an MCP reconnect"),
     ref: z.string().optional().describe("Ref ID from safari_snapshot"),
     selector: z.string().optional().describe("CSS selector"),
     x: z.coerce.number().optional().describe("X coordinate"),
@@ -2729,7 +2786,7 @@ server.tool(
   async (args) => {
     const sel = args.ref ? `[data-mcp-ref="${args.ref}"]` : args.selector;
     const result = await extensionOrFallback(
-      "hover", { selector: sel },
+      "hover", { selector: sel, ..._explicitReceipt(args) },
       () => safari.hover(args)
     );
     return textResult(result);
@@ -2742,6 +2799,7 @@ server.tool(
   "safari_handle_dialog",
   "Set up handler for the next alert/confirm/prompt dialog",
   {
+    receipt: z.string().optional().describe("Opaque extension-issued tab receipt — keeps targeting that tab after an MCP reconnect"),
     action: z.enum(["accept", "dismiss"]).optional().describe("Accept or dismiss (default: accept)"),
     text: z.string().optional().describe("Text to enter for prompt dialogs"),
   },
@@ -2997,6 +3055,7 @@ server.tool(
   "safari_accessibility_snapshot",
   "Get the accessibility tree of the page (roles, ARIA labels, focusable elements, form states). Essential for a11y auditing.",
   {
+    receipt: z.string().optional().describe("Opaque extension-issued tab receipt — keeps targeting that tab after an MCP reconnect"),
     selector: z.string().optional().describe("CSS selector for subtree (default: full page)"),
     maxDepth: z.coerce.number().optional().describe("Max tree depth (default: 5)"),
   },
@@ -3208,6 +3267,7 @@ server.tool(
   "safari_network_details",
   "Get captured network requests with full details (must call safari_start_network_capture first)",
   {
+    receipt: z.string().optional().describe("Opaque extension-issued tab receipt — keeps targeting that tab after an MCP reconnect"),
     limit: z.coerce.number().optional().describe("Max requests (default: 50)"),
     filter: z.string().optional().describe("Filter by URL substring"),
   },
@@ -3458,6 +3518,7 @@ server.tool(
   "safari_scroll_to_element",
   "Scroll to element by CSS selector OR text. For virtual DOM (Airtable) use text — scrolls down until text appears in DOM.",
   {
+    receipt: z.string().optional().describe("Opaque extension-issued tab receipt — keeps targeting that tab after an MCP reconnect"),
     selector: z.string().optional().describe("CSS selector of target element"),
     text: z.string().optional().describe("Text to find — scrolls down until it appears (for virtual DOM/lazy loading)"),
     block: z.enum(["start", "center", "end", "nearest"]).optional().describe("Scroll alignment (default: center)"),
@@ -3466,7 +3527,7 @@ server.tool(
   async (args) => {
     const result = await extensionOrFallback(
       "scroll_to_element",
-      { selector: args.selector, text: args.text, block: args.block },
+      { selector: args.selector, text: args.text, block: args.block, ..._explicitReceipt(args) },
       () => safari.scrollToElement(args)
     );
     return textResult(result);
