@@ -1087,11 +1087,17 @@ async function handleCommand(type, payload) {
         );
         if (!r || r.ok !== true) throw new Error((r && r.error) || "content bridge failed");
         _injectionBlockedTabs.add(evalTabId);
+        if (evalOrigin) _injectionBlockedOrigins.set(evalOrigin, Date.now() + _INJECTION_BLOCK_TTL_MS);
         return r.value;
       };
-      if (_injectionBlockedTabs.has(evalTabId)) {
+      const evalOrigin = _originKey(targetTab?.url);
+      const originBlocked = !!evalOrigin && (_injectionBlockedOrigins.get(evalOrigin) || 0) > Date.now();
+      if (_injectionBlockedTabs.has(evalTabId) || originBlocked) {
         try { return await viaBridge(); }
-        catch (_e) { _injectionBlockedTabs.delete(evalTabId); } // page changed — re-probe
+        catch (_e) { // page changed — re-probe
+          _injectionBlockedTabs.delete(evalTabId);
+          if (evalOrigin) _injectionBlockedOrigins.delete(evalOrigin);
+        }
       }
 
       // First contact with a hardened page: every execInTab strategy below will stall.
@@ -1202,14 +1208,23 @@ async function handleCommand(type, payload) {
       // If it fails, fall back to AppleScript screencapture -l (which also doesn't steal focus).
       // NEVER use browser.windows.update({ focused: true }) — it steals user's keyboard/mouse.
       let captureWindowId = _profileWindowId || null;
+      // captureVisibleTab only sees the window's selected tab, so ours must be selected for
+      // the capture — but the selection belongs to the user when they browse this window.
+      // Remember what they had selected and put it back (the AppleScript path already does
+      // this via _withTargetTabFronted; this path used to leave our tab in front).
+      let restoreTabId = null;
       if (tabId) {
         try {
           const tabInfo = await browser.tabs.get(tabId);
           captureWindowId = tabInfo.windowId;
-          // Only activate the correct tab — does NOT bring Safari window to foreground
-          await browser.tabs.update(tabId, { active: true });
+          if (!tabInfo.active) {
+            const [selected] = await browser.tabs.query({ active: true, windowId: tabInfo.windowId });
+            if (selected && selected.id !== tabId) restoreTabId = selected.id;
+            // Only selects the tab — does NOT bring the Safari window to the foreground
+            await browser.tabs.update(tabId, { active: true });
+            await new Promise(r => setTimeout(r, 150));
+          }
         } catch (_) {}
-        await new Promise(r => setTimeout(r, 150));
       }
       // Use JPEG with quality 50 to reduce size (~600KB PNG → ~60KB JPEG)
       try {
@@ -1227,6 +1242,8 @@ async function handleCommand(type, payload) {
         }
         // Any other error also falls back — better than stealing focus
         return "__SCREENSHOT_PERMISSION_DENIED__";
+      } finally {
+        if (restoreTabId !== null) browser.tabs.update(restoreTabId, { active: true }).catch(() => {});
       }
     }
 
@@ -3717,6 +3734,15 @@ const MAIN_WORLD_INJECT_MS = 3000;
 // pages fast instead of merely working. Cleared when the tab navigates or closes, so a
 // page that stops blocking injection is re-probed rather than downgraded forever.
 const _injectionBlockedTabs = new Set();
+// Same fact, keyed by origin: the per-tab set is cleared on every navigation, so a hardened
+// SPA (business.facebook.com) re-paid the ~10s probe on the first evaluate after EACH
+// navigate — 356 evaluates ≥10s in one week. An origin that blocked injection once is sent
+// straight to the bridge for a few hours; a bridge failure clears it and re-probes.
+const _injectionBlockedOrigins = new Map(); // origin → expiry (ms)
+const _INJECTION_BLOCK_TTL_MS = 6 * 60 * 60 * 1000;
+function _originKey(url) {
+  try { return new URL(String(url || "")).origin; } catch { return ""; }
+}
 function _withInjectionDeadline(promise, ms = MAIN_WORLD_INJECT_MS) {
   let timer;
   return Promise.race([

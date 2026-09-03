@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`safari_screenshot` can downscale before returning (`maxWidth`, or `SAFARI_MCP_SCREENSHOT_MAX_WIDTH` for a daemon-wide default).** Retina captures are 3024px wide — about 1,900 tokens each even after the API's own cap; 1280 keeps text readable at a third fewer tokens, 800 is plenty for layout checks. Uses the system `sips`, no new dependency; the original is returned untouched on any failure.
+- **`receipt` on 14 more tools** (`safari_navigate`, `go_back`, `go_forward`, `reload`, `snapshot`, `query_all`, `get_element`, `scroll_to`, `screenshot_element`, `click_and_read`, `right_click`, `clear_field`, `fill_form`, `replace_editor`). `snapshot` and `clear_field` already forwarded it internally, but their schemas dropped it silently.
+- **`safari_navigate` returns a fresh `receipt` when the navigation changed origin.** A receipt is bound to the origin it was minted on, so navigating your own tab to another site stranded every following call on "not valid for this origin" (~80 failures a week on one machine). That error now also says how to recover.
+- **Daemon log lines carry a wall-clock prefix** (`SAFARI_MCP_HTTP=1` only), so focus-restore traces can be matched to the operation that was running.
+
+### Changed
+- **Tab results are compact.** `list_tabs` no longer echoes `"active": false`, empty titles, or titles beyond 80 characters — roughly a third of its bytes; it was returning up to 30KB per call.
+- **Tool descriptions steer toward the receipt workflow:** keep the receipt from `safari_new_tab`, pass it on every call, skip `list_tabs`/`switch_tab`.
+
+### Fixed
+- **In a named profile, a parked extension worker no longer fails the first command after idle.** Safari suspends the idle worker; 30s later the daemon declared it gone and rejected everything queued with "Extension disconnected: HTTP poll timeout" — while nothing could have run those commands instead (a profile has no AppleScript fallback). Queued commands now wait for the worker's wake (Safari's 1-minute alarm at the latest), and `new_tab`/`list_tabs` get 75s to outlive that cycle.
+- **Extension: screenshots put the user's selected tab back.** `captureVisibleTab` needs the owned tab selected; the extension path left it selected afterwards, so a user browsing the same window lost their tab on every screenshot (the AppleScript path already restored it).
+- **Extension: a hardened site's injection block is remembered per origin.** business.facebook.com stalls script injection; the per-tab memory was cleared on every navigation, so the first `evaluate` after each navigate paid the ~10s probe again (356 evaluates ≥10s in one week). The origin now goes straight to the content bridge for six hours. Extension manifest 2.10.8.
+
 ## [2.17.1] - 2026-09-01
 
 ### Fixed
