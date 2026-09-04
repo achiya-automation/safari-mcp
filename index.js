@@ -742,6 +742,16 @@ try {
       return;
     }
 
+    // GET /keepalive — a plain page for the keepalive tab (SAFARI_MCP_KEEPALIVE_TAB=1).
+    // Any http(s) page of the profile hosts the content script, whose wake long-poll and
+    // runtime pings are what keep Safari's MV3 worker from parking; this page exists so
+    // there is always one, even after every owned tab was closed or Safari was relaunched.
+    if (req.method === "GET" && req.url.split("?")[0].split("#")[0] === "/keepalive") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+      res.end(KEEPALIVE_HTML);
+      return;
+    }
+
     // Every Safari-extension HTTP endpoint is authenticated in addition to its
     // CORS check. Origin alone is not authority: another extension has its own
     // extension-scheme origin, and a local process can forge or omit Origin.
@@ -880,6 +890,7 @@ try {
           _extensionConnected = true;
           console.error("[Safari MCP] Extension connected via HTTP polling");
         }
+        _scheduleKeepaliveTab();
       }
       if (!process.env.SAFARI_PROFILE) _extensionLastPollTime = Date.now();
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -933,6 +944,7 @@ try {
         console.error("[Safari MCP] Extension connected and profile-verified via HTTP polling");
       }
       _extensionLastPollTime = Date.now();
+      _scheduleKeepaliveTab();
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "verified" }));
       return;
@@ -1164,6 +1176,13 @@ async function _proxyToExtension(type, payload, timeoutMs = 30000) {
 // Detect stale HTTP connection (no poll in 30s = disconnected)
 // Only applies to primary instance (extension host) — not proxy mode
 const _staleHttpTimer = setInterval(() => {
+  // After a daemon restart the profile worker can sit in its reconnect backoff for minutes
+  // (measured 9 min on 4.9.26) while pages of the profile are already long-polling us for
+  // wake-ups. Releasing those polls makes each page ping the worker, and a pinged worker
+  // retries /connect at once (extension ≥2.10.9) instead of waiting out the backoff.
+  if (_isExtensionHost && process.env.SAFARI_PROFILE && !_profileExtensionVerified && _contentWakePolls.size) {
+    _releaseContentWakePolls();
+  }
   if (_isExtensionHost && _extensionConnected && !_extensionWs && _extensionLastPollTime > 0) {
     if (Date.now() - _extensionLastPollTime > _HTTP_WORKER_DISCONNECT_MS) {
       // A command already delivered to this worker is an at-most-once fence.
@@ -1328,6 +1347,44 @@ const _commandTimeouts = {
 // http(s) tab of the profile is open — its content script relays the wake). The two commands
 // that typically arrive first after idle must outlive that cycle instead of failing at 30s.
 if (process.env.SAFARI_PROFILE) { _commandTimeouts.new_tab = 75000; _commandTimeouts.list_tabs = 75000; }
+
+// ========== KEEPALIVE TAB (opt-in) ==========
+// Safari parks an idle extension worker; the first command afterwards then waits for the
+// 1-minute alarm (measured: new_tab 18s, or a hard failure before the queue fix). A page of
+// the profile that carries the content script relays wake-ups instantly and keeps the worker
+// alive — so keep exactly one such page open, served by this daemon itself.
+const KEEPALIVE_TAB_ENABLED = process.env.SAFARI_MCP_KEEPALIVE_TAB === "1";
+const KEEPALIVE_HTML = '<!doctype html><html lang="he" dir="rtl"><head><meta charset="utf-8"><title>Safari MCP · keepalive</title><meta name="robots" content="noindex"><style>body{font-family:-apple-system,system-ui,sans-serif;margin:3rem auto;max-width:36rem;padding:0 1rem;color:#1a2230;background:#f3f5f8;line-height:1.6}code{background:#ddeff2;padding:.1em .4em;border-radius:3px}</style></head><body><h1>Safari MCP</h1><p>הטאב הזה משאיר את ההרחבה ערה ברקע, כדי שהפקודה הראשונה אחרי הפסקה תרוץ מיד. אפשר להשאיר אותו פתוח; אם סוגרים אותו, הוא ייפתח שוב לבד.</p><p>לביטול: <code>SAFARI_MCP_KEEPALIVE_TAB=0</code> בהגדרות הדמון.</p></body></html>';
+const KEEPALIVE_URL = `http://127.0.0.1:${HTTP_PORT}/keepalive`;
+const KEEPALIVE_SESSION = `${SESSION_ID}:keepalive`;
+let _keepaliveBusy = false;
+let _keepaliveTimer = null;
+async function _ensureKeepaliveTab() {
+  if (!KEEPALIVE_TAB_ENABLED || _keepaliveBusy || !_isExtensionHost || !_extensionConnected) return;
+  if (_preferAppleScript && !_profileExtensionVerified) return;
+  _keepaliveBusy = true;
+  try {
+    const tabs = await sendToExtension("list_tabs", { sessionId: KEEPALIVE_SESSION }, 30000);
+    const list = Array.isArray(tabs) ? tabs : [];
+    // No window at all → new_tab would have to create one, and a WebExtension-created
+    // window is not guaranteed to land in this profile. Wait for a real window instead.
+    if (!list.length) return;
+    if (list.some((t) => String(t?.safeUrl || t?.url || "").startsWith(KEEPALIVE_URL))) return;
+    await sendToExtension("new_tab", { url: KEEPALIVE_URL, sessionId: KEEPALIVE_SESSION }, 45000);
+    console.error(`[Safari MCP] keepalive tab opened (${KEEPALIVE_URL})`);
+  } catch (err) {
+    console.error(`[Safari MCP] keepalive tab check skipped: ${err.message}`);
+  } finally {
+    _keepaliveBusy = false;
+  }
+}
+function _scheduleKeepaliveTab(delayMs = 3000) {
+  if (!KEEPALIVE_TAB_ENABLED) return;
+  if (_keepaliveTimer) clearTimeout(_keepaliveTimer);
+  _keepaliveTimer = setTimeout(() => { _keepaliveTimer = null; void _ensureKeepaliveTab(); }, delayMs);
+  _keepaliveTimer.unref();
+}
+if (KEEPALIVE_TAB_ENABLED) setInterval(() => void _ensureKeepaliveTab(), 10 * 60 * 1000).unref();
 
 // Commands where null result means failure (should fall back to AppleScript)
 const _nullMeansFailure = new Set([

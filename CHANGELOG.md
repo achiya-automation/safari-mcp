@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Keepalive tab (`SAFARI_MCP_KEEPALIVE_TAB=1`).** Safari parks an idle extension worker, and the first command afterwards waited for the 1-minute alarm (measured: `new_tab` 18s). The daemon now serves a tiny page at `/keepalive` on its bridge port and keeps exactly one such tab open in the profile window; its content script relays wake-ups instantly. Never creates a window — only a tab in an existing one.
+- **Profile-window self-heal (`SAFARI_MCP_OPEN_WINDOW_CMD`).** When the profile window stays absent for three detection cycles (a reboot, a closed window — 198 refusals in one log), the daemon runs the configured command with the profile name, at most every 2 minutes, then rediscovers the window. The command must open the window without focusing Safari.
+- **Extension: a content-script ping makes a backed-off worker retry the bridge immediately**, and the daemon releases pending wake polls while it has no verified worker — after a daemon restart the profile re-verifies in seconds instead of sitting in a reconnect backoff (measured 9 minutes on 4.9.26). Manifest 2.10.9.
+
 ## [2.18.1] - 2026-09-04
 
 ### Security

@@ -304,6 +304,7 @@ async function refreshTargetWindow(force = false) {
     _targetWindowCacheTime = 0;
     _profileWindowMissing = true;
     _profileMisses++;
+    _maybeOpenProfileWindow();
     // Log on transition into the missing state, then at most once per 5 minutes —
     // this steady state used to append one line per poll, unbounded (#81).
     if (_profileMisses === 1 || now - _lastMissingLogTime > 300000) {
@@ -311,6 +312,27 @@ async function refreshTargetWindow(force = false) {
       _logProfile(`WARNING: Profile "${SAFARI_PROFILE}" window not found — refusing to use front window`);
     }
   }
+}
+
+// ponytail: opt-in self-heal for the "profile window is closed" steady state (198 refusals in
+// one log, every morning after a reboot). SAFARI_MCP_OPEN_WINDOW_CMD is run with the profile
+// name once absence is established (3 consecutive misses), at most every 2 minutes; the poll
+// below then rediscovers the window. The command must open the window WITHOUT focusing
+// Safari (e.g. ~/bin/safari-bg-window, which presses the File-menu item via Accessibility).
+const OPEN_WINDOW_CMD = process.env.SAFARI_MCP_OPEN_WINDOW_CMD || "";
+let _lastOpenWindowAttempt = 0;
+function _maybeOpenProfileWindow() {
+  if (!OPEN_WINDOW_CMD || !SAFARI_PROFILE || _profileMisses < 3) return;
+  const now = Date.now();
+  if (now - _lastOpenWindowAttempt < 120000) return;
+  _lastOpenWindowAttempt = now;
+  _logProfile(`Profile "${SAFARI_PROFILE}" window absent — running ${OPEN_WINDOW_CMD}`);
+  execFileAsync(OPEN_WINDOW_CMD, [SAFARI_PROFILE], { timeout: 30000 })
+    .then(() => {
+      _profileMisses = 0; // re-arm the subprocess retry for the fresh window
+      setTimeout(() => { refreshTargetWindow(true).catch(() => {}); }, 3000).unref();
+    })
+    .catch((err) => _logProfile(`Open-window command failed: ${err.message}`));
 }
 
 // Background verification: periodically check that cached window ID still belongs to profile

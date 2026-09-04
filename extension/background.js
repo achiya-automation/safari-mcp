@@ -452,6 +452,13 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (Object.keys(msg).length !== 1) return false;
     if (!Number.isInteger(sender?.tab?.id)) return false;
     if (!_enabled || _bridgeWorkerSuperseded || _bridgeWorkerRetiring) return false;
+    // A page pinging while this worker sits in reconnect backoff is the earliest sign that
+    // the bridge is reachable again (the daemon releases wake polls while it has no verified
+    // worker). Retry now instead of waiting out a backoff of up to a minute.
+    if (!isConnected && !_connecting) {
+      if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
+      connect();
+    }
     sendResponse({ ok: true });
     return false;
   }

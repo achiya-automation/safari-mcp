@@ -485,6 +485,11 @@ test("background accepts only a page-bound authority-free keepalive message", ()
     _enabled: true,
     _bridgeWorkerSuperseded: false,
     _bridgeWorkerRetiring: false,
+    // The ping also nudges a backed-off worker to reconnect; a connected worker stays put.
+    isConnected: true,
+    _connecting: false,
+    _reconnectTimer: null,
+    connect() { throw new Error("connected worker must not reconnect on a ping"); },
   };
   vm.runInNewContext(listenerSource, context);
 
