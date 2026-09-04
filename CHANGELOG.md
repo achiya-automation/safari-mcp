@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.18.0] - 2026-09-04
+
 ### Added
 - **`safari_screenshot` can downscale before returning (`maxWidth`, or `SAFARI_MCP_SCREENSHOT_MAX_WIDTH` for a daemon-wide default).** Retina captures are 3024px wide — about 1,900 tokens each even after the API's own cap; 1280 keeps text readable at a third fewer tokens, 800 is plenty for layout checks. Uses the system `sips`, no new dependency; the original is returned untouched on any failure.
 - **`receipt` on 14 more tools** (`safari_navigate`, `go_back`, `go_forward`, `reload`, `snapshot`, `query_all`, `get_element`, `scroll_to`, `screenshot_element`, `click_and_read`, `right_click`, `clear_field`, `fill_form`, `replace_editor`). `snapshot` and `clear_field` already forwarded it internally, but their schemas dropped it silently.
@@ -21,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **In a named profile, a parked extension worker no longer fails the first command after idle.** Safari suspends the idle worker; 30s later the daemon declared it gone and rejected everything queued with "Extension disconnected: HTTP poll timeout" — while nothing could have run those commands instead (a profile has no AppleScript fallback). Queued commands now wait for the worker's wake (Safari's 1-minute alarm at the latest), and `new_tab`/`list_tabs` get 75s to outlive that cycle.
 - **Extension: screenshots put the user's selected tab back.** `captureVisibleTab` needs the owned tab selected; the extension path left it selected afterwards, so a user browsing the same window lost their tab on every screenshot (the AppleScript path already restored it).
 - **Extension: a hardened site's injection block is remembered per origin.** business.facebook.com stalls script injection; the per-tab memory was cleared on every navigation, so the first `evaluate` after each navigate paid the ~10s probe again (356 evaluates ≥10s in one week). The origin now goes straight to the content bridge for six hours. Extension manifest 2.10.8.
+- **A tab survives an MCP reconnect or daemon restart.** `SESSION_ID` was a fresh `randomUUID` on every start, so after any reconnect every tool fell through to the user's active tab and was stopped by the ownership guard. The HTTP daemon now persists its session identity to disk (stdio stays random per process), and a receipt minted before three restarts still reads and writes the right tab. Signal exits are logged with signal, ppid and uptime instead of appearing as an orphaned `Cleanup` line.
+- **Background connection hardening.** Content-script wake-ups carry an HMAC token derived from the bridge token; a successor worker may take over only within a 20s grace and never while a mutation is already dispatched to the active worker; queued commands whose request timer expired are dropped instead of being delivered out of band. 40+ new tests across bridge auth, profile routing and worker keepalive.
+- **The "profile extension unavailable" diagnosis names the real cause.** After three distinct workers fail profile proof, the daemon prints once that `mcpVerifiedProfile` in extension storage holds a nonce-suffixed value (`"<profile> — mcp-profile-check-<nonce>"`) instead of the bare profile name, the exact fix command, and the warning that a daemon restart cannot help because the stuck worker lives inside Safari (read the storage DB together with its WAL — `mode=ro` returns a stale value).
 
 ## [2.17.1] - 2026-09-01
 
