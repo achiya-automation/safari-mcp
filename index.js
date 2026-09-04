@@ -417,6 +417,10 @@ const _HTTP_WORKER_TTL_MS = 60 * 1000;
 const _HTTP_RELOAD_HANDOFF_TTL_MS = 30 * 1000;
 const _HTTP_WORKER_SUCCESSOR_GRACE_MS = 20 * 1000;
 const _HTTP_WORKER_DISCONNECT_MS = 30 * 1000;
+// Safari parks an idle profile worker every ~30s and its 1-minute alarm wakes it. Declaring
+// it gone in between bought nothing (a profile has no fallback) and cost a full
+// re-verification per minute — 61 flaps in two hours. Wait one alarm cycle plus margin.
+const _HTTP_WORKER_PARK_GRACE_MS = 75 * 1000;
 let _extensionLastPollTime = 0;
 let _extensionLastHeartbeat = 0;
 let _reloadHttpWorkerHandoff = null;
@@ -1185,6 +1189,7 @@ const _staleHttpTimer = setInterval(() => {
   }
   if (_isExtensionHost && _extensionConnected && !_extensionWs && _extensionLastPollTime > 0) {
     if (Date.now() - _extensionLastPollTime > _HTTP_WORKER_DISCONNECT_MS) {
+      if (process.env.SAFARI_PROFILE && Date.now() - _extensionLastPollTime <= _HTTP_WORKER_PARK_GRACE_MS) return;
       // A command already delivered to this worker is an at-most-once fence.
       // Its own bounded request timer releases the fence; disconnect cleanup must
       // not make an ordinary successor eligible while the old worker may finish it.
@@ -1483,11 +1488,26 @@ function _safeUrlForOutput(rawUrl) {
   }
 }
 
+// Receipts this daemon rotated on the caller's behalf (a cross-origin safari_navigate) stay
+// usable under their old name: callers routinely keep the first receipt they saw and ignore
+// the fresh one in the navigate result (nine consecutive "not valid for this origin" failures
+// in one session on 4.9.26). Whoever held the old capability held the tab.
+const _receiptAliases = new Map(); // old token → newer token
+function _aliasReceipt(oldToken, newToken) {
+  if (!oldToken || !newToken || oldToken === newToken) return;
+  _receiptAliases.set(oldToken, newToken);
+  if (_receiptAliases.size > 500) _receiptAliases.delete(_receiptAliases.keys().next().value);
+}
 function _receiptToken(value) {
   const raw = String(value || "");
-  if (/^[A-Za-z0-9_-]{24,}$/.test(raw)) return raw;
-  const legacy = raw.match(/(?:[?#&])mcp-tab=([A-Za-z0-9_-]{24,})(?:[&#]|$)/);
-  return legacy ? legacy[1] : "";
+  let token = "";
+  if (/^[A-Za-z0-9_-]{24,}$/.test(raw)) token = raw;
+  else {
+    const legacy = raw.match(/(?:[?#&])mcp-tab=([A-Za-z0-9_-]{24,})(?:[&#]|$)/);
+    token = legacy ? legacy[1] : "";
+  }
+  for (let hops = 0; token && _receiptAliases.has(token) && hops < 8; hops++) token = _receiptAliases.get(token);
+  return token;
 }
 
 // A caller-supplied receipt is the documented way for a stateless caller to name its
@@ -1993,12 +2013,17 @@ server.tool(
     // origin", ~80×/week). The caller chose the destination, so rotating here is safe —
     // hand back the new receipt instead of letting the caller discover the trap.
     const landed = result && typeof result === "object" ? result.url : "";
-    if (landed && _originOf(landed) !== _originOf(oldUrl) && _receiptToken(receipt || _getActiveReceipt())) {
+    const usedReceipt = _receiptToken(receipt || _getActiveReceipt());
+    if (landed && _originOf(landed) !== _originOf(oldUrl) && usedReceipt) {
       try {
         const fresh = _sanitizeTabResult(await extensionOrFallback(
           "get_tab_receipt", { ..._explicitReceipt({ receipt }) }, () => null
         ));
-        if (fresh?.receipt) { _setActiveReceipt(fresh.receipt); result = { ...result, receipt: fresh.receipt }; }
+        if (fresh?.receipt) {
+          _aliasReceipt(usedReceipt, fresh.receipt);
+          _setActiveReceipt(fresh.receipt);
+          result = { ...result, receipt: fresh.receipt };
+        }
       } catch { /* the navigation itself succeeded — a failed rotation must not fail the tool */ }
     }
     return textResult(result);
@@ -2625,6 +2650,7 @@ server.tool(
     // session now gets its own MAX_TABS and can only evict its own.
     const mySession = `${SESSION_ID}:${currentSessionId()}`;
     const myTabs = [..._openedTabs].filter(([, info]) => (info.sessionId || "") === mySession);
+    let evictedTab = null;
     if (myTabs.length >= MAX_TABS) {
       let oldestIdx = null, oldestTime = Infinity;
       for (const [idx, info] of myTabs) {
@@ -2640,6 +2666,7 @@ server.tool(
           );
         } catch {}
         _untrackTab(oldestIdx);
+        evictedTab = oldestIdx;
       }
     }
 
@@ -2667,7 +2694,12 @@ server.tool(
     }
     if (!requestedUrl) _markBlankTabOpened();
     if (safeResult?.receipt) _setActiveReceipt(safeResult.receipt);
-    return { content: [{ type: "text", text: typeof safeResult === 'string' ? safeResult : JSON.stringify(safeResult) }] };
+    // The eviction used to be stderr-only, so a session learned about its closed tab from
+    // the next "receipt … stale" error. Say it in the response instead.
+    const out = evictedTab !== null && safeResult && typeof safeResult === "object"
+      ? { ...safeResult, evictedTab, note: `Tab cap ${MAX_TABS}/session reached — your oldest tab #${evictedTab} was closed. Close tabs you are done with (safari_close_tab).` }
+      : safeResult;
+    return { content: [{ type: "text", text: typeof out === 'string' ? out : JSON.stringify(out) }] };
   }
 );
 

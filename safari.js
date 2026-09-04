@@ -327,7 +327,14 @@ function _maybeOpenProfileWindow() {
   if (now - _lastOpenWindowAttempt < 120000) return;
   _lastOpenWindowAttempt = now;
   _logProfile(`Profile "${SAFARI_PROFILE}" window absent — running ${OPEN_WINDOW_CMD}`);
-  execFileAsync(OPEN_WINDOW_CMD, [SAFARI_PROFILE], { timeout: 30000 })
+  // The opener presses a File-menu item, which needs Safari running and NOT hidden
+  // (`open -g -j` leaves the menu bar inaccessible). Launch it in the background first.
+  const ensureRunning = execFileAsync("/usr/bin/pgrep", ["-x", "Safari"]).then(() => null, () =>
+    execFileAsync("/usr/bin/open", ["-g", "-a", "Safari"])
+      .then(() => new Promise((r) => setTimeout(r, 5000)))
+      .catch(() => null));
+  ensureRunning
+    .then(() => execFileAsync(OPEN_WINDOW_CMD, [SAFARI_PROFILE], { timeout: 30000 }))
     .then(() => {
       _profileMisses = 0; // re-arm the subprocess retry for the fresh window
       setTimeout(() => { refreshTargetWindow(true).catch(() => {}); }, 3000).unref();
