@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.18.1] - 2026-09-04
+
+### Security
+- **`qs` 6.15.3 → 6.16.0** (transitive, via `express` in HTTP mode) — closes GHSA advisories for DoS via attacker-controlled `isBuffer` and array-limit bypass through bracket-key comma parsing (Dependabot #101).
+
 ## [2.18.0] - 2026-09-04
 
 ### Added
