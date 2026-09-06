@@ -45,6 +45,8 @@ jobs:
     runs-on: macos-latest
 
     strategy:
+      # One transient npm 503 on 09-04 cancelled the two sibling jobs that would have passed
+      fail-fast: false
       matrix:
         node-version: [20, 22, 24]
 
@@ -57,8 +59,18 @@ jobs:
 
       - run: npm ci
 
+      # The audit endpoint is a network call to registry.npmjs.org. A 503 from it says
+      # nothing about our dependencies — retry that; fail only on a real finding.
       - name: Audit production dependencies (fail on high+)
-        run: npm audit --audit-level=high --omit=dev
+        run: |
+          set -o pipefail
+          for attempt in 1 2 3; do
+            if npm audit --audit-level=high --omit=dev 2>&1 | tee audit.log; then exit 0; fi
+            grep -q "audit endpoint returned an error" audit.log || exit 1
+            echo "npm audit endpoint unavailable (attempt $attempt/3) — retrying in 30s"
+            sleep 30
+          done
+          exit 1
 
       - name: Verify syntax of entry points
         run: |
