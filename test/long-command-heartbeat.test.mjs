@@ -134,3 +134,30 @@ test("a silent worker still fails fast", () => {
   assert.equal(d.remaining(), 30000, "first arm is the plain timeout, not the ceiling");
   assert.ok(d.hardDeadline >= 180000, "ceiling must be generous enough for real heavy pages");
 });
+
+// 7.9.26 — a worker wedged inside one command (handleCommand never settled) beat every 5s
+// for hours; each beat refreshed the stale clock, the lease never freed, every call died.
+test("a beat only counts as liveness while a dispatched command is still awaited", () => {
+  const route = index.slice(index.indexOf("// POST /heartbeat"), index.indexOf("// POST /extension-verified"));
+  assert.match(route, /if \(liveInFlight\) _extensionLastPollTime = Date\.now\(\)/, "beat must not refresh the stale clock unconditionally");
+  assert.ok(route.indexOf("liveInFlight = true") > route.indexOf("hardDeadline"), "in-flight means dispatched to this worker and inside its hard ceiling");
+});
+
+test("a command that outlives its hard ceiling drops the wedged worker's lease", () => {
+  const send = index.slice(index.indexOf("function sendToExtension("), index.indexOf("const command = { id, type, payload };"));
+  assert.ok(send.includes("_dropWedgedHttpWorker("), "expire() must release the lease when the hard deadline is hit");
+  assert.ok(index.includes("function _dropWedgedHttpWorker(reason)"), "helper must exist");
+  const helper = index.slice(index.indexOf("function _dropWedgedHttpWorker(reason)"), index.indexOf("function _drainOnDisconnect(reason)"));
+  assert.ok(helper.includes("_activeHttpWorkerId = \"\"") && helper.includes("_drainOnDisconnect("), "dropping must clear the active worker and drain");
+});
+
+test("the extension bounds a wedged command so the poll loop never parks for good", () => {
+  const loop = background.slice(
+    background.indexOf("async function pollForCommands("),
+    background.indexOf("// ========== SHARED: Execute command and send response")
+  );
+  assert.match(loop, /Promise\.race\(\[\s*executeAndReply\(msg, bridgeUrl\),\s*_wedgedCommandGuard\(msg, bridgeUrl\)/, "executeAndReply must race a wedge guard");
+  assert.ok(background.includes("const _WEDGED_COMMAND_MS = 330000"), "the ceiling must exceed the host's hard deadline (max 4×75s)");
+  const guard = background.slice(background.indexOf("function _wedgedCommandGuard("), background.indexOf("// ========== SHARED: Execute command and send response"));
+  assert.ok(guard.includes("/result") && guard.includes("did not settle"), "the guard must answer the host with an error result");
+});

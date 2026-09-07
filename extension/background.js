@@ -732,7 +732,16 @@ async function pollForCommands(pollGeneration) {
               _bridgeFetch(`${bridgeUrl}/heartbeat`, { method: "POST" }).catch(() => {});
             }, 5000);
             await previousExecution.catch(() => {});
-            await executeAndReply(msg, bridgeUrl);
+            // 7.9.26: a command whose handleCommand never settles (a tab that never answers,
+            // a runtime call that hangs) used to park this loop for good: the beat kept the
+            // host believing we were alive, /poll went silent for hours, connectToServer
+            // waited on the same claim, and only a Safari restart brought the profile back.
+            // Bound it: past the host's hard ceiling we answer with an error, release the
+            // claim and keep polling; the abandoned promise may settle later into the void.
+            await Promise.race([
+              executeAndReply(msg, bridgeUrl),
+              _wedgedCommandGuard(msg, bridgeUrl),
+            ]);
           }
         } finally {
           if (beat) clearInterval(beat);
@@ -762,6 +771,33 @@ async function pollForCommands(pollGeneration) {
       if (pollAbort === controller) pollAbort = null;
     }
   }
+}
+
+// Ceiling for one command. The host's own hard deadline is max(4×timeout, 180s) and its
+// longest tool timeout is 75s, so nothing legitimate is still awaited after five minutes.
+const _WEDGED_COMMAND_MS = 330000;
+function _wedgedCommandGuard(msg, bridgeUrl) {
+  return new Promise((resolve) => {
+    setTimeout(async () => {
+      console.log("Safari MCP: command wedged, releasing the poll loop", msg && msg.type);
+      try {
+        await _bridgeFetch(`${bridgeUrl}/result`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            type: "response",
+            id: msg.id,
+            result: null,
+            error: `command ${msg.type} did not settle within ${_WEDGED_COMMAND_MS}ms`,
+          }),
+          signal: AbortSignal.timeout(5000),
+        });
+      } catch (e) {
+        /* the host most likely expired it already */
+      }
+      resolve();
+    }, _WEDGED_COMMAND_MS);
+  });
 }
 
 // ========== SHARED: Execute command and send response ==========
