@@ -908,15 +908,23 @@ try {
       const heartbeatingWorkerId = _requireActiveHttpWorker(req, res);
       if (!heartbeatingWorkerId) return;
       _extensionLastHeartbeat = Date.now();
-      _extensionLastPollTime = Date.now();
       // Re-arm in-flight deadlines: the worker told us it is still on the command.
       // hardDeadline inside armTimer keeps this from extending indefinitely.
+      let liveInFlight = false;
       for (const pending of _pendingRequests.values()) {
         if (pending.dispatchedWorkerId !== heartbeatingWorkerId) continue;
         if (!pending.armTimer || Date.now() >= pending.hardDeadline) continue;
+        liveInFlight = true;
         clearTimeout(pending.timer);
         pending.timer = pending.armTimer();
       }
+      // A beat proves liveness only while the worker is on a command we still wait for.
+      // 7.9.26: a worker wedged inside one command (its handleCommand never settled) kept
+      // beating every 5s for hours after that command's hard deadline had expired; each
+      // beat refreshed the stale clock, so "HTTP poll timeout" never fired, no successor
+      // could take the lease, and every tool call died with "Extension timeout". Once
+      // nothing dispatched to this worker is in flight, its beats no longer count as polls.
+      if (liveInFlight) _extensionLastPollTime = Date.now();
       res.writeHead(204);
       res.end();
       return;
@@ -1219,6 +1227,18 @@ _staleHttpTimer.unref();  // stale-detection must not keep the Node process aliv
 
 // ========== SHARED EXTENSION LOGIC ==========
 
+// A worker that keeps beating but never finishes a command holds the profile lease
+// hostage. Releasing it is the same bookkeeping the stale timer does on poll timeout.
+function _dropWedgedHttpWorker(reason) {
+  if (!_extensionConnected && !_activeHttpWorkerId) return;
+  _extensionConnected = false;
+  _activeHttpWorkerId = "";
+  _connectingHttpWorkers.clear();
+  _reloadHttpWorkerHandoff = null;
+  _drainOnDisconnect(`wedged worker: ${reason}`);
+  console.error(`[Safari MCP] Extension worker dropped as wedged (${reason})`);
+}
+
 // Drain pending requests and command queue on disconnect — allows fast fallback to AppleScript
 function _drainOnDisconnect(reason) {
   if (process.env.SAFARI_PROFILE) {
@@ -1301,6 +1321,7 @@ function sendToExtension(type, payload = {}, timeoutMs = 30000) {
     // hardDeadline is the ceiling, so a worker that beats forever cannot hang us.
     const hardDeadline = Date.now() + Math.max(timeoutMs * 4, 180000);
     const expire = () => {
+      const pending = _pendingRequests.get(id);
       _pendingRequests.delete(id);
       if (reloadHandoff) _cancelReloadHttpWorkerHandoff(reloadHandoff);
       // Also drop it from the HTTP poll queue — otherwise the extension could poll this command
@@ -1308,6 +1329,15 @@ function sendToExtension(type, payload = {}, timeoutMs = 30000) {
       const qi = _commandQueue.findIndex(c => c.id === id);
       if (qi >= 0) _commandQueue.splice(qi, 1);
       reject(new Error(`Extension timeout after ${timeoutMs}ms`));
+      // The worker took this command and never answered, even past the hard ceiling: it is
+      // wedged (see /heartbeat). Drop its lease now instead of waiting for the stale timer,
+      // so a fresh worker — or Safari re-spawning this one — can connect at once.
+      if (
+        pending && pending.dispatchedWorkerId && pending.dispatchedWorkerId === _activeHttpWorkerId &&
+        Date.now() >= pending.hardDeadline
+      ) {
+        _dropWedgedHttpWorker(`${type} exceeded its hard deadline`);
+      }
     };
     const armTimer = () => setTimeout(expire, Math.min(timeoutMs, Math.max(0, hardDeadline - Date.now())));
     _pendingRequests.set(id, {
