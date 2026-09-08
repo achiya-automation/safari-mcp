@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.19.1] - 2026-09-08
+
+### Fixed
+- **A wedged extension worker no longer holds the profile "connected" forever.** A worker stuck inside one command kept beating every 5s for hours after that command's hard deadline had passed; each beat refreshed the poll clock, so the host's "HTTP poll timeout" never fired, no successor could take the lease, and every tool call died with "Extension timeout". A heartbeat now counts as a poll only while a command dispatched to that worker is still awaited, and a command that passes the hard ceiling drops that worker's lease at once instead of waiting for the stale timer.
+- **The extension bounds a command that never settles (330s) and releases its poll loop.** A `handleCommand` that never resolved — a tab that stops answering, a runtime call that hangs — parked the poll loop for good: `/poll` went silent, `connectToServer` waited on the same claim, and only a Safari restart brought the profile back. Past the host's own ceiling (`max(4× timeout, 180s)`, longest tool timeout 75s) the worker answers with an error, releases the claim and keeps polling. Manifest 2.10.10.
+
 ## [2.19.0] - 2026-09-06
 
 ### Added
