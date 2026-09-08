@@ -1116,6 +1116,10 @@ async function handleCommand(type, payload) {
     // --- JavaScript Execution — multi-strategy to handle CSP restrictions ---
     // Strategy 1: indirect eval (fast, works when CSP allows unsafe-eval)
     // Strategy 2: script element injection (bypasses CSP in MAIN world context)
+    case "list_frames": {
+      return await listFrames(tabId);
+    }
+
     case "evaluate": {
       // Strategy 0: pages that stall injection outright. Every strategy below reaches
       // the page through scripting.executeScript, which on business.facebook.com never
@@ -1124,6 +1128,12 @@ async function handleCommand(type, payload) {
       // it FIRST once a tab is known to block injection, and fall back to it below
       // when a fresh tab turns out to block it too.
       const evalTabId = tabId || (await getActiveTab()).id;
+      // A frame selector short-circuits every strategy below: those all target the
+      // main frame, which is exactly what makes an embedded app unreachable.
+      if (payload.frame !== undefined && payload.frame !== null && payload.frame !== "") {
+        const _fid = await resolveFrameId(evalTabId, payload.frame);
+        return await evaluateInFrame(evalTabId, _fid, payload.script);
+      }
       const viaBridge = async () => {
         const r = await sendContentCommand(
           evalTabId, "mcp-content-eval", { source: payload.script }, 10000
@@ -4170,6 +4180,86 @@ function _isFrameMiss(value) {
 // Execute in ALL frames (including cross-origin iframes) and return the first real
 // match.  A top-frame `Element not found` is a semantic miss, not a result: allowing
 // it to win used to hide valid matches in every child frame behind it.
+// --- Frame targeting -------------------------------------------------------
+// Every other command reaches only the tab's main frame, so a cross-origin
+// iframe — a micro-frontend app shell, an embedded checkout, GoHighLevel's
+// workflow builder — was effectively invisible: read_page returned the outer
+// shell's loader text and evaluate ran outside the app entirely. Safari's
+// scripting.executeScript can address one frame by id, so these expose the
+// frame list and let a script run inside a chosen frame.
+async function listFrames(tabId = null) {
+  const id = tabId || (await getActiveTab()).id;
+  const results = await _executeAllFrames(() => ({
+    url: location.href,
+    title: document.title,
+    textLength: ((document.body && document.body.innerText) || "").length,
+  }), [], id);
+  return results.map((r, i) => (
+    r && r.error
+      ? { index: i, frameId: Number.isInteger(r.frameId) ? r.frameId : null, error: String(r.error) }
+      : { index: i, frameId: Number.isInteger(r && r.frameId) ? r.frameId : null, ...((r && r.result) || {}) }
+  ));
+}
+
+// Resolve a caller's frame selector to one concrete frameId. `frame` is either a
+// numeric frameId or a substring matched against each frame's URL. Ambiguity is
+// an error rather than a guess: silently picking one of several matching frames
+// is how an automation ends up acting on the wrong document.
+async function resolveFrameId(tabId, frame) {
+  if (typeof frame === "number" && Number.isInteger(frame)) return frame;
+  const needle = String(frame == null ? "" : frame).toLowerCase();
+  if (!needle) throw new Error("frame must be a frameId number or a URL substring");
+  const frames = await listFrames(tabId);
+  const hits = frames.filter((f) => !f.error && typeof f.url === "string" && f.url.toLowerCase().includes(needle));
+  if (hits.length === 0) {
+    throw new Error("No frame matched " + JSON.stringify(String(frame)) + ". Frames present: " +
+      (frames.map((f) => f.url || ("#" + f.index)).join(" | ") || "(none)"));
+  }
+  if (hits.length > 1) {
+    throw new Error("Frame selector " + JSON.stringify(String(frame)) + " matched " + hits.length +
+      " frames — narrow it: " + hits.map((f) => f.url).join(" | "));
+  }
+  if (!Number.isInteger(hits[0].frameId)) throw new Error("Matched frame has no stable frameId");
+  return hits[0].frameId;
+}
+
+// Run one script inside a single frame. MAIN world first so the script sees the
+// page's own globals; ISOLATED as the fallback for frames whose CSP blocks eval —
+// it still reads and mutates the DOM, which is what clicking and filling need.
+async function evaluateInFrame(tabId, frameId, script) {
+  const id = tabId || (await getActiveTab()).id;
+  const runner = async (src) => {
+    try {
+      const result = await (0, eval)(src);
+      if (result === undefined || result === null) return null;
+      return typeof result === "object" ? JSON.stringify(result) : String(result);
+    } catch (e) {
+      const m = String(e && e.message);
+      if (m.includes("unsafe-eval") || m.includes("trusted-types") || m.includes("Trusted Type")) {
+        return "__CSP_BLOCKED__";
+      }
+      return "Error: " + m;
+    }
+  };
+  const run = async (world) => {
+    const results = await _withInjectionDeadline(browser.scripting.executeScript({
+      target: { tabId: id, frameIds: [frameId] },
+      world,
+      func: runner,
+      args: [script],
+    }));
+    const first = results[0];
+    if (first && first.error) throw new Error(first.error);
+    return first && first.result;
+  };
+  const mainResult = await run("MAIN");
+  if (mainResult !== "__CSP_BLOCKED__") return mainResult;
+  const isolated = await run("ISOLATED");
+  return isolated === "__CSP_BLOCKED__"
+    ? "Error: eval is blocked by CSP in both MAIN and ISOLATED worlds for this frame"
+    : isolated;
+}
+
 async function execInAllFrames(func, args = [], tabId = null) {
   try {
     const results = await _executeAllFrames(func, args, tabId);

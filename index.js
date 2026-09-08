@@ -1445,6 +1445,7 @@ const _noOwnershipCheck = new Set([
   "reload_extension",
   // Read-only — don't modify the page
   "read_page", "get_source", "snapshot", "accessibility_snapshot",
+  "list_frames",
   "get_element", "query_all", "screenshot", "screenshot_element",
   "get_console", "list_console_messages", "start_console",
   "get_network", "list_network_requests", "start_network_capture",
@@ -2906,6 +2907,23 @@ server.tool(
   }
 );
 
+// ========== FRAMES ==========
+
+server.tool(
+  "safari_list_frames",
+  "List every document in the tab — the main page plus each iframe — with its frameId, URL and text length. Use when a page's content lives in a cross-origin iframe (an embedded app, a micro-frontend shell, a payment field): safari_read_page and safari_evaluate see only the main document there and come back empty or with a loader. Pass the frameId or a URL substring as safari_evaluate's `frame` to run inside it.",
+  {
+    receipt: z.string().optional().describe("Opaque extension-issued tab receipt"),
+  },
+  async (args) => {
+    const result = await extensionOrFallback(
+      "list_frames", { ..._explicitReceipt(args) },
+      () => { throw new Error("safari_list_frames needs the extension — AppleScript cannot enumerate frames. Check safari_doctor."); }
+    );
+    return { content: [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result, null, 2) }] };
+  }
+);
+
 // ========== EVALUATE JAVASCRIPT ==========
 
 server.tool(
@@ -2913,12 +2931,19 @@ server.tool(
   "Execute JavaScript in the current page (a returned Promise is awaited — fetch/timers work in background tabs; requestAnimationFrame never fires there). Automatically falls back to AppleScript when CSP blocks execution (e.g. Google Search Console, LinkedIn). For reading data, prefer safari_read_page or safari_snapshot. For interactions, prefer safari_click/fill with refs.",
   {
     script: z.string().describe("JavaScript code to execute"),
+    frame: z.union([z.string(), z.number()]).optional().describe("Run inside a sub-frame instead of the main document: a frameId from safari_list_frames, or a substring of the frame's URL (must match exactly one). Needed for cross-origin iframes — micro-frontend app shells, embedded checkouts — where the main document only holds a loader."),
     receipt: z.string().optional().describe("Opaque extension-issued tab receipt — pass the one safari_new_tab returned to keep targeting that tab after an MCP reconnect"),
   },
   async (args) => {
     const result = await extensionOrFallback(
-      "evaluate", { script: args.script, ..._explicitReceipt(args) },
-      () => safari.evaluate(args)
+      "evaluate",
+      { script: args.script, ...(args.frame === undefined ? {} : { frame: args.frame }), ..._explicitReceipt(args) },
+      () => {
+        if (args.frame !== undefined) {
+          throw new Error("safari_evaluate: frame targeting needs the extension — AppleScript reaches only the main document. Check the extension is connected (safari_doctor).");
+        }
+        return safari.evaluate(args);
+      }
     );
     return { content: [{ type: "text", text: (typeof result === 'string' ? result : JSON.stringify(result)) || "(no return value)" }] };
   }
