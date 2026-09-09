@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.20.0] - 2026-09-09
 
 ### Added
 - **Frame targeting: `safari_list_frames`, and a `frame` option on `safari_evaluate`.** Every command reached only the tab's main document, so a page whose content lives in a cross-origin iframe was unreadable and undrivable: `safari_read_page` returned the outer shell's loader text and `safari_evaluate` ran outside the app entirely. That is the normal shape of a micro-frontend console (GoHighLevel's workflow builder, an embedded checkout, a payment field) — the whole UI is one cross-origin child document, and page-context JS cannot cross into it, so the only remaining option was pixel-level native clicking, which steals focus and cannot verify what it hit. `safari_list_frames` enumerates every document with its `frameId`, URL and text length; passing that id — or a URL substring that matches exactly one frame — as `safari_evaluate`'s `frame` runs the script inside that document, with full read, mutate and `.click()` access. Ambiguous substrings are refused rather than guessed. MAIN world first, ISOLATED as the fallback for frames whose CSP blocks `eval`.
