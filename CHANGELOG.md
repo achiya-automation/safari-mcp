@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.21.0] - 2026-09-10
 
 ### Added
 - **Opt-in tab adoption (`SAFARI_MCP_ALLOW_USER_TABS=1`).** The server touches only tabs it opened itself, which is what stops it from clicking into and closing yours — but it also blocks "read the article I'm looking at" and "fill the form on my screen", where reopening the page throws away the very session state that made your tab worth using. With the flag set, an **explicit** `safari_switch_tab` adopts the tab you name instead of refusing it, and the session then works in it like one of its own. The flag unlocks adoption, not the guards: only `switch_tab` adopts, ambient operations still never land on whatever tab is frontmost, and `safari_close_tab` keeps refusing an adopted tab — closing is the one cost you cannot undo (#68). Adoption is session-local and is never written to the shared ownership file. `safari_doctor` reports the flag's state and every operation on an adopted tab logs `(user tab, opted-in)`. Default off. Design by @turner-moore in #92.
