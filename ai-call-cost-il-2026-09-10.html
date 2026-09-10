@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>I Priced 774 Hebrew AI Phone Calls. Transcription Was 6% of the Bill.</title>
+</head>
+<body>
+<h1>I Priced 774 Hebrew AI Phone Calls. Transcription Was 6% of the Bill.</h1>
+
+<p><img src="https://achiya-automation.github.io/safari-mcp/hero-ai-call-cost-2026-09-10.jpg" alt="A small brass balance scale weighing a navy ceramic telephone handset against three plain brass discs, on warm ivory paper"></p>
+
+<p><em>Twenty days of production calls for ten Israeli businesses, broken down to the agora. Also: why the per-minute pricing model everyone quotes is the wrong shape for how Israelis actually use the phone.</em></p>
+
+<p>For most of this year, the cost model in my voice codebase carried a comment I had written myself. About one line item it said: <em>"~1.5% of a call &mdash; add it only if a bill ever shows it mattering."</em></p>
+
+<p>The August invoice showed it mattering at 16%.</p>
+
+<p>Worse, a second line item that was not in the model at all turned out to be 59% of the bill. Between them, three quarters of what Google actually charged me was invisible to the thing I had built to predict what Google would charge me. I had been quoting confident per-call numbers off a model that was missing most of the cost.</p>
+
+<p>So I rebuilt it against the real invoice, line by line, and then re-priced every call that has run since. This is what came out.</p>
+
+<h2>What I measured</h2>
+
+<p>Ten Israeli businesses run an AI assistant that answers the calls they miss. It opens in Hebrew, asks who is calling and about what, filters the sales spam, and sends the owner a written summary. Some are one-person shops, some are clinics, one is a fish store.</p>
+
+<p>Between August 21 and September 10, 2026 (twenty days) they took <strong>774 production calls</strong>, totalling <strong>324.4 minutes of audio</strong>. Total variable cost: <strong>&#8362;36.67</strong>, or about <strong>&#8362;0.055 per answered call</strong>.</p>
+
+<p>One number before the breakdown, because it changes the arithmetic more than anything else in this article: the same table held <strong>627 test rows</strong>. My own probes, staging calls, load checks. That is 45% of every row in the calls table. Any cost figure that does not exclude them is wrong by nearly half, and it is wrong in the flattering direction, because probe calls are short and cheap. Every number here is production traffic only.</p>
+
+<h2>Where the money actually goes</h2>
+
+<p>The average call in that window lasted 30.3 seconds and cost &#8362;0.0555. Here is every agora of it:</p>
+
+<ul>
+<li><strong>WhatsApp summary to the owner &mdash; &#8362;0.0162 (29%)</strong></li>
+<li><strong>Model, Hebrew prompt re-billed per turn &mdash; &#8362;0.0113 (20%)</strong></li>
+<li><strong>Telephony, SIP leg plus Voice API leg &mdash; &#8362;0.0108 (19%)</strong></li>
+<li><strong>Model, audio the bot speaks &mdash; &#8362;0.0094 (17%)</strong></li>
+<li><strong>Spam and intent classifier &mdash; &#8362;0.0050 (9%)</strong></li>
+<li><strong>Speech-to-text &mdash; &#8362;0.0031 (6%)</strong></li>
+</ul>
+
+<p>Transcription, the part everyone means when they say "the AI", is the cheapest line on the list. The WhatsApp message that tells the business owner someone called costs <strong>five times more than listening to the entire call.</strong></p>
+
+<p>That inversion shows up in any stack built this way. The speech model itself has been commoditised (Soniox charges $0.12 an hour, which on a 30-second call is a third of an agora) while carrying the call, thinking in Hebrew, speaking back and delivering the result to a human have not been.</p>
+
+<h2>The Hebrew prompt is a line item, not a rounding error</h2>
+
+<p>The 20% for the Hebrew prompt deserves its own paragraph, because it is the one I got wrong.</p>
+
+<p>A live voice model re-reads your system prompt on <strong>every turn of the conversation</strong>. My Hebrew instruction block is about 8,900 characters, and Hebrew is token-hungry compared to English for the same meaning. Multiply that by every back-and-forth in the call and you get a cost that scales with <strong>how long the call runs</strong> rather than with how many calls you take.</p>
+
+<p>On the August invoice that was 6.7 million text-input tokens: &#8362;15.49, or 16% of the bill, for a block of text I wrote once. My model had it at 1.5%.</p>
+
+<p>If you are pricing a Hebrew voice agent and your spreadsheet has a row for speech-to-text but no row for "the system prompt, times every turn," your spreadsheet is off by more than your transcription line.</p>
+
+<h2>Per-minute pricing is the wrong shape for Israeli calls</h2>
+
+<p>Here is the distribution that broke my assumptions hardest.</p>
+
+<p>Median call length: <strong>16 seconds</strong>. Sixty-three percent of calls finished under 30 seconds. Even among the calls that produced a real message for the owner, someone who actually stated their name and their business, 151 of 223 came in under a minute. Only 16 calls in twenty days ran past two minutes.</p>
+
+<p>That is the shape of a missed-call answering service, and it is nothing like the shape the industry prices for. Today, <a href="https://www.retellai.com/pricing">Retell</a> quotes $0.07&ndash;$0.31 a minute for a voice agent (their own calculator lands on $0.11 for a reasonable Gemini-plus-Cartesia build), and <a href="https://vapi.ai/pricing">Vapi</a> charges $0.05 a minute for hosting on top of model costs at cost. Telephony almost universally bills 60/60: any fraction of a minute rounds up to a whole one.</p>
+
+<p>Run my 774 calls through that and you get <strong>752 billable minutes</strong> against <strong>324.4 real ones</strong>. Rounding alone inflates the bill by 2.3x before anyone charges for a single token.</p>
+
+<p>At $0.11 a minute, those 752 minutes come to $82.72, about &#8362;252. Mine cost &#8362;36.67 all in, and &#8362;23 of that if you strip out the two line items a platform like Retell does not have at all (the WhatsApp summary and the classifier).</p>
+
+<p>I want to be fair about that comparison. Retell and Vapi sell infrastructure, orchestration, dashboards, compliance and support, all of which I built and maintain myself instead, and their rates are reasonable for what they include. My argument is narrower: <strong>per-minute pricing charges you for the minute you did not use, and on a 16-second median that is most of the minute.</strong></p>
+
+<h2>What the spread looks like</h2>
+
+<p>Averages hide the interesting part, so: median cost per call &#8362;0.0439, p90 &#8362;0.1053, most expensive single call &#8362;0.3119.</p>
+
+<p>Split by what the call was:</p>
+
+<ul>
+<li><strong>223 calls carried a real message</strong>: 51.4 seconds, &#8362;0.082 each. These are the ones the business would otherwise have lost.</li>
+<li><strong>284 calls ended with no message</strong>: 8.5 seconds, &#8362;0.035 each. Someone hung up when a machine answered.</li>
+<li><strong>67 were spam</strong>, and cost &#8362;0.071 each to identify as spam.</li>
+</ul>
+
+<p>The calls with no message are 37% of the volume and still cost real money, because the phone leg, the greeting and the classifier all run before you find out nobody wanted to talk. Filtering junk is not free either: you pay roughly the price of a real call to establish that a call was not real.</p>
+
+<h2>If you are buying this, here is what I would ask</h2>
+
+<p>The Israeli market for AI phone answering runs from about &#8362;49 a month for missed-call pickup to the &#8362;179&ndash;549 range for a full receptionist. That is the retail shelf. Against a measured variable cost of &#8362;0.055 a call, the margin in a monthly plan is not subtle, and you should expect a vendor to be able to explain it rather than deny it. <a href="https://onimli.com/pricing/">The published monthly plans</a> for the service these numbers come from are &#8362;29 for 40 answered calls, &#8362;149 for 200, and &#8362;299 for 500, which works out to &#8362;0.60&ndash;0.75 a call at the cap against &#8362;0.055 of variable cost. The gap pays for the number, the integration, the support, and the months when nobody calls at all.</p>
+
+<p>Three questions I would put to any vendor:</p>
+
+<ol>
+<li><strong>Do you bill per call or per minute?</strong> On a 16-second median, per-minute with 60/60 rounding roughly doubles what you pay for the same service.</li>
+<li><strong>Is the summary message included?</strong> It is the single biggest line in my breakdown. If it is billed separately, or worse, if it goes out as a marketing-category WhatsApp template instead of a utility one, that one item can cost more than everything else combined.</li>
+<li><strong>What happens on a call with no message?</strong> A third of real traffic ends this way. Whether those count against your monthly quota is a bigger commercial question than the per-minute rate.</li>
+</ol>
+
+<h2>The bottom line</h2>
+
+<p>The expensive part of an AI phone call in Israel is not the AI hearing you. It is the phone line, the Hebrew instructions being re-read on every turn, and the message that gets the result to a human being. Transcription, the part with the futuristic name, is six agorot of every hundred.</p>
+
+<p>I only know that because a bill contradicted a comment I had written in my own code. I had been quoting per-call costs off a model that was missing 75% of the invoice, and nothing in the code would ever have told me. The invoice did.</p>
+
+<p>Which brings me to the question I actually want answered: <strong>if you run an AI service of any kind, when did you last reconcile your estimated per-unit cost against a real invoice, line by line, and what was the gap?</strong> I am collecting these. Mine was 75% and I have stopped assuming that is unusual.</p>
+
+<hr>
+
+<p><em>Achiya Cohen builds WhatsApp bots, AI phone agents and workflow automation for Israeli small businesses. The call data in this article comes from <a href="https://achiya-automation.com/services/voice-bot/">the AI phone service these ten businesses run on</a>. More at <a href="https://achiya-automation.com">achiya-automation.com</a>.</em></p>
+
+</body>
+</html>
