@@ -14,6 +14,7 @@ import { randomUUID } from "node:crypto";
 import { VIEWPORT_SCRIPT, SAFE_AREA_SCRIPT, PWA_SCRIPT, WEBKIT_COMPAT_SCRIPT } from "./injected-validators.js";
 import { escJsSingleQuote, escAppleScriptString } from "./injected-escape.js";
 import { currentSessionId } from "./session-context.js";
+import { allowUserTabs } from "./ownership-state.js";
 // Extension bridge is handled by index.js (WebSocket server on port 9223)
 
 const execFileAsync = promisify(execFile);
@@ -5781,6 +5782,14 @@ export async function doctor() {
   const passed = checks.filter((c) => c.ok).length;
   const lines = [`Safari MCP doctor — ${passed}/${checks.length} checks passed`, ""];
   if (osLine) lines.push(osLine, "");
+  // Not a pass/fail check — a state the user has to be able to see here rather than dig out
+  // of the host's env, so "why did it touch my tab" has an answer in the same report (#92).
+  lines.push(
+    allowUserTabs()
+      ? "ℹ️ Tab adoption (SAFARI_MCP_ALLOW_USER_TABS): ON — safari_switch_tab may adopt a tab you already had open. safari_close_tab still refuses an adopted tab."
+      : "ℹ️ Tab adoption (SAFARI_MCP_ALLOW_USER_TABS): off (default) — the session acts only on tabs it opened itself.",
+    "",
+  );
   for (const c of checks) {
     lines.push(`${c.ok ? "✅" : "❌"} ${c.label}: ${c.detail}`);
     if (!c.ok && c.fix) lines.push(`   → ${c.fix}`);

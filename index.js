@@ -16,6 +16,7 @@ import {
   OWNERSHIP_DIR, BLANK_TAB_SENTINEL,
   _openedTabs, _ownedTabURLs,
   _isURLOwned, _markBlankTabOpened, _addOwnedURL, _removeOwnedURL, _trackTab, _untrackTab,
+  allowUserTabs, _adoptUserTab, _isAdoptedURL,
 } from "./ownership-state.js";
 import { WebSocketServer } from "ws";
 import { createServer } from "node:http";
@@ -1866,11 +1867,24 @@ async function _runExtensionBatchAction(action, args = {}) {
 // an owned tab — this is what prevents navigating/clicking in the user's tabs.
 function _assertTabOwnership(opType, extensionPayload = {}) {
   if (_noOwnershipCheck.has(opType)) return;
+  // Closing is the one op the opt-in never unlocks (#92, condition 2). Adoption makes a
+  // user's tab writable, not disposable — a wrong close costs work that cannot be undone
+  // (#68). Checked before every early return so the batch action and the tool share it.
+  if (opType === "close_tab" && _isAdoptedURL(safari.getActiveTabURL())) {
+    const msg = `⚠️ Tab safety: refusing "close_tab" — this tab was adopted from you via SAFARI_MCP_ALLOW_USER_TABS, not opened by this MCP session. Close it yourself, or open your own tab with safari_new_tab.`;
+    console.error(`[Safari MCP] ${msg}`);
+    throw new Error(msg);
+  }
   // In a named profile the extension is the authority. A bearer receipt may be
   // presented after a stateless reconnect; only the extension can validate its exact
   // tab binding, freshness, digest, and origin.
   if (_preferAppleScript && _receiptToken(extensionPayload.receipt || _getActiveReceipt())) return;
   const currentUrl = safari.getActiveTabURL();
+  // An adopted tab (#92) is the session's target even though the session opened nothing.
+  if (_isAdoptedURL(currentUrl)) {
+    console.error(`[Safari MCP] "${opType}" on ${_safeUrlForOutput(currentUrl)} (user tab, opted-in)`);
+    return;
+  }
   if (_ownedTabURLs.size === 0 && _openedTabs.size === 0) {
     // No tabs opened yet — block everything except read-only ops
     const msg = `⚠️ Tab safety: no tabs opened yet. Call safari_new_tab first before "${opType}".`;
@@ -2781,7 +2795,12 @@ server.tool(
     }
 
     // Tab ownership check: verify target tab is one we opened
-    if (!process.env.SAFARI_PROFILE && _ownedTabURLs.size > 0) {
+    let adopted = false;
+    // `_ownedTabURLs.size > 0` alone skipped this whole lookup for a session that had opened
+    // nothing — fine while switch_tab could only reach owned tabs, but adoption (#92) has to
+    // work from a cold session, which is precisely the "read the article in my current tab"
+    // case the opt-in exists for.
+    if (!process.env.SAFARI_PROFILE && (_ownedTabURLs.size > 0 || allowUserTabs())) {
       // Get target tab's URL via list_tabs before switching
       try {
         const tabs = await extensionOrFallback(
@@ -2805,8 +2824,16 @@ server.tool(
           // fallback (which has no ownership check of its own) stays guarded.
           const trackedOrigin = _originOf(_openedTabs.get(index)?.url);
           const isTrackedRedirect = !!trackedOrigin && trackedOrigin === _originOf(target.url);
-          if (!isBlankOwned && !isTrackedRedirect) {
-            const msg = `⚠️ Tab safety: refusing switch_tab to index ${index} (${_safeUrlForOutput(target.url)}) — not opened by this MCP session. Use safari_new_tab to open your own tab.`;
+          if (!isBlankOwned && !isTrackedRedirect && allowUserTabs()) {
+            // The opt-in turns this refusal into a deliberate, named adoption (#92). Both
+            // spellings of the URL go in: the tool layer hands callers the query-stripped
+            // form and later compares against it, while list_tabs reported the raw one.
+            _adoptUserTab(target.url);
+            _adoptUserTab(_safeUrlForOutput(target.url));
+            adopted = true;
+            console.error(`[Safari MCP] switch_tab adopted ${_safeUrlForOutput(target.url)} (user tab, opted-in via SAFARI_MCP_ALLOW_USER_TABS)`);
+          } else if (!isBlankOwned && !isTrackedRedirect) {
+            const msg = `⚠️ Tab safety: refusing switch_tab to index ${index} (${_safeUrlForOutput(target.url)}) — not opened by this MCP session. Use safari_new_tab to open your own tab, or set SAFARI_MCP_ALLOW_USER_TABS=1 to let switch_tab adopt a tab you already had open.`;
             console.error(`[Safari MCP] ${msg}`);
             return errorResult(msg);
           }
@@ -2823,7 +2850,10 @@ server.tool(
     if (resolvedIndex) safari.setActiveTabIndex(resolvedIndex);
     if (safeResult?.safeUrl) safari.setActiveTabURL(safeResult.safeUrl);
     if (safeResult?.receipt || token) _setActiveReceipt(safeResult?.receipt || token);
-    return { content: [{ type: "text", text: JSON.stringify(safeResult) }] };
+    // Say so in the result, not only in the log: an agent that adopted a user's tab should
+    // be able to see that from the answer it got (#92, condition 3).
+    const reported = adopted ? { ...safeResult, note: "(user tab, opted-in)" } : safeResult;
+    return { content: [{ type: "text", text: JSON.stringify(reported) }] };
   }
 );
 

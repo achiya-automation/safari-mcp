@@ -62,6 +62,10 @@ export function _saveOwnershipFile(urls, removed = []) {
     const mergedTs = new Map();
     for (const e of _loadOwnershipFile()) mergedTs.set(e.url, e.ts);
     for (const url of urls) {
+      // Adopted user tabs (#92) are session-local by construction — see _adoptUserTab. This
+      // is the one place that writes the file, so the exclusion belongs here rather than at
+      // each caller: _pruneExpiredOwnership() also saves, and it does not know about adoption.
+      if (_adoptedTabURLs.has(url)) continue;
       const localTs = _ownedTabTimestamps.get(url) ?? now;
       mergedTs.set(url, Math.max(localTs, mergedTs.get(url) ?? 0));
     }
@@ -146,6 +150,47 @@ export function _markBlankTabOpened() {
     _ownedTabURLs.add(BLANK_TAB_SENTINEL);
     _saveOwnershipFile(_ownedTabURLs);
   }
+}
+
+// ========== OPT-IN TAB ADOPTION (#92) ==========
+// With SAFARI_MCP_ALLOW_USER_TABS set, an EXPLICIT safari_switch_tab may adopt a tab the
+// user already had open, and the session then acts on it like one of its own. The flag
+// deliberately unlocks adoption rather than blanket-skipping the guards: "the server acts
+// on the tab you pointed it at, not the one you wandered to" is the property that makes the
+// opt-in safe, and an ambient op landing on whatever tab is frontmost is the exact failure
+// the guards were built against. Read from the environment on each call so a host can flip
+// it without a restart and so tests need no module reload.
+export function allowUserTabs() {
+  const v = String(process.env.SAFARI_MCP_ALLOW_USER_TABS || "").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
+// URLs adopted from the user, as opposed to opened by this session. Two rules ride on this
+// set: closing is refused for every member (#68 — a wrong close costs the user work that a
+// wrong read never does), and nothing in it is ever written to the shared ownership file.
+export const _adoptedTabURLs = new Set();
+
+// Adoption is in-memory ONLY. owned-tabs.json is shared by every safari-mcp process on the
+// machine and outlives this session, so a persisted adoption would hand the user's tab to
+// the next process — one that has no _adoptedTabURLs entry and would therefore let
+// close_tab through. Session-local is also the honest lifetime: the opt-in is "act on the
+// tab I pointed you at", not "own it from now on".
+export function _adoptUserTab(url) {
+  if (!allowUserTabs()) return false;
+  if (!url || url === "about:blank" || url === "missing value" || url === "favorites://") return false;
+  _adoptedTabURLs.add(url);
+  if (!_ownedTabTimestamps.has(url)) _ownedTabTimestamps.set(url, Date.now());
+  _ownedTabURLs.add(url);
+  return true;
+}
+
+export function _isAdoptedURL(url) {
+  if (!url) return false;
+  if (_adoptedTabURLs.has(url)) return true;
+  // The caller may hold the query-stripped form of the URL (origin+pathname) that the tool
+  // layer hands back, while adoption recorded the raw one, or the reverse. Both name the
+  // same adopted document, and only a refusal hangs off this answer.
+  return findOwnedMatch(url, _adoptedTabURLs) !== null;
 }
 
 export function _addOwnedURL(url) {

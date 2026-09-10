@@ -348,6 +348,31 @@ Prefer stdio (one process per agent) over a persistent daemon? That works too �
 
 ---
 
+## Acting on a tab you already have open
+
+By default the server touches only tabs it opened itself. Point it at one of yours and it refuses:
+
+```
+Tab safety: refusing "click" — current tab (https://mail.example.com/inbox) was not
+opened by this MCP session. Use safari_new_tab or safari_switch_tab to target your own tab.
+```
+
+That default exists because early versions did click into and close people's tabs. But "read the article I'm looking at" and "fill in the form on my screen" are real, and reopening the page loses the session state that made your tab worth using. Set `SAFARI_MCP_ALLOW_USER_TABS=1` and an **explicit** `safari_switch_tab` adopts the tab instead of refusing it; from then on the session works in it like one of its own, and says so:
+
+```json
+{ "tabIndex": 3, "safeUrl": "https://mail.example.com/inbox", "note": "(user tab, opted-in)" }
+```
+
+What the flag deliberately does *not* do:
+
+- **It unlocks adoption, not the guards.** Only `safari_switch_tab` adopts, and only the tab you named. An ordinary click or navigate still never lands on whatever tab happens to be in front — the server acts on the tab you pointed it at, not the one you wandered to.
+- **`safari_close_tab` still refuses.** Closing is the one action whose cost you cannot undo, so an adopted tab is writable, never disposable. Close it yourself.
+- **Adoption is session-local.** Nothing is written to the shared ownership file, so it ends with the session rather than leaking to the next process on the machine.
+
+`safari_doctor` prints the flag's state, and every operation on an adopted tab logs `(user tab, opted-in)` — so "why did it touch my tab" has an answer instead of being a mystery. Default off; set it only for agents you want working inside your own browsing session. Designed in [#92](https://github.com/achiya-automation/safari-mcp/issues/92).
+
+---
+
 ## Environment variables
 
 | Variable | Default | What it does |
@@ -355,6 +380,7 @@ Prefer stdio (one process per agent) over a persistent daemon? That works too �
 | `SAFARI_MCP_HTTP` | off | Run one shared HTTP daemon instead of a process per client (see above). |
 | `SAFARI_MCP_HTTP_PORT` | `9225` | Port for that daemon. |
 | `SAFARI_PROFILE` | unset | Bind sessions to a named Safari profile. Unset = your ordinary windows. |
+| `SAFARI_MCP_ALLOW_USER_TABS` | off | Let `safari_switch_tab` adopt a tab **you** already had open, instead of refusing it (see below). |
 | `SAFARI_MCP_RAISE_ON_NAVIGATE` | off | Let navigation bring Safari to the front, and stop the focus guard from putting your previous app back. |
 | `SAFARI_MCP_SCREENSHOT_MAX_WIDTH` | unset | Downscale every `safari_screenshot` to this pixel width (Retina captures are 2× the viewport). Per-call `maxWidth` overrides it. |
 | `SAFARI_MCP_KEEPALIVE_TAB` | off | Keep one daemon-served page open in the profile window so Safari never parks the extension worker between commands. |
