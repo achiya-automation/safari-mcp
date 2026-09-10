@@ -2850,6 +2850,13 @@ server.tool(
     if (resolvedIndex) safari.setActiveTabIndex(resolvedIndex);
     if (safeResult?.safeUrl) safari.setActiveTabURL(safeResult.safeUrl);
     if (safeResult?.receipt || token) _setActiveReceipt(safeResult?.receipt || token);
+    // A switch by INDEX gets no receipt back, and the session was still holding the one it
+    // minted for the PREVIOUS tab. Every later command auto-attaches that receipt, so the
+    // switch reported `owned: true` and then the next evaluate/click died with "receipt is
+    // forged, stale, ambiguous, or not valid for this origin" — a dead end with no way out
+    // but opening another tab. Drop the stale capability instead: without one the command
+    // targets the tab this switch just selected, which is exactly what was asked for.
+    else _setActiveReceipt("");
     // Say so in the result, not only in the log: an agent that adopted a user's tab should
     // be able to see that from the answer it got (#92, condition 3).
     const reported = adopted ? { ...safeResult, note: "(user tab, opted-in)" } : safeResult;

@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **A `safari_switch_tab` by index no longer leaves the previous tab's receipt attached.** A switch by index gets no receipt back, and the session kept the one it had minted for the tab before — which every later command auto-attaches. The switch reported `owned: true` and the next `safari_evaluate` died with "receipt is forged, stale, ambiguous, or not valid for this origin", with no way out but opening another tab (observed on a tab that had navigated across origins). The stale capability is now dropped, so the command targets the tab the switch just selected.
+
 ## [2.21.0] - 2026-09-10
 
 ### Added

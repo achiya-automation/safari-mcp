@@ -146,3 +146,18 @@ test("safari_doctor reports the flag state either way", () => {
     "doctor must print the flag state in both directions"
   );
 });
+
+test("a switch by index drops the previous tab's receipt instead of keeping it", () => {
+  // switch_tab by index returns no receipt, and every later command auto-attaches the
+  // session's active one. Keeping the previous tab's receipt made the switch report
+  // owned:true and the next command fail with "receipt is … not valid for this origin",
+  // with no way out but opening another tab. Reproduced live 2026-09-10 on a tab that had
+  // navigated across origins.
+  const tail = index.slice(index.indexOf('server.tool(\n  "safari_switch_tab"'));
+  const body = tail.slice(0, tail.indexOf("\n);"));
+  assert.match(
+    body,
+    /if \(safeResult\?\.receipt \|\| token\) _setActiveReceipt\(safeResult\?\.receipt \|\| token\);[\s\S]{0,700}?\n\s*else _setActiveReceipt\(""\);/,
+    "a receipt-less switch must clear the stale active receipt"
+  );
+});
