@@ -29,3 +29,6 @@ hero-*.png
 
 # eslint --format json output from the CI no-undef gate
 eslint-report.json
+
+# מחוללי גיבוי מקומיים של עבודת ה-frames — לא חלק מהחבילה
+.bak-frames/
