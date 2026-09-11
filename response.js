@@ -28,3 +28,24 @@ export const errorResult = (msg) => ({
   content: [{ type: "text", text: msg }],
   isError: true,
 });
+
+/**
+ * `safari_evaluate` / `safari_eval_file` result text.
+ *
+ * Distinct from `textResult`: only these two tools surface a *script's* return value,
+ * so they need to say "the script returned nothing" — and the old form said it with a
+ * falsy check, `(… || "(no return value)")`. That collapsed three different outcomes
+ * into one string: a script returning `undefined` (nothing), a script returning `""`
+ * (a real value), and an injection that never ran at all (a failure). An empty return
+ * is a legitimate result and must stay distinguishable from no return.
+ */
+export const evalResult = (r) => {
+  let text;
+  if (typeof r === "string") {
+    text = r === "" ? '""' : r;
+  } else {
+    const json = JSON.stringify(r); // undefined for undefined/function/symbol
+    text = json === undefined ? "(no return value)" : json;
+  }
+  return { content: [{ type: "text", text }] };
+};

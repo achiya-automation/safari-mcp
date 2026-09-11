@@ -11,7 +11,7 @@ import { startTransport } from "./transport.js";
 import { currentSessionId } from "./session-context.js";
 import { z } from "zod";
 import * as safari from "./safari.js";
-import { textResult, jsonResult, imageResult, errorResult } from "./response.js";
+import { textResult, jsonResult, imageResult, errorResult, evalResult } from "./response.js";
 import {
   OWNERSHIP_DIR, BLANK_TAB_SENTINEL,
   _openedTabs, _ownedTabURLs,
@@ -2982,7 +2982,7 @@ server.tool(
         return safari.evaluate(args);
       }
     );
-    return { content: [{ type: "text", text: (typeof result === 'string' ? result : JSON.stringify(result)) || "(no return value)" }] };
+    return evalResult(result);
   }
 );
 
@@ -2993,7 +2993,7 @@ server.tool(
   async (args) => {
     const script = readFileSync(args.path, "utf8");
     const result = await extensionOrFallback("evaluate", { script }, () => safari.evaluate({ script }));
-    return { content: [{ type: "text", text: (typeof result === "string" ? result : JSON.stringify(result)) || "(no return value)" }] };
+    return evalResult(result);
   }
 );
 

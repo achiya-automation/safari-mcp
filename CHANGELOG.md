@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.21.2] - 2026-09-11
+
+### Fixed
+- **`safari_evaluate` no longer reports an empty-string return as "(no return value)".** The result text was built with a falsy check standing in for an existence check, so three different outcomes printed the same line: a script that returned `undefined`, a script that returned `""`, and an injection that never ran at all because the page's CSP refused it. `(() => 0)()` printed `0` while `(() => "")()` printed `(no return value)`, since `"0"` is a truthy string and `""` is not. An empty return is now shown as `""` and stays distinguishable from no return, which also makes a silently blocked evaluation visible instead of indistinguishable from success. Both `safari_evaluate` and `safari_eval_file` now share one `evalResult` envelope in `response.js` alongside every other tool response.
+
 ## [2.21.1] - 2026-09-11
 
 ### Fixed
