@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.21.4] - 2026-09-14
+
+### Fixed
+- **The documented tool count was one short, and now it cannot drift again.** `safari_list_frames` was registered in v2.19.0 and never reached the README: the table listed 97 tools against 98 registrations, the JavaScript category header said 1 where it held 2, and `server.json` — the description the MCP Registry publishes to every directory that ingests it — carried the stale number outward. The count is now 98 everywhere and `safari_list_frames` has its table row. This is the third time these numbers have parted company (80 → 96, 96 → 97, 97 → 98) and each earlier fix corrected digits by hand, so `test/doc-tool-count.test.mjs` now derives the count from the registrations and fails CI when the heading, the table rows, any category header, the prose, the social-preview alt text, the share link, or `server.json` disagrees. Registering a tool and forgetting the docs is a red build now, not something a reader finds months later.
+
 ## [2.21.3] - 2026-09-14
 
 ### Fixed
