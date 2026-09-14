@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.21.5] - 2026-09-14
+
+### Fixed
+- **A page that refuses every JavaScript injection no longer looks like a script that returned nothing (#106).** The extension's evaluate ladder ends in a terminal state whose own text reads "CSP blocked all strategies (script needs DOM). Falling back to AppleScript" — but the server never recognised that marker, so the promised fallback did not run and the marker itself was handed back as the tool's value. With the marker now matched, the AppleScript path actually runs; and when that also comes back empty, `safari_evaluate` raises instead of printing an empty result. This is the case that costs an agent the most: `(no return value)` from a script that never executed is byte-identical to `(no return value)` from a script that ran and returned nothing, so the agent concludes the element was not there and keeps building on it. The error names what happened and points at the paths that still work on such a page (`safari_read_page`, `safari_snapshot`, `safari_get_element`, `safari_extract_links`). A legitimately empty return is untouched: the new guard fires only on the CSP marker, never on emptiness alone, and `test/csp-terminal-state.test.mjs` asserts that distinction.
+
 ## [2.21.4] - 2026-09-14
 
 ### Fixed

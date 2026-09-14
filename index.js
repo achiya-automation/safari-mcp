@@ -1924,6 +1924,10 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
 
   let result;
   let usedExtension = false;
+  // The extension's evaluate ladder has a terminal state: every injection strategy was
+  // refused. It announces itself as "Falling back to AppleScript", so the caller must
+  // never be handed an empty value as if the script had simply returned nothing (#106).
+  let hardCspBlock = false;
   try {
     if (_extensionConnected && (!_preferAppleScript || _profileExtensionVerified)) {
       try {
@@ -1952,7 +1956,11 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
           if (reloadHandoff) _cancelReloadHttpWorkerHandoff(reloadHandoff);
           throw error;
         }
-        const isCspError = typeof result === 'string' && (result.includes('unsafe-eval') || result.includes('trusted-types') || result.includes('Trusted Type') || result.includes('Content Security Policy'));
+        // The ladder's own terminal marker. It was not in this list, so the fallback the
+        // marker's text promises never actually ran and its text reached the caller as
+        // the tool's value instead of as a failure (#106).
+        hardCspBlock = typeof result === 'string' && result.includes('CSP blocked all strategies');
+        const isCspError = hardCspBlock || (typeof result === 'string' && (result.includes('unsafe-eval') || result.includes('trusted-types') || result.includes('Trusted Type') || result.includes('Content Security Policy')));
         const isPermissionDenied = typeof result === 'string' && result.includes('__SCREENSHOT_PERMISSION_DENIED__');
         const isElementMiss = typeof result === 'string' && result.startsWith('Element not found');
         const isFailed = result === null || isElementMiss;
@@ -1998,6 +2006,16 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
       const t0 = Date.now();
       result = await fallbackFn();
       console.error(`[Safari MCP] ${extensionType} via AppleScript (${Date.now() - t0}ms)`);
+      // Both paths are now exhausted. An empty value here means the script never ran,
+      // which is byte-identical to a script that legitimately returned nothing — and an
+      // agent reads that as "no such element" and keeps building on it. Fail instead.
+      if (hardCspBlock && (result === undefined || result === null)) {
+        throw new Error(
+          `safari_${extensionType}: this page refused every JavaScript injection strategy (CSP), ` +
+          "and the AppleScript fallback returned nothing — the script did not run. " +
+          "Reading the page still works here: safari_read_page, safari_snapshot, safari_get_element, safari_extract_links."
+        );
+      }
     }
   } finally {
     safari.setFocusGuard(false);
