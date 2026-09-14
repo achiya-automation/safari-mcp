@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.21.3] - 2026-09-14
+
+### Fixed
+- **`safari_query_all` now says when its `x`/`y` are not page coordinates.** When the main frame matches nothing, the query falls back to every child frame — and each element's `x`/`y` then come from `getBoundingClientRect()` inside *that* frame, so they are relative to the iframe's viewport, not the page. `safari_click`, `safari_double_click`, `safari_right_click`, `safari_native_click` and `safari_drag` all take page coordinates, so an agent that read a match out of an embedded checkout or app shell and clicked its reported position landed somewhere else on the page, silently and only on the pages this fallback exists for. The caveat had been written as a comment in the extension source, where no caller ever reads it: cross-frame matches now carry `frameRelative: true` in the payload and the tool result ends with a line naming the frame and pointing at selectors or a `safari_snapshot` ref instead. Raised by a reader of the write-up on the original find (dev.to #4413737), who asked whether the fix had been anything more than a corrected comment. It had not been.
+
 ## [2.21.2] - 2026-09-11
 
 ### Fixed

@@ -2761,7 +2761,16 @@ async function handleCommand(type, payload) {
         if (mainResult && JSON.parse(mainResult).length > 0) return mainResult;
       } catch { return mainResult; }
       const frameResult = await execAcrossFrames(queryFn, [payload.selector, payload.limit || 20], tabId);
-      return frameResult || mainResult;
+      if (!frameResult) return mainResult;
+      // Reaching here means the main frame matched nothing, so every element below came
+      // from a child frame and its x/y are that frame's viewport coordinates. Say so in
+      // the payload: the caller is an agent reading this JSON, and the click tools take
+      // page coordinates — a comment in this file never reaches it.
+      try {
+        return JSON.stringify(JSON.parse(frameResult).map((el) => ({ ...el, frameRelative: true })));
+      } catch {
+        return frameResult;
+      }
     }
 
     default:

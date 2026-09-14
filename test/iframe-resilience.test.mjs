@@ -154,3 +154,22 @@ test("reload waits for a newer verified extension generation", () => {
     "direct reload baseline must be captured after the old worker replies"
   );
 });
+
+test("cross-frame query_all matches carry the coordinate caveat to the caller", () => {
+  const start = background.indexOf('case "query_all":');
+  assert.ok(start >= 0, "query_all command case should exist");
+  const source = background.slice(start, background.indexOf("default:", start));
+
+  // A child frame reports x/y in its own viewport while safari_click takes page
+  // coordinates, so the all-frames fallback must mark the payload rather than leave the
+  // caveat in a source comment no agent ever reads.
+  assert.match(source, /frameRelative: true/);
+  assert.match(source, /frame: location\.href/);
+  assert.doesNotMatch(source, /return frameResult \|\| mainResult/);
+
+  assert.match(index, /"frameRelative":true/);
+  assert.ok(
+    index.includes("relative to that frame") && index.includes("safari_snapshot ref"),
+    "safari_query_all must tell the caller the cross-frame coordinates are not page coordinates"
+  );
+});

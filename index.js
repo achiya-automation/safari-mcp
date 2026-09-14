@@ -3014,7 +3014,7 @@ server.tool(
 
 server.tool(
   "safari_query_all",
-  "Find all elements matching a CSS selector (returns tag, text, href, value)",
+  "Find all elements matching a CSS selector (returns tag, text, href, value). x/y are relative to each element's own frame viewport — for matches inside an iframe, click by selector or snapshot ref, not by these coordinates",
   {
     selector: z.string().describe("CSS selector"),
     limit: z.coerce.number().optional().describe("Max results (default: 20)"),
@@ -3025,6 +3025,15 @@ server.tool(
       "query_all", { selector: args.selector, limit: args.limit, ..._explicitReceipt(args) },
       () => safari.querySelectorAll(args)
     );
+    // The matches live inside a child frame, so their x/y are that frame's viewport
+    // coordinates while safari_click and friends take page coordinates. Warn in the
+    // result text, which is the only part of this an agent actually reads.
+    if (typeof result === "string" && result.includes('"frameRelative":true')) {
+      return textResult(
+        result +
+          "\n\nNote: these matches are inside a child frame. Their x/y are relative to that frame's viewport (see \"frame\"), not to the page — click them by selector or by a safari_snapshot ref; passing these coordinates to safari_click lands somewhere else."
+      );
+    }
     return textResult(result);
   }
 );
