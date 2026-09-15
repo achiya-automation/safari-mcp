@@ -4682,12 +4682,24 @@ export async function emulate(args) {
   const overrideJS = buildNavigatorOverrideJS(target);
   if (overrideJS) await runJS(overrideJS);
 
-  let actual = null;
-  try { actual = JSON.parse(await runJS("JSON.stringify([window.innerWidth, window.innerHeight])")); } catch (_e) { /* reported as null */ }
+  const actual = await _relayoutAndMeasure();
   const notes = [];
   if (overrideJS) notes.push("navigator.userAgent/platform/maxTouchPoints are overridden for this page's JavaScript only: the HTTP User-Agent header is unchanged, and a reload or navigation clears the override — call safari_emulate again after navigating.");
-  if (actual && actual[0] !== target.width) notes.push(`Safari kept the window wider than ${target.width}px (page viewport ${actual[0]}px) — desktop Safari has a minimum window width.`);
+  if (actual && actual[0] > target.width) notes.push(`Safari kept the window wider than ${target.width}px (page viewport ${actual[0]}px).`);
+  if (actual && actual[1] < target.height) notes.push(`The screen is too short for a ${target.height}px viewport — the page gets ${actual[1]}px.`);
   return JSON.stringify({ device: target.name, viewport: { requested: [target.width, target.height], actual }, userAgent: target.ua || "(unchanged)", notes });
+}
+
+// A background tab keeps its old layout — innerWidth, media queries, even outerWidth — until
+// it is shown (seen on Safari 27: 1512px after a resize to 402 until the tab was fronted). Show
+// ours for a moment (selection restored, Safari never activated) so the new size sticks.
+async function _relayoutAndMeasure() {
+  let size = null;
+  await _withTargetTabFronted(async () => {
+    await new Promise((r) => setTimeout(r, 250));
+    try { size = JSON.parse(await runJS("JSON.stringify([window.innerWidth, window.innerHeight])")); } catch (_e) { /* reported as null */ }
+  });
+  return size;
 }
 
 export async function resetEmulation() {
@@ -4698,7 +4710,8 @@ export async function resetEmulation() {
   await osascriptFast(`tell application "Safari" to set bounds of ${getTargetWindowRef()} to {${bounds}}`);
   // Deleting the marked getters restores Navigator.prototype's — no reload, so page state survives.
   await runJS(RESET_NAVIGATOR_JS);
-  return `Emulation reset: window bounds {${bounds}}, navigator overrides removed`;
+  const viewport = await _relayoutAndMeasure();
+  return `Emulation reset: window bounds {${bounds}}, viewport ${viewport ? viewport.join("×") : "unknown"}, navigator overrides removed`;
 }
 
 // ========== CONSOLE CAPTURE ==========
