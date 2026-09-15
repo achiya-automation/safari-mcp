@@ -200,6 +200,76 @@ test("a healthy HTTP worker keeps its lease unless reload grants an exact one-sh
   );
 });
 
+// 15.9.26, caught by diagnostic logging: a reload sent after the active worker had parked
+// was never delivered ("never delivered; last poll 56s ago") while Safari's fresh worker
+// was refused every 3s ("verify refused … lease held by" the parked one). The unarmed
+// handoff pinned a lease nobody could use until the reload timed out at 30s.
+test("a reload the parked worker never received moves to its successor", () => {
+  const helperSource = index.slice(
+    index.indexOf("function _prepareReloadHttpWorkerHandoff("),
+    index.indexOf("function _requireActiveHttpWorker(")
+  );
+  const harness = Function("randomBytes", `
+    const baseNow = Date.now();
+    let _activeHttpWorkerId = "worker-a";
+    let _extensionConnected = true;
+    let _extensionLastPollTime = baseNow;
+    let _extensionLastHeartbeat = 0;
+    let _reloadHttpWorkerHandoff = null;
+    const _pendingRequests = new Map();
+    const _HTTP_RELOAD_HANDOFF_TTL_MS = 30_000;
+    const _HTTP_WORKER_SUCCESSOR_GRACE_MS = 20_000;
+    ${helperSource}
+    return {
+      mayReplace: (id, token, now) => _mayReplaceActiveHttpWorker(id, token, now),
+      prepare: _prepareReloadHttpWorkerHandoff,
+      arm: _armReloadHttpWorkerHandoff,
+      // What /extension-verified does once a successor wins the lease.
+      takeLease: (id) => { _activeHttpWorkerId = id; _adoptReloadHandoff(id); },
+      handoff: () => _reloadHttpWorkerHandoff,
+      queue: (handoff) => _pendingRequests.set("reload", { reloadHandoff: handoff, dispatchedWorkerId: "" }),
+      deliverTo: (id) => { _pendingRequests.get("reload").dispatchedWorkerId = id; },
+      // _handleExtensionResponse drops the pending request before it arms the handoff.
+      answer: () => { _pendingRequests.delete("reload"); },
+      now: baseNow,
+    };
+  `)(() => ({ toString: () => "handoff_token_abcdefghijklmnop" }));
+
+  const handoff = harness.prepare();
+  harness.queue(handoff);
+  assert.equal(
+    harness.mayReplace("worker-b", "", harness.now + 1),
+    false,
+    "a live worker keeps the lease for the reload it is about to receive"
+  );
+  assert.equal(
+    harness.mayReplace("worker-b", "", harness.now + 21_000),
+    true,
+    "a parked worker can never receive the reload, so its successor must get the lease"
+  );
+
+  harness.takeLease("worker-b");
+  assert.equal(harness.handoff(), handoff, "the undelivered reload keeps its handoff");
+  assert.equal(handoff.fromWorkerId, "worker-b", "and the successor is the worker that will reload");
+  harness.deliverTo("worker-b");
+  harness.answer();
+  assert.equal(harness.arm(handoff), true, "its result can arm the handoff");
+  assert.equal(
+    harness.mayReplace("worker-c", handoff.token, harness.now + 21_001),
+    true,
+    "the reloaded worker takes over with the one-shot token"
+  );
+
+  harness.takeLease("worker-c");
+  assert.equal(harness.handoff(), null, "an armed handoff is spent once the reloaded worker holds the lease");
+
+  const delivered = harness.prepare();
+  harness.queue(delivered);
+  harness.deliverTo("worker-c");
+  harness.takeLease("worker-d");
+  assert.equal(harness.handoff(), null, "a reload already delivered to another worker is not handed on");
+});
+
 test("HTTP command dispatch and results stay bound to exactly one worker", () => {
   const dequeueSource = index.slice(
     index.indexOf("function _dequeueHttpCommand("),

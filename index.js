@@ -492,6 +492,20 @@ function _cancelReloadHttpWorkerHandoff(handoff) {
   if (_reloadHttpWorkerHandoff === handoff) _reloadHttpWorkerHandoff = null;
 }
 
+function _reloadAwaitsDelivery(handoff) {
+  return [..._pendingRequests.values()].some(
+    (pending) => pending.reloadHandoff === handoff && !pending.dispatchedWorkerId
+  );
+}
+
+// A new worker won the lease. A reload its predecessor never received moves with the
+// lease — that worker is the one that will run it; any other prepared handoff is void.
+function _adoptReloadHandoff(workerId) {
+  const handoff = _reloadHttpWorkerHandoff;
+  if (handoff && !handoff.armed && _reloadAwaitsDelivery(handoff)) handoff.fromWorkerId = workerId;
+  else _reloadHttpWorkerHandoff = null;
+}
+
 function _activeHttpWorkerIsFresh(now = Date.now()) {
   const lastActivity = Math.max(_extensionLastPollTime, _extensionLastHeartbeat);
   return !!_activeHttpWorkerId && _extensionConnected && lastActivity > 0 && now - lastActivity <= _HTTP_WORKER_SUCCESSOR_GRACE_MS;
@@ -513,7 +527,14 @@ function _mayReplaceActiveHttpWorker(workerId, presentedToken, now = Date.now())
   if (handoff) {
     // While the old worker is preparing a reload, no unrelated worker may use a
     // momentary poll/heartbeat gap to clear the handoff before /result arms it.
-    if (!handoff.armed) return false;
+    // A reload nobody has received is not being prepared, though: a parked worker can
+    // never take it, and pinning its lease deadlocked the reload until it timed out
+    // (15.9.26). Then only the ordinary freshness rule applies, and the successor
+    // inherits the reload (_adoptReloadHandoff).
+    if (!handoff.armed) {
+      if (!_reloadAwaitsDelivery(handoff)) return false;
+      return !_activeHttpWorkerIsFresh(now);
+    }
     if (handoff.expiresAt >= now) {
       return handoff.fromWorkerId === _activeHttpWorkerId && presentedToken === handoff.token;
     }
@@ -891,7 +912,7 @@ try {
         _activeHttpWorkerId = workerId;
         _connectingHttpWorkers.delete(workerId);
         if (workerChanged) {
-          _reloadHttpWorkerHandoff = null;
+          _adoptReloadHandoff(workerId);
           _extensionConnectionGeneration += 1;
         }
         if (!_extensionConnected) {
@@ -952,7 +973,7 @@ try {
       const workerChanged = workerId !== _activeHttpWorkerId;
       _activeHttpWorkerId = workerId;
       _connectingHttpWorkers.delete(workerId);
-      if (workerChanged) _reloadHttpWorkerHandoff = null;
+      if (workerChanged) _adoptReloadHandoff(workerId);
       _profileExtensionVerified = true;
       if (workerChanged) _extensionConnectionGeneration += 1;
       if (!_extensionConnected) {
