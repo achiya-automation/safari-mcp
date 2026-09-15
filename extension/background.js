@@ -2883,11 +2883,30 @@ function _withBrowserEpochStorageLock(operation) {
   return current;
 }
 
+/**
+ * Adopt `epoch` as the live browser-session identity. Storage is the authority, so a
+ * value that disagrees with the cache is not an error — it is a rotation, and the only
+ * correct response is to take the new one. Bumping the generation is what tells every
+ * operation that captured the previous one to abort instead of writing a record stamped
+ * with an epoch that is no longer current.
+ */
+function _adoptBrowserSessionEpoch(epoch) {
+  if (_browserSessionEpoch && _browserSessionEpoch !== epoch) _browserEpochGeneration++;
+  _browserSessionEpoch = epoch;
+  return epoch;
+}
+
 async function _ensureBrowserSessionEpoch() {
   if (!_browserSessionStorageAvailable) {
     throw new Error("Browser session storage is unavailable; refusing durable tab authority");
   }
-  if (/^[a-f0-9]{36}$/.test(_browserSessionEpoch)) return _browserSessionEpoch;
+  // Deliberately no cache short-circuit. `storage.session` is the authority and it can
+  // rotate under a worker that stays alive — a Safari session teardown clears it, and a
+  // racing worker start can replace it. Returning the cached value forever meant every
+  // receipt minted after such a rotation carried the *old* epoch, was handed to the
+  // client as valid, and was then dropped wholesale by the next cold `_hydrateOwnedTabs`,
+  // which does read storage. Re-reading here costs one local get per ownership mutation
+  // and is what makes the generation guards below reachable at all (#105).
   if (!_browserEpochInitializationPromise) {
     const generation = _browserEpochGeneration;
     _browserEpochInitializationPromise = _withBrowserEpochStorageLock(async () => {
@@ -2905,8 +2924,7 @@ async function _ensureBrowserSessionEpoch() {
         if (generation !== _browserEpochGeneration) {
           throw new Error("Browser-session identity changed during initialization");
         }
-        _browserSessionEpoch = persisted;
-        return persisted;
+        return _adoptBrowserSessionEpoch(persisted);
       }
       const epoch = _mintMcpTabMarker();
       try {
@@ -2929,8 +2947,7 @@ async function _ensureBrowserSessionEpoch() {
       if (generation !== _browserEpochGeneration) {
         throw new Error("Browser-session identity changed during initialization");
       }
-      _browserSessionEpoch = confirmedEpoch;
-      return confirmedEpoch;
+      return _adoptBrowserSessionEpoch(confirmedEpoch);
     });
   }
   const initialization = _browserEpochInitializationPromise;

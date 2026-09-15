@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.21.6] - 2026-09-15
+
+### Fixed
+- **A tab receipt minted while the browser-session epoch had rotated is caught at mint time instead of an hour later (#105).** `browser.storage.session` is the authority for that epoch, but the extension worker read it once and then returned its cached copy for the rest of its life. When the stored epoch rotated under a worker that stayed alive — a Safari session teardown clears it, a racing worker start can replace it — every receipt minted afterwards was stamped with the *old* epoch and handed to the caller as valid. Nothing noticed until the next cold start, where `_hydrateOwnedTabs()` does read storage, found every persisted record stamped with the previous epoch and dropped the whole array at once. That is why the report has two tabs minted five seconds apart dying together, `getReceipt` unable to rotate either, and `safari_switch_tab` calling an index "not opened by this MCP session" for a tab the session had just opened. The epoch is now re-read on every resolution and a value that disagrees with the cache is adopted rather than ignored.
+- **The guard written to catch that could never fire.** `_browserEpochGeneration` was compared at six sites and assigned at exactly one — its own declaration — so the counter never moved: the three bare comparisons inside `_ensureBrowserSessionEpoch` were unreachable outright and the three compound ones survived only on their other clause. Adopting a rotated epoch now increments it, which is what tells an operation that captured the earlier generation to abort instead of persisting a record stamped with an epoch that is no longer current. `test/browser-epoch-rotation.test.mjs` runs the real functions against a fake session store to lock the rotation behaviour, and adds the source contract that would have caught the omission at review: a counter that is snapshotted and compared has to be written somewhere, or every guard built on it is decoration.
+
 ## [2.21.5] - 2026-09-14
 
 ### Fixed
