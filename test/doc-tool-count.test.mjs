@@ -14,6 +14,7 @@ import { readFileSync } from "node:fs";
 const index = readFileSync(new URL("../index.js", import.meta.url), "utf8");
 const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
 const serverJson = readFileSync(new URL("../server.json", import.meta.url), "utf8");
+const pkg = readFileSync(new URL("../package.json", import.meta.url), "utf8");
 
 const registered = [...index.matchAll(/server\.tool\(\s*\n?\s*"([a-zA-Z_0-9]+)"/g)].map((m) => m[1]);
 const TOOL_COUNT = registered.length;
@@ -100,4 +101,10 @@ test("every prose mention of the tool count agrees with the code", () => {
   // directory that ingests the registry rather than only readers of this repo.
   const registryDesc = serverJson.match(/(\d+) tools/);
   assert.ok(registryDesc && Number(registryDesc[1]) === TOOL_COUNT, "server.json states a stale tool count");
+
+  // package.json's description is the npm listing, and it drifted to 97 while server.json
+  // was corrected to 98 — the count travels through more than one channel, so checking
+  // only the one the last fix touched is how the next count parts company again.
+  const npmDesc = JSON.parse(pkg).description.match(/(\d+) tools/);
+  assert.ok(npmDesc && Number(npmDesc[1]) === TOOL_COUNT, "package.json states a stale tool count on npm");
 });
