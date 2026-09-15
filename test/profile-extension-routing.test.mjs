@@ -632,6 +632,7 @@ test("OFF→ON during connect starts one fresh generation after prior command ex
      let isConnected = false;
      let _targetProfile = null;
      let _reconnectDelay = 3000;
+     let _reconnectTimer = null;
      const _BRIDGE_RELOAD_HANDOFF_KEY = "reload";
      let _commandExecutionTail = new Promise((resolve) => { globalThis.__releaseOldCommand = resolve; });
      ${connectSource}

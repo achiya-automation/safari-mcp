@@ -639,6 +639,10 @@ async function connect() {
       if (_restartInvalidatedConnect(pollGeneration)) return;
       isConnected = true;
       _reconnectDelay = 3000; // Reset backoff on success
+      // A retry scheduled before this attempt succeeded (the wake alarm, a lease-held
+      // backoff) would run connect() again seconds later, invalidate this healthy loop and
+      // drop the command it had just been handed (15.9.26: every keepalive list_tabs).
+      if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
       updateBadge("ON");
       _startHeartbeat(); // Keep service worker alive between polls
       _connecting = false;
@@ -693,7 +697,12 @@ async function pollForCommands(pollGeneration) {
       const res = await _bridgeFetch(`${bridgeUrl}/poll`, {
         signal: controller.signal,
       });
-      if (pollGeneration !== _pollLoopGeneration) return;
+      // The response is here, so a reconnect must no longer abort this fetch (that would
+      // kill the body), and a loop it invalidated must still run a command it received:
+      // the host marked it dispatched to this worker, so nobody else ever will.
+      if (pollAbort === controller) pollAbort = null;
+      const invalidated = pollGeneration !== _pollLoopGeneration;
+      if (invalidated && res.status !== 200) return;
       if (res.status === 423) {
         // A replacement worker completed profile verification. This stale worker must
         // stay dormant until Safari reloads it; reconnecting would steal the lease back.
@@ -4607,8 +4616,9 @@ function _stopHeartbeat() {
 browser.alarms.create("keepalive", { periodInMinutes: 1 });
 browser.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "keepalive" || alarm.name === "reconnect") {
-    // Only reconnect if disconnected, enabled, and no reconnect already scheduled
-    if (!isConnected && _enabled && !_bridgeWorkerSuperseded && !_bridgeWorkerRetiring && !_reconnectTimer) {
+    // Only reconnect if disconnected, enabled, and no reconnect already scheduled or in
+    // flight — a worker woken by this alarm is still connecting, not disconnected
+    if (!isConnected && !_connecting && _enabled && !_bridgeWorkerSuperseded && !_bridgeWorkerRetiring && !_reconnectTimer) {
       scheduleReconnect();
     }
     // Restart heartbeat in case it was lost on worker restart
