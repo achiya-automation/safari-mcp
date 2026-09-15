@@ -108,3 +108,18 @@ test("every prose mention of the tool count agrees with the code", () => {
   const npmDesc = JSON.parse(pkg).description.match(/(\d+) tools/);
   assert.ok(npmDesc && Number(npmDesc[1]) === TOOL_COUNT, "package.json states a stale tool count on npm");
 });
+
+test("the directory manifests, examples page and install banner agree with the code", () => {
+  // Still more channels: glama.json is the Glama directory listing, mcp.json and .mcp.json
+  // repeat the description, the examples page states the count, and the postinstall banner
+  // prints it on install. They said 97 and 96 while everything checked above said 98. A file
+  // may drop the number, as the banner now has; it may not state a different one, and
+  // "96 native browser tools" is stating one, so the words between are allowed for.
+  const files = ["glama.json", "mcp.json", ".mcp.json", "examples/README.md", "scripts/postinstall.cjs"];
+  const stale = files.flatMap((file) =>
+    [...readFileSync(new URL(`../${file}`, import.meta.url), "utf8").matchAll(/\b(\d+) (?:[a-z-]+ ){0,3}tools\b/gi)]
+      .filter((m) => Number(m[1]) !== TOOL_COUNT)
+      .map((m) => `${file}: "${m[0]}"`)
+  );
+  assert.deepEqual(stale, [], "these files state a tool count that index.js does not register");
+});

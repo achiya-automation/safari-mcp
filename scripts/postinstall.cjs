@@ -77,7 +77,7 @@ ensureCodesign();
 if (process.env.CI || process.env.SAFARI_MCP_SILENT_INSTALL === "1") process.exit(0);
 
 const msg = `
-${c.bold}${c.cyan}🦁 Safari MCP installed${c.reset} ${c.dim}— 96 native browser tools for AI agents${c.reset}
+${c.bold}${c.cyan}🦁 Safari MCP installed${c.reset} ${c.dim}— native browser tools for AI agents${c.reset}
 
 ${c.bold}Next steps:${c.reset}
   1. Enable Safari → Develop → ${c.yellow}Allow JavaScript from Apple Events${c.reset}

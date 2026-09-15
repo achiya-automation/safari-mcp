@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The tool count was still stale in six places the guard never read.** The npm description published with 2.21.6, `glama.json` (the Glama directory listing), `mcp.json`, `.mcp.json` and the examples page said 97, and the postinstall banner said 96: the guard added in 2.21.4 read only the README and `server.json`. All now match the 98 registered tools, except the banner, which drops the number instead of keeping one more copy in step. `test/doc-tool-count.test.mjs` now reads each of them and fails CI when one states a different count, matching phrasings like the banner's "96 native browser tools" and not only "N tools".
+
 ## [2.21.6] - 2026-09-15
 
 ### Fixed
