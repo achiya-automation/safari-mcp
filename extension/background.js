@@ -719,6 +719,7 @@ async function pollForCommands(pollGeneration) {
         const claim = new Promise((resolve) => { releaseClaim = resolve; });
         _commandExecutionTail = previousExecution.catch(() => {}).then(() => claim);
         let beat = null;
+        let guard = null;
         try {
           // A single malformed/truncated body must NOT tear down the poll loop — a bad
           // packet used to throw SyntaxError here, fall through to "server gone", and
@@ -738,13 +739,15 @@ async function pollForCommands(pollGeneration) {
             // waited on the same claim, and only a Safari restart brought the profile back.
             // Bound it: past the host's hard ceiling we answer with an error, release the
             // claim and keep polling; the abandoned promise may settle later into the void.
+            guard = _wedgedCommandGuard(msg, bridgeUrl);
             await Promise.race([
               executeAndReply(msg, bridgeUrl),
-              _wedgedCommandGuard(msg, bridgeUrl),
+              guard,
             ]);
           }
         } finally {
           if (beat) clearInterval(beat);
+          if (guard) guard.cancel();
           releaseClaim();
         }
       }
@@ -777,8 +780,9 @@ async function pollForCommands(pollGeneration) {
 // longest tool timeout is 75s, so nothing legitimate is still awaited after five minutes.
 const _WEDGED_COMMAND_MS = 330000;
 function _wedgedCommandGuard(msg, bridgeUrl) {
-  return new Promise((resolve) => {
-    setTimeout(async () => {
+  let timer = null;
+  const fired = new Promise((resolve) => {
+    timer = setTimeout(async () => {
       console.log("Safari MCP: command wedged, releasing the poll loop", msg && msg.type);
       try {
         await _bridgeFetch(`${bridgeUrl}/result`, {
@@ -798,6 +802,10 @@ function _wedgedCommandGuard(msg, bridgeUrl) {
       resolve();
     }, _WEDGED_COMMAND_MS);
   });
+  // The poll loop cancels the guard however the command ends. An uncancelled timer fired
+  // 330s after EVERY command and posted "did not settle" for an id the host had already
+  // answered (15.9.26: one bogus result per command, five and a half minutes late).
+  return Object.assign(fired, { cancel: () => clearTimeout(timer) });
 }
 
 // ========== SHARED: Execute command and send response ==========

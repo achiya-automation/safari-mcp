@@ -156,8 +156,49 @@ test("the extension bounds a wedged command so the poll loop never parks for goo
     background.indexOf("async function pollForCommands("),
     background.indexOf("// ========== SHARED: Execute command and send response")
   );
-  assert.match(loop, /Promise\.race\(\[\s*executeAndReply\(msg, bridgeUrl\),\s*_wedgedCommandGuard\(msg, bridgeUrl\)/, "executeAndReply must race a wedge guard");
+  assert.match(loop, /guard = _wedgedCommandGuard\(msg, bridgeUrl\)/, "every executed command gets a wedge guard");
+  assert.match(loop, /Promise\.race\(\[\s*executeAndReply\(msg, bridgeUrl\),\s*guard,?\s*\]\)/, "executeAndReply must race its wedge guard");
+  assert.match(loop, /finally \{[\s\S]*guard\.cancel\(\)/, "the guard is cancelled however the command ends");
   assert.ok(background.includes("const _WEDGED_COMMAND_MS = 330000"), "the ceiling must exceed the host's hard deadline (max 4×75s)");
   const guard = background.slice(background.indexOf("function _wedgedCommandGuard("), background.indexOf("// ========== SHARED: Execute command and send response"));
   assert.ok(guard.includes("/result") && guard.includes("did not settle"), "the guard must answer the host with an error result");
+});
+
+// 15.9.26 — the guard's timer was never cleared, so 330s after EVERY command the worker
+// posted "did not settle" for an id the host had already answered: a steady stream of
+// results for unknown requests, one per command, long after each one finished.
+test("a command that settles cancels its guard, and only a wedged one is answered", async () => {
+  const source = background.slice(
+    background.indexOf("function _wedgedCommandGuard("),
+    background.indexOf("// ========== SHARED: Execute command and send response")
+  );
+  const timers = new Map();
+  let nextTimer = 1;
+  const posts = [];
+  const wedgedCommandGuard = new Function(
+    "setTimeout", "clearTimeout", "_bridgeFetch", "console", "AbortSignal", "_WEDGED_COMMAND_MS",
+    `"use strict"; ${source}; return _wedgedCommandGuard;`
+  )(
+    (fire) => { const id = nextTimer++; timers.set(id, fire); return id; },
+    (id) => { timers.delete(id); },
+    async (_url, init) => { posts.push(JSON.parse(init.body)); return { ok: true }; },
+    { log() {} },
+    { timeout: () => undefined },
+    330000
+  );
+  const elapse = async () => {
+    for (const [id, fire] of [...timers]) { timers.delete(id); await fire(); }
+  };
+
+  const settled = wedgedCommandGuard({ id: "settled", type: "evaluate" }, "http://127.0.0.1:9224");
+  settled.cancel();
+  await elapse();
+  assert.deepEqual(posts, [], "a command that already answered must not be answered again");
+
+  const wedged = wedgedCommandGuard({ id: "wedged", type: "evaluate" }, "http://127.0.0.1:9224");
+  await elapse();
+  await wedged;
+  assert.equal(posts.length, 1, "a command still running at the ceiling gets exactly one error result");
+  assert.equal(posts[0].id, "wedged");
+  assert.match(posts[0].error, /did not settle/);
 });
