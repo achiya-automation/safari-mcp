@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A server that lost the bridge port no longer leaves the extension without a bridge until someone restarts it.** When another process holds the extension bridge port at startup, the server runs as a secondary and proxies through that primary — but it never tried the port again, so once the primary exited it kept proxying to nothing and every tool failed. Seen live on the HTTP LaunchAgent daemon: it restarted while a short-lived `node index.js` held 9224, came up as a secondary, and nothing listened on 9224 after that process exited. A secondary whose primary stops answering now takes the port over. `test/bridge-port-takeover.test.mjs` reproduces the sequence with two real server processes on free ports.
+- **`npm test` no longer takes the production bridge ports.** `test/stdio-lifecycle.test.mjs` started a real server on the default ports 9224/9223, so a test run during a daemon restart was exactly what held the port in the incident above. It now runs on free ports, and a guard test fails when any test spawns `index.js` without `SAFARI_MCP_BRIDGE_PORT` and `SAFARI_MCP_BRIDGE_WS_PORT`.
+
 ## [2.21.7] - 2026-09-15
 
 ### Fixed

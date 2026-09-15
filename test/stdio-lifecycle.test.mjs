@@ -1,7 +1,18 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { createServer } from "node:net";
 import { test } from "node:test";
+
+async function freePort() {
+  const server = createServer();
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const { port } = /** @type {import("node:net").AddressInfo} */ (server.address());
+  server.close();
+  await once(server, "close");
+  return port;
+}
 
 function withTimeout(promise, timeoutMs, message) {
   let timer;
@@ -14,7 +25,14 @@ function withTimeout(promise, timeoutMs, message) {
 test("stdio server exits when the client closes stdin", { timeout: 15_000 }, async () => {
   const child = spawn(process.execPath, ["index.js"], {
     cwd: process.cwd(),
-    env: { ...process.env, SAFARI_MCP_QUIET: "1" },
+    env: {
+      ...process.env,
+      SAFARI_MCP_QUIET: "1",
+      // Never the production bridge ports: a run during a daemon restart took 9224 and
+      // left the LaunchAgent daemon a secondary with no primary (15.9.26).
+      SAFARI_MCP_BRIDGE_PORT: String(await freePort()),
+      SAFARI_MCP_BRIDGE_WS_PORT: String(await freePort()),
+    },
     stdio: ["pipe", "pipe", "pipe"],
   });
   const exit = once(child, "exit");

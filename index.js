@@ -721,6 +721,9 @@ function _handleContentWakeRequest(req, res) {
   return true;
 }
 
+// Binds the extension bridge port; set once the bridge server exists (see PROXY MODE).
+let _listenAsExtensionHost = null;
+
 try {
   const httpServer = createServer((req, res) => {
     if (_handleContentWakeRequest(req, res)) return;
@@ -1108,18 +1111,31 @@ try {
     res.end("Not found");
   });
 
-  httpServer.listen(HTTP_PORT, "127.0.0.1", () => {
+  let binding = false;
+  let proxying = false;
+  httpServer.on("listening", () => {
+    binding = false;
     _isExtensionHost = true;
     console.error(`[Safari MCP] HTTP server listening on port ${HTTP_PORT} (extension host)`);
   });
   httpServer.on("error", (err) => {
-    if (err.code === "EADDRINUSE") {
+    binding = false;
+    if (err.code === "EADDRINUSE" && !proxying) {
+      proxying = true;
       console.error(`[Safari MCP] HTTP port ${HTTP_PORT} in use — will proxy commands to primary instance`);
       _isExtensionHost = false;
       // Check if primary instance has extension connected
       _checkPrimaryExtension();
     }
   });
+  // Callable again after a failed bind; the guard keeps a second call from throwing
+  // ERR_SERVER_ALREADY_LISTEN while a bind is still in flight.
+  _listenAsExtensionHost = () => {
+    if (binding || httpServer.listening) return;
+    binding = true;
+    httpServer.listen(HTTP_PORT, "127.0.0.1");
+  };
+  _listenAsExtensionHost();
 } catch {}
 
 // ========== PROXY MODE ==========
@@ -1156,7 +1172,14 @@ async function _checkPrimaryExtension() {
       }
     }
   } catch {
+    // Nothing answers on the bridge port: the primary is gone. A secondary that keeps
+    // proxying to nobody leaves the extension without a bridge until a restart (seen
+    // 15.9.26, after a short-lived process held the port during a daemon restart), so
+    // take the port over. If something else still holds it, the bind fails quietly.
     _primaryHasExtension = false;
+    _extensionConnected = false;
+    if (process.env.SAFARI_PROFILE) _profileExtensionVerified = false;
+    _listenAsExtensionHost?.();
   }
   // Re-check every 10s (unref'd — must not keep the Node process alive on its own)
   setTimeout(_checkPrimaryExtension, 10000).unref();
