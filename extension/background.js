@@ -1443,11 +1443,11 @@ async function handleCommand(type, payload) {
             }
             el = exactBest || partialBest;
           }
-        } else if (x !== undefined && y !== undefined) {
+        } else if (x != null && y != null) {
           el = document.elementFromPoint(x, y);
         }
 
-        if (!el) return "Element not found" + (ref ? " ref=" + ref : "") + (selector ? " selector=" + selector : "") + (text ? ' text="' + text + '"' : "") + (x !== undefined ? " x=" + x + " y=" + y : "");
+        if (!el) return "Element not found" + (ref ? " ref=" + ref : "") + (selector ? " selector=" + selector : "") + (text ? ' text="' + text + '"' : "") + (x != null ? " x=" + x + " y=" + y : "");
 
         // --- Visibility check ---
         const cs = window.getComputedStyle(el);
@@ -1568,69 +1568,16 @@ async function handleCommand(type, payload) {
         return "Navigated to: " + href;
       }
 
-      // Fallback: if element not found in main frame, try all frames (cross-origin iframes)
+      // Fallback: the content bridge runs in the top frame's ISOLATED world, so it misses
+      // child documents and closed shadow roots. Probe every frame read-only, then click
+      // once in the one frame (and the one world) that can reach the target.
       if (result && (result.startsWith("Element not found") || result === "No click target")) {
-        const iframeArgs = [payload.selector, payload.text, payload.ref];
-        const iframeResult = await execInFirstMatchingFrameMutating((selector, text, ref) => {
-          const deepQuery = (query, root = document) => {
-            const direct = root.querySelector(query);
-            if (direct) return direct;
-            for (const host of root.querySelectorAll("*")) {
-              if (!host.shadowRoot) continue;
-              const nested = deepQuery(query, host.shadowRoot);
-              if (nested) return nested;
-            }
-            return null;
-          };
-          if (ref) {
-            const safeRef = String(ref).replace(/["\\]/g, "\\$&");
-            return !!deepQuery('[data-mcp-ref="' + safeRef + '"]');
-          }
-          if (selector) return !!deepQuery(selector);
-          if (!text) return false;
-          const candidates = document.querySelectorAll("button, a, [role='button'], input[type='submit']");
-          for (let i = 0; i < candidates.length; i++) {
-            const value = (candidates[i].innerText || candidates[i].textContent || "").trim();
-            if (value && (value === text || value.includes(text) || text.includes(value))) return true;
-          }
-          return false;
-        }, iframeArgs, (selector, text, ref) => {
-          const deepQuery = (query, root = document) => {
-            const direct = root.querySelector(query);
-            if (direct) return direct;
-            for (const host of root.querySelectorAll("*")) {
-              if (!host.shadowRoot) continue;
-              const nested = deepQuery(query, host.shadowRoot);
-              if (nested) return nested;
-            }
-            return null;
-          };
-          let el = null;
-          if (ref) {
-            const safeRef = String(ref).replace(/["\\]/g, "\\$&");
-            el = deepQuery('[data-mcp-ref="' + safeRef + '"]');
-          } else if (selector) {
-            el = deepQuery(selector);
-          } else if (text) {
-            // Search interactive elements by text
-            const candidates = document.querySelectorAll("button, a, [role='button'], input[type='submit']");
-            for (let i = 0; i < candidates.length; i++) {
-              const t = (candidates[i].innerText || candidates[i].textContent || "").trim();
-              if (t === text) { el = candidates[i]; break; }
-            }
-            // Fuzzy: contains match
-            if (!el) {
-              for (let i = 0; i < candidates.length; i++) {
-                const t = (candidates[i].innerText || candidates[i].textContent || "").trim();
-                if (t && (t.includes(text) || text.includes(t))) { el = candidates[i]; break; }
-              }
-            }
-          }
-          if (!el) return null;
-          el.scrollIntoView({ block: "center", behavior: "instant" });
-          el.click();
-          return "Clicked (iframe): " + el.tagName + (el.textContent ? ' "' + el.textContent.trim().substring(0, 50) + '"' : "");
-        }, iframeArgs, tabId);
+        const target = [payload.selector, payload.text, payload.ref];
+        const iframeResult = await execInFirstMatchingFrameMutating(
+          _clickFrameAction, [...target, "probe"],
+          _clickFrameAction, [...target, "click"],
+          tabId
+        );
         if (iframeResult) return iframeResult;
       }
       return result;
@@ -1911,7 +1858,10 @@ async function handleCommand(type, payload) {
       const result = await execInTab((text, selector) => {
         if (selector) {
           const el = (window.__mcpDeepQuery || document.querySelector.bind(document))(selector);
-          if (!el) return "Element not found: " + selector;
+          // __mcpDeepQuery also returns fields from same-origin iframes, but every strategy
+          // below types through THIS document (execCommand, activeElement) — into whichever
+          // top-frame field last had focus. A miss sends the frame fallback to type there.
+          if (!el || el.ownerDocument !== document) return "Element not found: " + selector;
           el.focus();
         }
 
@@ -2426,7 +2376,7 @@ async function handleCommand(type, payload) {
         const dq = window.__mcpDeepQuery || document.querySelector.bind(document);
         let el = null;
         if (selector) el = dq(selector);
-        else if (x !== undefined && y !== undefined) el = document.elementFromPoint(x, y);
+        else if (x != null && y != null) el = document.elementFromPoint(x, y);
         if (!el) return "Element not found: " + (selector || "x=" + x + ",y=" + y);
         el.scrollIntoView({ block: "center" });
         const r = el.getBoundingClientRect();
@@ -2449,7 +2399,7 @@ async function handleCommand(type, payload) {
         const dq = window.__mcpDeepQuery || document.querySelector.bind(document);
         let el = null;
         if (selector) el = dq(selector);
-        else if (x !== undefined && y !== undefined) el = document.elementFromPoint(x, y);
+        else if (x != null && y != null) el = document.elementFromPoint(x, y);
         if (!el) return "Element not found: " + (selector || "x=" + x + ",y=" + y);
         el.scrollIntoView({ block: "center" });
         const r = el.getBoundingClientRect();
@@ -3838,6 +3788,15 @@ function _withInjectionDeadline(promise, ms = MAIN_WORLD_INJECT_MS) {
   ]);
 }
 
+// Safari's scripting.executeScript drops `undefined` entries from `args` and shifts every
+// later argument left: a ref-only click probe `(selector, text, ref)` received the ref as
+// its selector, and wait_for by text received its text as a selector. Every executor
+// sends args through here; injected functions test these values with truthiness or
+// `!= null`, so null carries the same meaning and keeps each argument in its position.
+function _scriptArgs(args) {
+  return Array.from(args || [], (value) => (value === undefined ? null : value));
+}
+
 async function execInTab(func, args = [], tabId = null) {
   const id = tabId || (await getActiveTab()).id;
   try {
@@ -3862,13 +3821,13 @@ async function execInTab(func, args = [], tabId = null) {
     let results;
     try {
       results = await _withInjectionDeadline(
-        browser.scripting.executeScript({ target: { tabId: id }, world: "MAIN", func, args })
+        browser.scripting.executeScript({ target: { tabId: id }, world: "MAIN", func, args: _scriptArgs(args) })
       );
     } catch (mainErr) {
       if (!/injection stalled/.test(mainErr?.message || "")) throw mainErr;
       console.warn("Safari MCP: MAIN world stalled, retrying ISOLATED on tabId=" + id);
       results = await _withInjectionDeadline(
-        browser.scripting.executeScript({ target: { tabId: id }, world: "ISOLATED", func, args })
+        browser.scripting.executeScript({ target: { tabId: id }, world: "ISOLATED", func, args: _scriptArgs(args) })
       );
       // If ISOLATED stalls too the page blocks injection outright, and there is nothing
       // generic left to try — execInTab relays a FUNCTION, which the content bridge
@@ -3898,7 +3857,7 @@ async function execInTabIsolated(func, args = [], tabId = null) {
     target: { tabId: id },
     world: "ISOLATED",
     func,
-    args,
+    args: _scriptArgs(args),
   });
   try {
     let results;
@@ -3938,7 +3897,7 @@ async function _executeAllFrames(func, args = [], tabId = null) {
     target: { tabId: id, allFrames: true },
     world,
     func,
-    args,
+    args: _scriptArgs(args),
   }));
 
   try {
@@ -3955,12 +3914,14 @@ async function _executeAllFrames(func, args = [], tabId = null) {
 
 // Mutating fallbacks must never broadcast an action to every frame or retry it after
 // an ambiguous executeScript rejection. First locate one frame with a read-only probe,
-// then dispatch once to that concrete frame in ISOLATED world. If the one dispatch has
-// an unknown outcome, fail terminally so a caller can verify state before retrying.
+// then dispatch once to that concrete frame in ISOLATED world — or in MAIN when the probe
+// answers "MAIN", because its match sits in a closed shadow root ISOLATED cannot reach.
+// If the one dispatch has an unknown outcome, fail terminally so a caller can verify
+// state before retrying.
 async function execInFirstMatchingFrameMutating(matchFunc, matchArgs, func, args, tabId = null) {
   const id = tabId || (await getActiveTab()).id;
   const matches = await _executeAllFrames(matchFunc, matchArgs, id);
-  const match = matches.find((entry) => !entry?.error && entry?.result === true);
+  const match = matches.find((entry) => !entry?.error && (entry?.result === true || entry?.result === "MAIN"));
   if (!match) return null;
   if (!Number.isInteger(match.frameId)) {
     throw new Error("Matched frame has no stable frameId; refusing mutating iframe fallback");
@@ -3969,9 +3930,9 @@ async function execInFirstMatchingFrameMutating(matchFunc, matchArgs, func, args
   try {
     const results = await _withInjectionDeadline(browser.scripting.executeScript({
       target: { tabId: id, frameIds: [match.frameId] },
-      world: "ISOLATED",
+      world: match.result === "MAIN" ? "MAIN" : "ISOLATED",
       func,
-      args,
+      args: _scriptArgs(args),
     }));
     const first = results[0];
     if (first?.error) throw new Error(first.error);
@@ -3979,6 +3940,53 @@ async function execInFirstMatchingFrameMutating(matchFunc, matchArgs, func, args
   } catch (error) {
     throw new Error("Mutating iframe injection outcome is unknown; refusing automatic retry: " + (error?.message || String(error)));
   }
+}
+
+// Click fallback for targets the top-frame content bridge cannot see: child documents and
+// closed shadow roots. Safari serializes it into each frame, so it stays self-contained.
+// Probe mode is read-only and names the world that can reach the match — a closed shadow
+// root is visible only to MAIN, through the getter content.js installs at document_start.
+function _clickFrameAction(selector, text, ref, mode) {
+  const getShadowRoot = window.__mcpGetShadowRoot || ((host) => host.shadowRoot);
+  const roots = [];
+  const collect = (root) => {
+    roots.push(root);
+    for (const host of root.querySelectorAll("*")) {
+      const shadow = getShadowRoot(host);
+      if (shadow) collect(shadow);
+    }
+  };
+  collect(document);
+
+  let el = null;
+  const query = ref ? '[data-mcp-ref="' + String(ref).replace(/["\\]/g, "\\$&") + '"]' : selector;
+  if (query) {
+    for (const root of roots) {
+      el = root.querySelector(query);
+      if (el) break;
+    }
+  } else if (text) {
+    const label = (candidate) => (candidate.innerText || candidate.textContent || "").trim();
+    const candidates = roots.flatMap((root) => [...root.querySelectorAll("button, a, [role='button'], input[type='submit']")]);
+    el = candidates.find((candidate) => label(candidate) === text) ||
+      candidates.find((candidate) => {
+        const value = label(candidate);
+        return value && (value.includes(text) || text.includes(value));
+      });
+  }
+
+  if (mode === "probe") {
+    if (!el) return false;
+    for (let root = el.getRootNode(); root instanceof ShadowRoot; root = root.host.getRootNode()) {
+      if (root.mode === "closed") return "MAIN";
+    }
+    return true;
+  }
+  if (!el) return null;
+  el.scrollIntoView({ block: "center", behavior: "instant" });
+  el.click();
+  return "Clicked" + (window === top ? "" : " (iframe)") + ": " + el.tagName +
+    (el.textContent ? ' "' + el.textContent.trim().substring(0, 50) + '"' : "");
 }
 
 // Shared exact-frame probe and MAIN-world one-shot popup capture. It stays
@@ -4193,7 +4201,7 @@ async function execInExactMatchingFrameMainOnce(matchFunc, matchArgs, func, args
       target: { tabId: id, frameIds: [matches[0].frameId] },
       world: "MAIN",
       func,
-      args,
+      args: _scriptArgs(args),
     }));
     const first = results[0];
     if (first?.error) throw new Error(first.error);

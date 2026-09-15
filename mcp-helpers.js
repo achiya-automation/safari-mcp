@@ -15,11 +15,15 @@ if (window.__mcpVersion !== 6) {
   window.mcpCollectRoots = function() {
     if (!window.__mcpRootsDirty && window.__mcpCachedRoots) return window.__mcpCachedRoots;
     var roots = [];
+    // Closed roots come from the getter the extension's content.js installs at
+    // document_start; without it mcpFindRef fell back to coordinates and returned the host.
+    var getShadowRoot = window.__mcpGetShadowRoot || function(el) { return el.shadowRoot; };
     function collect(root) {
       roots.push(root);
       var all = root.querySelectorAll('*');
       for (var i = 0; i < all.length; i++) {
-        if (all[i].shadowRoot) collect(all[i].shadowRoot);
+        var shadow = getShadowRoot(all[i]);
+        if (shadow) collect(shadow);
       }
     }
     collect(document);

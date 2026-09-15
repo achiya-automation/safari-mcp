@@ -156,12 +156,14 @@ test("exact-frame executor mutates one proven frame in MAIN and rejects ambiguit
       "_executeAllFrames",
       "getActiveTab",
       "_withInjectionDeadline",
+      "_scriptArgs",
       "browser",
       `${helperSource}; return execInExactMatchingFrameMainOnce;`
     )(
       async () => probes,
       async () => ({ id: 55 }),
       async (promise) => await promise,
+      (args) => args,
       {
         scripting: {
           executeScript: async (options) => {

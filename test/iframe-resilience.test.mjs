@@ -47,14 +47,22 @@ test("get_element and wait_for inspect child frames", () => {
 
 test("a snapshot ref can be clicked inside a child frame", () => {
   const click = commandCase("click", "click_and_read");
-  const iframeFallback = click.slice(click.indexOf("Fallback: if element not found in main frame"));
-  assert.match(iframeFallback, /execInFirstMatchingFrameMutating/);
-  assert.match(iframeFallback, /\(selector, text, ref\)/);
-  assert.match(iframeFallback, /data-mcp-ref/);
-  assert.match(iframeFallback, /payload\.selector, payload\.text, payload\.ref/);
-  assert.ok((iframeFallback.match(/host\.shadowRoot/g) || []).length >= 2, "both iframe click probe and dispatch must traverse open shadow roots");
-  assert.match(iframeFallback, /if \(value &&/);
-  assert.match(iframeFallback, /if \(t &&/);
+  const iframeFallback = click.slice(click.indexOf("Fallback: the content bridge"));
+  assert.match(iframeFallback, /const target = \[payload\.selector, payload\.text, payload\.ref\]/);
+  assert.match(
+    iframeFallback,
+    /execInFirstMatchingFrameMutating\(\s*_clickFrameAction, \[\.\.\.target, "probe"\],\s*_clickFrameAction, \[\.\.\.target, "click"\]/,
+    "probe and dispatch must be the same resolver, so they agree on the element"
+  );
+
+  const action = background.slice(
+    background.indexOf("function _clickFrameAction("),
+    background.indexOf("function _popupClickFrameAction(")
+  );
+  assert.match(action, /data-mcp-ref/);
+  assert.match(action, /window\.__mcpGetShadowRoot \|\| \(\(host\) => host\.shadowRoot\)/, "open roots everywhere, closed roots from MAIN");
+  assert.match(action, /root\.mode === "closed"\) return "MAIN"/, "a closed-root match must name the only world that can click it");
+  assert.match(action, /return value && \(/, "fuzzy text matching must skip empty labels");
 });
 
 test("mutating iframe fallbacks target one proven frame and never auto-retry", () => {
@@ -68,7 +76,7 @@ test("mutating iframe fallbacks target one proven frame and never auto-retry", (
   const source = background.slice(start, end);
   assert.match(source, /_executeAllFrames\(matchFunc/);
   assert.match(source, /frameIds: \[match\.frameId\]/);
-  assert.match(source, /world: "ISOLATED"/);
+  assert.match(source, /world: match\.result === "MAIN" \? "MAIN" : "ISOLATED"/, "MAIN only when the probe proved a closed shadow root");
   assert.match(source, /refusing automatic retry/);
   assert.equal(
     (source.match(/browser\.scripting\.executeScript/g) || []).length,
@@ -79,7 +87,7 @@ test("mutating iframe fallbacks target one proven frame and never auto-retry", (
 
 test("type_text does not type into a top-frame field when an iframe ref is missing there", () => {
   const source = commandCase("type_text", "press_key");
-  assert.match(source, /if \(!el\) return "Element not found: " \+ selector/);
+  assert.match(source, /if \(!el \|\| el\.ownerDocument !== document\) return "Element not found: " \+ selector/);
   assert.match(source, /result\.startsWith\("Element not found"\)/);
   assert.match(source, /return !!deepQuery\(selector\)/);
   assert.match(source, /selector \? deepQuery\(selector\) : document\.activeElement/);
