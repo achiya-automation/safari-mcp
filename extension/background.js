@@ -1260,44 +1260,50 @@ async function handleCommand(type, payload) {
       // Strategy: try captureVisibleTab WITHOUT focusing the window first.
       // If it fails, fall back to AppleScript screencapture -l (which also doesn't steal focus).
       // NEVER use browser.windows.update({ focused: true }) — it steals user's keyboard/mouse.
-      let captureWindowId = _profileWindowId || null;
-      // captureVisibleTab only sees the window's selected tab, so ours must be selected for
-      // the capture — but the selection belongs to the user when they browse this window.
-      // Remember what they had selected and put it back (the AppleScript path already does
-      // this via _withTargetTabFronted; this path used to leave our tab in front).
-      let restoreTabId = null;
-      if (tabId) {
+      return _withTabSelected(tabId, async (windowId) => {
+        // Use JPEG with quality 50 to reduce size (~600KB PNG → ~60KB JPEG)
         try {
-          const tabInfo = await browser.tabs.get(tabId);
-          captureWindowId = tabInfo.windowId;
-          if (!tabInfo.active) {
-            const [selected] = await browser.tabs.query({ active: true, windowId: tabInfo.windowId });
-            if (selected && selected.id !== tabId) restoreTabId = selected.id;
-            // Only selects the tab — does NOT bring the Safari window to the foreground
-            await browser.tabs.update(tabId, { active: true });
-            await new Promise(r => setTimeout(r, 150));
-          }
-        } catch (_) {}
-      }
-      // Use JPEG with quality 50 to reduce size (~600KB PNG → ~60KB JPEG)
-      try {
-        const dataUrl = await browser.tabs.captureVisibleTab(captureWindowId, {
-          format: "jpeg",
-          quality: 50,
-        });
-        return dataUrl.split(",")[1];
-      } catch (screenshotErr) {
-        // Permission lost or window not visible — signal MCP to use AppleScript fallback
-        // AppleScript uses screencapture -l<windowId> which captures without stealing focus
-        const msg = screenshotErr.message || "";
-        if (msg.includes("permission") || msg.includes("screencapture") || msg.includes("Screen Recording") || msg.includes("visible")) {
+          const dataUrl = await browser.tabs.captureVisibleTab(windowId, {
+            format: "jpeg",
+            quality: 50,
+          });
+          return dataUrl.split(",")[1];
+        } catch (_) {
+          // Permission lost or window not visible — signal MCP to use AppleScript fallback
+          // AppleScript uses screencapture -l<windowId> which captures without stealing focus
           return "__SCREENSHOT_PERMISSION_DENIED__";
         }
-        // Any other error also falls back — better than stealing focus
-        return "__SCREENSHOT_PERMISSION_DENIED__";
-      } finally {
-        if (restoreTabId !== null) browser.tabs.update(restoreTabId, { active: true }).catch(() => {});
-      }
+      });
+    }
+
+    case "screenshot_element": {
+      // A profile session refuses the AppleScript crop, so crop here: capture the tab as
+      // "screenshot" does and cut out the element, measured while the tab is selected.
+      let box = null;
+      const dataUrl = await _withTabSelected(tabId, async (windowId) => {
+        box = await execInTab(async (selector) => {
+          const el = (window.__mcpDeepQuery || document.querySelector.bind(document))(selector);
+          if (!el) return null;
+          el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          const r = el.getBoundingClientRect();
+          let left = r.left, top = r.top;
+          // A same-origin iframe match is measured in its frame's viewport: add the frame's
+          // position and border to get the page viewport the capture shows.
+          for (let view = el.ownerDocument.defaultView; view.frameElement; view = view.parent) {
+            const frame = view.frameElement.getBoundingClientRect();
+            left += frame.left + view.frameElement.clientLeft;
+            top += frame.top + view.frameElement.clientTop;
+          }
+          return { left, top, width: r.width, height: r.height, viewportWidth: window.innerWidth };
+        }, [payload.selector], tabId);
+        if (!box) return null;
+        return browser.tabs.captureVisibleTab(windowId, { format: "png" }).catch(() => null);
+      });
+      if (!box) return "Element not found: " + payload.selector;
+      // Same signal as "screenshot": outside a profile the AppleScript crop can still try.
+      if (!dataUrl) return "__SCREENSHOT_PERMISSION_DENIED__";
+      return (await _cropCapture(dataUrl, box)) || "Element has no visible area: " + payload.selector;
     }
 
     // --- Click & Input ---
@@ -4374,6 +4380,58 @@ async function waitForTabLoad(tabId, timeout = 30000) {
     browser.tabs.onUpdated.addListener(updateListener);
     browser.tabs.onRemoved.addListener(removeListener);
   });
+}
+
+// captureVisibleTab only sees the window's selected tab, so ours must be selected for
+// the capture — but the selection belongs to the user when they browse this window.
+// Remember what they had selected and put it back (the AppleScript path already does
+// this via _withTargetTabFronted; the extension path used to leave our tab in front).
+// `capture(windowId)` runs while the tab is selected.
+async function _withTabSelected(tabId, capture) {
+  let windowId = _profileWindowId || null;
+  let restoreTabId = null;
+  if (tabId) {
+    try {
+      const tabInfo = await browser.tabs.get(tabId);
+      windowId = tabInfo.windowId;
+      if (!tabInfo.active) {
+        const [selected] = await browser.tabs.query({ active: true, windowId: tabInfo.windowId });
+        if (selected && selected.id !== tabId) restoreTabId = selected.id;
+        // Only selects the tab — does NOT bring the Safari window to the foreground
+        await browser.tabs.update(tabId, { active: true });
+        await new Promise(r => setTimeout(r, 150));
+      }
+    } catch (_) {}
+  }
+  try {
+    return await capture(windowId);
+  } finally {
+    if (restoreTabId !== null) browser.tabs.update(restoreTabId, { active: true }).catch(() => {});
+  }
+}
+
+// Cuts a viewport box (CSS pixels) out of a captureVisibleTab data URL, clipped to what
+// the capture shows. Returns JPEG base64, or null when nothing of the box is on screen.
+async function _cropCapture(dataUrl, box) {
+  const image = new Image();
+  await new Promise((resolve, reject) => {
+    image.onload = resolve;
+    image.onerror = () => reject(new Error("screenshot_element: the tab capture could not be decoded"));
+    image.src = dataUrl;
+  });
+  // Scale from the capture itself rather than devicePixelRatio, so the crop follows the
+  // resolution Safari actually rendered.
+  const scale = image.naturalWidth / box.viewportWidth;
+  const left = Math.max(0, Math.round(box.left * scale));
+  const top = Math.max(0, Math.round(box.top * scale));
+  const width = Math.min(image.naturalWidth, Math.round((box.left + box.width) * scale)) - left;
+  const height = Math.min(image.naturalHeight, Math.round((box.top + box.height) * scale)) - top;
+  if (width <= 0 || height <= 0) return null;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  canvas.getContext("2d").drawImage(image, left, top, width, height, 0, 0, width, height);
+  return canvas.toDataURL("image/jpeg", 0.8).split(",")[1];
 }
 
 function sleep(ms) {

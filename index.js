@@ -2608,16 +2608,14 @@ server.tool(
 
 server.tool(
   "safari_screenshot_element",
-  "Take a screenshot of a specific element (by CSS selector). Returns base64 PNG image.",
+  "Take a screenshot of a specific element (by CSS selector). Returns a base64 image.",
   { selector: z.string().describe("CSS selector of the element to capture"), receipt: z.string().optional().describe("Tab receipt from safari_new_tab — pins this call to that tab (survives reconnects/subagents)"), },
   async ({ selector, receipt }) => {
-    const base64 = await extensionOrFallback(
+    // The extension crops to JPEG, the AppleScript path to PNG; a miss comes back as text.
+    return imageResult(await extensionOrFallback(
       "screenshot_element", { selector, ..._explicitReceipt({ receipt }) },
       () => safari.screenshotElement({ selector })
-    );
-    return {
-      content: [{ type: "image", data: base64, mimeType: "image/jpeg" }],
-    };
+    ));
   }
 );
 

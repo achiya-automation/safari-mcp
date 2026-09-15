@@ -18,10 +18,16 @@ export const jsonResult = (r) => ({
   content: [{ type: "text", text: JSON.stringify(r, null, 2) }],
 });
 
-/** Image response (base64 + mime type). */
-export const imageResult = (data, mimeType = "image/jpeg") => ({
-  content: [{ type: "image", data, mimeType }],
-});
+/**
+ * Image response for base64 JPEG or PNG, labelled by the data's own magic bytes. Anything
+ * else is a message ("Element not found: …"): sent as image bytes the client cannot decode
+ * it and the reason is lost, so it is raised as the tool's error instead.
+ */
+export const imageResult = (data) => {
+  const mimeType = /^\/9j\//.test(data) ? "image/jpeg" : /^iVBORw0KGgo/.test(data) ? "image/png" : null;
+  if (!mimeType) throw new Error(String(data || "no image data returned"));
+  return { content: [{ type: "image", data, mimeType }] };
+};
 
 /** Error response — sets `isError` so the MCP client renders it as a failure. */
 export const errorResult = (msg) => ({
