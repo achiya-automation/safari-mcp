@@ -11,7 +11,7 @@ import { readFile, writeFile, unlink, appendFile, mkdir } from "node:fs/promises
 import { readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
-import { VIEWPORT_SCRIPT, SAFE_AREA_SCRIPT, PWA_SCRIPT, WEBKIT_COMPAT_SCRIPT } from "./injected-validators.js";
+import { VIEWPORT_SCRIPT, SAFE_AREA_SCRIPT, PWA_SCRIPT, WEBKIT_COMPAT_SCRIPT, ALL_SHEETS_FN } from "./injected-validators.js";
 import { escJsSingleQuote, escAppleScriptString } from "./injected-escape.js";
 import { currentSessionId } from "./session-context.js";
 import { allowUserTabs } from "./ownership-state.js";
@@ -3595,7 +3595,7 @@ async function _screenshotFronted({ fullPage }) {
     }
 
     // Final fallback: throw with clear message for the retry logic in index.js
-    throw new Error("screencapture failed — Screen Recording permission may have been lost. Grant permission in System Settings → Privacy & Security → Screen Recording, then restart Safari.");
+    throw new Error("screencapture failed — Screen Recording permission may have been lost. Grant permission in System Settings → Privacy & Security → Screen & System Audio Recording, then restart Safari.");
   } finally {
     await unlink(tmpFile).catch(() => {});
   }
@@ -4600,70 +4600,105 @@ export async function pasteImageFromFile({ filePath }) {
 
 // ========== EMULATE (VIEWPORT) ==========
 
-export async function emulate({ device, width, height, userAgent, scale = 1 }) {
-  await refreshTargetWindow();
-  const devices = {
-    "iphone-14": { width: 390, height: 844, ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" },
-    "iphone-14-pro-max": { width: 430, height: 932, ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" },
-    "ipad": { width: 820, height: 1180, ua: "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" },
-    "ipad-pro": { width: 1024, height: 1366, ua: "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" },
-    "pixel-7": { width: 412, height: 915, ua: "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36" },
-    "galaxy-s24": { width: 412, height: 915, ua: "Mozilla/5.0 (Linux; Android 14; SM-S921B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36" },
-  };
+// Captured from Mobile Safari on the iOS/iPadOS 27.0 simulator (Xcode 27, 2026-09-15). Since
+// iOS 26 Safari freezes the OS token (18_6 at 26.0, 18_7 from 26.2) and only Version/ moves.
+// iPadOS requests desktop sites, so an iPad sends the Mac UA and platform "MacIntel"; pages tell
+// it apart by navigator.maxTouchPoints, which the override sets too.
+const UA_IOS_27 = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0 Mobile/15E148 Safari/604.1";
+const UA_IPADOS_27 = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0 Safari/605.1.15";
+const _iphone = (width, height) => ({ width, height, ua: UA_IOS_27, platform: "iPhone", touchPoints: 5 });
+const _ipad = (width, height) => ({ width, height, ua: UA_IPADOS_27, touchPoints: 5 });
 
-  const d = device ? devices[device.toLowerCase()] : null;
-  const w = d ? d.width : (width || 375);
-  const h = d ? d.height : (height || 812);
-  const ua = d ? d.ua : (userAgent || "");
+// Portrait CSS viewport (screen points). The iphone-14* / ipad / ipad-pro names predate iOS 27
+// and stay so existing callers keep working.
+export const EMULATION_DEVICES = {
+  "iphone-18-pro": _iphone(402, 874),
+  "iphone-18-pro-max": _iphone(440, 956),
+  "iphone-air": _iphone(420, 912),
+  "iphone-17": _iphone(402, 874),
+  "iphone-17e": _iphone(390, 844),
+  "iphone-16": _iphone(393, 852),
+  "iphone-14": _iphone(390, 844),
+  "iphone-14-pro-max": _iphone(430, 932),
+  "ipad": _ipad(820, 1180),
+  "ipad-air-11": _ipad(820, 1180),
+  "ipad-air-13": _ipad(1024, 1366),
+  "ipad-pro-11": _ipad(834, 1210),
+  "ipad-pro-13": _ipad(1032, 1376),
+  "ipad-pro": _ipad(1024, 1366),
+  "pixel-7": { width: 412, height: 915, ua: "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36" },
+  "galaxy-s24": { width: 412, height: 915, ua: "Mozilla/5.0 (Linux; Android 14; SM-S921B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36" },
+};
 
-  // Resize Safari window to match device
-  await osascript(
-    `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {0, 0, ${w}, ${h + 100}}`
-  );
-
-  // Override viewport meta and user agent if specified
-  if (ua) {
-    await runJS(
-      `Object.defineProperty(navigator,'userAgent',{get:function(){return '${ua.replace(/'/g, "\\'")}'},configurable:true})`
-    );
+// Pure. An unknown name used to fall through to a bare 375×812 window with no UA while the
+// result still echoed the requested device — refuse it instead.
+export function resolveEmulation({ device, width, height, userAgent } = {}) {
+  if (device) {
+    const name = String(device).trim().toLowerCase();
+    if (!Object.hasOwn(EMULATION_DEVICES, name)) {
+      throw new Error(`Unknown device "${device}". Available: ${Object.keys(EMULATION_DEVICES).join(", ")} — or pass width/height (and userAgent).`);
+    }
+    return { name, ...EMULATION_DEVICES[name] };
   }
+  const size = (v, fallback) => (Number(v) > 0 ? Math.round(Number(v)) : fallback);
+  return { name: "custom", width: size(width, 375), height: size(height, 812), ua: userAgent || "" };
+}
 
-  // Set viewport meta tag
-  await runJS(
-    `(function(){var m=document.querySelector('meta[name=viewport]');if(!m){m=document.createElement('meta');m.name='viewport';document.head.appendChild(m);}m.content='width=${w},initial-scale=${scale}';})()`
-  );
+// Pure. The getters carry a marker so resetEmulation() removes only what emulate() added.
+export function buildNavigatorOverrideJS({ ua, platform, touchPoints } = {}) {
+  const props = [];
+  if (ua) props.push(`['userAgent','${escJsSingleQuote(ua)}']`);
+  if (platform) props.push(`['platform','${escJsSingleQuote(platform)}']`);
+  if (touchPoints != null) props.push(`['maxTouchPoints',${Number(touchPoints)}]`);
+  if (!props.length) return "";
+  return `(function(){[${props.join(",")}].forEach(function(p){var g=function(){return p[1]};g.__mcpEmulated=true;Object.defineProperty(navigator,p[0],{get:g,configurable:true})});return navigator.userAgent})()`;
+}
 
-  // Reload to apply changes, then wait for load — polled from Node (`do JavaScript`
-  // can't await an in-page loop).
-  const navIndex = _st().activeTabIndex;
-  await runJS("location.reload()", { tabIndex: navIndex });
-  await new Promise(r => setTimeout(r, 200));
-  await _pollReadyAndRead(navIndex);
+export const RESET_NAVIGATOR_JS = "(function(){['userAgent','platform','maxTouchPoints'].forEach(function(k){var d=Object.getOwnPropertyDescriptor(navigator,k);if(d&&d.get&&d.get.__mcpEmulated)delete navigator[k]});return navigator.userAgent})()";
 
-  return JSON.stringify({
-    device: device || "custom",
-    width: w,
-    height: h,
-    userAgent: ua ? ua.substring(0, 60) + "..." : "(default)",
-  });
+export async function emulate(args) {
+  const target = resolveEmulation(args);
+  await refreshTargetWindow();
+  const winRef = getTargetWindowRef();
+  const st = _st();
+  // Remember the user's window once, so reset_emulation puts it back instead of forcing 1440×900.
+  // Comma-joined explicitly: the helper daemon returns "" for an AppleScript list.
+  if (!st.preEmulationBounds) {
+    const b = String(await osascriptFast(
+      `tell application "Safari"\n  set b to bounds of ${winRef}\n  return (item 1 of b as text) & "," & (item 2 of b as text) & "," & (item 3 of b as text) & "," & (item 4 of b as text)\nend tell`
+    ).catch(() => "")).trim();
+    if (/^-?\d+,-?\d+,-?\d+,-?\d+$/.test(b)) st.preEmulationBounds = b;
+  }
+  // Size from the measured browser chrome, so the page viewport — not the window — matches.
+  let chrome = 90;
+  try {
+    const c = Number(await runJS("(window.outerHeight - window.innerHeight) + ''"));
+    if (Number.isFinite(c) && c >= 50 && c <= 200) chrome = c;
+  } catch (_e) { /* keep the Safari 26/27 default */ }
+  await osascriptFast(`tell application "Safari" to set bounds of ${winRef} to {0, 0, ${target.width}, ${target.height + chrome}}`);
+
+  // No reload after this: a reload gives the page a fresh navigator and silently drops the
+  // override — which is what the old reload-to-apply step did to every emulation.
+  const overrideJS = buildNavigatorOverrideJS(target);
+  if (overrideJS) await runJS(overrideJS);
+
+  let actual = null;
+  try { actual = JSON.parse(await runJS("JSON.stringify([window.innerWidth, window.innerHeight])")); } catch (_e) { /* reported as null */ }
+  const notes = [];
+  if (overrideJS) notes.push("navigator.userAgent/platform/maxTouchPoints are overridden for this page's JavaScript only: the HTTP User-Agent header is unchanged, and a reload or navigation clears the override — call safari_emulate again after navigating.");
+  if (actual && actual[0] !== target.width) notes.push(`Safari kept the window wider than ${target.width}px (page viewport ${actual[0]}px) — desktop Safari has a minimum window width.`);
+  return JSON.stringify({ device: target.name, viewport: { requested: [target.width, target.height], actual }, userAgent: target.ua || "(unchanged)", notes });
 }
 
 export async function resetEmulation() {
   await refreshTargetWindow();
-  // Reset user agent — remove the defineProperty override set by emulate()
-  await runJS(
-    "try{var d=Object.getOwnPropertyDescriptor(Navigator.prototype,'userAgent');if(d){Object.defineProperty(navigator,'userAgent',d);}else{delete navigator.userAgent;}}catch(_){}"
-  );
-  // Maximize window
-  await osascript(
-    `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {0, 0, 1440, 900}`
-  );
-  // Reload + wait for load — polled from Node (`do JavaScript` can't await an in-page loop).
-  const navIndex = _st().activeTabIndex;
-  await runJS("location.reload()", { tabIndex: navIndex });
-  await new Promise(r => setTimeout(r, 200));
-  await _pollReadyAndRead(navIndex);
-  return "Emulation reset to desktop";
+  const st = _st();
+  const bounds = st.preEmulationBounds || "0,0,1440,900";
+  st.preEmulationBounds = null;
+  await osascriptFast(`tell application "Safari" to set bounds of ${getTargetWindowRef()} to {${bounds}}`);
+  // Deleting the marked getters restores Navigator.prototype's — no reload, so page state survives.
+  await runJS(RESET_NAVIGATOR_JS);
+  return `Emulation reset: window bounds {${bounds}}, navigator overrides removed`;
 }
 
 // ========== CONSOLE CAPTURE ==========
@@ -5619,10 +5654,12 @@ export async function listIndexedDBs() {
 export async function getCSSCoverage() {
   return evalReturningJSON(
     `
+      ${ALL_SHEETS_FN}
       var results = [];
-      for (var i = 0; i < document.styleSheets.length; i++) {
+      var sheets = allSheets();
+      for (var i = 0; i < sheets.length; i++) {
+        var sheet = sheets[i];
         try {
-          var sheet = document.styleSheets[i];
           var rules = sheet.cssRules || sheet.rules;
           var total = rules.length;
           var used = 0;
@@ -5637,7 +5674,7 @@ export async function getCSSCoverage() {
             } else { used++; }
           }
           results.push({
-            href: sheet.href || '(inline)',
+            href: sheet.href || (sheet.ownerNode ? '(inline)' : '(adopted)'),
             totalRules: total,
             usedRules: used,
             unusedRules: total - used,
@@ -5645,7 +5682,7 @@ export async function getCSSCoverage() {
             unusedSelectors: unused.slice(0, 20),
           });
         } catch(e) {
-          results.push({ href: sheet.href || '(inline)', error: 'CORS blocked' });
+          results.push({ href: sheet.href || (sheet.ownerNode ? '(inline)' : '(adopted)'), error: 'CORS blocked' });
         }
       }
       return JSON.stringify(results);
@@ -5735,7 +5772,7 @@ export async function doctor() {
     else aeDetail = m.slice(0, 80);
   }
   add(aeOk, "Apple Events / Automation", aeDetail,
-    "System Settings > Privacy & Security > Automation → enable Safari for your terminal/host app; and Safari > Develop > Allow JavaScript from Apple Events.");
+    "System Settings > Privacy & Security > Automation → enable Safari for your terminal/host app; and Safari > Settings > Developer > Allow JavaScript from Apple Events.");
 
   // 3-5. Native helper daemon + Accessibility + Screen Recording (one preflight round-trip)
   let pf = null, pfErr = "";
@@ -5751,10 +5788,13 @@ export async function doctor() {
     "It auto-restarts; if this persists, reinstall safari-mcp.");
   add(!!pf && pf.accessibility === true, "Accessibility (native clicks)",
     pf ? (pf.accessibility ? "CGEvent posting permitted" : "NOT permitted — native clicks silently no-op (the #29 root cause)") : "unknown (helper not responding)",
-    "System Settings > Privacy & Security > Accessibility → enable safari-helper, then retry.");
+    "System Settings > Privacy & Security > Accessibility (named \"Device Control and Data Access\" on macOS 27) → enable safari-helper, then retry.");
+  // macOS attributes the capture to whoever launched this process: the terminal/IDE for a
+  // stdio server, but node itself under launchd (a LaunchAgent daemon has ppid 1) — and a
+  // Homebrew node upgrade changes that path, so the grant has to follow the new binary.
   add(!!pf && pf.screenRecording === true, "Screen Recording (screenshots)",
-    pf ? (pf.screenRecording ? "permitted" : "NOT permitted — screenshots will be blank/blocked") : "unknown (helper not responding)",
-    "System Settings > Privacy & Security > Screen Recording → enable your terminal/host app.");
+    pf ? (pf.screenRecording ? "permitted" : "NOT permitted — screenshots taken through AppleScript and safari_save_pdf fail (extension screenshots don't need it)") : "unknown (helper not responding)",
+    `System Settings > Privacy & Security > Screen & System Audio Recording → enable ${process.ppid === 1 ? `node at ${process.execPath} (this server runs under launchd)` : "the terminal/IDE that launched this server"}.`);
 
   // 6. Helper codesign identity — a stale/ad-hoc id breaks the Accessibility grant on reinstall
   let idOk = false, idDetail = "";

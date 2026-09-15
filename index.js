@@ -3166,13 +3166,12 @@ server.tool(
 
 server.tool(
   "safari_emulate",
-  "Emulate a mobile device by resizing window and setting user agent. Devices: iphone-14, iphone-14-pro-max, ipad, ipad-pro, pixel-7, galaxy-s24. Or use custom width/height.",
+  `Emulate a mobile device: sizes the Safari window to the device's CSS viewport and overrides navigator.userAgent/platform/maxTouchPoints (iOS/iPadOS 27 values) in the current page — JavaScript only: the HTTP User-Agent header is unchanged and a reload or navigation clears it. Devices: ${Object.keys(safari.EMULATION_DEVICES).join(", ")}. Or pass width/height (and userAgent).`,
   {
-    device: z.string().optional().describe("Device name: iphone-14, ipad, pixel-7, galaxy-s24, etc."),
+    device: z.string().optional().describe("Device name from the list in the description, e.g. iphone-18-pro, iphone-air, ipad-pro-11"),
     width: z.coerce.number().optional().describe("Custom viewport width"),
     height: z.coerce.number().optional().describe("Custom viewport height"),
     userAgent: z.string().optional().describe("Custom user agent string"),
-    scale: z.coerce.number().optional().describe("Initial scale (default: 1)"),
   },
   async (args) => {
     _assertTabOwnership("emulate");
@@ -3183,7 +3182,7 @@ server.tool(
 
 server.tool(
   "safari_reset_emulation",
-  "Reset device emulation back to desktop mode",
+  "Reset device emulation: restores the window size from before safari_emulate and removes its navigator overrides (no reload)",
   {},
   async () => {
     _assertTabOwnership("reset_emulation");

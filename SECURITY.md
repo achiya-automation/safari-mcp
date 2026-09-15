@@ -50,7 +50,7 @@ safari-mcp is a **local-only** tool designed for developer use on macOS:
 
 ### JavaScript from Apple Events
 
-Safari's "Allow JavaScript from Apple Events" setting (under Develop menu) must be enabled for safari-mcp to function. This setting allows external processes to execute JavaScript in Safari tabs. Users should be aware that:
+Safari's "Allow JavaScript from Apple Events" setting (Safari → Settings → Developer) must be enabled for safari-mcp to function. This setting allows external processes to execute JavaScript in Safari tabs. Users should be aware that:
 
 - This is a Safari developer feature intended for automation.
 - It should only be enabled when actively using safari-mcp or similar tools.

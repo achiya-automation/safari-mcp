@@ -32,7 +32,13 @@ export const VIEWPORT_SCRIPT = `(function(){
       return JSON.stringify({viewport: content, attrs: attrs, ok: issues.length===0, errors: errors, warnings: warnings, issues: issues});
     })()`;
 
+// Safari 27 stopped listing constructable (adopted) style sheets in document.styleSheets, per
+// the CSSOM spec (Safari 27.0 release notes, 174583340). Stylesheet scans append them
+// explicitly, skipping any an older engine still lists, so they see the same rules on both.
+export const ALL_SHEETS_FN = `function allSheets(){var out=[].slice.call(document.styleSheets);var ad=document.adoptedStyleSheets||[];for(var a=0;a<ad.length;a++){if(out.indexOf(ad[a])===-1)out.push(ad[a]);}return out;}`;
+
 export const SAFE_AREA_SCRIPT = `(function(){
+      ${ALL_SHEETS_FN}
       if (!document.body) return JSON.stringify({error:'No document.body yet'});
       var probe = document.createElement('div');
       probe.style.cssText = 'position:fixed;top:env(safe-area-inset-top,0px);right:env(safe-area-inset-right,0px);bottom:env(safe-area-inset-bottom,0px);left:env(safe-area-inset-left,0px);pointer-events:none;visibility:hidden;';
@@ -44,7 +50,7 @@ export const SAFE_AREA_SCRIPT = `(function(){
       var viewportFitCover = meta ? ((meta.getAttribute('content')||'').indexOf('viewport-fit=cover') !== -1) : false;
       var usedInCSS = false;
       try {
-        var sheets = document.styleSheets;
+        var sheets = allSheets();
         for (var i=0; i<sheets.length; i++) {
           try {
             var rules = sheets[i].cssRules;
@@ -68,17 +74,18 @@ export const PWA_SCRIPT = `(function(){
       var manifest = getLink('manifest');
       var has180 = touchIcons.some(function(i){return i.sizes==='180x180';});
       var checks = [];
-      checks.push({pass: capable==='yes', label:'apple-mobile-web-app-capable', detail: capable==='yes' ? 'standalone mode enabled' : 'not set to yes — opens in Safari, not standalone'});
+      checks.push({pass: capable==='yes' || manifest!==null, label:'standalone launch (apple-mobile-web-app-capable or manifest)', detail: capable==='yes' ? 'apple-mobile-web-app-capable=yes' : (manifest!==null ? 'manifest linked — its display member sets standalone' : 'neither set — iOS/iPadOS 26+ still open any Home Screen site as a web app by default; iOS 18 and older open it in Safari')});
       checks.push({pass: touchIcons.length>0, label:'apple-touch-icon', detail: touchIcons.length>0 ? (touchIcons.length+' icon(s): '+touchIcons.map(function(i){return i.sizes;}).join(', ')+(has180?'':' (missing 180x180 for iPhone)')) : 'none — iOS uses a screenshot as the icon'});
-      checks.push({pass: themeColor!==null, label:'theme-color', detail: themeColor!==null ? ('set to '+themeColor) : 'not set — Safari 15+ tints the tab bar with it'});
+      checks.push({pass: themeColor!==null, label:'theme-color', detail: (themeColor!==null ? ('set to '+themeColor) : 'not set') + ' — Chrome and Android color their UI with it; Safari 26+ ignores it and tints its bars from the page background'});
       checks.push({pass: statusBar!==null, label:'apple-mobile-web-app-status-bar-style', detail: statusBar!==null ? ('set to '+statusBar) : 'not set — defaults to black-on-white'});
-      checks.push({pass: manifest!==null, label:'web app manifest', detail: manifest!==null ? ('found: '+manifest) : 'no manifest link — required for PWA install prompts'});
+      checks.push({pass: manifest!==null, label:'web app manifest', detail: manifest!==null ? ('found: '+manifest) : 'no manifest link — the Home Screen web app gets no name, id, scope or display mode of its own (Safari has no install prompt to trigger)'});
       checks.push({pass: splash>0, label:'apple-touch-startup-image', detail: splash>0 ? (splash+' splash screen(s)') : 'none — white screen while the app loads'});
       var passed = checks.filter(function(c){return c.pass;}).length;
       return JSON.stringify({passed: passed, total: checks.length, checks: checks});
     })()`;
 
 export const WEBKIT_COMPAT_SCRIPT = `(function(){
+      ${ALL_SHEETS_FN}
       var seen = {};
       function collectFromStyle(style){
         for (var k=0; k<style.length; k++){
@@ -96,7 +103,7 @@ export const WEBKIT_COMPAT_SCRIPT = `(function(){
           if (rule.cssRules){ try { processRules(rule.cssRules); } catch(e){} }
         }
       }
-      var sheets = document.styleSheets;
+      var sheets = allSheets();
       for (var i=0; i<sheets.length; i++){ try { processRules(sheets[i].cssRules); } catch(e){} }
       var inline = document.querySelectorAll('[style]');
       for (var n=0; n<inline.length; n++) collectFromStyle(inline[n].style);

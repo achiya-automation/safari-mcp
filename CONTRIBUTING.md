@@ -34,7 +34,7 @@ npm install
 
 Enable Safari automation:
 1. Safari > Settings > Advanced > **Show features for web developers** ✓
-2. Develop menu > **Allow JavaScript from Apple Events** ✓
+2. Safari > Settings > Developer > **Allow JavaScript from Apple Events** ✓
 
 *(Optional)* Build the Safari Extension: open `xcode/Safari MCP/Safari MCP.xcodeproj` and build "Safari MCP (macOS)".
 

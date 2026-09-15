@@ -80,11 +80,11 @@ const msg = `
 ${c.bold}${c.cyan}🦁 Safari MCP installed${c.reset} ${c.dim}— native browser tools for AI agents${c.reset}
 
 ${c.bold}Next steps:${c.reset}
-  1. Enable Safari → Develop → ${c.yellow}Allow JavaScript from Apple Events${c.reset}
+  1. Enable Safari → Settings → Developer → ${c.yellow}Allow JavaScript from Apple Events${c.reset}
   2. Add to your MCP client config:
      ${c.dim}{ "mcpServers": { "safari": { "command": "npx", "args": ["safari-mcp"] } } }${c.reset}
   3. ${c.bold}For native_click / native_keyboard${c.reset} (no focus stealing):
-     System Settings → Privacy & Security → ${c.yellow}Accessibility${c.reset} → add
+     System Settings → Privacy & Security → ${c.yellow}Accessibility${c.reset} ${c.dim}(macOS 27: Device Control and Data Access)${c.reset} → add
      ${c.dim}node_modules/safari-mcp/safari-helper${c.reset} ${c.dim}(or the global install path)${c.reset}
 
 ${c.bold}${c.magenta}⭐ Found this useful?${c.reset} A star helps others discover it:

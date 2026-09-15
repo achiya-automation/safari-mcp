@@ -43,7 +43,7 @@ Native WebKit. ~60% less CPU. Background operation. 98 tools. One `npx` command.
 
 > 📰 **Featured on freeCodeCamp:** [How to Connect Your AI Coding Agent to a Browser on macOS](https://www.freecodecamp.org/news/how-to-connect-your-ai-coding-agent-to-a-browser-on-macos/) · [HackerNoon: Reverse-Engineering React, Shadow DOM, and CSP](https://hackernoon.com/i-had-to-reverse-engineer-react-shadow-dom-and-csp-to-automate-safari-without-chrome)
 
-> 🍎 **Apple shipped an official Safari MCP** (July 2026 — Safari Technology Preview 247+ and the Safari 27 beta). It's built on `safaridriver` for isolated debugging sessions. safari-mcp drives the **real Safari you're already logged into** — on the stable Safari that ships with macOS today, with 98 tools. See the full comparison below.
+> 🍎 **Apple ships an official Safari MCP** — `safaridriver --mcp`, first in Safari Technology Preview 247 (July 2026) and in stable Safari since 27.0. It drives an isolated automation session for debugging. safari-mcp drives the **real Safari you're already logged into** — your cookies and sessions, in the background, with 98 tools. See the full comparison below.
 
 ---
 
@@ -81,7 +81,7 @@ Not solicited testimonials — quotes lifted from the public issue tracker, each
 - macOS (any version with Safari)
 - Node.js 20+
 - Safari → Settings → Advanced → **Show features for web developers** ✓
-- Safari → Develop → **Allow JavaScript from Apple Events** ✓
+- Safari → Settings → Developer → **Allow JavaScript from Apple Events** ✓
 
 ### Install (one command)
 
@@ -631,23 +631,25 @@ Safari MCP runs locally on your Mac with minimal attack surface:
 
 ### vs Apple's Official Safari MCP (safaridriver)
 
-In July 2026 Apple shipped an **official** Safari MCP server built on `safaridriver` — first in Safari Technology Preview 247, and now also in the Safari 27 beta. That's great validation for the category — and it's built for a different job. Apple's server drives an **isolated WebDriver automation session** for debugging; safari-mcp drives the **real Safari you're already logged into**.
+In July 2026 Apple shipped an **official** Safari MCP server built on `safaridriver` — first in Safari Technology Preview 247, and in stable Safari since 27.0. That's great validation for the category — and it's built for a different job. Apple's server drives an **isolated WebDriver automation session** for debugging; safari-mcp drives the **real Safari you're already logged into**.
 
-It has not reached a stable Safari release yet: on macOS 26.5.2 with Safari 26.5.2, `safaridriver --help` lists `--port`, `--bidi`, `--enable` and `--diagnose`, and no `--mcp` (verified 2026-07-23). Check your own machine with `safaridriver --help | grep mcp` before assuming either way.
+On macOS 27.0 with Safari 27.0, `safaridriver --help` lists `--mcp` and its `tools/list` answers with 17 entries (verified 2026-09-15); Safari 26.5.2 had no `--mcp` (verified 2026-07-23). Check your own machine with `safaridriver --help | grep mcp`.
+
+> **Running both?** Apple's setup guide registers its server under the name `safari-mcp` (`claude mcp add safari-mcp -- /usr/bin/safaridriver --mcp`) — the same name as this package. Give one of them a different name, e.g. `claude mcp add safari-webdriver -- /usr/bin/safaridriver --mcp`, so your client doesn't overwrite one with the other or leave you guessing which server answered.
 
 | | 🦁 safari-mcp *(this repo)* | Apple `safaridriver --mcp` |
 |---|:---:|:---:|
 | **Your real logins / cookies** | ✅ Your actual Safari | ⚠️ Isolated automation session — no access to AutoFill or browsing activity |
-| **Runs on** | ✅ Stable Safari, every Mac | ⚠️ Safari Technology Preview 247+ or the Safari 27 beta — not in stable Safari 26.5 |
+| **Runs on** | ✅ Stable Safari, every Mac | ⚠️ Safari 27 or later, or Safari Technology Preview 247+ |
 | **Background (no focus steal)** | ✅ Yes | ❌ Dedicated window with a "controlled by automation" banner |
-| **Tools** | **98** | ~17 |
+| **Tools** | **98** | 17 |
 | **Storage** (cookies, localStorage, IndexedDB) | ✅ 10 tools | ❌ |
 | **Network mocking + throttling** | ✅ Yes | ❌ Read-only network inspection |
 | **Device emulation** (iPhone, iPad) | ✅ Yes | ⚠️ Viewport + media type only |
-| **Setup** | `npx safari-mcp` | Enable "remote automation and external agents", then point your client at that build's `safaridriver --mcp` |
+| **Setup** | `npx safari-mcp` | Enable "Allow remote automation and external agents" in Safari's Developer settings, then point your client at `safaridriver --mcp` |
 | **Official Apple support** | ❌ Community (MIT) | ✅ Apple, WebDriver-standard |
 
-> **When Apple's server is the right pick:** you specifically want a clean-room, WebDriver-standard session for compatibility debugging and you already run a preview or beta build. **For everything else — daily automation on the browser you're already signed into, on the Safari that shipped with your Mac — safari-mcp is built for exactly that.**
+> **When Apple's server is the right pick:** you specifically want a clean-room, WebDriver-standard session for compatibility debugging on Safari 27 or later. **For everything else — daily automation on the browser you're already signed into, in the background — safari-mcp is built for exactly that.**
 
 ### Why Safari MCP and Not the Other Safari MCP Projects?
 
@@ -759,12 +761,12 @@ Alternatively, open `xcode/Safari MCP/Safari MCP.xcodeproj` directly in Xcode, s
 
 Then in Safari:
 1. Safari → Settings → Advanced → enable **Show features for web developers**
-2. Safari → Develop → **Allow Unsigned Extensions** (required each Safari restart)
+2. Safari → Settings → Developer → **Allow unsigned extensions** (required each Safari restart)
 3. Safari → Settings → Extensions → enable **Safari MCP Bridge**
 
 The extension connects automatically to the first local bridge whose declared Safari profile matches its own. The default bridge ports are `9224`, `9228`, `9232`, and `9236`; a single-profile setup normally uses `9224`.
 
-> **Note:** "Allow Unsigned Extensions" resets every time Safari restarts. You'll need to re-enable it in the Develop menu after each restart. The extension itself stays installed.
+> **Note:** "Allow unsigned extensions" resets every time Safari restarts. You'll need to re-enable it in Safari → Settings → Developer after each restart. The extension itself stays installed.
 
 **Toolbar icon status:**
 - **ON** — connected to MCP server
@@ -779,16 +781,16 @@ Safari MCP needs these one-time permissions:
 
 | Permission | Where | Why |
 |-----------|-------|-----|
-| JavaScript from Apple Events | Safari → Develop menu | Required for `do JavaScript` |
+| JavaScript from Apple Events | Safari → Settings → Developer | Required for `do JavaScript` |
 | Automation → Safari | System Settings → Privacy & Security → Automation | Required for all AppleScript-backed tools |
-| Screen Recording | System Settings → Privacy & Security → Screen Recording | Required for `safari_screenshot` |
-| Accessibility (safari-helper) | System Settings → Privacy & Security → Accessibility | Required for `safari_native_click`, `safari_native_keyboard`, `safari_native_hover` and `safari_save_pdf` |
+| Screen Recording | System Settings → Privacy & Security → Screen & System Audio Recording | Required for `safari_screenshot` without the extension, and for `safari_save_pdf` |
+| Accessibility (safari-helper) | System Settings → Privacy & Security → Accessibility (named **Device Control and Data Access** on macOS 27) | Required for `safari_native_click`, `safari_native_keyboard`, `safari_native_hover` and `safari_save_pdf` |
 
 ### Granting Accessibility to safari-helper (required for `safari_native_*`)
 
 The `safari_native_click`, `safari_native_keyboard` and `safari_native_hover` tools inject OS-level `CGEvent` events into Safari without stealing focus. macOS requires the underlying helper binary to be approved in **Accessibility** before those events can reach a non-frontmost window.
 
-1. Open **System Settings → Privacy & Security → Accessibility**.
+1. Open **System Settings → Privacy & Security → Accessibility** (on macOS 27 the pane is named **Device Control and Data Access**).
 2. Click `+` (unlock with your password if needed).
 3. Navigate to the helper binary and add it:
    - npm global install: `$(npm root -g)/safari-mcp/safari-helper`
@@ -818,11 +820,12 @@ That call registers the Terminal app in the Automation database and then trigger
 
 | Issue | Fix |
 |-------|-----|
-| "AppleScript error" | Enable "Allow JavaScript from Apple Events" in Safari → Develop |
+| "AppleScript error" | Enable "Allow JavaScript from Apple Events" in Safari → Settings → Developer |
 | "Not authorized to send Apple events to Safari" | Grant Automation → Safari to your IDE (see above) |
 | "Not authorized" after `npm update` | Updating changes the binary's cdhash — macOS silently revokes Automation permission. Re-run the `osascript` one-liner above to re-grant it |
 | `safari_native_click` reports success but page doesn't react | Add `safari-helper` to **System Settings → Privacy & Security → Accessibility** (see [Granting Accessibility](#granting-accessibility-to-safari-helper-required-for-safari_native_) above). Confirm by attaching a `click` listener with `{capture:true}` in the page console — without the grant, no `isTrusted: true` event fires |
-| Screenshots empty | Grant Screen Recording permission to Terminal/VS Code |
+| Screenshots empty | Grant Screen & System Audio Recording to Terminal/VS Code — or, when safari-mcp runs as a LaunchAgent, to the `node` binary itself (a Homebrew node upgrade changes its path, so re-grant after upgrading). `safari_doctor` names the exact binary |
+| Extension missing after enabling "Allow unsigned extensions" (macOS 27) | Known macOS 27.0 issue (183044008): with the setting on, rebuild the extension app (see [Installing the Extension](#installing-the-extension)) and it appears |
 | Tab not found | Call `safari_list_tabs` to refresh tab indices |
 | Hebrew keyboard issues | All typing uses JS events — immune to keyboard layout |
 | HTTPS blocked | `safari_navigate` auto-tries HTTPS first, falls back to HTTP |

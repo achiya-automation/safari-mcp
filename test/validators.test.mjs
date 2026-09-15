@@ -77,6 +77,13 @@ test("PWA: a bare page passes none of the 6 checks", () => {
   assert.equal(r.passed, 0);
 });
 
+test("PWA: a manifest alone satisfies the standalone check — iOS 26+ needs no apple-mobile-web-app-capable", () => {
+  const r = runInDom(`<!doctype html><html><head><link rel="manifest" href="/manifest.json"></head><body></body></html>`, PWA_SCRIPT);
+  const standalone = r.checks.find((c) => /standalone/.test(c.label));
+  assert.equal(standalone.pass, true);
+  assert.doesNotMatch(r.checks.find((c) => c.label === "web app manifest").detail, /install prompt/);
+});
+
 test("SAFE_AREA: returns the expected shape; viewport-fit detected from meta (DOM path)", () => {
   const html = `<!doctype html><html><head>${GOOD_HEAD}
     <style>.x{padding-top:env(safe-area-inset-top,0px)}</style></head><body></body></html>`;
