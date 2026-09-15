@@ -3778,12 +3778,12 @@ const _INJECTION_BLOCK_TTL_MS = 6 * 60 * 60 * 1000;
 function _originKey(url) {
   try { return new URL(String(url || "")).origin; } catch { return ""; }
 }
-function _withInjectionDeadline(promise, ms = MAIN_WORLD_INJECT_MS) {
+function _withInjectionDeadline(promise, ms = MAIN_WORLD_INJECT_MS, message = "MAIN world injection stalled") {
   let timer;
   return Promise.race([
     promise.finally(() => clearTimeout(timer)),
     new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error("MAIN world injection stalled")), ms);
+      timer = setTimeout(() => reject(new Error(message)), ms);
     }),
   ]);
 }
@@ -4421,19 +4421,21 @@ async function _withTabSelected(tabId, capture) {
 // Cuts a viewport box (CSS pixels) out of a captureVisibleTab data URL, clipped to what
 // the capture shows. Returns JPEG base64, or null when nothing of the box is on screen.
 async function _cropCapture(dataUrl, box) {
-  const image = new Image();
-  await new Promise((resolve, reject) => {
-    image.onload = resolve;
-    image.onerror = () => reject(new Error("screenshot_element: the tab capture could not be decoded"));
-    image.src = dataUrl;
-  });
+  // Not through an <img>: in Safari's extension background page it never finished loading
+  // the capture, and the command hung until the worker's 330s guard with every later
+  // command queued behind it. Decode the bytes directly, and bound the decode so a stall
+  // fails this command instead of the worker.
+  const bytes = Uint8Array.from(atob(dataUrl.slice(dataUrl.indexOf(",") + 1)), (c) => c.charCodeAt(0));
+  const image = await _withInjectionDeadline(
+    createImageBitmap(new Blob([bytes])), 10000, "screenshot_element: decoding the tab capture stalled"
+  );
   // Scale from the capture itself rather than devicePixelRatio, so the crop follows the
   // resolution Safari actually rendered.
-  const scale = image.naturalWidth / box.viewportWidth;
+  const scale = image.width / box.viewportWidth;
   const left = Math.max(0, Math.round(box.left * scale));
   const top = Math.max(0, Math.round(box.top * scale));
-  const width = Math.min(image.naturalWidth, Math.round((box.left + box.width) * scale)) - left;
-  const height = Math.min(image.naturalHeight, Math.round((box.top + box.height) * scale)) - top;
+  const width = Math.min(image.width, Math.round((box.left + box.width) * scale)) - left;
+  const height = Math.min(image.height, Math.round((box.top + box.height) * scale)) - top;
   if (width <= 0 || height <= 0) return null;
   const canvas = document.createElement("canvas");
   canvas.width = width;

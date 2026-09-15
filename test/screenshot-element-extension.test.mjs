@@ -74,12 +74,18 @@ function fakePage({ rect, frameOffset = null }) {
   return page;
 }
 
+const CAPTURE_BYTES = "PNG bytes of the tab capture";
+
 /**
  * Runs the real "screenshot_element" case with its real helpers. Window 3 shows the user's
- * tab 7; the session's tab 42 waits in the background. The capture is 3024×1718, a 2×
- * Retina shot of a 1512px-wide viewport. Every observable step is recorded in order.
+ * tab 7; the session's tab 42 waits in the background. The capture decodes to 3024×1718, a
+ * 2× Retina shot of a 1512px-wide viewport. Every observable step is recorded in order.
+ * `decode` replaces the bitmap decoder; `timers` replaces the decode deadline's clock.
+ * @param {string} selector
+ * @param {ReturnType<typeof fakePage>} page
+ * @param {{ decode?: Function, timers?: { setTimeout: Function, clearTimeout: Function } }} [options]
  */
-async function screenshotElement(selector, page) {
+async function screenshotElement(selector, page, { decode = null, timers = { setTimeout, clearTimeout } } = {}) {
   const events = [];
   const tabs = [
     { id: 7, windowId: 3, active: true },
@@ -95,7 +101,7 @@ async function screenshotElement(selector, page) {
       },
       captureVisibleTab: async (windowId, { format }) => {
         events.push(`capture window ${windowId} as ${format} showing tab ${tabs.find((tab) => tab.active).id}`);
-        return "data:image/png;base64,CAPTURE";
+        return `data:image/png;base64,${Buffer.from(CAPTURE_BYTES).toString("base64")}`;
       },
     },
   };
@@ -104,15 +110,12 @@ async function screenshotElement(selector, page) {
     const inPage = new Function("window", "document", "setTimeout", `"use strict"; return (${func});`);
     return inPage(page.window, page.document, (resolve) => resolve())(...args);
   };
-  class FakeImage {
-    onload = () => {};
-    set src(url) {
-      assert.equal(url, "data:image/png;base64,CAPTURE", "the crop must decode the capture it was given");
-      this.naturalWidth = 3024;
-      this.naturalHeight = 1718;
-      queueMicrotask(() => this.onload());
-    }
-  }
+  // No Image here on purpose: an <img> never finished loading the capture in Safari's
+  // extension background page, so the crop must decode the bytes itself.
+  const createImageBitmap = decode || (async (blob) => {
+    assert.equal(Buffer.from(await blob.arrayBuffer()).toString(), CAPTURE_BYTES, "the crop must decode the capture it was given");
+    return { width: 3024, height: 1718 };
+  });
   const document = {
     createElement(tag) {
       assert.equal(tag, "canvas");
@@ -130,10 +133,14 @@ async function screenshotElement(selector, page) {
     "browser", "_profileWindowId",
     `"use strict"; return (${topLevelFunction("async function _withTabSelected(")});`
   )(browser, null);
+  const withDeadline = new Function(
+    "MAIN_WORLD_INJECT_MS", "setTimeout", "clearTimeout",
+    `"use strict"; return (${topLevelFunction("function _withInjectionDeadline(")});`
+  )(3000, timers.setTimeout, timers.clearTimeout);
   const cropCapture = new Function(
-    "Image", "document",
+    "createImageBitmap", "document", "_withInjectionDeadline",
     `"use strict"; return (${topLevelFunction("async function _cropCapture(")});`
-  )(FakeImage, document);
+  )(createImageBitmap, document, withDeadline);
   const caseBody = sourceBetween(handleCommand, 'case "screenshot_element":', "\n    case ");
   const run = new Function(
     "browser", "execInTab", "_withTabSelected", "_cropCapture", "tabId", "payload",
@@ -183,6 +190,17 @@ test("a selector that matches nothing is a miss: nothing is captured", async () 
 test("an element with nothing on screen is reported instead of returned as an empty image", async () => {
   const { result } = await screenshotElement("#t", fakePage({ rect: { left: 700, top: 400, width: 0, height: 0 } }));
   assert.equal(result, "Element has no visible area: #t");
+});
+
+test("a capture that never decodes fails the command instead of blocking the worker", async () => {
+  // A command that never settles holds the worker's poll loop: every later command times
+  // out until the 330s wedge guard. The decode deadline must end it as this command's error.
+  const page = fakePage({ rect: { left: 636, top: 369, width: 240, height: 120 } });
+  const fireAtOnce = { setTimeout: (fire) => { queueMicrotask(fire); return 0; }, clearTimeout: () => {} };
+  await assert.rejects(
+    screenshotElement("#t", page, { decode: () => new Promise(() => {}), timers: fireAtOnce }),
+    /decoding the tab capture stalled/
+  );
 });
 
 test("the tool labels image data by its own bytes and raises anything else as an error", () => {
