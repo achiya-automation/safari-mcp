@@ -21,6 +21,11 @@
  * finder behind `safari_select_option` refs) skipped closed roots and fell back to
  * coordinates, returning the shadow host.
  *
+ * Live, the bridge can also be gone entirely (it is, in every tab that was open during an
+ * extension update). sendContentCommand then scheduled a top-document-only action and
+ * answered "Scheduled" before knowing whether it would find anything, so closed-root and
+ * iframe clicks and fills did nothing while reporting success — the fallback never ran.
+ *
  * The harness runs the real command cases from extension/background.js against jsdom,
  * with an executeScript fake that behaves like Safari: one run per frame, `undefined`
  * args dropped, and an ISOLATED world that cannot see the page's `__mcp*` globals.
@@ -51,22 +56,23 @@ function commandCase(name, nextName) {
 
 function stubLayout(win) {
   win.PointerEvent = win.PointerEvent || win.MouseEvent;
+  win.document.elementFromPoint = () => null; // jsdom has no hit testing; callers fall back to the target itself
   win.Element.prototype.scrollIntoView = function () {};
   win.Element.prototype.getBoundingClientRect = function () {
     return { left: 10, top: 20, right: 110, bottom: 60, width: 100, height: 40, x: 10, y: 20 };
   };
 }
 
-function harness() {
+function harness({ bridge = "live" } = {}) {
   const dom = new JSDOM(
     '<body><button data-mcp-ref="2_2">Top button</button><closed-host></closed-host><iframe></iframe></body>',
     { url: "http://127.0.0.1:8765/", pretendToBeVisual: true, runScripts: "outside-only" }
   );
   const top = dom.window;
-  const frame = top.document.querySelector("iframe").contentWindow;
+  const frame = /** @type {any} */ (top.document.querySelector("iframe")).contentWindow;
   const hits = [];
   const typed = [];
-  for (const [label, win] of [["top", top], ["frame", frame]]) {
+  for (const { label, win } of [{ label: "top", win: top }, { label: "frame", win: frame }]) {
     stubLayout(win);
     win.document.execCommand = (command, _ui, value) => {
       typed.push({ document: label, command, value });
@@ -107,7 +113,10 @@ function harness() {
   const injections = [];
   const browser = {
     tabs: {
-      sendMessage: async (_tabId, message) => new Promise((resolve) => {
+      // "dead": the listener is gone, as in every tab that was open during an extension
+      // update — Safari then rejects at once and sendContentCommand takes its recovery path.
+      sendMessage: async (_tabId, message) => new Promise((resolve, reject) => {
+        if (bridge === "dead") return reject(new Error("Could not establish connection. Receiving end does not exist."));
         if (!top.__mcpContentCommandState.listener(message, {}, resolve)) resolve(undefined);
       }),
       update: async () => {},
@@ -144,6 +153,7 @@ function harness() {
     commandCase("click", "click_open_popup"),
     commandCase("type_text", "press_key"),
     commandCase("wait_for", "hover"),
+    commandCase("fill", "type_text"),
   ].join("\n");
   const deps = {
     browser,
@@ -176,8 +186,8 @@ function harness() {
   };
 }
 
-async function withHarness(fn) {
-  const h = harness();
+async function withHarness(fn, options) {
+  const h = harness(options);
   try { await fn(h); } finally { h.close(); }
 }
 
@@ -232,3 +242,23 @@ test("mcpFindRef resolves a ref inside a closed shadow root instead of its host"
   h.top.eval(HELPERS);
   assert.equal(h.top.mcpFindRef("2_7")?.tagName, "SELECT");
 }));
+
+test("with the bridge gone, a closed-root or iframe click reaches the fallback instead of being scheduled into nothing", () => withHarness(async (h) => {
+  assert.match(await h.run("click", { ref: "2_5" }), /^Clicked: BUTTON "Shadow button"/);
+  assert.match(await h.run("click", { text: "Inner frame button" }), /^Clicked \(iframe\): BUTTON "Inner frame button"/);
+  assert.deepEqual(h.hits, ["closed", "frame"]);
+}, { bridge: "dead" }));
+
+test("with the bridge gone, a top-document click is still scheduled once", () => withHarness(async (h) => {
+  assert.equal(await h.run("click", { ref: "2_2" }), "Scheduled mcp-content-click");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(h.hits, ["top"]);
+  assert.equal(h.injections.filter((call) => call.allFrames).length, 0, "a found target must not fall through to the all-frame fallback");
+}, { bridge: "dead" }));
+
+test("with the bridge gone, fill reaches a field inside an iframe", () => withHarness(async (h) => {
+  const result = await h.run("fill", { selector: '[data-mcp-ref="2_ns_2"]', value: "filled" });
+  assert.notEqual(result, "Scheduled mcp-content-fill");
+  const frameInput = h.top.document.querySelector("iframe").contentDocument.querySelector("input");
+  assert.equal(frameInput.value, "filled");
+}, { bridge: "dead" }));

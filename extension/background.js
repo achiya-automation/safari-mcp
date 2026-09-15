@@ -3698,6 +3698,9 @@ async function sendContentCommand(tabId, type, payload, timeoutMs = 1500) {
     // injected into such a tab. Schedule a small, self-contained DOM action and
     // return BEFORE it runs: page-listener exceptions then cannot be misreported as
     // an executeScript failure, and a filled form survives an extension repair.
+    // The target is resolved before returning, though: this lookup sees only the top
+    // document, so a miss must reach the caller's frame / closed-shadow fallback
+    // instead of reporting "Scheduled" for an action that can never find its element.
     const scheduled = await browser.scripting.executeScript({
       target: { tabId },
       world: "ISOLATED",
@@ -3721,10 +3724,10 @@ async function sendContentCommand(tabId, type, payload, timeoutMs = 1500) {
           }
           return null;
         };
+        const el = find();
+        if (!el) return { ok: false, result: "Element not found" };
         setTimeout(() => {
           try {
-            const el = find();
-            if (!el) return;
             if (commandType === "mcp-content-fill") {
               const value = String(commandPayload.value ?? "");
               el.focus();
