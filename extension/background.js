@@ -907,12 +907,10 @@ async function handleCommand(type, payload) {
   let targetTab;
   try {
     if (suppliedReceipt) {
+      // Throws a refusal naming the failed check; it never returns without a tab.
       targetTab = await _resolveReceiptTab(suppliedReceipt, {
         allowOriginChange: allowReceiptOriginChange,
       });
-      if (!targetTab) {
-        throw new Error("Tab safety: receipt is forged, stale, ambiguous, or not valid for this origin");
-      }
       receiptResolved = true;
       payload._receiptTabId = targetTab.id;
       // A valid receipt names one concrete tab. It may move a stateless session into
@@ -3227,18 +3225,25 @@ async function _refreshAllReceiptIdentities() {
   });
 }
 
+// Each refusal names the check that failed. They used to share one sentence ("forged,
+// stale, ambiguous, or not valid for this origin"), and the server appends getReceipt
+// advice for an origin change to anything that says "not valid for this origin" — so a
+// receipt this worker had simply never seen was told to rotate a tab that never moved.
 async function _resolveReceiptTab(token, { allowOriginChange = false } = {}) {
   return _withReceiptMutationLock(async () => {
     const normalized = String(token || "");
-    if (!/^[A-Za-z0-9_-]{24,}$/.test(normalized)) return null;
     const record = _receiptByToken.get(normalized);
-    if (!_isValidReceiptRecord(normalized, record)) return null;
+    if (!/^[A-Za-z0-9_-]{24,}$/.test(normalized) || !_isValidReceiptRecord(normalized, record)) {
+      throw new Error("Tab safety: this extension has no record of that receipt. It was never issued by this extension instance, or it ended when its tab closed, when getReceipt replaced it, or when Safari or the extension restarted. Open the tab again with safari_new_tab.");
+    }
     const browserEpoch = await _ensureBrowserSessionEpoch();
-    if (record.browserEpoch !== browserEpoch) return null;
+    if (record.browserEpoch !== browserEpoch) {
+      throw new Error("Tab safety: receipt belongs to an earlier browser session — Safari or the extension restarted after it was issued. Open the tab again with safari_new_tab.");
+    }
 
     const allTabs = await browser.tabs.query({});
     const direct = allTabs.find((tab) => tab.id === record.tabId) || null;
-    if (!direct) return null;
+    if (!direct) throw new Error("Tab safety: the receipt's tab is closed. Open a new one with safari_new_tab.");
     const directDigest = await _digestTabUrl(direct.url || "");
     if (directDigest === record.identityDigest ||
       (_tokenByTabId.get(direct.id) === normalized && _isTabOwnedByAnySession(direct.id))) {
@@ -3256,11 +3261,14 @@ async function _resolveReceiptTab(token, { allowOriginChange = false } = {}) {
         }
       }
     } else {
-      return null;
+      throw new Error("Tab safety: the receipt's tab has moved to a different page and no MCP session owns it any more. Open the tab again with safari_new_tab.");
     }
 
     const currentOrigin = _receiptOrigin(direct.url);
-    if (!allowOriginChange && currentOrigin !== record.receiptOrigin) return null;
+    // index.js keys its getReceipt advice on "not valid for this origin"; keep that phrase here only.
+    if (!allowOriginChange && currentOrigin !== record.receiptOrigin) {
+      throw new Error("Tab safety: receipt is not valid for this origin.");
+    }
     return direct;
   });
 }

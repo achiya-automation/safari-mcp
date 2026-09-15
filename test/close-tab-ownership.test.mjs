@@ -186,10 +186,10 @@ test("extension resolves the opaque receipt to one concrete tab before close", (
   assert.ok(start > 0 && end > start, "handleCommand receipt preflight should exist");
   const preflight = background.slice(start, end);
   const resolveAt = preflight.indexOf("await _resolveReceiptTab(suppliedReceipt");
-  const rejectAt = preflight.indexOf("if (!targetTab)");
   const bindAt = preflight.indexOf("payload._receiptTabId = targetTab.id");
   assert.ok(resolveAt > 0, "receipt must be resolved by the extension's durable registry");
-  assert.ok(resolveAt < rejectAt && rejectAt < bindAt, "resolution must succeed before its tab id is trusted");
+  // The resolver throws its refusal, so reaching the bind means resolution succeeded.
+  assert.ok(resolveAt < bindAt, "resolution must succeed before its tab id is trusted");
 
   const closeCase = background.slice(
     background.indexOf('case "close_tab"'),
@@ -213,7 +213,7 @@ test("forged, stale, and cross-origin receipts fail closed", async () => {
   const forged = makeReceiptResolver({
     tabs: [{ id: 42, windowId: 3, url: originalUrl }],
   });
-  assert.equal(await forged.resolveReceipt(token), null, "an unissued bearer token must prove nothing");
+  await assert.rejects(forged.resolveReceipt(token), /no record of that receipt/, "an unissued bearer token must prove nothing");
 
   const stale = makeReceiptResolver({
     records: new Map([[token, {
@@ -226,7 +226,7 @@ test("forged, stale, and cross-origin receipts fail closed", async () => {
     }]]),
     tabs: [{ id: 42, windowId: 3, url: "https://owned.example/different?private=two#other" }],
   });
-  assert.equal(await stale.resolveReceipt(token), null, "a receipt whose tab identity no longer matches must fail closed");
+  await assert.rejects(stale.resolveReceipt(token), /different page/, "a receipt whose tab identity no longer matches must fail closed");
 
   const crossOriginUrl = "https://other.example/app?private=three#route";
   const crossOrigin = makeReceiptResolver({
@@ -240,7 +240,7 @@ test("forged, stale, and cross-origin receipts fail closed", async () => {
     }]]),
     tabs: [{ id: 42, windowId: 3, url: crossOriginUrl }],
   });
-  assert.equal(await crossOrigin.resolveReceipt(token), null, "a receipt must not authorize a different origin");
+  await assert.rejects(crossOrigin.resolveReceipt(token), /not valid for this origin/, "a receipt must not authorize a different origin");
 
   const preflight = background.slice(
     background.indexOf("async function handleCommand("),
@@ -248,10 +248,11 @@ test("forged, stale, and cross-origin receipts fail closed", async () => {
   );
   assert.match(
     preflight,
-    /if \(!targetTab\)\s*\{\s*throw new Error\("Tab safety: receipt is forged, stale, ambiguous, or not valid for this origin"\)/,
-    "the command path must turn a failed lookup into a refusal"
+    /targetTab = await _resolveReceiptTab\(suppliedReceipt/,
+    "the command path must take its target from the resolver, which throws on a failed lookup"
   );
   assert.doesNotMatch(preflight, /\$\{suppliedReceipt\}/, "the refusal must not echo the bearer receipt");
+  assert.doesNotMatch(resolveReceiptSource, /\$\{(normalized|token)\}/, "the refusal must not echo the bearer receipt");
 });
 
 test("receipt close removes only the resolved tab and returns no URL", async () => {

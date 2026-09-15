@@ -917,12 +917,12 @@ test("opaque receipts resolve by token, digest, and original origin and fail clo
   };
   const direct = makeResolver({ tabs: [ownedTab] });
   assert.equal(await direct.resolve(token), ownedTab);
-  assert.equal(await direct.resolve("forged_receipt_abcdefghijklmnopqrstuvwxyz"), null);
+  await assert.rejects(direct.resolve("forged_receipt_abcdefghijklmnopqrstuvwxyz"), /no record of that receipt/);
 
   const redirected = makeResolver({
     tabs: [{ ...ownedTab, url: "https://other.test/redirected" }],
   });
-  assert.equal(await redirected.resolve(token), null, "cross-origin mutation authority must fail");
+  await assert.rejects(redirected.resolve(token), /not valid for this origin/, "cross-origin mutation authority must fail");
   assert.equal(
     (await redirected.resolve(token, { allowOriginChange: true }))?.id,
     42,
@@ -935,7 +935,7 @@ test("opaque receipts resolve by token, digest, and original origin and fail clo
       { id: 85, windowId: 8, url: "https://example.test/same" },
     ],
   });
-  assert.equal(await ambiguous.resolve(token), null, "two digest matches must never be guessed");
+  await assert.rejects(ambiguous.resolve(token), /tab is closed/, "two digest matches must never be guessed");
   assert.equal(ambiguous.replacements, 0, "ambiguous receipts must not rebind ownership");
 });
 

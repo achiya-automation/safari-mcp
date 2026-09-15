@@ -175,7 +175,7 @@ test("receipt resolution rejects forged, cross-origin, stale, and changed-tab-id
   };
 
   const forged = makeResolver(null, []);
-  assert.equal(await forged.resolve(token), null);
+  await assert.rejects(forged.resolve(token), /no record of that receipt/);
 
   const validUrl = "https://a.test/path?sig=1#app";
   const direct = makeResolver({
@@ -191,7 +191,7 @@ test("receipt resolution rejects forged, cross-origin, stale, and changed-tab-id
     receiptOrigin: "https://a.test",
     identityDigest: `digest:${redirectedUrl}`,
   }, [{ id: 42, windowId: 7, url: redirectedUrl }]);
-  assert.equal(await redirected.resolve(token), null, "old-origin receipt cannot authorize mutation after redirect");
+  await assert.rejects(redirected.resolve(token), /not valid for this origin/, "old-origin receipt cannot authorize mutation after redirect");
   assert.equal(
     (await redirected.resolve(token, { allowOriginChange: true })).id,
     42,
@@ -207,7 +207,7 @@ test("receipt resolution rejects forged, cross-origin, stale, and changed-tab-id
     { id: 51, windowId: 7, url: duplicateUrl },
     { id: 52, windowId: 7, url: duplicateUrl },
   ]);
-  assert.equal(await changedId.resolve(token), null);
+  await assert.rejects(changedId.resolve(token), /tab is closed/);
   assert.deepEqual(changedId.replacements, []);
 
   const uniqueButChangedId = makeResolver({
@@ -215,7 +215,7 @@ test("receipt resolution rejects forged, cross-origin, stale, and changed-tab-id
     receiptOrigin: "https://a.test",
     identityDigest: `digest:${duplicateUrl}`,
   }, [{ id: 52, windowId: 7, url: duplicateUrl }]);
-  assert.equal(await uniqueButChangedId.resolve(token), null, "digest-only rebinding must fail closed even when unique");
+  await assert.rejects(uniqueButChangedId.resolve(token), /tab is closed/, "digest-only rebinding must fail closed even when unique");
   assert.deepEqual(uniqueButChangedId.replacements, []);
   assert.equal(uniqueButChangedId.tokenByTabId.has(52), false);
   assert.equal(uniqueButChangedId.persists(), 0);
