@@ -34,6 +34,7 @@ test("legacy wrong:<profile> window verdicts migrate to a stable profile identit
   assert.equal(canonical("wrong:אוטומציות — עמוד הפתיחה"), "אוטומציות");
   assert.equal(canonical("wrong:עבודה — Meta Business Suite"), "עבודה");
   assert.equal(canonical("מחקר אנונימי"), "מחקר אנונימי");
+  assert.equal(canonical("מחקר אנונימי — mcp-profile-check-1789461845260"), "מחקר אנונימי");
   assert.equal(canonical("notfound"), "");
   assert.equal(canonical("__personal__"), "");
 });
