@@ -833,6 +833,74 @@ That call registers the Terminal app in the Automation database and then trigger
 
 ---
 
+## FAQ
+
+<details>
+<summary><b>Does it work with Safari Technology Preview?</b></summary>
+
+No. Every AppleScript path targets `application "Safari"` and the native helper looks for the bundle id `com.apple.Safari`, so STP (`com.apple.SafariTechnologyPreview`) is a different application that safari-mcp never addresses. Run it against stable Safari.
+
+Note that Apple's *own* `safaridriver --mcp` server is the one that needs STP 247+ (or Safari 27+) — see [Safari MCP vs Alternatives](#safari-mcp-vs-alternatives). The two are unrelated.
+</details>
+
+<details>
+<summary><b>Can it handle private/incognito tabs?</b></summary>
+
+Not as a supported mode, and it is untested. No tool opens a private window, and Safari disables extensions in Private Browsing unless you turn each one on explicitly, so the extension bridge — and everything in the "With Extension" column of [Safari Extension (Optional)](#safari-extension-optional) — is off there by default.
+
+If you want an isolated identity, use a separate Safari **profile** instead: profile windows are a first-class concept here (see [Running several agents at once](#running-several-agents-at-once)).
+</details>
+
+<details>
+<summary><b>Does it work with multiple Safari windows?</b></summary>
+
+Yes. Tab lookups walk `every window` rather than assuming window 1, and a tab is pinned by its window's `(index, tabCount)` pair, because an index on its own is ambiguous once two windows are open. Profile windows are recognised by Safari's `ProfileName — Tab Title` window naming.
+
+The reliable handle is still the **receipt** that `safari_new_tab` returns: pass it to every later call and the tab is addressed directly, no matter how many windows move around it.
+</details>
+
+<details>
+<summary><b>What macOS versions are supported?</b></summary>
+
+Any macOS with Safari — the package declares `"os": ["darwin"]` and no minimum OS, and there is no version gate in the code. Node.js 20+ is the hard requirement (`"engines": { "node": ">=20" }`).
+
+Two places where the OS does matter in practice:
+- On **macOS 27** the Accessibility pane is renamed **Device Control and Data Access** — same grant, new name (see [macOS Permissions](#macos-permissions)).
+- Safari 26 and 27 changed several web-platform behaviours that specific tools account for; those are handled, not blocked.
+</details>
+
+<details>
+<summary><b>Can I run multiple instances simultaneously?</b></summary>
+
+Yes — that is what [Running several agents at once](#running-several-agents-at-once) covers. Each session owns its own tabs, and ownership is tracked per session rather than by tab index, so one agent cannot act on (or close) a tab another agent owns.
+
+One process binds the extension bridge port; the others proxy through it and take the port over if that process exits.
+</details>
+
+<details>
+<summary><b>Do I need to keep Safari in the foreground?</b></summary>
+
+No. `safari_new_tab` opens a **background** tab and never steals focus, and the few commands macOS forces an implicit activate on restore your previous frontmost app afterwards — with a guard that leaves focus alone if you were typing in Safari yourself a moment earlier.
+
+The two exceptions are the deliberately native tools — `safari_native_click`, `safari_native_keyboard`, `safari_native_hover` — which post real OS events and therefore land wherever the frontmost window is. Do not use those while you are working in another Safari tab.
+</details>
+
+<details>
+<summary><b>How does it interact with Safari extensions?</b></summary>
+
+Your existing extensions keep running normally; safari-mcp drives the same Safari you use, so content blockers and password managers behave exactly as they do for you.
+
+safari-mcp also ships **its own optional extension**. Without it roughly 80% of the tools still work over AppleScript alone; with it you additionally get closed shadow DOM, strict-CSP sites, deep framework state and loading-state detection. Dialog handling, native clicks and PDF export go the other way — those are AppleScript-only. The full split is in [Safari Extension (Optional)](#safari-extension-optional).
+</details>
+
+<details>
+<summary><b>What happens if "Allow JavaScript from Apple Events" is not enabled?</b></summary>
+
+Anything that evaluates JavaScript fails — `safari_evaluate`, `safari_read_page`, form filling, extraction — while pure AppleScript actions such as opening or switching tabs still work. That is the usual cause of "it opens the tab but reads nothing".
+
+Turn it on in **Safari → Settings → Advanced → Show features for web developers**, then **Safari → Settings → Developer → Allow JavaScript from Apple Events**. Both are listed under [Prerequisites](#prerequisites). `safari_doctor` walks the rest of the chain (Automation, native helper, Accessibility, Screen Recording) and names this setting in its fix hint — but its Apple Events check only counts windows, which Automation permission alone satisfies, so it will not fail on this one for you.
+</details>
+
 ## Works With
 
 Safari MCP works with any MCP-compatible client:
