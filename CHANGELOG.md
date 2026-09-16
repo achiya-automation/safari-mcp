@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.21.9] - 2026-09-16
+
+### Fixed
+- **The Safari extension app bundle no longer reports a version three months behind the extension it ships.** All eight build configurations in `xcode/Safari MCP/Safari MCP.xcodeproj` carried `MARKETING_VERSION = 2.10.5` while `extension/manifest.json` had moved on to 2.10.17, so a freshly rebuilt app showed 2.10.5 in Safari's extension list while `safari_reload_extension` — which answers with `browser.runtime.getManifest().version` (`extension/background.js`) — reported 2.10.17. With the two numbers disagreeing there was no way to tell from the outside whether an Xcode rebuild had actually replaced the running extension, which is exactly the check a profile reload needs. The bundle's marketing version now tracks the manifest (2.10.18, `CURRENT_PROJECT_VERSION` 4), so the version Safari shows and the version the reload reports are the same string.
+- `test/profile-extension-routing.test.mjs` now also pins that a window title carrying a profile-check suffix (`מחקר אנונימי — mcp-profile-check-<epoch>`) still canonicalizes to the bare profile name, so the probe tab a profile check opens can never be read as a different profile.
+
 ## [2.21.8] - 2026-09-15
 
 ### Fixed
