@@ -642,12 +642,15 @@ On macOS 27.0 with Safari 27.0, `safaridriver --help` lists `--mcp` and its `too
 | **Your real logins / cookies** | ✅ Your actual Safari | ⚠️ Isolated automation session — no access to AutoFill or browsing activity |
 | **Runs on** | ✅ Stable Safari, every Mac | ⚠️ Safari 27 or later, or Safari Technology Preview 247+ |
 | **Background (no focus steal)** | ✅ Yes | ❌ Dedicated window with a "controlled by automation" banner |
+| **Page sees `navigator.webdriver`** | ✅ `false` — an ordinary tab | ⚠️ `true` — required of every WebDriver session |
 | **Tools** | **98** | 17 |
 | **Storage** (cookies, localStorage, IndexedDB) | ✅ 10 tools | ❌ |
 | **Network mocking + throttling** | ✅ Yes | ❌ Read-only network inspection |
 | **Device emulation** (iPhone, iPad) | ✅ Yes | ⚠️ Viewport + media type only |
 | **Setup** | `npx safari-mcp` | Enable "Allow remote automation and external agents" in Safari's Developer settings, then point your client at `safaridriver --mcp` |
 | **Official Apple support** | ❌ Community (MIT) | ✅ Apple, WebDriver-standard |
+
+> **About that `navigator.webdriver` row:** the WebDriver standard requires every remote-controlled session to report `true`, so Apple's server does. safari-mcp evaluates JavaScript in an ordinary tab, so it reads `false` (checked on Safari 27.0, 2026-09-17). That is the difference if a site refuses WebDriver traffic. It is not an anti-detection feature — nothing else about the browser is disguised, and your real logins are in use, so treat every page as if it knows exactly who you are.
 
 > **When Apple's server is the right pick:** you specifically want a clean-room, WebDriver-standard session for compatibility debugging on Safari 27 or later. **For everything else — daily automation on the browser you're already signed into, in the background — safari-mcp is built for exactly that.**
 
