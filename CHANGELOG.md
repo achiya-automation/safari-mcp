@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.21.10] - 2026-09-17
+
+### Documentation
+- **A FAQ section, eight collapsible entries, closing [#9](https://github.com/achiya-automation/safari-mcp/issues/9).** Safari Technology Preview, Private Browsing, multiple windows, which macOS versions are supported, running several instances, what "background" actually means, how this relates to other Safari extensions, and what breaks without "Allow JavaScript from Apple Events". Every answer is anchored in the code or in an existing README section rather than written from memory. Shipped to `main` on 2026-09-16; this is the release that carries it to npm.
+- **The Apple comparison now answers the question the traffic is arriving with.** For two weeks the largest referrer to this repository has been a Hacker News comment linking straight to the `#vs-apples-official-safari-mcp` anchor and saying Apple's server is "not well suited for stealth use cases". The table said nothing about the one mechanical difference behind that: the W3C WebDriver standard requires every remote-controlled session to report `navigator.webdriver` as `true`, so `safaridriver --mcp` does, while safari-mcp evaluates JavaScript in an ordinary tab and reads `false` (checked on Safari 27.0, 2026-09-17). The row states the difference and the note beneath it states the limit — it is not an anti-detection feature, nothing else about the browser is disguised, and the session carries your real logins.
+
 ## [2.21.9] - 2026-09-16
 
 ### Fixed
