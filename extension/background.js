@@ -153,7 +153,11 @@ async function _listTabsForSession(sessionId) {
   });
 }
 
-async function _waitForNavigatedTab(tabId, timeoutMs = 2000) {
+// 2s was a happy-path budget. Safari routinely blows past it whenever the profile is
+// busy — several tabs loading at once, or a second session driving the same window —
+// and the caller's own budget is 30s (75s on a profile), so waiting a little longer
+// here is free. It stays well short of that ceiling.
+async function _waitForNavigatedTab(tabId, timeoutMs = 12000) {
   const deadline = Date.now() + timeoutMs;
   do {
     const liveTab = await browser.tabs.get(tabId).catch(() => null);
@@ -233,11 +237,15 @@ async function _newTabForSession(sessionId, payload) {
     if (!acceptedTab) {
       throw new Error("Safari did not accept the new tab navigation");
     }
+    // Never throw the tab away here. By this point it exists, ownership is already
+    // durable, and tabs.update() has accepted the destination — Safari is merely slow
+    // to report it. Throwing stranded exactly that tab with no receipt and told the
+    // caller creation had failed, which is how a busy profile locked a whole session
+    // out of opening tabs. Fall back to the URL we asked for: same-origin navigations
+    // (the common case, including SPA query redirects) match it, and anything that
+    // lands cross-origin can re-mint through get_tab_receipt on the still-owned tab.
     const liveNavigatedTab = await _waitForNavigatedTab(newTab.id);
-    if (!liveNavigatedTab) {
-      throw new Error("Safari did not expose the new tab navigation before receipt issuance");
-    }
-    receiptTab = liveNavigatedTab;
+    receiptTab = liveNavigatedTab || { ...newTab, url: rawNavigationUrl };
   }
   const receiptIdentity = receiptTab.url || rawNavigationUrl || "about:blank";
   const receipt = await _issueTabReceipt(receiptTab, {

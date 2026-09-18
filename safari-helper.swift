@@ -555,7 +555,15 @@ func performNativeKeyboard(keyCode: UInt16, flags: CGEventFlags = [], windowId: 
 
 // ========== Response Helper ==========
 
-func respond(_ obj: [String: Any]) {
+// Replies are emitted from several background queues at once (one per in-flight
+// AppleScript), so the write itself must be atomic: print() is not, and two
+// concurrent writers can interleave bytes mid-line and corrupt both JSON objects.
+// This lock guards only the write — microseconds — and never waits on AppleScript.
+let _stdoutLock = NSLock()
+
+func emitResponse(_ obj: [String: Any]) {
+  _stdoutLock.lock()
+  defer { _stdoutLock.unlock() }
   if let data = try? JSONSerialization.data(withJSONObject: obj),
      let str = String(data: data, encoding: .utf8) {
     print(str)
@@ -563,6 +571,11 @@ func respond(_ obj: [String: Any]) {
     print("{\"error\":\"serialization failed\"}")
   }
   fflush(stdout)
+}
+
+// CLI-mode call sites (--click and friends) have no request id to echo.
+func respond(_ obj: [String: Any]) {
+  emitResponse(obj)
 }
 
 // ========== CLI Mode: --click X Y [--window WID] [--double] ==========
@@ -618,14 +631,47 @@ if args.count >= 2 && args[1] == "--paste" {
 // that accepts stdin but can no longer dispatch work.
 let _inFlightLock = NSLock()
 var _inFlightScripts = 0
+// Scripts that blew their own timeout and left their GCD thread parked inside
+// executeAndReturnError. Concurrency made the plain in-flight count useless as a
+// wedge signal: N genuinely parallel commands are healthy, N *stuck* ones are not.
+var _stuckScripts = 0
+
+final class _ScriptState {
+  var finished = false
+  var timedOut = false
+}
+
+// AppleScript execution is serialized on purpose. NSAppleScript is not thread-safe:
+// two concurrent executeAndReturnError() calls clobber each other's state, and a
+// measured run had a 3-second script return the *next* script's result under its own
+// request id — silent cross-talk, the worst possible failure for a measurement tool.
+// Safari processes Apple Events one at a time regardless, so a serial queue costs no
+// real throughput. What it buys is that the stdin reader never waits on it: native
+// commands (clicks, keystrokes, front-app checks) and every other session keep moving
+// while a heavy `do JavaScript` is still running.
+let _appleScriptQueue = DispatchQueue(label: "com.achiya-automation.safari-mcp.applescript")
 
 func handleLine(_ line: String) {
   guard !line.isEmpty else { return }
 
   guard let data = line.data(using: .utf8),
         let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-    respond(["error": "invalid input"])
+    // Unparseable line: there is no id to echo, and the shadowing respond() below
+    // does not exist yet from this guard's point of view.
+    emitResponse(["error": "invalid input"])
     return
+  }
+
+  // Echo the caller's request id on every reply. Commands now finish out of order,
+  // so the Node side matches replies by identity instead of by arrival order — that
+  // is what lets several checks run at once instead of queueing behind each other.
+  // Shadows the global respond(), so every call site below tags itself for free.
+  let requestId = json["id"]
+  func respond(_ obj: [String: Any]) {
+    guard let rid = requestId else { emitResponse(obj); return }
+    var tagged = obj
+    tagged["id"] = rid
+    emitResponse(tagged)
   }
 
   // Debug: list pressable elements and their labels
@@ -868,41 +914,63 @@ func handleLine(_ line: String) {
     return
   }
 
-  // Execute on a background thread to avoid blocking stdin reading.
+  // Execute AND await on background threads so stdin reading never blocks.
   // Heavy pages (SourceForge, etc.) can cause executeAndReturnError() to block
-  // for 10-30+ seconds, preventing ALL subsequent commands from being read.
+  // for 10-30+ seconds. Dispatching the execution alone was not enough: handleLine
+  // still waited on the semaphore inline, so one slow `do JavaScript` stalled every
+  // later command — including native ones that never touch Apple Events — and a
+  // second session sharing this Safari looked completely dead for 30s at a time.
   _inFlightLock.lock()
-  let alreadyStuck = _inFlightScripts
+  let alreadyStuck = _stuckScripts
   _inFlightLock.unlock()
   if alreadyStuck >= 8 {
     respond(["error": "daemon wedged: \(alreadyStuck) AppleScript executions still blocked past their timeout — exiting for a clean respawn"])
     exit(1)
   }
 
-  let semaphore = DispatchSemaphore(value: 0)
-  var scriptResult: NSAppleEventDescriptor?
-  var scriptError: NSDictionary?
-
   _inFlightLock.lock(); _inFlightScripts += 1; _inFlightLock.unlock()
-  DispatchQueue.global(qos: .userInitiated).async {
-    var errorDict: NSDictionary?
-    scriptResult = nsScript.executeAndReturnError(&errorDict)
-    scriptError = errorDict
-    _inFlightLock.lock(); _inFlightScripts -= 1; _inFlightLock.unlock()
-    semaphore.signal()
-  }
 
-  // Wait up to 30 seconds for the script to complete.
-  // If it times out, respond with error but don't block the loop forever.
-  let waitResult = semaphore.wait(timeout: .now() + 30.0)
+  // handleLine returns immediately; the reply is delivered from this queue when the
+  // script finishes. The autorelease pool moves in here with it, so each command
+  // still drains its own NSAppleScript instead of retaining it until process exit.
+  _appleScriptQueue.async {
+    autoreleasepool {
+      let state = _ScriptState()
+      let semaphore = DispatchSemaphore(value: 0)
+      var scriptResult: NSAppleEventDescriptor?
+      var scriptError: NSDictionary?
 
-  if waitResult == .timedOut {
-    respond(["error": "AppleScript execution timed out (30s)"])
-  } else if let error = scriptError {
-    let msg = (error["NSAppleScriptErrorMessage"] as? String) ?? "AppleScript error"
-    respond(["error": msg])
-  } else {
-    respond(["result": scriptResult?.stringValue ?? ""])
+      DispatchQueue.global(qos: .userInitiated).async {
+        var errorDict: NSDictionary?
+        scriptResult = nsScript.executeAndReturnError(&errorDict)
+        scriptError = errorDict
+        _inFlightLock.lock()
+        _inFlightScripts -= 1
+        state.finished = true
+        // A late finish frees the parked thread, so stop counting it as wedged.
+        if state.timedOut { _stuckScripts -= 1 }
+        _inFlightLock.unlock()
+        semaphore.signal()
+      }
+
+      // Wait up to 30 seconds for the script to complete. On timeout the thread stays
+      // parked inside executeAndReturnError, so charge it against the wedge budget.
+      if semaphore.wait(timeout: .now() + 30.0) == .timedOut {
+        _inFlightLock.lock()
+        // finished may have landed in the same instant; only a real overrun counts.
+        if !state.finished {
+          state.timedOut = true
+          _stuckScripts += 1
+        }
+        _inFlightLock.unlock()
+        respond(["error": "AppleScript execution timed out (30s)"])
+      } else if let error = scriptError {
+        let msg = (error["NSAppleScriptErrorMessage"] as? String) ?? "AppleScript error"
+        respond(["error": msg])
+      } else {
+        respond(["result": scriptResult?.stringValue ?? ""])
+      }
+    }
   }
 }
 
@@ -913,8 +981,21 @@ while let line = readLine(strippingNewline: true) {
   autoreleasepool { handleLine(line) }
 }
 
-// stdin closed — the parent Node process is gone (clean shutdown or crash). GCD
-// threads still blocked inside executeAndReturnError would keep this process alive
-// as an orphan holding Apple Events / Accessibility grants; with no parent left to
-// read results there is nothing useful to finish. Exit explicitly.
+// stdin closed. Two very different callers reach this line.
+//
+// A one-shot invocation — `echo '{"script":"…"}' | safari-helper` — closes stdin the
+// instant the command is written, long before the script it just asked for has run.
+// Replies are emitted asynchronously now, so exiting here would drop the answer on
+// the floor and the caller would read nothing at all.
+//
+// A dead parent (clean shutdown or crash) has nobody left to read results, and GCD
+// threads still blocked inside executeAndReturnError would keep this process alive as
+// an orphan holding Apple Events / Accessibility grants.
+//
+// Draining the serial queue serves both: it returns immediately when nothing is in
+// flight (the dead-parent case), and waits just long enough for work already running
+// to answer. The bound is one script timeout, so a wedged script can't strand us.
+let drained = DispatchSemaphore(value: 0)
+_appleScriptQueue.async { drained.signal() }
+_ = drained.wait(timeout: .now() + 35.0)
 exit(0)

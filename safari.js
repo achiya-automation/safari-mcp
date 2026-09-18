@@ -35,27 +35,78 @@ let _helperProc = null;
 const _helperQueue = []; // callbacks waiting for responses
 let _helperConsecutiveTimeouts = 0; // Track consecutive timeouts — kill threshold lives where it's checked (currently 5)
 
-// ── Helper request serialization ──────────────────────────────────────────
-// The Swift helper runs each request on its own background thread, so it can
-// finish requests out of order. The Node side matches responses to callbacks by
-// FIFO queue position — correct ONLY if at most one request is in flight at a
-// time. This mutex enforces exactly that: every helper round-trip runs strictly
-// one at a time. Helper calls are ~5ms so serializing costs nothing measurable,
-// but it eliminates the response/callback desync that made tab resolution
-// silently return the wrong tab when the user was browsing concurrently.
+// ── Helper request correlation ────────────────────────────────────────────
+// The Swift helper finishes requests out of order on purpose: a native click must
+// not wait behind a slow `do JavaScript`. Responses used to be matched to callbacks
+// by FIFO queue position, which is correct ONLY with one request in flight — so a
+// mutex serialized every round-trip. That mutex was also the ceiling: one heavy page
+// froze every other check in the session for as long as it took, and a second Safari
+// session looked completely dead meanwhile.
+//
+// Each request now carries an id the daemon echoes back, so replies are matched by
+// identity and may overtake each other freely. The FIFO queue stays as the fallback
+// path for a daemon binary older than this protocol (it echoes no id), and the mutex
+// stays engaged until the running daemon has proven it speaks ids.
+let _helperSeq = 0;
+const _helperPending = new Map(); // request id → callback
+let _helperSupportsIds = false;   // flipped by the first id-matched reply
+
+function _helperLine(payload, cb) {
+  const id = "r" + ++_helperSeq;
+  cb.__helperId = id;
+  _helperPending.set(id, cb);
+  return JSON.stringify({ ...payload, id }) + "\n";
+}
+
+function _forgetHelperCb(cb) {
+  if (cb?.__helperId) _helperPending.delete(cb.__helperId);
+}
+
 let _helperLock = Promise.resolve();
 function _withHelperLock(makePromise) {
+  // Correlation by id makes serialization unnecessary — this is the line that lets
+  // several checks run at once. Until the daemon proves it echoes ids, stay serial:
+  // FIFO matching is only honest with a single request in flight.
+  if (_helperSupportsIds) return Promise.resolve().then(makePromise);
   const result = _helperLock.then(makePromise, makePromise);
   _helperLock = result.then(() => {}, () => {});
   return result;
 }
 
+// A timed-out request keeps its slot: the daemon may still answer, and that late
+// reply is proof of life. Swap both trackers to the replacement consumer so the FIFO
+// queue stays aligned AND the id still resolves to something.
+function _replaceHelperCb(cb, consumer) {
+  const idx = _helperQueue.indexOf(cb);
+  if (idx >= 0) _helperQueue[idx] = consumer;
+  if (cb?.__helperId) {
+    consumer.__helperId = cb.__helperId;
+    _helperPending.set(cb.__helperId, consumer);
+  }
+}
+
+// The write never reached the daemon, so no reply is coming for this request.
+function _dropHelperCb(cb) {
+  const idx = _helperQueue.indexOf(cb);
+  if (idx >= 0) _helperQueue.splice(idx, 1);
+  _forgetHelperCb(cb);
+}
+
 // Reject all pending callbacks when helper crashes
 function _drainHelperQueue(reason) {
+  const pending = [..._helperPending.values()];
+  _helperPending.clear();
   while (_helperQueue.length > 0) {
     const cb = _helperQueue.shift();
-    if (cb) cb(JSON.stringify({ error: reason }));
+    if (cb) {
+      const idx = pending.indexOf(cb);
+      if (idx >= 0) pending.splice(idx, 1);
+      cb(JSON.stringify({ error: reason }));
+    }
   }
+  // Callbacks tracked only by id (the queue entry was already consumed) still need
+  // their rejection, or their caller hangs until its own timeout fires.
+  for (const cb of pending) cb(JSON.stringify({ error: reason }));
 }
 
 function startHelper() {
@@ -70,8 +121,25 @@ function startHelper() {
       _buf = lines.pop(); // Keep incomplete line
       for (const line of lines) {
         if (!line.trim()) continue;
+        let replyId = null;
+        try {
+          const parsed = JSON.parse(line);
+          if (parsed && typeof parsed.id === "string") replyId = parsed.id;
+        } catch { /* not JSON — fall through to arrival order */ }
+
+        const keyed = replyId ? _helperPending.get(replyId) : null;
+        if (keyed) {
+          _helperPending.delete(replyId);
+          const qi = _helperQueue.indexOf(keyed);
+          if (qi >= 0) _helperQueue.splice(qi, 1);
+          _helperSupportsIds = true; // this daemon speaks the correlated protocol
+          keyed(line);
+          continue;
+        }
+
+        // Legacy daemon, or a reply whose request already timed out.
         const cb = _helperQueue.shift();
-        if (cb) cb(line);
+        if (cb) { _forgetHelperCb(cb); cb(line); }
       }
     });
     _helperProc.on("error", () => { _drainHelperQueue("helper process error"); _helperProc = null; _scheduleRestart(); });
@@ -607,8 +675,7 @@ function _helperHideSafari(timeout = 2000) {
     const timer = setTimeout(() => {
       if (!resolved) {
         resolved = true;
-        const idx = _helperQueue.indexOf(cb);
-        if (idx >= 0) _helperQueue[idx] = () => {};
+        _replaceHelperCb(cb, () => {});
         resolve();
       }
     }, timeout);
@@ -619,10 +686,9 @@ function _helperHideSafari(timeout = 2000) {
       resolve();
     }
     _helperQueue.push(cb);
-    try { _helperProc.stdin.write('{"hideSafari":true}\n'); }
+    try { _helperProc.stdin.write(_helperLine({ hideSafari: true }, cb)); }
     catch {
-      const idx = _helperQueue.indexOf(cb);
-      if (idx >= 0) _helperQueue.splice(idx, 1);
+      _dropHelperCb(cb);
       clearTimeout(timer);
       resolve();
     }
@@ -636,8 +702,7 @@ function _helperActivateApp(bundleId, timeout = 2000) {
     const timer = setTimeout(() => {
       if (!resolved) {
         resolved = true;
-        const idx = _helperQueue.indexOf(cb);
-        if (idx >= 0) _helperQueue[idx] = () => {};
+        _replaceHelperCb(cb, () => {});
         resolve();
       }
     }, timeout);
@@ -648,10 +713,9 @@ function _helperActivateApp(bundleId, timeout = 2000) {
       resolve();
     }
     _helperQueue.push(cb);
-    try { _helperProc.stdin.write(JSON.stringify({ activateApp: bundleId }) + '\n'); }
+    try { _helperProc.stdin.write(_helperLine({ activateApp: bundleId }, cb)); }
     catch {
-      const idx = _helperQueue.indexOf(cb);
-      if (idx >= 0) _helperQueue.splice(idx, 1);
+      _dropHelperCb(cb);
       clearTimeout(timer);
       resolve();
     }
@@ -875,8 +939,7 @@ function _osascriptFastHelper(script, timeout) {
       // consecutive-timeout counter instead of discarding the signal. Killing the daemon on a
       // slow page is pointless (the fresh daemon hits the same slow page) and disruptive.
       // Only a helper that NEVER replies (truly hung) accumulates timeouts with no late reply.
-      const idx = _helperQueue.indexOf(cb);
-      if (idx >= 0) _helperQueue[idx] = () => { _helperConsecutiveTimeouts = 0; }; // late reply ⇒ alive
+      _replaceHelperCb(cb, () => { _helperConsecutiveTimeouts = 0; }); // late reply ⇒ alive
       _helperConsecutiveTimeouts++;
       if (_helperConsecutiveTimeouts >= 5) {
         console.error(`[Safari MCP] safari-helper: ${_helperConsecutiveTimeouts} consecutive timeouts with no late replies — killing daemon`);
@@ -911,10 +974,9 @@ function _osascriptFastHelper(script, timeout) {
     }
     _helperQueue.push(cb);
     try {
-      _helperProc.stdin.write(JSON.stringify({ script }) + "\n");
+      _helperProc.stdin.write(_helperLine({ script }, cb));
     } catch (writeErr) {
-      const idx = _helperQueue.indexOf(cb);
-      if (idx >= 0) _helperQueue.splice(idx, 1);
+      _dropHelperCb(cb);
       clearTimeout(timer);
       reject(new Error("safari-helper write failed: " + writeErr.message));
     }
@@ -935,8 +997,7 @@ function _helperPreflight(timeout = 3000) {
     const timer = setTimeout(() => {
       if (resolved) return;
       resolved = true;
-      const idx = _helperQueue.indexOf(cb);
-      if (idx >= 0) _helperQueue[idx] = () => {}; // no-op consumer for a late reply
+      _replaceHelperCb(cb, () => {}); // no-op consumer for a late reply
       reject(new Error("preflight timeout"));
     }, timeout);
     function cb(line) {
@@ -948,10 +1009,9 @@ function _helperPreflight(timeout = 3000) {
     }
     _helperQueue.push(cb);
     try {
-      _helperProc.stdin.write(JSON.stringify({ preflight: true }) + "\n");
+      _helperProc.stdin.write(_helperLine({ preflight: true }, cb));
     } catch (writeErr) {
-      const idx = _helperQueue.indexOf(cb);
-      if (idx >= 0) _helperQueue.splice(idx, 1);
+      _dropHelperCb(cb);
       clearTimeout(timer);
       reject(new Error("preflight write failed: " + writeErr.message));
     }
@@ -980,8 +1040,7 @@ function _helperNativeClickRaw(x, y, doubleClick = false, windowId = 0, timeout 
     const timer = setTimeout(() => {
       if (resolved) return;
       resolved = true;
-      const idx = _helperQueue.indexOf(cb);
-      if (idx >= 0) _helperQueue[idx] = () => {}; // No-op consumer for late response
+      _replaceHelperCb(cb, () => {}); // No-op consumer for late response
       reject(new Error("native click timeout"));
     }, timeout);
 
@@ -1003,12 +1062,11 @@ function _helperNativeClickRaw(x, y, doubleClick = false, windowId = 0, timeout 
     if (doubleClick) cmd.click.double = true;
     if (windowId) cmd.click.windowId = windowId;
     try {
-      _helperProc.stdin.write(JSON.stringify(cmd) + "\n");
+      _helperProc.stdin.write(_helperLine(cmd, cb));
     } catch (e) {
       // EPIPE if the daemon died in the gap after the writable check — splice our callback
       // out so it can't consume the NEXT command's response (FIFO desync), then reject.
-      const i = _helperQueue.indexOf(cb);
-      if (i >= 0) _helperQueue.splice(i, 1);
+      _dropHelperCb(cb);
       clearTimeout(timer);
       resolved = true;
       reject(e);
@@ -1029,8 +1087,7 @@ function _helperNativeHover(x, y, windowId = 0, dwellMs = 500, restoreMouse = tr
     const timer = setTimeout(() => {
       if (resolved) return;
       resolved = true;
-      const idx = _helperQueue.indexOf(cb);
-      if (idx >= 0) _helperQueue[idx] = () => {};
+      _replaceHelperCb(cb, () => {});
       reject(new Error("native hover timeout"));
     }, timeout);
 
@@ -1051,12 +1108,11 @@ function _helperNativeHover(x, y, windowId = 0, dwellMs = 500, restoreMouse = tr
     const cmd = { hover: { x, y, dwellMs, restoreMouse } };
     if (windowId) cmd.hover.windowId = windowId;
     try {
-      _helperProc.stdin.write(JSON.stringify(cmd) + "\n");
+      _helperProc.stdin.write(_helperLine(cmd, cb));
     } catch (e) {
       // EPIPE if the daemon died in the gap after the writable check — splice our callback
       // out so it can't consume the NEXT command's response (FIFO desync), then reject.
-      const i = _helperQueue.indexOf(cb);
-      if (i >= 0) _helperQueue.splice(i, 1);
+      _dropHelperCb(cb);
       clearTimeout(timer);
       resolved = true;
       reject(e);
@@ -1081,8 +1137,7 @@ function _helperNativeKeyboardRaw(keyCode, flags = [], windowId = 0, timeout = 5
     const timer = setTimeout(() => {
       if (resolved) return;
       resolved = true;
-      const idx = _helperQueue.indexOf(cb);
-      if (idx >= 0) _helperQueue[idx] = () => {}; // No-op consumer for late response
+      _replaceHelperCb(cb, () => {}); // No-op consumer for late response
       reject(new Error("native keyboard timeout"));
     }, timeout);
 
@@ -1103,12 +1158,11 @@ function _helperNativeKeyboardRaw(keyCode, flags = [], windowId = 0, timeout = 5
     const cmd = { keyboard: { keyCode, flags } };
     if (windowId) cmd.keyboard.windowId = windowId;
     try {
-      _helperProc.stdin.write(JSON.stringify(cmd) + "\n");
+      _helperProc.stdin.write(_helperLine(cmd, cb));
     } catch (e) {
       // EPIPE if the daemon died in the gap after the writable check — splice our callback
       // out so it can't consume the NEXT command's response (FIFO desync), then reject.
-      const i = _helperQueue.indexOf(cb);
-      if (i >= 0) _helperQueue.splice(i, 1);
+      _dropHelperCb(cb);
       clearTimeout(timer);
       resolved = true;
       reject(e);
@@ -1126,8 +1180,7 @@ function _helperGetFrontApp(timeout = 2000) {
     const timer = setTimeout(() => {
       if (!resolved) {
         resolved = true;
-        const idx = _helperQueue.indexOf(cb);
-        if (idx >= 0) _helperQueue[idx] = () => {};
+        _replaceHelperCb(cb, () => {});
         resolve(null);
       }
     }, timeout);
@@ -1138,10 +1191,9 @@ function _helperGetFrontApp(timeout = 2000) {
       try { resolve(JSON.parse(line)); } catch { resolve(null); }
     }
     _helperQueue.push(cb);
-    try { _helperProc.stdin.write('{"getFrontApp":true}\n'); }
+    try { _helperProc.stdin.write(_helperLine({ getFrontApp: true }, cb)); }
     catch {
-      const idx = _helperQueue.indexOf(cb);
-      if (idx >= 0) _helperQueue.splice(idx, 1);
+      _dropHelperCb(cb);
       clearTimeout(timer);
       resolve(null);
     }
