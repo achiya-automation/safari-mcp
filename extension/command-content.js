@@ -570,7 +570,7 @@ function handleFill(payload) {
     }
     if (!el) return { ok: false, result: "Element not found" };
     if (el.disabled || el.getAttribute("aria-disabled") === "true") {
-      return { ok: false, result: "Element is DISABLED — cannot fill" };
+      return { ok: false, result: "Element is DISABLED \u2014 cannot fill" };
     }
 
     const value = String(payload.value ?? "");
@@ -646,7 +646,7 @@ function handleClick(payload) {
     if (!el) return { ok: false, result: "Element not found" };
     if (!isVisible(el)) return { ok: false, result: "Element not visible" };
     if (el.disabled || el.getAttribute("aria-disabled") === "true") {
-      return { ok: false, result: "Element is DISABLED — cannot click" };
+      return { ok: false, result: "Element is DISABLED \u2014 cannot click" };
     }
 
     el.scrollIntoView({ block: "center", inline: "center" });

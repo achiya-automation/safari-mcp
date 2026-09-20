@@ -27,6 +27,15 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { jpegSize } from "./image-size.js";
+import {
+  createLedger as createWorkerLedger,
+  noteConnect as ledgerNoteConnect,
+  noteVerdict as ledgerNoteVerdict,
+  noteVerified as ledgerNoteVerified,
+  summarize as summarizeWorkerLedger,
+  readProfileIdentities,
+  describeProfileIdentities,
+} from "./worker-ledger.js";
 
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 MB cap on POST body — prevents DoS
 
@@ -350,22 +359,72 @@ let _profileExtensionVerified = !process.env.SAFARI_PROFILE;
 // the operator is told the one thing that fixes it instead of debugging the bridge.
 const _unverifiedWorkerIds = new Set();
 let _staleWorkerAdviceShown = false;
+// Every worker that reaches /connect, with what it announced and what the profile probe
+// answered it — the evidence the warning below and safari_doctor print (#109).
+const _workerLedger = createWorkerLedger();
+const _rejectedWorkerIdsLogged = new Set();
 function _noteUnverifiedWorker(workerId) {
   if (!process.env.SAFARI_PROFILE || _profileExtensionVerified || !workerId) return;
   _unverifiedWorkerIds.add(workerId);
   if (_staleWorkerAdviceShown || _unverifiedWorkerIds.size < 3) return;
   _staleWorkerAdviceShown = true;
+  // 20.9.26 (#109): the old text prescribed a sqlite write for a "poisoned" stored identity.
+  // The real defect was in the extension — Safari decodes background.js in the system's
+  // legacy encoding, so its canonicalizer could not see its own em dash and never stripped
+  // "<profile> — <title>" (fixed in extension 2.10.24) — and nothing here said which
+  // workers the counted ones were. Print the ledger instead of one theory.
   console.error(
     `[Safari MCP] ⚠️ ${_unverifiedWorkerIds.size} extension workers connected but none proved profile ` +
-    `"${process.env.SAFARI_PROFILE}". The usual cause is a poisoned identity in that profile's extension ` +
-    `storage: mcpVerifiedProfile holds "<profile> — mcp-profile-check-<nonce>" instead of the bare ` +
-    `profile name, so _verifyProfileMatch rejects it forever. Fix (Safari must be quit first, and read ` +
-    `the DB together with its -wal or you will see a stale value): sqlite3 on ` +
-    `~/Library/Containers/com.apple.Safari/Data/Library/WebKit/WebExtensions/<uuid>/` +
-    `"com.achiya-automation.safari-mcp.Extension (...)"/LocalStorage.db — ` +
-    `UPDATE extension_storage SET value='"<profile>"' WHERE key='mcpVerifiedProfile'; then reopen Safari. ` +
-    `Restarting this server, rebuilding the app, or bumping its version do NOT help.`
+    `"${process.env.SAFARI_PROFILE}". Safari runs one worker per profile and each one tries this port. ` +
+    `Run safari_doctor: it lists these workers plus what every profile's extension storage holds ` +
+    `(identity, heartbeat, badge). A stored identity that still carries a window-title suffix under an ` +
+    `extension older than 2.10.24 is the #109 defect — rebuild and reinstall the app. A worker rejected ` +
+    `with 426 or 401 is one Safari kept from an older build — disable and re-enable the extension in ` +
+    `that profile, or relaunch Safari. Workers seen so far:\n  ` +
+    summarizeWorkerLedger(_workerLedger, { activeWorkerId: _activeHttpWorkerId }).join("\n  ")
   );
+}
+
+// One line per distinct verdict per worker: "match", "wrong:<window name>", "notfound"
+// or "error:<message>". Repeats of the same verdict only refresh the ledger timestamp.
+function _logProfileVerdict(workerId, verdict) {
+  if (!ledgerNoteVerdict(_workerLedger, workerId, verdict)) return;
+  console.error(`[Safari MCP] Profile probe from worker ${workerId.slice(0, 8)} for "${process.env.SAFARI_PROFILE}": ${verdict}`);
+}
+
+// What safari_doctor appends about the bridge: this host's role, the lease holder, the
+// workers seen, and what each profile's extension storage holds (read-only sqlite).
+async function _extensionBridgeReport() {
+  const lines = ["", "🔌 Extension bridge"];
+  const profile = process.env.SAFARI_PROFILE || "";
+  if (!_isExtensionHost) {
+    lines.push(`   this process is not the extension host (another safari-mcp owns port ${HTTP_PORT}); ask it, or run safari_doctor through the daemon`);
+    return lines;
+  }
+  const pollAge = _extensionLastPollTime ? `${Math.max(0, Math.round((Date.now() - _extensionLastPollTime) / 1000))}s ago` : "never";
+  if (_extensionConnected && (!profile || _profileExtensionVerified)) {
+    lines.push(`   ${profile ? `profile "${profile}" verified` : "connected"} — worker ${_activeHttpWorkerId.slice(0, 8)}, last poll ${pollAge}`);
+  } else {
+    lines.push(`   ❌ ${profile ? `no worker has proved profile "${profile}"` : "no worker connected"} — last poll ${pollAge}${_unverifiedWorkerIds.size ? `, ${_unverifiedWorkerIds.size} other worker(s) tried` : ""}`);
+  }
+  const seen = summarizeWorkerLedger(_workerLedger, { activeWorkerId: _activeHttpWorkerId });
+  lines.push(...(seen.length ? seen : ["no worker has reached /connect since this host started"]).map((l) => `   • ${l}`));
+  const { promisify: pfy } = await import("node:util");
+  const { readdir } = await import("node:fs/promises");
+  const execFileAsync = pfy(execFile);
+  let identities = [];
+  let storageError = null;
+  try {
+    identities = await readProfileIdentities({
+      home: homedir(),
+      readdir,
+      runSqlite: async (db) => (await execFileAsync("sqlite3", ["-readonly", db,
+        "SELECT key, value FROM extension_storage WHERE key IN ('mcpVerifiedProfile','_heartbeat','mcpStatus')"],
+        { timeout: 2000 })).stdout,
+    });
+  } catch (e) { storageError = e; }
+  lines.push(...describeProfileIdentities(identities, { profile, error: storageError }).map((l) => `   ◦ ${l}`));
+  return lines;
 }
 
 // A named profile is driven only by its verified WebExtension worker. The worker
@@ -794,6 +853,17 @@ try {
         req.url === "/verify-profile"
       ));
     if (extensionBridgeEndpoint && !_bridgeTokenMatches(req.headers["x-safari-mcp-token"])) {
+      // Silent until 20.9.26: a worker whose bundled token no longer matches this host's
+      // retries forever and never shows up in the ledger. Name it once.
+      const rejectedId = _httpWorkerId(req) || "(no worker id)";
+      if (!_rejectedWorkerIdsLogged.has(rejectedId)) {
+        _rejectedWorkerIdsLogged.add(rejectedId);
+        console.error(
+          `[Safari MCP] ⚠️ Extension worker ${rejectedId.slice(0, 8)} rejected (401) on ${req.method} ${req.url.split("?")[0]}: ` +
+          `its bridge token does not match extension/bridge-auth-token as this host read it — a worker started ` +
+          `before the app was rebuilt, or two checkouts with different tokens. Relaunch Safari (or reinstall the app).`
+        );
+      }
       res.writeHead(401);
       res.end("Unauthorized");
       return;
@@ -889,6 +959,22 @@ try {
         connectUrl.searchParams.get("verifier") !== "existing-tab-v1" ||
         connectUrl.searchParams.get("protocol") !== EXTENSION_BRIDGE_PROTOCOL
       )) {
+        // A 426 used to be silent: the worker Safari kept from an older build retried
+        // forever and the host counted only the accepted workers (#109).
+        const rejected = {
+          verifier: String(connectUrl.searchParams.get("verifier") || "").slice(0, 40),
+          protocol: String(connectUrl.searchParams.get("protocol") || "").slice(0, 40),
+        };
+        ledgerNoteConnect(_workerLedger, workerId, { rejected });
+        if (!_rejectedWorkerIdsLogged.has(workerId)) {
+          _rejectedWorkerIdsLogged.add(workerId);
+          console.error(
+            `[Safari MCP] ⚠️ Extension worker ${workerId.slice(0, 8)} rejected (426 upgrade_required): it announced ` +
+            `verifier="${rejected.verifier}" protocol="${rejected.protocol}", this host requires existing-tab-v1 / ` +
+            `${EXTENSION_BRIDGE_PROTOCOL}. Safari is still running a worker from an older build in one of its ` +
+            `profiles — disable and re-enable the extension there, or relaunch Safari.`
+          );
+        }
         res.writeHead(426, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "upgrade_required" }));
         return;
@@ -897,6 +983,7 @@ try {
       // /extension-verified. Remembering rejected workers would let a stale process
       // skip the protocol gate by posting the second handshake step directly.
       _rememberConnectingHttpWorker(workerId, _reloadHandoffToken(req));
+      ledgerNoteConnect(_workerLedger, workerId);
       _noteUnverifiedWorker(workerId);
       // When SAFARI_PROFILE is set, don't mark as connected until profile is verified.
       // A personal-profile extension connecting first would incorrectly set the flag.
@@ -975,10 +1062,11 @@ try {
       _connectingHttpWorkers.delete(workerId);
       if (workerChanged) _adoptReloadHandoff(workerId);
       _profileExtensionVerified = true;
+      ledgerNoteVerified(_workerLedger, workerId);
       if (workerChanged) _extensionConnectionGeneration += 1;
       if (!_extensionConnected) {
         _extensionConnected = true;
-        console.error("[Safari MCP] Extension connected and profile-verified via HTTP polling");
+        console.error(`[Safari MCP] Extension connected and profile-verified via HTTP polling (worker ${workerId.slice(0, 8)})`);
       }
       _extensionLastPollTime = Date.now();
       _scheduleKeepaliveTab();
@@ -1037,6 +1125,7 @@ try {
           // 1s pgrep + 2.5s osascript = 3.5s worst case, and the catch below still answers 200.
           const { stdout } = await execFileAsync("osascript", ["-e", script], { timeout: 2500 });
           const out = stdout.trim();
+          _logProfileVerdict(workerId, out);
           if (out === "match") {
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ match: true }));
@@ -1045,6 +1134,9 @@ try {
             res.end(JSON.stringify({ match: false, actualProfile: out }));
           }
         } catch (err) {
+          // Apple Events not answering (locked screen, a modal Safari dialog, TCC -1743)
+          // lands here as a timeout: the worker reads it as inconclusive and keeps retrying.
+          _logProfileVerdict(workerId, `error:${String(err.message || err).slice(0, 80)}`);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ match: false, error: err.message }));
         }
@@ -3818,11 +3910,13 @@ server.tool(
 
 server.tool(
   "safari_doctor",
-  "Diagnose the macOS permission + daemon chain in one shot: Safari running, Apple Events/Automation, native helper daemon, Accessibility (native clicks), Screen Recording, and the helper's codesign identity. Returns a pass/fail checklist with the exact System Settings fix per failure. Run this FIRST when clicks/screenshots/startup 'don't work even with permissions granted'.",
+  "Diagnose the macOS permission + daemon chain in one shot: Safari running, Apple Events/Automation, native helper daemon, Accessibility (native clicks), Screen Recording, and the helper's codesign identity. Returns a pass/fail checklist with the exact System Settings fix per failure, then the extension bridge: which worker holds the profile lease, every worker that tried and what the profile probe answered it, and what each Safari profile's extension storage holds. Run this FIRST when clicks/screenshots/startup 'don't work even with permissions granted' or when tools answer 'profile extension unavailable'.",
   {},
   async () => {
     const result = await safari.doctor();
-    return textResult(result);
+    // Best-effort: the permission checklist above must never be lost to a bridge error.
+    const bridge = await _extensionBridgeReport().catch((e) => ["", `🔌 Extension bridge: report failed (${String(e.message || e).slice(0, 80)})`]);
+    return textResult([result, ...bridge].join("\n"));
   }
 );
 

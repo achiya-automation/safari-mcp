@@ -38,8 +38,11 @@ async function _storedReloadHandoffToken() {
 
 async function _bridgeAuthToken() {
   if (!_bridgeAuthTokenPromise) {
+    // Bounded: an extension-resource fetch that never settles would wedge every
+    // connect() behind it — this is the one await before /connect with no timeout.
     _bridgeAuthTokenPromise = fetch(browser.runtime.getURL("bridge-auth-token"), {
       cache: "no-store",
+      signal: AbortSignal.timeout(5000),
     }).then(async (response) => {
       if (!response.ok) throw new Error("Safari MCP bridge authentication resource is unavailable");
       const token = (await response.text()).trim();
@@ -347,7 +350,7 @@ async function _closeTabForSession(sessionId, targetTab, payload) {
       await _addOwnedTab(sessionId, target.id);
     }
     if (!_isTabOwnedBySession(sessionId, target.id)) {
-      throw new Error(`⚠️ Tab safety: refusing to close tab ${requestedIndex} (${_safeTabUrl(target.url)}) — not opened by this MCP session.`);
+      throw new Error(`\u26a0\ufe0f Tab safety: refusing to close tab ${requestedIndex} (${_safeTabUrl(target.url)}) \u2014 not opened by this MCP session.`);
     }
     await _removeOwnedTab(sessionId, target.id);
     if (isLastTab) {
@@ -399,7 +402,7 @@ async function _switchTabForSession(sessionId, targetTab, payload) {
     if (suppliedReceipt && targetTab && target.id === targetTab.id) {
       await _addOwnedTab(sessionId, target.id);
     } else {
-      throw new Error(`⚠️ Tab safety: refusing "switch_tab" to tab ${target.id} (${_safeTabUrl(target.url)}) — not opened by this MCP session. Use safari_new_tab first.`);
+      throw new Error(`\u26a0\ufe0f Tab safety: refusing "switch_tab" to tab ${target.id} (${_safeTabUrl(target.url)}) \u2014 not opened by this MCP session. Use safari_new_tab first.`);
     }
   }
   // Do not visually activate the tab. Extension APIs work on background tabs; only
@@ -428,7 +431,12 @@ function _canonicalProfileName(value) {
   let name = String(value || "").normalize("NFC").trim();
   if (!name || name === "notfound" || name === "__personal__") return "";
   name = name.replace(/^wrong:/, "").trim();
-  const titleSeparator = name.indexOf(" — ");
+  // The separator is written as an escape on purpose. Safari loads this file in the
+  // system's legacy text encoding, not UTF-8 (20.9.26, #109: on a Hebrew Mac the raw
+  // " \u2014 " literal arrived as U+05D2 U+20AC U+201D), so a raw em dash here never
+  // matched the real one in a window title and the suffix was never stripped — a
+  // profile whose identity was stored with its title was rejected forever.
+  const titleSeparator = name.indexOf(" \u2014 ");
   if (titleSeparator > 0) name = name.slice(0, titleSeparator);
   return name.normalize("NFC").trim();
 }
@@ -613,7 +621,7 @@ async function connect() {
         // keep scanning when its target does not match the worker's proven identity.
         const isCorrectProfile = await _verifyProfileMatch(data.profile);
         if (!isCorrectProfile) {
-          console.log(`Safari MCP: bridge ${candidate} wants profile "${data.profile}" — trying next bridge`);
+          console.log(`Safari MCP: bridge ${candidate} wants profile "${data.profile}" \u2014 trying next bridge`);
           continue;
         }
         const verifiedResponse = await _bridgeFetch(`${HTTP_URL}/extension-verified`, {
@@ -947,7 +955,7 @@ async function handleCommand(type, payload) {
   // of the same profile was told its tab was "a different profile".
   const sessionWindow = _windowForSession(sessionId);
   if (tabId !== null && sessionWindow && targetTab.windowId !== sessionWindow) {
-    throw new Error("Tab belongs to a different profile — refusing to operate on personal tabs");
+    throw new Error("Tab belongs to a different profile \u2014 refusing to operate on personal tabs");
   }
 
   // ========== TAB OWNERSHIP GUARD ==========
@@ -966,7 +974,7 @@ async function handleCommand(type, payload) {
     } else {
       // A cold or brand-new session has no authority to mutate the user's active tab.
       // Stateless callers can present a receipt; otherwise they must create a tab first.
-      throw new Error(`⚠️ Tab safety: refusing "${type}" on tab ${tabId} (${_safeTabUrl(targetTab.url)}) — not opened by this MCP session. Use safari_new_tab first or provide its receipt.`);
+      throw new Error(`\u26a0\ufe0f Tab safety: refusing "${type}" on tab ${tabId} (${_safeTabUrl(targetTab.url)}) \u2014 not opened by this MCP session. Use safari_new_tab first or provide its receipt.`);
     }
   }
 
@@ -1363,7 +1371,7 @@ async function handleCommand(type, payload) {
             // Stale ref detection: check if refs exist but this ID is from a different generation
             const age = window.__mcpRefsTime ? Math.round((Date.now() - window.__mcpRefsTime) / 1000) : -1;
             if (refs && age > 30) {
-              return "__STALE_REF__:Ref '" + refId + "' not found. Snapshot is " + age + "s old — take a fresh snapshot.";
+              return "__STALE_REF__:Ref '" + refId + "' not found. Snapshot is " + age + "s old \u2014 take a fresh snapshot.";
             }
             return null;
           }
@@ -1481,7 +1489,7 @@ async function handleCommand(type, payload) {
         // --- Disabled check ---
         if (el.disabled || el.getAttribute("aria-disabled") === "true") {
           const reason = el.getAttribute("aria-label") || el.getAttribute("title") || el.textContent?.trim().substring(0, 60) || el.tagName;
-          return "Element is DISABLED — cannot click: " + reason + ". Check if form requirements are met (required fields, permissions, etc.)";
+          return "Element is DISABLED \u2014 cannot click: " + reason + ". Check if form requirements are met (required fields, permissions, etc.)";
         }
 
         // Meta's legacy rel=dialog router needs the click to originate on the inner
@@ -1787,7 +1795,7 @@ async function handleCommand(type, payload) {
               // If editor already has content, warn. If empty, type char-by-char.
               const hasContent = el.textContent && el.textContent.trim().length > 0;
               if (hasContent) {
-                ceResult = "ERROR: Closure/Medium editor detected — safari_fill cannot replace existing content without breaking the editor. Use safari_click to focus this element, then safari_type_text to type into it. To clear first, manually select all and delete via safari_press_key.";
+                ceResult = "ERROR: Closure/Medium editor detected \u2014 safari_fill cannot replace existing content without breaking the editor. Use safari_click to focus this element, then safari_type_text to type into it. To clear first, manually select all and delete via safari_press_key.";
               } else {
                 // Empty editor — char-by-char with Enter handling (matches type_text strategy)
                 (window.__mcpClosureType || function(){})(value, el);
@@ -1974,7 +1982,7 @@ async function handleCommand(type, payload) {
         // Deduplication check: if text was added twice (editor + execCommand), undo one copy
         if (beforeLen >= 0 && ae.textContent.length > beforeLen + text.length * 1.5) {
           document.execCommand("undo", false, null);
-          return "Typed " + text.length + " chars (deduplicated — editor handled insertion)";
+          return "Typed " + text.length + " chars (deduplicated \u2014 editor handled insertion)";
         }
         return "Typed " + text.length + " chars";
       }, [payload.text, payload.selector], tabId);
@@ -3246,7 +3254,7 @@ async function _resolveReceiptTab(token, { allowOriginChange = false } = {}) {
     }
     const browserEpoch = await _ensureBrowserSessionEpoch();
     if (record.browserEpoch !== browserEpoch) {
-      throw new Error("Tab safety: receipt belongs to an earlier browser session — Safari or the extension restarted after it was issued. Open the tab again with safari_new_tab.");
+      throw new Error("Tab safety: receipt belongs to an earlier browser session \u2014 Safari or the extension restarted after it was issued. Open the tab again with safari_new_tab.");
     }
 
     const allTabs = await browser.tabs.query({});
@@ -3499,7 +3507,7 @@ async function _verifyProfileMatch(expectedProfile) {
       }
     }
     if (!checkTab) {
-      console.log("Safari MCP: no existing injectable tab for profile verification — rejecting without opening a tab");
+      console.log("Safari MCP: no existing injectable tab for profile verification \u2014 rejecting without opening a tab");
       return false;
     }
 
@@ -3529,7 +3537,7 @@ async function _verifyProfileMatch(expectedProfile) {
       try {
         result = await verifyRes.json();
       } catch {
-        console.warn("Safari MCP: profile verification response invalid JSON — rejecting");
+        console.warn("Safari MCP: profile verification response invalid JSON \u2014 rejecting");
         return false;
       }
       const detectedProfile = _canonicalProfileName(result.actualProfile);
@@ -3548,10 +3556,10 @@ async function _verifyProfileMatch(expectedProfile) {
       }
     }
     // Verification endpoint not available or non-200 — reject to be safe
-    console.log("Safari MCP: profile verification inconclusive — rejecting connection");
+    console.log("Safari MCP: profile verification inconclusive \u2014 rejecting connection");
     return false;
   } catch (err) {
-    console.warn("Safari MCP: profile verification error:", err.message, "— rejecting connection");
+    console.warn("Safari MCP: profile verification error:", err.message, "\u2014 rejecting connection");
     return false; // Reject on error — better to miss extension than operate in wrong profile
   }
 }
@@ -4293,7 +4301,7 @@ async function resolveFrameId(tabId, frame) {
   }
   if (hits.length > 1) {
     throw new Error("Frame selector " + JSON.stringify(String(frame)) + " matched " + hits.length +
-      " frames — narrow it: " + hits.map((f) => f.url).join(" | "));
+      " frames \u2014 narrow it: " + hits.map((f) => f.url).join(" | "));
   }
   if (!Number.isInteger(hits[0].frameId)) throw new Error("Matched frame has no stable frameId");
   return hits[0].frameId;
@@ -4363,7 +4371,7 @@ async function execAcrossFrames(func, args = [], tabId = null) {
       try {
         const parsed = JSON.parse(r.result);
         if (Array.isArray(parsed) && parsed.length) merged.push(...parsed);
-      } catch { /* frame returned a non-array payload — ignore it */ }
+      } catch { /* frame returned a non-array payload \u2014 ignore it */ }
     }
     return merged.length ? JSON.stringify(merged) : null;
   } catch {
