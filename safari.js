@@ -4231,16 +4231,29 @@ export async function resizeWindow({ width, height }) {
 
 // ========== COOKIES & STORAGE ==========
 
+// The storage tools below are plain page JavaScript (document.cookie, localStorage,
+// sessionStorage). Until 2.21.13 they went straight to AppleScript, so a stuck Apple
+// Events channel failed them with `Safari profile "X" window not found` while
+// safari_evaluate, list_tabs and run_script kept answering through the extension
+// (geo-audit, 2026-09-20). index.js points this hook at the same extension-first
+// ladder safari_evaluate uses; the fallback it hands back is the original runJS.
+// Without a runner (tests, direct imports) pageJS is runJS.
+let _pageJSRunner = null;
+export function setPageJSRunner(fn) { _pageJSRunner = typeof fn === "function" ? fn : null; }
+function pageJS(js, fallback = () => runJS(js)) {
+  return _pageJSRunner ? _pageJSRunner(js, fallback) : fallback();
+}
+
 export async function getCookies() {
-  return runJS("document.cookie");
+  return pageJS("document.cookie");
 }
 
 export async function getLocalStorage({ key }) {
   if (key) {
     const safeKey = escJsSingleQuote(key);
-    return runJS(`localStorage.getItem('${safeKey}')`);
+    return pageJS(`localStorage.getItem('${safeKey}')`);
   }
-  return runJS(
+  return pageJS(
     "JSON.stringify(Object.fromEntries(Object.keys(localStorage).map(function(k){var v=localStorage.getItem(k);return[k,v==null?null:v.substring(0,200)]})))"
   );
 }
@@ -5156,18 +5169,18 @@ export async function setCookie({ name, value, domain, path: cookiePath, expires
   if (expires) cookie += `; expires=${escJsSingleQuote(expires)}`;
   if (secure) cookie += '; secure';
   if (sameSite) cookie += `; samesite=${sameSite}`;
-  return runJS(`document.cookie='${cookie}'; 'Cookie set: ${safeName}'`);
+  return pageJS(`document.cookie='${cookie}'; 'Cookie set: ${safeName}'`);
 }
 
 export async function deleteCookies({ name, all }) {
   if (all) {
-    return runJS(
+    return pageJS(
       `(function(){var cookies=document.cookie.split(';');var count=0;cookies.forEach(function(c){var name=c.split('=')[0].trim();document.cookie=name+'=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/';count++;});return 'Deleted '+count+' cookies';})()`
     );
   }
   if (name) {
     const safeName = escJsSingleQuote(name);
-    return runJS(
+    return pageJS(
       `document.cookie='${safeName}=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/'; 'Deleted cookie: ${safeName}'`
     );
   }
@@ -5179,9 +5192,9 @@ export async function deleteCookies({ name, all }) {
 export async function getSessionStorage({ key }) {
   if (key) {
     const safeKey = escJsSingleQuote(key);
-    return runJS(`sessionStorage.getItem('${safeKey}')`);
+    return pageJS(`sessionStorage.getItem('${safeKey}')`);
   }
-  return runJS(
+  return pageJS(
     "JSON.stringify(Object.fromEntries(Object.keys(sessionStorage).map(function(k){var v=sessionStorage.getItem(k);return[k,v==null?null:v.substring(0,200)]})))"
   );
 }
@@ -5189,34 +5202,34 @@ export async function getSessionStorage({ key }) {
 export async function setSessionStorage({ key, value }) {
   const safeKey = escJsSingleQuote(key);
   const safeValue = escJsSingleQuote(value);
-  return runJS(`sessionStorage.setItem('${safeKey}','${safeValue}'); 'Set sessionStorage: ${safeKey}'`);
+  return pageJS(`sessionStorage.setItem('${safeKey}','${safeValue}'); 'Set sessionStorage: ${safeKey}'`);
 }
 
 export async function setLocalStorage({ key, value }) {
   const safeKey = escJsSingleQuote(key);
   const safeValue = escJsSingleQuote(value);
-  return runJS(`localStorage.setItem('${safeKey}','${safeValue}'); 'Set localStorage: ${safeKey}'`);
+  return pageJS(`localStorage.setItem('${safeKey}','${safeValue}'); 'Set localStorage: ${safeKey}'`);
 }
 
 export async function deleteLocalStorage({ key }) {
   if (key) {
     const safeKey = escJsSingleQuote(key);
-    return runJS(`localStorage.removeItem('${safeKey}'); 'Deleted localStorage: ${safeKey}'`);
+    return pageJS(`localStorage.removeItem('${safeKey}'); 'Deleted localStorage: ${safeKey}'`);
   }
-  return runJS("var n=localStorage.length; localStorage.clear(); 'Cleared localStorage: '+n+' items'");
+  return pageJS("var n=localStorage.length; localStorage.clear(); 'Cleared localStorage: '+n+' items'");
 }
 
 export async function deleteSessionStorage({ key }) {
   if (key) {
     const safeKey = escJsSingleQuote(key);
-    return runJS(`sessionStorage.removeItem('${safeKey}'); 'Deleted sessionStorage: ${safeKey}'`);
+    return pageJS(`sessionStorage.removeItem('${safeKey}'); 'Deleted sessionStorage: ${safeKey}'`);
   }
-  return runJS("var n=sessionStorage.length; sessionStorage.clear(); 'Cleared sessionStorage: '+n+' items'");
+  return pageJS("var n=sessionStorage.length; sessionStorage.clear(); 'Cleared sessionStorage: '+n+' items'");
 }
 
 // Export all storage state (cookies + localStorage + sessionStorage) as JSON
 export async function exportStorageState() {
-  return runJS(
+  return pageJS(
     `JSON.stringify({
       url: location.href,
       cookies: document.cookie,
@@ -5250,10 +5263,7 @@ export async function importStorageState({ state }) {
   }
   // Use runJSLarge for large sessions (many cookies/localStorage keys can exceed 260KB limit of runJS)
   const script = cmds.join(";") + "; 'Imported ' + " + cmds.length + " + ' items'";
-  if (script.length > 200000) {
-    return runJSLarge(script, { timeout: 30000 });
-  }
-  return runJS(script);
+  return pageJS(script, () => (script.length > 200000 ? runJSLarge(script, { timeout: 30000 }) : runJS(script)));
 }
 
 // ========== CLIPBOARD ==========

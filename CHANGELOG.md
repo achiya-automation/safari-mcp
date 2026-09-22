@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.21.13] - 2026-09-22
+
+### Fixed
+- **The cookie and storage tools no longer die with a stuck Apple Events channel.** `safari_get_cookies`, `safari_set_cookie`, `safari_delete_cookies`, `safari_local_storage`, `safari_session_storage` and their set/delete/export/import siblings were the last page-JavaScript tools bound to AppleScript: every one of them went through `do JavaScript`, which first looks the profile window up over Apple Events. On 2026-09-20, with five morning sessions driving the same Safari and every `osascript` waiting out its 30-second timeout, `safari_delete_cookies` answered `Safari profile "…" window not found` while `safari_list_tabs`, `safari_run_script` and `safari_evaluate` on the same tab kept working through the extension — so a cold-session measurement that only needed its cookies cleared could not start. The eleven storage functions now run their page JavaScript through the same extension-first ladder as `safari_evaluate` (`safari.setPageJSRunner`, installed by the host); the AppleScript path is the fallback it always was, and a named profile stays extension-only like every other tool. `test/storage-page-js-runner.test.mjs` fails if any of them reaches for AppleScript directly again. No extension change.
+
 ## [2.21.12] - 2026-09-20
 
 ### Fixed

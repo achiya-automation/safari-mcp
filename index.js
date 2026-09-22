@@ -2172,6 +2172,13 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
   return result;
 }
 
+// The cookie / localStorage / sessionStorage tools run their page JavaScript through the
+// same extension-first ladder as safari_evaluate. They used to go straight to AppleScript,
+// which is why a stuck Apple Events channel failed safari_delete_cookies with
+// `Safari profile "X" window not found` while list_tabs, run_script and evaluate kept
+// working (geo-audit, 2026-09-20). The fallback safari.js hands us is its original runJS.
+safari.setPageJSRunner((script, fallback) => extensionOrFallback("evaluate", { script }, fallback));
+
 // Read version from package.json to avoid hardcoded mismatch
 const _pkgVersion = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'package.json'), 'utf8')).version;
 // Factory so each MCP session (in HTTP mode) gets its own McpServer — McpServer is single-connection.
