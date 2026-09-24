@@ -209,12 +209,15 @@ export function _removeOwnedURL(url) {
   }
 }
 
-export function _trackTab(tabIndex, url, sessionId = "") {
+export function _trackTab(tabIndex, url, sessionId = "", marker = "") {
   // sessionId is what keeps the tab cap per-session. In HTTP daemon mode one process
   // serves many Claude sessions, and this map is process-wide: without it, the cap is
   // the SUM of every session's tabs, and the "close the oldest" eviction happily closed
   // a tab another session was still working in.
-  _openedTabs.set(tabIndex, { url: url || "", openedAt: Date.now(), sessionId });
+  // marker is the tab's identity stamp (window.name / __mcpTabMarker). The index and the
+  // URL both go stale — indices shift, and the tab navigates — so every path that later
+  // CLOSES this tab resolves it through the marker instead (#112).
+  _openedTabs.set(tabIndex, { url: url || "", openedAt: Date.now(), sessionId, marker: marker || "" });
   _addOwnedURL(url);
 }
 

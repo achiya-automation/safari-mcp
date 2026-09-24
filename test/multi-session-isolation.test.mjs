@@ -91,7 +91,7 @@ test("eviction can only close a tab the calling session opened", () => {
 
 test("every tab we open is stamped with its session", () => {
   assert.ok(
-    /_trackTab\(tabIndex, url, sessionId = ""\)/.test(ownership),
+    /_trackTab\(tabIndex, url, sessionId = ""[,)]/.test(ownership),
     "_trackTab must accept a session"
   );
   assert.ok(/openedAt: Date\.now\(\), sessionId/.test(ownership), "and record it");

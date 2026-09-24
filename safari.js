@@ -728,6 +728,39 @@ export function setActiveTabIndex(idx) { _st().activeTabIndex = idx; }
 export function getActiveTabURL() { return _st().activeTabURL; }
 export function setActiveTabURL(url) { _st().activeTabURL = url; _st().lastResolveTime = Date.now(); }
 
+export function getActiveTabMarker() { return _st().activeTabMarker; }
+
+// Find the tab carrying an EXACT identity marker. Returns its index, or null when the
+// marker is on no tab — or when the scan itself could not be completed.
+//
+// resolveActiveTab() resolves *this session's current* tab and falls back to a URL match;
+// this one takes the marker as an argument and has no fallback, because its callers are
+// the destructive ones (shutdown cleanup, tab eviction). They hold a tab recorded minutes
+// earlier: its index has shifted and it may have navigated, so a URL match there can land
+// on a tab the USER opened on the same URL and close that instead (#112, the same
+// principle as #68). No proof of identity means no close.
+export async function findTabByMarker(marker) {
+  if (!marker) return null;
+  const safeMarker = String(marker).replace(/'/g, "\\'");
+  const check = `(function(){try{return (window.name==='${safeMarker}'||window.__mcpTabMarker==='${safeMarker}')?'1':'0'}catch(e){return '0'}})()`;
+  const scanScript = `tell application "Safari"
+    set w to ${getTargetWindowRef()}
+    set n to count of tabs of w
+    repeat with i from n to 1 by -1
+      try
+        if (do JavaScript "${check}" in tab i of w) is "1" then return i
+      end try
+    end repeat
+    return 0
+  end tell`;
+  // Fast daemon first; a hiccup retries once through the reliable subprocess.
+  let res = await osascriptFast(scanScript).catch(() => null);
+  if (res === null) res = await osascript(scanScript).catch(() => null);
+  if (res === null) return null;
+  const found = Number(String(res).trim());
+  return found > 0 ? found : null;
+}
+
 // Resolve our tracked URL to current tab index — single combined osascript call
 async function resolveActiveTab() {
   if (!_st().activeTabURL && !_st().activeTabMarker) return _st().activeTabIndex;

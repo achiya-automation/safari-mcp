@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.21.14] - 2026-09-24
+
+### Fixed
+- **Shutdown cleanup no longer closes a tab of the user's that happens to sit on the URL our tab started from ([#112](https://github.com/achiya-automation/safari-mcp/issues/112)).** `_cleanupTabs()` closed the tabs this process had opened by looking their *recorded URL* up in the live tab list. Both coordinates it trusted go stale: the MCP tab navigates away from the URL it was opened on, and `find` returns the first tab matching a URL — usually the user's older one. So a session that opened `example.com/a` and clicked through to `/b` exited by closing the user's `/a` tab and leaving its own tab open. Reproduced from the report at the source: the pre-fix function picks tab 1 (the user's) over tab 2 (ours). Every tracked tab now records the identity marker stamped on it (`window.name` / `__mcpTabMarker`, the same one `resolveActiveTab()` proves ownership with), and the close paths resolve that marker to a current index through the new `findTabByMarker()` immediately before each close, so index shifts between closures cannot mis-target either. A tab whose marker is on no tab is left open: a stray MCP tab costs nothing, a closed user tab costs their work — the principle from [#68](https://github.com/achiya-automation/safari-mcp/issues/68), which the explicit-index path in `closeTab()` deliberately does not re-check. The same URL lookup sat in the memory-monitor sweep (`_closeOldestMCPTab`), and the per-session tab cap evicted by the index recorded at open time; both now prove the tab first, and the cap skips the eviction rather than close an unproven tab. `test/cleanup-tab-identity.test.mjs` covers the reported navigation case, two tabs on an identical URL, an unprovable marker, renumbering across consecutive closes, and the named-profile path that still defers to extension-safe cleanup. Reported by [@scarabone](https://github.com/scarabone). No extension change.
+
 ## [2.21.13] - 2026-09-22
 
 ### Fixed

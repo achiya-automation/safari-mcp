@@ -169,6 +169,16 @@ const WEBKIT_MEMORY_LIMIT_MB = parseInt(process.env.MCP_WEBKIT_LIMIT_MB || "3000
 // _removeOwnedURL, _trackTab, _untrackTab, BLANK_TAB_SENTINEL) are imported from
 // ownership-state.js at the top of this file.
 
+// Resolve a tab we recorded earlier to its CURRENT index, proving identity by the marker
+// stamped on it. Returns null when the tab carries no marker we can find — the caller then
+// leaves it alone. Never matches by URL: the tab navigates after we open it, and the user
+// can have a tab of their own on the URL we recorded, so a URL match closed THEIR tab
+// (#112). A stray MCP tab left open costs nothing; a closed user tab costs their work.
+async function _verifiedTabIndex(info) {
+  if (!info?.marker) return null;
+  try { return await safari.findTabByMarker(info.marker); } catch { return null; }
+}
+
 // Close all MCP-opened tabs on process exit
 async function _cleanupTabs() {
   if (_openedTabs.size === 0) return;
@@ -181,17 +191,14 @@ async function _cleanupTabs() {
     return;
   }
   console.error(`[Safari MCP] Cleanup: closing ${_openedTabs.size} MCP-opened tabs`);
-  // Close by URL (not index) — indices shift as tabs are closed
-  const urlsToClose = [..._openedTabs.values()].map(v => v.url).filter(Boolean);
-  for (const url of urlsToClose) {
+  // Resolve each tab by its identity marker right before closing it — indices shift after
+  // every closure, and the marker is the only coordinate that survives navigation. Name the
+  // index explicitly: it was just proven ours, and closeTab's own ownership check covers
+  // only this session's active tab (#68).
+  for (const info of [..._openedTabs.values()]) {
     try {
-      // Re-resolve index by URL before each close (indices shift after each closure)
-      const tabs = await safari.listTabs();
-      const parsed = typeof tabs === 'string' ? JSON.parse(tabs) : tabs;
-      const match = parsed.find(t => t.url === url);
-      // Name the tab explicitly: it was just resolved out of our own opened-tab table, and
-      // closeTab refuses anything it cannot prove it owns (#68).
-      if (match) await safari.closeTab(match.index);
+      const idx = await _verifiedTabIndex(info);
+      if (idx) await safari.closeTab(idx);
     } catch {}
   }
   _openedTabs.clear();
@@ -256,13 +263,8 @@ async function _closeOldestMCPTab() {
   }
   if (oldestIdx !== null) {
     try {
-      const info = _openedTabs.get(oldestIdx);
-      if (info?.url) {
-        const tabs = await safari.listTabs();
-        const parsed = typeof tabs === 'string' ? JSON.parse(tabs) : tabs;
-        const match = parsed.find(t => t.url === info.url);
-        if (match) await safari.closeTab(match.index);
-      }
+      const idx = await _verifiedTabIndex(_openedTabs.get(oldestIdx));
+      if (idx) await safari.closeTab(idx);
     } catch {}
     _untrackTab(oldestIdx);
   }
@@ -1765,7 +1767,7 @@ async function _runExtensionBatchAction(action, args = {}) {
       const value = _sanitizeTabResult(normalize(raw));
       if (value && typeof value === "object" && value.tabIndex) {
         safari.setActiveTabIndex(value.tabIndex);
-        _trackTab(value.tabIndex, requestedUrl, mySession);
+        _trackTab(value.tabIndex, requestedUrl, mySession, safari.getActiveTabMarker());
       }
       const trackUrl = requestedUrl || "about:blank";
       if (trackUrl) {
@@ -2863,11 +2865,19 @@ server.tool(
       if (oldestIdx !== null) {
         console.error(`[Safari MCP] Tab limit (${MAX_TABS}) reached for this session — closing its oldest tab #${oldestIdx}`);
         try {
-          await extensionOrFallback(
-            "close_tab",
-            { index: oldestIdx },
-            () => safari.closeTab(oldestIdx)
-          );
+          // The recorded index has shifted if any tab closed since; on the AppleScript path
+          // re-prove it by marker first, and skip the eviction when it cannot be proven
+          // (#112). The extension resolves its own owned tab ids, so it keeps the recorded one.
+          const evictIdx = process.env.SAFARI_PROFILE
+            ? oldestIdx
+            : await _verifiedTabIndex(_openedTabs.get(oldestIdx));
+          if (evictIdx) {
+            await extensionOrFallback(
+              "close_tab",
+              { index: evictIdx },
+              () => safari.closeTab(evictIdx)
+            );
+          }
         } catch {}
         _untrackTab(oldestIdx);
         evictedTab = oldestIdx;
@@ -2889,7 +2899,7 @@ server.tool(
     // remains internal and is never copied into the MCP response.
     if (safeResult?.tabIndex) {
       safari.setActiveTabIndex(safeResult.tabIndex);
-      _trackTab(safeResult.tabIndex, requestedUrl, mySession);
+      _trackTab(safeResult.tabIndex, requestedUrl, mySession, safari.getActiveTabMarker());
     }
     if (requestedUrl) {
       const trackUrl = requestedUrl;
@@ -3084,7 +3094,7 @@ server.tool(
                 await extensionOrFallback("switch_tab", { index: resolved.index }, () => safari.switchTab(resolved.index));
                 safari.setActiveTabIndex(resolved.index);
                 safari.setActiveTabURL(resolved.url);
-                _trackTab(resolved.index, resolved.url, `${SESSION_ID}:${currentSessionId()}`);  // own the popup for THIS session, else the next interaction trips the tab-safety guard
+                _trackTab(resolved.index, resolved.url, `${SESSION_ID}:${currentSessionId()}`, safari.getActiveTabMarker());  // own the popup for THIS session, else the next interaction trips the tab-safety guard
                 return { content: [{ type: "text", text: `Found new tab: ${resolved.title} (${resolved.url})` }] };
               }
               continue;
@@ -3093,7 +3103,7 @@ server.tool(
             await extensionOrFallback("switch_tab", { index: tab.index }, () => safari.switchTab(tab.index));
             safari.setActiveTabIndex(tab.index);
             safari.setActiveTabURL(tab.url);
-            _trackTab(tab.index, tab.url, `${SESSION_ID}:${currentSessionId()}`);  // own the new tab for THIS session, else the next interaction trips the tab-safety guard
+            _trackTab(tab.index, tab.url, `${SESSION_ID}:${currentSessionId()}`, safari.getActiveTabMarker());  // own the new tab for THIS session, else the next interaction trips the tab-safety guard
             return { content: [{ type: "text", text: `Found new tab: ${tab.title} (${tab.url})` }] };
           }
         }
