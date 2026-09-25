@@ -17,7 +17,7 @@ https://github.com/wong2/awesome-mcp-servers/compare/main...achiya-automation:aw
 Adding **Safari MCP** to the Community Servers list.
 
 ## What it does
-Native Safari browser automation for AI agents on macOS. 80 tools covering navigation, clicks, forms, screenshots, network, accessibility, storage, and more. AppleScript + JavaScript — no WebDriver, no Puppeteer, no Playwright, no Chrome.
+Native Safari browser automation for AI agents on macOS. 98 tools covering navigation, clicks, forms, screenshots, network, accessibility, storage, and more. AppleScript + JavaScript — no WebDriver, no Puppeteer, no Playwright, no Chrome.
 
 ## Why it fits this list
 - ~60% less CPU than headless Chrome on Apple Silicon
@@ -50,7 +50,7 @@ https://github.com/appcypher/awesome-mcp-servers/compare/main...achiya-automatio
 Adding **Safari MCP** to the **System Automation** section (next to Apple Shortcuts).
 
 ## What it does
-Native Safari browser automation for AI agents on macOS. 80 tools for navigation, clicks, forms, screenshots, network, accessibility, storage. AppleScript + JavaScript.
+Native Safari browser automation for AI agents on macOS. 98 tools for navigation, clicks, forms, screenshots, network, accessibility, storage. AppleScript + JavaScript.
 
 ## Why it fits this list
 - ~60% less CPU than headless Chrome on Apple Silicon

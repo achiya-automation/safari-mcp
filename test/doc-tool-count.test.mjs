@@ -115,7 +115,20 @@ test("the directory manifests, examples page and install banner agree with the c
   // prints it on install. They said 97 and 96 while everything checked above said 98. A file
   // may drop the number, as the banner now has; it may not state a different one, and
   // "96 native browser tools" is stating one, so the words between are allowed for.
-  const files = ["glama.json", "mcp.json", ".mcp.json", "examples/README.md", "scripts/postinstall.cjs"];
+  // `.launch/manual-submissions.md` is the last of them and the one that bites hardest: its
+  // blurbs are pasted verbatim into third-party directory submissions, so a stale number
+  // there does not sit in the repo, it becomes someone else's listing. mcp.so still shows
+  // "80 tools" today because that is the March 2026 text it was submitted with. The other
+  // `.launch/*.md` files record posts that were actually published and are deliberately
+  // left alone — correcting them would falsify the record of what went out.
+  const files = [
+    "glama.json",
+    "mcp.json",
+    ".mcp.json",
+    "examples/README.md",
+    "scripts/postinstall.cjs",
+    ".launch/manual-submissions.md",
+  ];
   const stale = files.flatMap((file) =>
     [...readFileSync(new URL(`../${file}`, import.meta.url), "utf8").matchAll(/\b(\d+) (?:[a-z-]+ ){0,3}tools\b/gi)]
       .filter((m) => Number(m[1]) !== TOOL_COUNT)
