@@ -1144,146 +1144,20 @@ async function handleCommand(type, payload) {
       }, [payload.maxLength || 200000], tabId);
     }
 
-    // --- JavaScript Execution — multi-strategy to handle CSP restrictions ---
-    // Strategy 1: indirect eval (fast, works when CSP allows unsafe-eval)
-    // Strategy 2: script element injection (bypasses CSP in MAIN world context)
+    // --- JavaScript Execution — see _evaluateOnce and _evalRunner ---
     case "list_frames": {
       return await listFrames(tabId);
     }
 
     case "evaluate": {
-      // Strategy 0: pages that stall injection outright. Every strategy below reaches
-      // the page through scripting.executeScript, which on business.facebook.com never
-      // resolves — so all three died on the caller's timeout and evaluate was simply
-      // unavailable there. The content-script bridge needs no injection at all, so try
-      // it FIRST once a tab is known to block injection, and fall back to it below
-      // when a fresh tab turns out to block it too.
       const evalTabId = tabId || (await getActiveTab()).id;
-      // A frame selector short-circuits every strategy below: those all target the
-      // main frame, which is exactly what makes an embedded app unreachable.
+      // A frame selector short-circuits the page-level path: that one targets the main
+      // frame, which is exactly what makes an embedded app unreachable.
       if (payload.frame !== undefined && payload.frame !== null && payload.frame !== "") {
         const _fid = await resolveFrameId(evalTabId, payload.frame);
         return await evaluateInFrame(evalTabId, _fid, payload.script);
       }
-      const viaBridge = async () => {
-        const r = await sendContentCommand(
-          evalTabId, "mcp-content-eval", { source: payload.script }, 10000
-        );
-        if (!r || r.ok !== true) throw new Error((r && r.error) || "content bridge failed");
-        _injectionBlockedTabs.add(evalTabId);
-        if (evalOrigin) _injectionBlockedOrigins.set(evalOrigin, Date.now() + _INJECTION_BLOCK_TTL_MS);
-        return r.value;
-      };
-      const evalOrigin = _originKey(targetTab?.url);
-      const originBlocked = !!evalOrigin && (_injectionBlockedOrigins.get(evalOrigin) || 0) > Date.now();
-      if (_injectionBlockedTabs.has(evalTabId) || originBlocked) {
-        try { return await viaBridge(); }
-        catch (_e) { // page changed — re-probe
-          _injectionBlockedTabs.delete(evalTabId);
-          if (evalOrigin) _injectionBlockedOrigins.delete(evalOrigin);
-        }
-      }
-
-      // First contact with a hardened page: every execInTab strategy below will stall.
-      // Catch that here so it costs one bounded probe, not the caller's whole timeout.
-      const evalStrategies = async () => {
-      // Strategy 1: Direct eval via execInTab (fast, works when CSP allows unsafe-eval)
-      const evalResult = await execInTab(async (script) => {
-        try {
-          const result = await (0, eval)(script);
-          if (result === undefined || result === null) return null;
-          return typeof result === "object" ? JSON.stringify(result) : String(result);
-        } catch (e) {
-          if (e.message.includes("unsafe-eval") || e.message.includes("trusted-types") || e.message.includes("Trusted Type")) {
-            return "__CSP_BLOCKED__";
-          }
-          return "Error: " + e.message;
-        }
-      }, [payload.script], tabId);
-
-      if (evalResult !== "__CSP_BLOCKED__") return evalResult;
-
-      // Strategy 2: Script element injection (works when inline scripts are allowed)
-      const injectResult = await execInTab(async (script) => {
-        return await new Promise((resolve) => {
-          // Unpredictable key — a Date.now()-based name let a hostile page pre-seed
-          // window["__mcp_eval_<now>"] with a fabricated {done:true,v:...} result.
-          const id = "__mcp_eval_" + (crypto.randomUUID
-            ? crypto.randomUUID().replace(/-/g, "")
-            : Date.now().toString(36) + Math.random().toString(36).slice(2));
-          window[id] = { done: false };
-          const s = document.createElement("script");
-          const code = "try{var __r=(function(){" + script + "})();if(__r&&typeof __r.then==='function'){__r.then(function(v){window['" + id + "']={done:true,v:v};}).catch(function(e){window['" + id + "']={done:true,e:e.message};});}else{window['" + id + "']={done:true,v:__r};}}catch(e){window['" + id + "']={done:true,e:e.message};}";
-          // Prefer the policy pre-registered by content.js at document_start —
-          // pages that block new policy creation post-load (GSC, modern Google admin)
-          // still accept ours because it was grandfathered in before their CSP applied.
-          if (window.__mcpTrustedPolicy && typeof window.__mcpTrustedPolicy.createScript === "function") {
-            try { s.textContent = window.__mcpTrustedPolicy.createScript(code); }
-            catch (_) { s.textContent = code; }
-          } else if (window.trustedTypes && window.trustedTypes.createPolicy) {
-            try {
-              const policy = window.trustedTypes.createPolicy("mcpEval_" + Date.now(), { createScript: (s) => s });
-              s.textContent = policy.createScript(code);
-            } catch (_) { s.textContent = code; }
-          } else {
-            s.textContent = code;
-          }
-          document.documentElement.appendChild(s);
-          s.remove();
-          let attempts = 0;
-          const poll = () => {
-            const r = window[id];
-            if (r && r.done) {
-              delete window[id];
-              if (r.e) resolve("Error: " + r.e);
-              else resolve(r.v === undefined || r.v === null ? null : typeof r.v === "object" ? JSON.stringify(r.v) : String(r.v));
-              return;
-            }
-            if (++attempts > 100) { delete window[id]; resolve("Error: timeout"); return; }
-            setTimeout(poll, 50);
-          };
-          poll();
-        });
-      }, [payload.script], tabId);
-
-      // If script injection also failed due to CSP, try Worker thread (separate CSP context)
-      const isInjectCsp = injectResult && typeof injectResult === "string" && (injectResult.includes("unsafe-eval") || injectResult.includes("trusted-types") || injectResult.includes("Content Security Policy"));
-      if (!isInjectCsp) return injectResult;
-
-      // Strategy 3: Web Worker — has its own CSP context, can execute arbitrary JS.
-      // Cannot access page DOM — only for pure computations. DOM scripts fall to AppleScript.
-      // SECURITY: This is a browser automation MCP tool — executing user scripts is its core purpose.
-      const workerResult = await execInTab(async (script) => {
-        if (/\b(document|window|querySelector|getElementById|innerHTML|textContent|style|className)\b/.test(script)) {
-          return "__CSP_NEEDS_DOM__";
-        }
-        return await new Promise((resolve) => {
-          try {
-            const wSrc = 'self.onmessage=function(e){try{var r=(0,self["ev"+"al"])(e.data);self.postMessage({ok:true,r:typeof r==="object"?JSON.stringify(r):String(r!=null?r:"null")})}catch(err){self.postMessage({ok:false,e:err.message})}};';
-            const blob = new Blob([wSrc], { type: "application/javascript" });
-            const url = URL.createObjectURL(blob);
-            const w = new Worker(url);
-            const timer = setTimeout(() => { w.terminate(); URL.revokeObjectURL(url); resolve("Error: Worker timeout"); }, 10000);
-            w.onmessage = (ev) => { clearTimeout(timer); w.terminate(); URL.revokeObjectURL(url); resolve(ev.data.ok ? ev.data.r : "Error: " + ev.data.e); };
-            w.onerror = (ev) => { clearTimeout(timer); w.terminate(); URL.revokeObjectURL(url); resolve("Error: " + ev.message); };
-            w.postMessage(script);
-          } catch (e) { resolve("Error: Worker failed: " + e.message); }
-        });
-      }, [payload.script], tabId);
-
-      if (workerResult !== "__CSP_NEEDS_DOM__") return workerResult;
-      return "Error: CSP blocked all strategies (script needs DOM). Falling back to AppleScript.";
-      };
-
-      try {
-        return await evalStrategies();
-      } catch (err) {
-        // "injection stalled" means the page refuses executeScript in both worlds, so
-        // none of the strategies above can ever reach it. The bridge does not inject.
-        if (!/injection stalled/.test(err?.message || "")) throw err;
-        console.warn("Safari MCP: injection blocked on this page, using content bridge");
-        return await viaBridge();
-      }
+      return await _evaluateOnce(evalTabId, targetTab?.url, payload.script);
     }
 
     // --- Screenshot ---
@@ -3803,20 +3677,21 @@ async function sendContentCommand(tabId, type, payload, timeoutMs = 1500) {
   }
 }
 
-// Every probe plus the content bridge must fit inside the server's 30s command
-// timeout with room to spare: helpers 3 + MAIN 3 + ISOLATED 3 + bridge 10 ≈ 19s.
-// Earlier values (8s each) added up to ~29s and the caller gave up first, so the
-// bridge never got to answer and the tab was never marked as injection-blocked.
+// Every probe must fit inside the server's 30s command timeout with room to spare:
+// helpers 3 + MAIN 3 + ISOLATED 3 ≈ 9s. Earlier values (8s each) added up to ~29s and
+// the caller gave up first. evaluate waits this long for its injection to answer before
+// bringing in the content bridge, within its own EVAL_BUDGET_MS.
 const MAIN_WORLD_INJECT_MS = 3000;
-// Tabs where BOTH injection worlds stalled. Only the first command on such a page pays
-// the probing cost; afterwards we go straight to the content bridge, which keeps these
-// pages fast instead of merely working. Cleared when the tab navigates or closes, so a
-// page that stops blocking injection is re-probed rather than downgraded forever.
+// Tabs where the injected evaluate never answered and the content bridge did. Only the
+// first evaluate on such a page pays that wait; afterwards we go straight to the bridge,
+// which keeps these pages fast instead of merely working. Cleared when the tab navigates
+// or closes, so a page that stops blocking injection is re-probed rather than downgraded
+// forever - and when the injection answers after all (the script was merely slow).
 const _injectionBlockedTabs = new Set();
 // Same fact, keyed by origin: the per-tab set is cleared on every navigation, so a hardened
 // SPA (business.facebook.com) re-paid the ~10s probe on the first evaluate after EACH
 // navigate — 356 evaluates ≥10s in one week. An origin that blocked injection once is sent
-// straight to the bridge for a few hours; a bridge failure clears it and re-probes.
+// straight to the bridge for a few hours; a tab with no bridge clears it and re-probes.
 const _injectionBlockedOrigins = new Map(); // origin → expiry (ms)
 const _INJECTION_BLOCK_TTL_MS = 6 * 60 * 60 * 1000;
 function _originKey(url) {
@@ -4307,31 +4182,264 @@ async function resolveFrameId(tabId, frame) {
   return hits[0].frameId;
 }
 
+// ========== EVALUATE ==========
+// One safari_evaluate starts the caller's script at most once. The old ladder bounded each
+// executeScript at 3s - a bound on the whole run, not on the injection starting - and on
+// expiry started the same script again: in the ISOLATED world, then through the content
+// bridge, whose own 4s fallback started it once more. A script that merely ran longer than
+// 3s ran up to four times, and every POST in it repeated (TOI, 22.9.26: two live duplicate
+// posts; 27.9.26: four drafts from one call). The slow script also filed its origin as
+// injection-blocked, so later calls went bridge-first, hit the bridge's 10s limit and
+// re-probed the whole ladder: more runs.
+//
+// Now the script starts once, in MAIN. Three seconds without an answer only bring in the
+// content bridge under the same runId: in MAIN it JOINS the run the injection started (on
+// business.facebook.com that executeScript answer never arrives), or starts the run when
+// the injection never began. It never starts a second one - see _evalRunner.
+const EVAL_BUDGET_MS = 25000;
+// What executeScript rejects with when it never reached the page. Any other failure may
+// come after the script started (it navigated the page, say), so it is never retried.
+const _EVAL_NOT_STARTED = /does not have access|Invalid call to scripting\.executeScript|Cannot access|Missing host permission|No tab with id/i;
+
+async function _evaluateOnce(tabId, pageUrl, script) {
+  const runId = crypto.randomUUID().replace(/-/g, "");
+  const deadline = Date.now() + EVAL_BUDGET_MS;
+  const origin = _originKey(pageUrl);
+  const setBlocked = (blocked) => {
+    if (blocked) {
+      _injectionBlockedTabs.add(tabId);
+      if (origin) _injectionBlockedOrigins.set(origin, Date.now() + _INJECTION_BLOCK_TTL_MS);
+    } else {
+      _injectionBlockedTabs.delete(tabId);
+      if (origin) _injectionBlockedOrigins.delete(origin);
+    }
+  };
+
+  // Strategy 0: a page known to stall injection goes straight to the bridge. Only a tab with
+  // no bridge listening falls through to injection: once the bridge holds the script, a
+  // failure is final, because the script may have run.
+  if (_injectionBlockedTabs.has(tabId) || (_injectionBlockedOrigins.get(origin) || 0) > Date.now()) {
+    if (await _contentBridgeListening(tabId)) {
+      return _evalOutcome(await _bridgeEval(tabId, runId, script, deadline));
+    }
+    setBlocked(false);
+  }
+
+  let mainAnswered = false;
+  const main = browser.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: _evalRunner,
+    args: [runId, script, EVAL_BUDGET_MS + 5000],
+  }).then((results) => {
+    mainAnswered = true;
+    const first = results && results[0];
+    if (first && first.error) throw new Error(first.error);
+    // Safari hands back no result at all on some CSP pages (LinkedIn); that was, and stays, null.
+    return (first && first.result) || { ok: true, value: null };
+  });
+  const mainReply = main.then((reply) => reply, (err) => ({ failed: String((err && err.message) || err) }));
+
+  const early = await Promise.race([mainReply, sleep(MAIN_WORLD_INJECT_MS).then(() => null)]);
+  if (early && early.failed !== undefined) {
+    throw new Error((_EVAL_NOT_STARTED.test(early.failed)
+      ? "evaluate did not start: "
+      : "evaluate failed after the script may have started (it was not run again): ") + early.failed);
+  }
+  if (early && !early.notRun) return _evalOutcome(early);
+
+  // Slow, answered into the void (business.facebook.com), or never started: the bridge
+  // tells these apart by runId - it joins a run that started and starts one that did not.
+  const bridge = _bridgeEval(tabId, runId, script, deadline);
+  const outcome = await new Promise((resolve) => {
+    let open = 2;
+    const timer = setTimeout(() => resolve(null), Math.max(0, deadline - Date.now()));
+    const take = (reply, fromBridge) => {
+      if (reply && (reply.ok === true || reply.ok === false)) {
+        clearTimeout(timer);
+        resolve({ reply, fromBridge });
+      } else if (--open === 0) {
+        clearTimeout(timer);
+        resolve(null);
+      }
+    };
+    mainReply.then((reply) => take(reply, false));
+    bridge.then((reply) => take(reply, true));
+  });
+  if (outcome && outcome.fromBridge && !mainAnswered) {
+    // Filed as blocked so the next evaluate here goes bridge-first - unless the injection
+    // answers after all: then the script was just slow and the page takes injection fine.
+    setBlocked(true);
+    main.then(() => setBlocked(false), () => {});
+  }
+  if (outcome) return _evalOutcome(outcome.reply);
+  throw new Error("evaluate: the page gave no result within " + EVAL_BUDGET_MS / 1000 + "s. The script was " +
+    "started at most once and may still be running there; it was not run again - check the page before retrying.");
+}
+
+// A reply with `ok` is the script's own outcome: its value, or the error it threw. Anything
+// else means no path produced one.
+function _evalOutcome(reply) {
+  if (reply && reply.ok === true) return reply.value;
+  if (reply && reply.ok === false) {
+    return reply.csp
+      ? "Error: CSP blocked all strategies - the script did not run. Falling back to AppleScript."
+      : "Error: " + reply.error;
+  }
+  throw new Error("evaluate: the content bridge gave no result (" + ((reply && reply.error) || "no answer") +
+    "). The script may have run in the page; it was not run again - check the page before retrying.");
+}
+
+// Hands the evaluate to the content bridge (command-content.js, then content.js in MAIN)
+// under its runId and waits out the evaluate's deadline. Never throws.
+async function _bridgeEval(tabId, runId, script, deadline) {
+  const budgetMs = Math.max(0, deadline - Date.now());
+  let timer;
+  try {
+    const reply = await Promise.race([
+      browser.tabs.sendMessage(tabId, {
+        type: "mcp-content-eval-once",
+        payload: { id: runId, source: script, budgetMs, keepMs: EVAL_BUDGET_MS + 5000 },
+      }),
+      new Promise((resolve) => { timer = setTimeout(() => resolve({ pending: true }), budgetMs); }),
+    ]);
+    return reply && typeof reply === "object" ? reply : { unavailable: true };
+  } catch (err) {
+    return { unavailable: true, error: String((err && err.message) || err) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Whether this tab's command bridge answers at all. A tab opened before the extension
+// loaded has none - the one case where bridge-first may fall back to injection knowing
+// the script cannot have started.
+async function _contentBridgeListening(tabId) {
+  let timer;
+  try {
+    const answer = await Promise.race([
+      browser.tabs.sendMessage(tabId, { type: "mcp-content-ping" }),
+      new Promise((resolve) => { timer = setTimeout(resolve, 1500); }),
+    ]);
+    return answer === true;
+  } catch (_) {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Runs one evaluate in the page's MAIN world, at most once per runId. Every path that can
+// start the script shares the runId and claims it first: this injected runner, the bridge
+// in content.js (also MAIN) and command-content.js's ISOLATED fallback. A claim is a
+// document listener cancelling the event "__mcp_claim_<runId>", so a cancelled dispatch
+// means some world already holds the run: DOM events cross the MAIN/ISOLATED boundary
+// synchronously, window properties do not. Within MAIN the run's promise also stays on
+// window for keepMs, so the bridge can join a run whose executeScript answer never
+// arrives. Self-contained: Safari serialises it into the page.
+async function _evalRunner(runId, script, keepMs) {
+  const key = "__mcp_run_" + runId;
+  if (window[key]) return window[key];
+  const claim = "__mcp_claim_" + runId;
+  if (!document.dispatchEvent(new Event(claim, { cancelable: true }))) return { notRun: true };
+  document.addEventListener(claim, (e) => e.preventDefault());
+  const text = (v) => (v === undefined || v === null ? null : typeof v === "object" ? JSON.stringify(v) : String(v));
+  const fail = (e) => ({ ok: false, error: String((e && e.message) || e) });
+  const run = (async () => {
+    // Strategy 1: indirect eval, where the page's CSP allows unsafe-eval. The "0" probe tells
+    // a refused eval (nothing ran) from a script that throws by itself: that one ran, and
+    // must not run again through a later strategy.
+    let evalAllowed = true;
+    try { (0, eval)("0"); } catch (_) { evalAllowed = false; }
+    if (evalAllowed) {
+      try { return { ok: true, value: text(await (0, eval)(script)) }; } catch (e) { return fail(e); }
+    }
+    // Strategy 2: an inline <script>, for pages that refuse eval but accept the Trusted Types
+    // policy content.js registered at document_start, or the page's own nonce: a nonce-based
+    // script-src runs nothing else (facebook.com allowed 'unsafe-eval' on 2026-08-23, no longer
+    // on 2026-09-27). An inline script runs inside appendChild, so by the next line the hook has
+    // started it, or nothing ran. It goes in as an expression first, so `document.title`
+    // answers as through eval; a statement list is a SyntaxError there, which runs nothing,
+    // and then goes in as a function body, where only `return` yields a value.
+    const hook = key + "_start";
+    let started = null;
+    window[hook] = (fn) => { started = (async () => fn())(); };
+    let policy = window.__mcpTrustedPolicy;
+    if (!(policy && typeof policy.createScript === "function") && window.trustedTypes && window.trustedTypes.createPolicy) {
+      try { policy = window.trustedTypes.createPolicy("mcpEval_" + runId, { createScript: (c) => c }); } catch (_) { policy = null; }
+    }
+    const nonced = document.querySelector("script[nonce]");
+    for (const body of ["return (" + script.replace(/[\s;]+$/, "") + "\n);", script]) {
+      try {
+        const code = "window[" + JSON.stringify(hook) + "](function(){" + body + "\n})";
+        const s = document.createElement("script");
+        try { s.textContent = policy ? policy.createScript(code) : code; } catch (_) { s.textContent = code; }
+        if (nonced && nonced.nonce) s.nonce = nonced.nonce;
+        document.documentElement.appendChild(s);
+        s.remove();
+      } catch (_) {
+        // Trusted Types refused the plain string: the script did not start.
+      }
+      if (started) break;
+    }
+    delete window[hook];
+    if (started) {
+      try { return { ok: true, value: text(await started) }; } catch (e) { return fail(e); }
+    }
+    // Strategy 3: a Worker has its own CSP context - pure computation only, no DOM. A worker
+    // that cannot start, or whose eval is refused too, ran nothing: say so ({csp}), so the
+    // caller may still try AppleScript. Its script's own errors are only reported.
+    if (/\b(document|window|querySelector|getElementById|innerHTML|textContent|style|className)\b/.test(script)) {
+      return { ok: false, csp: true };
+    }
+    return await new Promise((resolve) => {
+      try {
+        const src = 'self.onmessage=function(e){try{(0,self["ev"+"al"])("0")}catch(err){self.postMessage({csp:true});return}try{var r=(0,self["ev"+"al"])(e.data);self.postMessage({ok:true,r:typeof r==="object"?JSON.stringify(r):String(r!=null?r:"null")})}catch(err){self.postMessage({ok:false,e:err.message})}};';
+        const url = URL.createObjectURL(new Blob([src], { type: "application/javascript" }));
+        const w = new Worker(url);
+        const end = (reply) => { clearTimeout(timer); w.terminate(); URL.revokeObjectURL(url); resolve(reply); };
+        const timer = setTimeout(() => end({ ok: false, error: "Worker timeout" }), 10000);
+        w.onmessage = (ev) => end(ev.data.csp ? { ok: false, csp: true }
+          : ev.data.ok ? { ok: true, value: ev.data.r } : { ok: false, error: ev.data.e });
+        w.onerror = () => end({ ok: false, csp: true });
+        w.postMessage(script);
+      } catch (_) {
+        resolve({ ok: false, csp: true });
+      }
+    });
+  })();
+  Object.defineProperty(window, key, { value: run, configurable: true });
+  setTimeout(() => { delete window[key]; }, keepMs);
+  return run;
+}
+
 // Run one script inside a single frame. MAIN world first so the script sees the
 // page's own globals; ISOLATED as the fallback for frames whose CSP blocks eval —
 // it still reads and mutates the DOM, which is what clicking and filling need.
 async function evaluateInFrame(tabId, frameId, script) {
   const id = tabId || (await getActiveTab()).id;
   const runner = async (src) => {
+    // Only a refused eval moves on to ISOLATED: it ran nothing. A script that throws by
+    // itself - even a CSP error from an eval of its own - ran, and must not run again.
+    try { (0, eval)("0"); } catch (_) { return "__CSP_BLOCKED__"; }
     try {
       const result = await (0, eval)(src);
       if (result === undefined || result === null) return null;
       return typeof result === "object" ? JSON.stringify(result) : String(result);
     } catch (e) {
-      const m = String(e && e.message);
-      if (m.includes("unsafe-eval") || m.includes("trusted-types") || m.includes("Trusted Type")) {
-        return "__CSP_BLOCKED__";
-      }
-      return "Error: " + m;
+      return "Error: " + String(e && e.message);
     }
   };
   const run = async (world) => {
+    // Bounded by the evaluate's budget, not the 3s injection probe: a slow script is
+    // still running, and giving up on it early only invited a retry.
     const results = await _withInjectionDeadline(browser.scripting.executeScript({
       target: { tabId: id, frameIds: [frameId] },
       world,
       func: runner,
       args: [script],
-    }));
+    }), EVAL_BUDGET_MS, "evaluate in frame: no result within " + EVAL_BUDGET_MS / 1000 +
+      "s - the script may still be running; it was not run again");
     const first = results[0];
     if (first && first.error) throw new Error(first.error);
     return first && first.result;

@@ -1216,7 +1216,7 @@ try {
           res.end(JSON.stringify({ result }));
         } catch (err) {
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: err.message }));
+          res.end(JSON.stringify({ error: err.message, dispatched: err.dispatched }));
         }
       });
       return;
@@ -1318,7 +1318,7 @@ async function _proxyToExtension(type, payload, timeoutMs = 30000) {
   });
   if (!res.ok) throw new Error(`Proxy error: ${res.status}`);
   const data = await res.json();
-  if (data.error) throw new Error(data.error);
+  if (data.error) throw Object.assign(new Error(data.error), { dispatched: data.dispatched });
   return data.result;
 }
 
@@ -1390,10 +1390,11 @@ function _drainOnDisconnect(reason) {
     return;
   }
   // Reject all in-flight requests immediately (instead of waiting for timeout)
+  const queued = new Set(_commandQueue.map((c) => c.id));
   for (const [id, pending] of _pendingRequests) {
     clearTimeout(pending.timer);
     if (pending.reloadHandoff) _cancelReloadHttpWorkerHandoff(pending.reloadHandoff);
-    pending.reject(new Error(`Extension disconnected: ${reason}`));
+    pending.reject(Object.assign(new Error(`Extension disconnected: ${reason}`), { dispatched: !queued.has(id) }));
   }
   _pendingRequests.clear();
   // Clear queued commands that will never be picked up
@@ -1441,7 +1442,7 @@ function sendToExtension(type, payload = {}, timeoutMs = 30000) {
 
   return new Promise((resolve, reject) => {
     if (!_extensionConnected) {
-      reject(new Error("Extension not connected"));
+      reject(Object.assign(new Error("Extension not connected"), { dispatched: false }));
       return;
     }
     const reloadHandoff = type === "reload_extension" &&
@@ -1467,7 +1468,8 @@ function sendToExtension(type, payload = {}, timeoutMs = 30000) {
       // long after the caller gave up and run a stale navigate/click out of band.
       const qi = _commandQueue.findIndex(c => c.id === id);
       if (qi >= 0) _commandQueue.splice(qi, 1);
-      reject(new Error(`Extension timeout after ${timeoutMs}ms`));
+      // Still queued = never polled, so nothing ran; callers may retry elsewhere only then.
+      reject(Object.assign(new Error(`Extension timeout after ${timeoutMs}ms`), { dispatched: qi < 0 }));
       // The worker took this command and never answered, even past the hard ceiling: it is
       // wedged (see /heartbeat). Drop its lease now instead of waiting for the stale timer,
       // so a fresh worker — or Safari re-spawning this one — can connect at once.
@@ -2098,7 +2100,9 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
         // marker's text promises never actually ran and its text reached the caller as
         // the tool's value instead of as a failure (#106).
         hardCspBlock = typeof result === 'string' && result.includes('CSP blocked all strategies');
-        const isCspError = hardCspBlock || (typeof result === 'string' && (result.includes('unsafe-eval') || result.includes('trusted-types') || result.includes('Trusted Type') || result.includes('Content Security Policy')));
+        // An evaluate reports "nothing ran" through that marker alone. Other CSP wording in
+        // its result is the script's own error: it ran, and AppleScript must not run it again.
+        const isCspError = hardCspBlock || (extensionType !== "evaluate" && typeof result === 'string' && (result.includes('unsafe-eval') || result.includes('trusted-types') || result.includes('Trusted Type') || result.includes('Content Security Policy')));
         const isPermissionDenied = typeof result === 'string' && result.includes('__SCREENSHOT_PERMISSION_DENIED__');
         const isElementMiss = typeof result === 'string' && result.startsWith('Element not found');
         const isFailed = result === null || isElementMiss;
@@ -2134,6 +2138,12 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
           throw err;
         }
         if (_preferAppleScript) throw new Error(`Safari profile extension unavailable for "${extensionType}": ${err.message}`);
+        // evaluate runs arbitrary side effects. Once the extension may have started the
+        // script — the command reached it and did not come back with "did not start" —
+        // AppleScript would run it a second time: every POST in it repeated.
+        if (extensionType === "evaluate" && err?.dispatched !== false && !/evaluate did not start/.test(err.message)) {
+          throw new Error(`safari_evaluate: ${err.message} — the script may already have run in the page, so it was not re-run through AppleScript`, { cause: err });
+        }
         console.error(`[Safari MCP] ${extensionType} extension failed: ${err.message} — falling back to AppleScript`);
       }
     }
@@ -3158,10 +3168,15 @@ server.tool(
 server.tool(
   "safari_eval_file",
   "Execute JavaScript read from a FILE path (avoids passing huge scripts inline / manual copy). Same engine as safari_evaluate: extension-first (no focus steal), AppleScript fallback. Use to upload binary via a generated .js containing base64.",
-  { path: z.string().describe("Absolute path to a .js file whose contents are the script to execute") },
+  {
+    path: z.string().describe("Absolute path to a .js file whose contents are the script to execute"),
+    receipt: z.string().optional().describe("Opaque extension-issued tab receipt — pass the one safari_new_tab returned to keep targeting that tab after an MCP reconnect"),
+  },
   async (args) => {
     const script = readFileSync(args.path, "utf8");
-    const result = await extensionOrFallback("evaluate", { script }, () => safari.evaluate({ script }));
+    const result = await extensionOrFallback(
+      "evaluate", { script, ..._explicitReceipt(args) }, () => safari.evaluate({ script })
+    );
     return evalResult(result);
   }
 );

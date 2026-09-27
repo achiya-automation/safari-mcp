@@ -479,15 +479,22 @@ _initializeMcpKeepalive();
       sendResponse(handleFill(message.payload || {}));
       return true;
     }
-    // Last-resort path for evaluate. On hardened SPAs (business.facebook.com) BOTH
-    // scripting.executeScript worlds hang forever instead of rejecting, while this
-    // already-injected listener keeps answering — clicks kept working there the whole
-    // time. Nothing is injected here, so there is no injection to stall on.
-    if (message.type === "mcp-content-eval") {
-      // The relayed function is often async (the evaluate handler awaits inside it), so
-      // this must resolve before answering — returning the promise itself serialised to
-      // "{}" and silently produced an empty result.
+    // Last-resort path for evaluate. On hardened SPAs (business.facebook.com) the
+    // scripting.executeScript answer never arrives, while this already-injected listener
+    // keeps answering — clicks kept working there the whole time. Nothing is injected
+    // here, so there is no injection to stall on. The type is new with the runId
+    // protocol: a bridge left over from an older build must not take these, because it
+    // would start the script without checking the claim.
+    if (message.type === "mcp-content-eval-once") {
+      // The script is often async, so this must resolve before answering — returning the
+      // promise itself serialised to "{}" and silently produced an empty result.
       handleEval(message.payload || {}).then(sendResponse);
+      return true;
+    }
+    // Lets the background tell "no bridge in this tab" (nothing can have run) from a
+    // bridge that took an evaluate and then failed (the script may have run).
+    if (message.type === "mcp-content-ping") {
+      sendResponse(true);
       return true;
     }
     return false;
@@ -505,39 +512,42 @@ _initializeMcpKeepalive();
 // governs eval here, and a hardened page (business.facebook.com) forbids it — an
 // earlier attempt with new Function() died exactly there. content.js is already in
 // MAIN world from document_start and holds a grandfathered Trusted Types policy, so
-// hand the work to it over a CustomEvent and wait for its reply.
+// hand the work to it and wait for its reply. The id is the evaluate's runId: content.js
+// joins a run the injected runner already started instead of starting it again.
 function handleEval(payload) {
   return new Promise((resolve) => {
-    const id = "b" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    const id = String(payload.id || "");
+    const source = String(payload.source || "");
     let settled = false;
     const finish = (result) => {
       if (settled) return;
       settled = true;
       window.removeEventListener("message", onReply);
-      clearTimeout(timer);
+      clearTimeout(fallback);
+      clearTimeout(bound);
       resolve(result);
     };
     function onReply(ev) {
       if (ev.source !== window) return;
       const d = ev.data;
-      if (!d || d.__mcp !== "eval_res" || d.id !== id) return;
+      if (!d || d.__mcp !== "eval_once_res" || d.id !== id) return;
       finish(d.result && typeof d.result === "object"
         ? d.result
         : { ok: false, error: "malformed bridge reply" });
     }
-    // Bounded independently of the background's own deadline, so a page that never
-    // answers cannot hold the command open. If MAIN never replies (its listener failed
-    // to install, or the page tore it out), try here: a content script is governed by
-    // the PAGE's CSP, and the pages this bridge targets do allow 'unsafe-eval'.
-    const timer = setTimeout(() => {
-      let out;
-      try {
-        out = (0, eval)(String(payload.source || ""));
-      } catch (err) {
-        finish({ ok: false, error: "eval bridge did not answer; isolated retry: " + ((err && err.message) || err) });
+    // No reply means no content.js in MAIN — the manifest leaves it out of LinkedIn, X and
+    // the Google apps — so after 4s the script runs here, under the PAGE's CSP. Unless a
+    // world already claimed the runId: that run is under way, and its answer comes from
+    // content.js or from the injected runner, never from a second start.
+    const fallback = setTimeout(() => {
+      const claim = "__mcp_claim_" + id;
+      if (!document.dispatchEvent(new Event(claim, { cancelable: true }))) return;
+      document.addEventListener(claim, (e) => e.preventDefault());
+      try { (0, eval)("0"); } catch (_) {
+        finish({ ok: false, csp: true, error: "eval is blocked by the page's CSP" });
         return;
       }
-      Promise.resolve(out).then(
+      (async () => (0, eval)(source))().then(
         (v) => {
           if (v === undefined || v === null) return finish({ ok: true, value: null });
           if (typeof v === "object") {
@@ -549,14 +559,12 @@ function handleEval(payload) {
         (err) => finish({ ok: false, error: (err && err.message) || String(err) })
       );
     }, 4000);
+    // The background has stopped waiting by now; free the listener without an answer.
+    const bound = setTimeout(() => finish({ pending: true }), (Number(payload.budgetMs) || 25000) + 1000);
     // postMessage, not CustomEvent: a CustomEvent's detail arrives as null in the MAIN
     // world, so the listener there fired with nothing to run.
     window.addEventListener("message", onReply);
-    try {
-      window.postMessage({ __mcp: "eval_req", id, source: String(payload.source || "") }, "*");
-    } catch (err) {
-      finish({ ok: false, error: (err && err.message) || String(err) });
-    }
+    window.postMessage({ __mcp: "eval_once", id, source, keepMs: payload.keepMs }, "*");
   });
 }
 

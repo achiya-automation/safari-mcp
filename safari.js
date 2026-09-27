@@ -4114,10 +4114,12 @@ export function _buildEvalExpr(js) {
         expr = `(async function(){${js}})()`;
       }
     } else {
-      // Indirect eval yields the completion value of an arbitrary statement list;
-      // the catch re-runs the body plainly when a strict CSP blocks eval.
+      // Indirect eval yields the completion value of an arbitrary statement list. The
+      // plain body is the fallback for a strict CSP that refuses eval — probed with "0",
+      // so a script that threw by itself (it ran) is not run a second time.
       const escaped = js.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n').replace(/\r/g, '\\r');
-      expr = "(function(){ try { return (0,eval)('" + escaped + "') } catch(_e) { " + js.replace(/\n/g, ' ') + " } })()";
+      expr = "(function(){ var __mcpEvalOk = true; try { (0,eval)('0') } catch(_e) { __mcpEvalOk = false } " +
+        "if (__mcpEvalOk) return (0,eval)('" + escaped + "'); " + js.replace(/\n/g, ' ') + " })()";
     }
   }
   return { isAsync, expr };
@@ -4127,24 +4129,35 @@ export function _buildEvalExpr(js) {
 // the moment the synchronous portion finishes, handing back an unsettled Promise.
 // So the work is started fire-and-forget into a page global, then that global is
 // polled synchronously from the Node side (the same pattern navigate() uses).
-async function _evaluateAsync(expr) {
-  // Token is identifier-safe (base36 → [0-9a-z], `_` prefix) so `window.<token>`
-  // dot access needs no quoting/escaping through the AppleScript bridge.
-  const token = '__mcpEval_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-  const slot = 'window.' + token;
-  // A SYNC outer function installs the globals, starts the async work (NOT awaited
-  // here — `do JavaScript` would not await it anyway) and returns immediately.
-  const kickoff =
-    `(function(){${slot}={done:false};(async function(){try{` +
-    `var __v=await (${expr});` +
+//
+// Token is identifier-safe (base36 → [0-9a-z], `_` prefix) so `window.<token>`
+// dot access needs no quoting/escaping through the AppleScript bridge.
+function _newEvalSlot() {
+  return 'window.__mcpEval_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+}
+
+// Page-side statement that awaits `valueJs` and records the outcome in `slot`.
+function _settleIntoSlot(slot, valueJs) {
+  return `(async function(){try{var __v=await (${valueJs});` +
     `${slot}.val=(__v===undefined||__v===null)?null:(typeof __v==='object'?JSON.stringify(__v):String(__v));` +
     `}catch(__e){${slot}.err=(__e&&__e.message)||String(__e);}` +
-    `finally{${slot}.done=true;}})();return 'ok';})()`;
+    `finally{${slot}.done=true;}})();`;
+}
+
+async function _evaluateAsync(expr) {
+  const slot = _newEvalSlot();
+  // A SYNC outer function installs the globals, starts the async work (NOT awaited
+  // here — `do JavaScript` would not await it anyway) and returns immediately.
+  const kickoff = `(function(){${slot}={done:false};${_settleIntoSlot(slot, expr)}return 'ok';})()`;
   const started = await runJS(kickoff, { timeout: 10000 });
   if (started !== 'ok') {
     return typeof started === 'string' && started ? started : '(no return value)';
   }
-  // Poll the result global until the async work settles (35s budget).
+  return _awaitEvalSlot(slot);
+}
+
+// Poll the result global until the async work settles (35s budget).
+async function _awaitEvalSlot(slot) {
   const pollJs =
     `(function(){var s=${slot};if(!s)return '__MCP_GONE__';` +
     `if(!s.done)return '';return JSON.stringify({v:s.val,e:s.err});})()`;
@@ -4172,25 +4185,28 @@ async function _evaluateAsync(expr) {
   }
 }
 
+// Sync: a single `do JavaScript` over one expression — `do JavaScript` only returns the
+// value of a single expression, so the whole script is one IIFE. The regex async-sniff in
+// _buildEvalExpr only catches a literal await/.then/async and misses scripts whose *value*
+// is a thenable (`Promise.resolve(5)`, an async IIFE with no inner await). Such a value is
+// awaited in place into a slot: the script already ran, and evaluating it again — as this
+// used to on "[object Promise]" — repeated every side effect in it.
+export function _buildSyncEvalJs(expr, slot) {
+  return `(function(){ try { var __r = (${expr}); ` +
+    `if (__r && typeof __r.then === 'function') { ${slot}={done:false}; ${_settleIntoSlot(slot, '__r')} return '__MCP_EVAL_PENDING__'; } ` +
+    `return __r; } catch(__mcpErr) { return 'Error: ' + __mcpErr.message; } })()`;
+}
+
 export async function evaluate({ script }) {
   const js = (script || '').trim();
   if (!js) return '(no return value)';
   const { isAsync, expr } = _buildEvalExpr(js);
   if (isAsync) return _evaluateAsync(expr);
-  // Sync: a single `do JavaScript` over one expression. `do JavaScript` only
-  // returns the value of a single expression, so the whole script is one IIFE.
-  const wrappedJs = `(function(){ try { return (${expr}); } catch(__mcpErr) { return 'Error: ' + __mcpErr.message; } })()`;
+  const slot = _newEvalSlot();
+  const wrappedJs = _buildSyncEvalJs(expr, slot);
   if (process.env.MCP_DEBUG) console.error('[evaluate] wrapped:', wrappedJs.substring(0, 300));
   const result = await runJS(wrappedJs);
-  // The regex async-sniff in _buildEvalExpr only catches a literal await/.then/async.
-  // It misses scripts whose *value* is a thenable — `Promise.resolve(5)`, an async IIFE
-  // with no inner await, any fn returning a promise. `do JavaScript` can't await those,
-  // so they come back as the literal "[object Promise]". Re-run through the async poller
-  // in that case. (Pathological: a script genuinely returning the string "[object Promise]"
-  // re-runs to the same value, so there is no downside.)
-  if (typeof result === 'string' && result.trim() === '[object Promise]') {
-    return _evaluateAsync(expr);
-  }
+  if (typeof result === 'string' && result.trim() === '__MCP_EVAL_PENDING__') return _awaitEvalSlot(slot);
   if (result === null || result === undefined || result === '') {
     return '(no return value)';
   }

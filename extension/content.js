@@ -10,16 +10,23 @@
 // so CSP cannot block it.
 
 // Last-resort evaluate path for pages that stall scripting.executeScript outright
-// (business.facebook.com: BOTH worlds hang forever instead of rejecting, so every
-// evaluate strategy above them dies on the caller's timeout).
+// (business.facebook.com: the injected evaluate never answers, so every evaluate died on
+// the caller's timeout).
 //
 // This script is ALREADY in MAIN world from document_start, so nothing has to be
 // injected to reach the page — that is the whole point. command-content.js lives in
 // the ISOLATED world where it can talk to the background but where the page's CSP
-// forbids eval; it hands the work here over a CustomEvent, and we run it through the
+// forbids eval; it hands the work here over postMessage, and we run it through the
 // same grandfathered Trusted Types policy the injected strategy uses.
-if (!window.__mcpEvalBridge) {
-  window.__mcpEvalBridge = true;
+//
+// Each request carries the evaluate's runId, and a run starts at most once per runId
+// (see _evalRunner in background.js): if the injected runner already started it in this
+// world we join its promise, if another world claimed it we stay out, else we claim it.
+// The message tags and the guard below are new with that protocol, so a listener left
+// over from an older build — which would start the script without looking — never sees
+// these requests.
+if (!window.__mcpEvalOnceBridge) {
+  window.__mcpEvalOnceBridge = true;
   // window.postMessage, not CustomEvent: a CustomEvent's `detail` does not survive the
   // ISOLATED→MAIN world boundary (it arrives as null), so the bridge received the event
   // but never the script — it simply timed out. postMessage is structured-cloned across
@@ -27,88 +34,67 @@ if (!window.__mcpEvalBridge) {
   window.addEventListener("message", function (ev) {
     if (ev.source !== window) return;                       // ignore other frames
     var d = ev.data;
-    if (!d || d.__mcp !== "eval_req" || typeof d.id !== "string") return;
+    if (!d || d.__mcp !== "eval_once" || typeof d.id !== "string") return;
     var id = d.id;
-    var outKey = "__mcp_eval_out_" + id;
-    var answered = false;
-    var reply = function (detail) {
-      if (answered) return;
-      answered = true;
-      try { delete window[outKey]; } catch (_e) {}
-      window.postMessage({ __mcp: "eval_res", id: id, result: detail }, "*");
+    var key = "__mcp_run_" + id;
+    var reply = function (result) {
+      window.postMessage({ __mcp: "eval_once_res", id: id, result: result }, "*");
     };
-    var settle = function (v) {
-      if (v === undefined || v === null) { reply({ ok: true, value: null }); return; }
-      if (typeof v === "object") {
-        try { reply({ ok: true, value: JSON.stringify(v) }); }
-        catch (_e) { reply({ ok: true, value: String(v) }); }
-      } else {
-        reply({ ok: true, value: String(v) });
-      }
+    if (window[key]) { window[key].then(reply); return; }
+    var claim = "__mcp_claim_" + id;
+    if (!document.dispatchEvent(new Event(claim, { cancelable: true }))) return;
+    document.addEventListener(claim, function (e) { e.preventDefault(); });
+    var source = String(d.source);
+    var text = function (v) {
+      return v === undefined || v === null ? null : typeof v === "object" ? JSON.stringify(v) : String(v);
     };
-
-    // Direct eval first. We are in MAIN world, so this runs under the PAGE's CSP —
-    // and business.facebook.com actually allows 'unsafe-eval'. Its script-src does
-    // carry a nonce, which is precisely what blocks the injected-<script> path below,
-    // so trying that first would fail on the very page this bridge exists for.
-    try {
-      var direct = (0, eval)(String(d.source));
-      if (direct && typeof direct.then === "function") {
-        direct.then(settle, function (e) { reply({ ok: false, error: String((e && e.message) || e) }); });
-      } else {
-        settle(direct);
+    var fail = function (e) { return { ok: false, error: String((e && e.message) || e) }; };
+    var run = (async function () {
+      // Direct eval first. We are in MAIN world, so this runs under the PAGE's CSP —
+      // and business.facebook.com actually allows 'unsafe-eval'. Its script-src does
+      // carry a nonce, which is precisely what blocks the injected-<script> path below,
+      // so trying that first would fail on the very page this bridge exists for. The
+      // "0" probe tells a refused eval (nothing ran) from a script that throws by
+      // itself: that one ran, and must not run again through the <script> path.
+      var evalAllowed = true;
+      try { (0, eval)("0"); } catch (_e) { evalAllowed = false; }
+      if (evalAllowed) {
+        try { return { ok: true, value: text(await (0, eval)(source)) }; } catch (e) { return fail(e); }
       }
-      return;
-    } catch (evalErr) {
-      var m = String((evalErr && evalErr.message) || evalErr);
-      // A real script error must surface as-is; only a CSP refusal justifies the
-      // slower injected path.
-      if (!/unsafe-eval|Content Security Policy|trusted-types|Trusted Type/i.test(m)) {
-        reply({ ok: false, error: m });
-        return;
-      }
-    }
-
-    try {
-      var code =
-        "try{var __r=(function(){" + String(d.source) + "})();" +
-        "if(__r&&typeof __r.then==='function'){__r.then(function(v){window['" + outKey + "']={done:true,v:v};}," +
-        "function(e){window['" + outKey + "']={done:true,e:String((e&&e.message)||e)};});}" +
-        "else{window['" + outKey + "']={done:true,v:__r};}}" +
-        "catch(e){window['" + outKey + "']={done:true,e:String((e&&e.message)||e)};}";
-      var s = document.createElement("script");
-      if (window.__mcpTrustedPolicy && typeof window.__mcpTrustedPolicy.createScript === "function") {
-        try { s.textContent = window.__mcpTrustedPolicy.createScript(code); }
-        catch (_e) { s.textContent = code; }
-      } else {
-        s.textContent = code;
-      }
-      document.documentElement.appendChild(s);
-      s.remove();
-      var tries = 0;
-      var poll = function () {
-        var r = window[outKey];
-        if (r && r.done) {
-          if (r.e) { reply({ ok: false, error: r.e }); return; }
-          var v = r.v;
-          if (v === undefined || v === null) { reply({ ok: true, value: null }); return; }
-          // Serialise here: a CustomEvent detail crossing into the ISOLATED world must
-          // survive structured clone, and page objects (DOM nodes, class instances) do not.
-          if (typeof v === "object") {
-            try { reply({ ok: true, value: JSON.stringify(v) }); }
-            catch (_e) { reply({ ok: true, value: String(v) }); }
+      // An inline script runs inside appendChild, so by the next line the hook has
+      // started it — or nothing ran. A nonce-based script-src (facebook.com, since it no
+      // longer allows 'unsafe-eval') takes it only with the page's nonce. It goes in as an
+      // expression first, so `document.title` answers as through eval; a statement list
+      // is a SyntaxError there, which runs nothing, and then goes in as a function body.
+      var hook = key + "_start";
+      var started = null;
+      window[hook] = function (fn) { started = (async function () { return fn(); })(); };
+      var nonced = document.querySelector("script[nonce]");
+      var bodies = ["return (" + source.replace(/[\s;]+$/, "") + "\n);", source];
+      for (var i = 0; i < bodies.length && !started; i++) {
+        try {
+          var code = "window[" + JSON.stringify(hook) + "](function(){" + bodies[i] + "\n})";
+          var s = document.createElement("script");
+          if (window.__mcpTrustedPolicy && typeof window.__mcpTrustedPolicy.createScript === "function") {
+            try { s.textContent = window.__mcpTrustedPolicy.createScript(code); }
+            catch (_e) { s.textContent = code; }
           } else {
-            reply({ ok: true, value: String(v) });
+            s.textContent = code;
           }
-          return;
+          if (nonced && nonced.nonce) s.nonce = nonced.nonce;
+          document.documentElement.appendChild(s);
+          s.remove();
+        } catch (_e) {
+          // Trusted Types refused the plain string: the script did not start.
         }
-        if (++tries > 160) { reply({ ok: false, error: "eval bridge timeout" }); return; }
-        setTimeout(poll, 50);
-      };
-      poll();
-    } catch (e) {
-      reply({ ok: false, error: String((e && e.message) || e) });
-    }
+      }
+      delete window[hook];
+      if (!started) return { ok: false, csp: true, error: "the page's CSP blocks eval and inline scripts" };
+      try { return { ok: true, value: text(await started) }; } catch (e) { return fail(e); }
+    })();
+    Object.defineProperty(window, key, { value: run, configurable: true });
+    setTimeout(function () { delete window[key]; }, d.keepMs || 30000);
+    run.then(reply);
   });
 }
 
