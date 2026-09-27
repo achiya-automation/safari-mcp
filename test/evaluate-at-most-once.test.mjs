@@ -152,6 +152,7 @@ function fakePage({ injection = "answers", mainBridge = true, evalRefused = fals
     scripting: {
       executeScript({ world: name, func, args = [] }) {
         injections.push(name);
+        const injection = page.injection;
         if (injection === "never") return new Promise(() => {});
         const running = Promise.resolve(vm.runInContext(`(${func})`, worlds[name])(...args));
         if (injection === "void") {
@@ -185,7 +186,13 @@ function fakePage({ injection = "answers", mainBridge = true, evalRefused = fals
       query: async () => [{ id: 1 }],
     },
   };
-  return { effects, injections, bridgeMessages, evaluate: extensionEvaluate(browser) };
+  const page = {
+    effects, injections, bridgeMessages, injection,
+    evaluate: extensionEvaluate(browser),
+    // The tab's content scripts are gone, as in a tab that predates the extension.
+    dropBridge: () => { commandListeners.length = 0; },
+  };
+  return page;
 }
 
 /** Records its side effect, then takes 5s to finish — like saving a draft. */
@@ -227,6 +234,16 @@ describe("an evaluate starts its script at most once", { concurrency: true }, ()
     assert.equal(await page.evaluate(slowScript("draft")), "saved");
     await settle();
     assert.deepEqual(page.effects, ["MAIN:draft"]);
+  });
+
+  test("a page filed as blocked whose tab has no bridge falls back to injection — and the script still runs once", async () => {
+    const page = fakePage({ injection: "never" });
+    assert.equal(await page.evaluate('__post("first"); "ok"'), "ok"); // files the page as blocked
+    page.dropBridge();
+    page.injection = "answers";
+    assert.equal(await page.evaluate('__post("second"); "ok"'), "ok");
+    assert.deepEqual(page.effects, ["MAIN:first", "MAIN:second"]);
+    assert.ok(page.bridgeMessages.includes("mcp-content-ping"), "bridge-first asks whether a bridge listens before using it");
   });
 
   test("a page without content.js in MAIN (LinkedIn, X, Google apps): a slow script still starts once", async () => {
