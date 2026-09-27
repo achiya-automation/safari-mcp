@@ -1446,7 +1446,40 @@ function _handleExtensionResponse(msg, respondingWorkerId = "") {
 }
 
 // Send command to extension (via WebSocket, HTTP command queue, or proxy to primary)
+// Thermal backpressure (opt-in). With SAFARI_MCP_THERMAL_FILE naming a JSON file whose `_t` is the chip
+// temperature and `_ts` its epoch seconds (e.g. a thermal monitor's latest sample), page-work commands wait
+// while the chip is at or above SAFARI_MCP_THERMAL_MAX (default 80) — until it is 2° cooler, at most
+// SAFARI_MCP_THERMAL_WAIT_MS (default 20000) — so many agents in many tabs slow down instead of heating the
+// Mac. Closing and listing tabs never wait; a stale or missing reading holds nothing.
+const _THERMAL_FILE = process.env.SAFARI_MCP_THERMAL_FILE || "";
+const _THERMAL_MAX = parseFloat(process.env.SAFARI_MCP_THERMAL_MAX || "80");
+const _THERMAL_WAIT_MS = parseInt(process.env.SAFARI_MCP_THERMAL_WAIT_MS || "20000", 10);
+const _THERMAL_FREE = new Set(["close_tab", "list_tabs", "get_tab_receipt", "get_tab_locus", "switch_tab", "reload_extension"]);
+
+function _chipTemp() {
+  try {
+    const row = JSON.parse(readFileSync(_THERMAL_FILE, "utf8"));
+    return Date.now() / 1000 - row._ts <= 15 ? Number(row._t) || 0 : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function _thermalGate(type) {
+  if (!_THERMAL_FILE || _THERMAL_FREE.has(type) || _chipTemp() < _THERMAL_MAX) return;
+  console.error(`[Safari MCP] chip at ${Math.round(_chipTemp())}°C — holding "${type}" up to ${_THERMAL_WAIT_MS / 1000}s so the Mac can cool`);
+  const until = Date.now() + _THERMAL_WAIT_MS;
+  while (Date.now() < until && _chipTemp() >= _THERMAL_MAX - 2) {
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+}
+
 function sendToExtension(type, payload = {}, timeoutMs = 30000) {
+  if (!_THERMAL_FILE || _THERMAL_FREE.has(type)) return _sendToExtension(type, payload, timeoutMs);
+  return _thermalGate(type).then(() => _sendToExtension(type, payload, timeoutMs));
+}
+
+function _sendToExtension(type, payload = {}, timeoutMs = 30000) {
   // If we're a secondary instance, proxy through primary
   if (!_isExtensionHost && _primaryHasExtension) {
     return _proxyToExtension(type, payload, timeoutMs);

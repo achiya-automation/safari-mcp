@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Opt-in thermal backpressure.** Set `SAFARI_MCP_THERMAL_FILE` to a JSON file whose `_t` is the chip temperature and `_ts` its epoch seconds (for example a thermal monitor's latest sample), and page-work commands wait while the chip is at or above `SAFARI_MCP_THERMAL_MAX` (default 80) — until it is 2° cooler, at most `SAFARI_MCP_THERMAL_WAIT_MS` (default 20000). Many agents working in many tabs then slow down instead of heating the Mac. Closing and listing tabs never wait, and a stale or missing reading holds nothing.
+
 ### Fixed
 - **An idle daemon no longer wakes up 200 times a second.** The extension's `/poll` long-poll re-checked the command queue on a 5 ms `setInterval` for as long as it was open — which is always, since the extension re-polls at once. It now waits for an event (a command queued, the active worker switched or dropped) and answers immediately; delivery is as fast as before. The profile-window self-heal poll runs every 15 s instead of 3 s (each tick was a `pgrep` plus an Apple Event to Safari, and every AppleScript caller re-validates the window itself), and `isSafariRunning()` reuses a positive answer for 1 s instead of spawning `pgrep` on every AppleScript call.
 - **Under a Safari profile, `safari_navigate` refuses non-http(s) URLs.** The extension cannot issue a receipt for `about:blank` or `file://`, so after such a navigation no tool could reach the tab again — not even `safari_close_tab` — and it stayed open for good.
