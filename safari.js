@@ -198,10 +198,16 @@ process.on("unhandledRejection", (reason) => {
 
 // ========== SAFARI RUNNING CHECK ==========
 // Prevent AppleScript from auto-launching Safari when it's closed
+// ponytail: a "running" answer is reused for 1s — AppleScript waits poll every 100–200ms and each
+// call spawned a pgrep. Ceiling: a Safari quit inside that second can let one script relaunch it.
+let _safariRunningUntil = 0;
 async function isSafariRunning() {
+  if (Date.now() < _safariRunningUntil) return true;
   try {
     const { stdout } = await execFileAsync("pgrep", ["-x", "Safari"], { timeout: 2000 });
-    return stdout.trim().length > 0;
+    const running = stdout.trim().length > 0;
+    if (running) _safariRunningUntil = Date.now() + 1000;
+    return running;
   } catch {
     return false; // pgrep exits 1 when no match
   }
@@ -413,14 +419,17 @@ function _maybeOpenProfileWindow() {
 
 // Background verification: periodically check that cached window ID still belongs to profile
 if (SAFARI_PROFILE) {
-  // Self-scheduling poll with exponential backoff (#81): 3s while the window is
+  // Self-scheduling poll with exponential backoff (#81): 15s while the window is
   // present (or flakily undetected), doubling per consecutive miss up to 60s
   // while it is absent — a closed profile window is a steady state, and the
   // fixed 3s cadence used to spawn an osascript subprocess per cycle, forever.
-  // The first successful detection resets to 3s, so rediscovery stays
+  // The first successful detection resets to 15s, so rediscovery stays
   // responsive: once the user opens the window, the next poll lands within 60s
-  // and everything after it is back on the 3s cadence.
-  const _POLL_BASE_MS = 3000;
+  // and everything after it is back on the 15s cadence. This poll is only the
+  // background self-heal: every AppleScript caller re-validates the window itself
+  // (refreshTargetWindow, 1s cache), so 3s cost a pgrep + an Apple Event to
+  // Safari every 3 seconds per daemon for nothing.
+  const _POLL_BASE_MS = 15000;
   const _POLL_MAX_MS = 60000;
   const _pollOnce = async () => {
     // No cached window (e.g. flaky detection at startup) — keep trying to

@@ -708,6 +708,14 @@ function _releaseContentWakePolls() {
   for (const finish of [..._contentWakePolls]) finish();
 }
 
+// Open GET /poll long-polls, each a check() that answers its request if it can. Woken when a
+// command is queued or the active worker changes — the 5ms setInterval they replace kept both
+// daemons at ~200 wake-ups a second while idle.
+const _httpPollWaiters = new Set();
+function _wakeHttpPolls() {
+  for (const check of [..._httpPollWaiters]) check();
+}
+
 function _setContentWakeCors(req, res) {
   const origin = typeof req.headers.origin === "string" ? req.headers.origin : "";
   res.setHeader("Access-Control-Allow-Origin", origin || "*");
@@ -893,34 +901,32 @@ try {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(queuedCommand));
       } else {
-        // Long-poll: wait up to 5 seconds for a command
-        const timer = setTimeout(() => {
-          res.writeHead(204);
-          res.end();
-        }, 5000);
-
-        const checkInterval = setInterval(() => {
+        // Long-poll: wait up to 5 seconds for a command; _wakeHttpPolls() runs check().
+        const check = () => {
           if (pollingWorkerId !== _activeHttpWorkerId) {
-            clearTimeout(timer);
-            clearInterval(checkInterval);
+            done();
             res.writeHead(423);
             res.end("Worker superseded");
             return;
           }
           const cmd = _dequeueHttpCommand(pollingWorkerId);
           if (cmd) {
-            clearTimeout(timer);
-            clearInterval(checkInterval);
+            done();
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify(cmd));
           }
-        }, 5); // Check every 5ms (reduced from 20ms — cuts avg command delivery delay from 10ms to 2.5ms)
-
-        // Cleanup on client disconnect
-        req.on("close", () => {
+        };
+        const timer = setTimeout(() => {
+          done();
+          res.writeHead(204);
+          res.end();
+        }, 5000);
+        const done = () => {
           clearTimeout(timer);
-          clearInterval(checkInterval);
-        });
+          _httpPollWaiters.delete(check);
+        };
+        _httpPollWaiters.add(check);
+        req.on("close", done); // client went away
       }
       return;
     }
@@ -1003,6 +1009,7 @@ try {
         if (workerChanged) {
           _adoptReloadHandoff(workerId);
           _extensionConnectionGeneration += 1;
+          _wakeHttpPolls(); // the superseded worker's open poll answers 423 now
         }
         if (!_extensionConnected) {
           _extensionConnected = true;
@@ -1062,7 +1069,10 @@ try {
       const workerChanged = workerId !== _activeHttpWorkerId;
       _activeHttpWorkerId = workerId;
       _connectingHttpWorkers.delete(workerId);
-      if (workerChanged) _adoptReloadHandoff(workerId);
+      if (workerChanged) {
+        _adoptReloadHandoff(workerId);
+        _wakeHttpPolls();
+      }
       _profileExtensionVerified = true;
       ledgerNoteVerified(_workerLedger, workerId);
       if (workerChanged) _extensionConnectionGeneration += 1;
@@ -1357,6 +1367,7 @@ const _staleHttpTimer = setInterval(() => {
       _activeHttpWorkerId = "";
       _connectingHttpWorkers.clear();
       _reloadHttpWorkerHandoff = null;
+      _wakeHttpPolls();
       _drainOnDisconnect("HTTP poll timeout");
       console.error("[Safari MCP] Extension disconnected (HTTP poll timeout)");
     }
@@ -1374,6 +1385,7 @@ function _dropWedgedHttpWorker(reason) {
   _activeHttpWorkerId = "";
   _connectingHttpWorkers.clear();
   _reloadHttpWorkerHandoff = null;
+  _wakeHttpPolls();
   _drainOnDisconnect(`wedged worker: ${reason}`);
   console.error(`[Safari MCP] Extension worker dropped as wedged (${reason})`);
 }
@@ -1499,6 +1511,7 @@ function sendToExtension(type, payload = {}, timeoutMs = 30000) {
     } else {
       // Otherwise, queue for HTTP polling
       _commandQueue.push(command);
+      _wakeHttpPolls();
       _releaseContentWakePolls();
     }
   });
@@ -2214,6 +2227,11 @@ server.tool(
     receipt: z.string().optional().describe("Tab receipt from safari_new_tab — pins this call to that tab (survives reconnects/subagents)"),
   },
   async ({ url, receipt }) => {
+    // The profile extension can only issue receipts for http(s) pages: after a trip to
+    // about:blank or file:// no tool could reach the tab again, not even to close it.
+    if (process.env.SAFARI_PROFILE && !/^https?:\/\//i.test(url.trim())) {
+      throw new Error(`safari_navigate only opens http(s) URLs in a Safari profile ("${url.slice(0, 40)}" would leave the tab unreachable). To free the tab, use safari_close_tab.`);
+    }
     const oldUrl = safari.getActiveTabURL();
     // Pre-register the destination as owned BEFORE navigating. We are navigating OUR
     // tab, so the target URL is ours even if navigate() throws mid-load on a slow SPA.
@@ -4072,7 +4090,9 @@ try {
 } catch { /* banner is best-effort, never block startup */ }
 }
 
-_startMemoryMonitor();
+// Under a profile the monitor can only log: _closeOldestMCPTab() refuses to touch profile tabs, and
+// its RSS reading hides compressed/swapped pages (433MB of RSS against 6.8GB of footprint, 27.9).
+if (!process.env.SAFARI_PROFILE) _startMemoryMonitor();
 
 // Runtime guard for the silent stale-identity regression (#29): postinstall re-signs the
 // helper to a stable id so the Accessibility grant persists, but `npm ci`, `--ignore-scripts`,
