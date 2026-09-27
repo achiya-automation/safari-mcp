@@ -70,7 +70,7 @@ Get everything search engines and social platforms see: title, description, Open
 ```json
 {
   "title": "Safari MCP - Browser Automation for AI Agents",
-  "description": "80 tools for native Safari automation...",
+  "description": "98 tools for native Safari automation...",
   "canonical": "https://example.com/safari-mcp",
   "og": {
     "og:title": "Safari MCP",

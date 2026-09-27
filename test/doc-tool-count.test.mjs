@@ -115,6 +115,11 @@ test("the directory manifests, examples page and install banner agree with the c
   // prints it on install. They said 97 and 96 while everything checked above said 98. A file
   // may drop the number, as the banner now has; it may not state a different one, and
   // "96 native browser tools" is stating one, so the words between are allowed for.
+  // `examples/data-extraction.md` joins the list because its sample `safari_extract_meta`
+  // output describes this project's own page, so the number in it reads as a claim. Two
+  // files are deliberately left out: `CHANGELOG.md` and `docs/http-transport-design.md`
+  // ("design approved 2026-07-02") state the count as it was on a date they name, the same
+  // reason the other `.launch/*.md` files keep their 80s.
   // `.launch/manual-submissions.md` is the last of them and the one that bites hardest: its
   // blurbs are pasted verbatim into third-party directory submissions, so a stale number
   // there does not sit in the repo, it becomes someone else's listing. mcp.so still shows
@@ -126,6 +131,7 @@ test("the directory manifests, examples page and install banner agree with the c
     "mcp.json",
     ".mcp.json",
     "examples/README.md",
+    "examples/data-extraction.md",
     "scripts/postinstall.cjs",
     ".launch/manual-submissions.md",
   ];
