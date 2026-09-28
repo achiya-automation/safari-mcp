@@ -280,7 +280,8 @@ async function _restoreClipboard(savedContent) {
 // wrong (often the user's) tab. Now keyed per MCP session via _st(). Field notes:
 //   activeTabIndex  — null = use front document (default)
 //   activeTabURL    — URL-based tracking (stable even when tabs shift)
-//   hasOwnedTab     — once true (after first safari_new_tab in the session), write ops
+//   hasOwnedTab     — once true (after the session's first tab, whether AppleScript or the
+//                     extension opened or picked it), write ops
 //                     (navigate/click/fill) MUST NOT fall back to "current tab of window"
 //                     (the USER'S tab). The 30s grace window was insufficient — tracking
 //                     can be lost late in a session (e.g. tab ghost recovery in runJS);
@@ -744,11 +745,14 @@ export function getActiveTabMarker() { return _st().activeTabMarker; }
 // report stays unknown rather than naming the previous tab. The marker has to go: it names the
 // last tab AppleScript opened or claimed, and resolveActiveTab() tries it before the index and
 // URL, so every later AppleScript fallback, closeTab included, went back to that older tab.
+// The session owns a tab from here on, as it does after newTab(): once it loses track of this
+// one, the fallbacks refuse instead of running in the front document — the user's tab.
 export function setActiveTabFromExtension(idx, url) {
   const s = _st();
   s.activeTabIndex = idx || null;
   s.activeTabURL = url || null;
   s.activeTabMarker = null;
+  s.hasOwnedTab = true;
   s.lastResolveTime = Date.now();
 }
 

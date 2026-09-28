@@ -3114,6 +3114,13 @@ server.tool(
     _untrackClosedTab(viaAppleScript ? (marker ? { marker } : { receipt: _getActiveReceipt() }) : { receipt: token });
     // Closing another tab by its receipt leaves the current one current.
     if (viaAppleScript || closesCurrent) _clearActiveReceipt();
+    // AppleScript's closeTab() forgets the tab it closed. After the extension's close, safari.js
+    // still tracked the closed tab by index and URL, and that index now names whichever tab
+    // shifted into it.
+    if (!viaAppleScript && closesCurrent) {
+      safari.setActiveTabIndex(null);
+      safari.setActiveTabURL(null);
+    }
     return textResult(result);
   }
 );
