@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.22.4] - 2026-09-28
+
+### Changed
+- **A comment in `safari-helper.swift` uses a neutral example window name.** The example `axpressWindow` request named a real window; it now says `Example Window`. Comment only: the shipped `safari-helper` binary is unchanged, so its Accessibility grant is untouched.
+
 ## [2.22.3] - 2026-09-28
 
 ### Fixed

@@ -781,7 +781,7 @@ func handleLine(_ line: String) {
   }
 
   // Handle window-scoped AX press
-  // {"axpressWindow": {"window": "בננה בוק", "title": "Save"}}
+  // {"axpressWindow": {"window": "Example Window", "title": "Save"}}
   if let apw = json["axpressWindow"] as? [String: Any],
      let wm = apw["window"] as? String, let title = apw["title"] as? String {
     if let denied = ensurePostEventAccess() { respond(denied); return }
