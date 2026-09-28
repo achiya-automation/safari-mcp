@@ -38,6 +38,7 @@ beforeEach(() => {
 
 const safariSource = readFileSync(new URL("../safari.js", import.meta.url), "utf8");
 const index = readFileSync(new URL("../index.js", import.meta.url), "utf8");
+const background = readFileSync(new URL("../extension/background.js", import.meta.url), "utf8");
 
 function between(source, start, end) {
   const from = source.indexOf(start);
@@ -58,7 +59,8 @@ const RECEIPT_B2 = "ReceiptB2_" + "c".repeat(24);
 
 // Tab i is tabs[i - 1]; closing one renumbers every tab after it, as Safari does. `marker` is
 // what an AppleScript stamp left in the tab's window.name. `later` tabs open right after the
-// first listing (a popup the page opens while safari_wait_for_new_tab polls).
+// first listing (a popup the page opens while safari_wait_for_new_tab polls). A tab with `next`
+// is listed once at its `url` and at `next` after that: a popup opens on about:blank.
 function safariWindow(tabs, later = []) {
   const url = (i) => tabs[i - 1]?.url || "";
   const run = async (script) => {
@@ -89,6 +91,7 @@ function safariWindow(tabs, later = []) {
   };
   const list = () => {
     const listed = tabs.map((t, i) => ({ index: i + 1, url: t.url }));
+    for (const t of tabs) if (t.next) [t.url, t.next] = [t.next, undefined];
     tabs.push(...later.splice(0));
     return listed;
   };
@@ -174,6 +177,11 @@ function loadServer(safari, extensionOrFallback) {
   );
 }
 
+// background.js's own URL reduction: origin + path, no query string or fragment.
+const safeTabUrl = new Function(
+  `${between(background, "function _safeTabUrl(", "\nfunction _receiptOrigin")}\nreturn _safeTabUrl;`
+)();
+
 // extensionOrFallback with the extension answering `types` as background.js does. Every other
 // type fails over to the AppleScript function index.js passes in.
 function extension(window, types) {
@@ -188,7 +196,8 @@ function extension(window, types) {
       return { title: "", safeUrl: window.tabs[target - 1].url, receipt: RECEIPT_B, tabIndex: target, owned: true };
     },
     get_tab_receipt: () => ({ index: b(), safeUrl: B_URL, receipt: RECEIPT_B2 }),
-    list_tabs: () => window.list().map(({ index: i, url }) => ({ index: i, title: "", safeUrl: url, active: false })),
+    // _listTabsForSession: each tab's safeUrl, and no `url` at all.
+    list_tabs: () => window.list().map(({ index: i, url }) => ({ index: i, title: "", safeUrl: safeTabUrl(url), active: false })),
   };
   return async (type, payload, fallback) => (types.includes(type) ? replies[type](payload) : fallback());
 }
@@ -197,9 +206,10 @@ function extension(window, types) {
 
 // Tab 1 is the user's. A (tab 2) was opened through AppleScript, so safari.js tracks it by its
 // marker. B becomes tab 3: the extension opens it (`opens`), the page pops it up while
-// safari_wait_for_new_tab polls (`pops`), or the extension opened it earlier.
-function session({ opens = false, pops = false } = {}) {
-  const b = { url: B_URL, marker: null };
+// safari_wait_for_new_tab polls (`pops`, as `popup` when one is given), or the extension
+// opened it earlier.
+function session({ opens = false, pops = false, popup = { url: B_URL, marker: null } } = {}) {
+  const b = popup;
   const window = safariWindow(
     [{ url: USER_URL, marker: null }, { url: A_URL, marker: A_MARKER }, ...(opens || pops ? [] : [b])],
     pops ? [b] : []
@@ -254,3 +264,55 @@ for (const path of PATHS.filter((p) => p.name !== "run_script getReceipt")) {
     assert.equal(await safari.resolveActiveTab(), 2);
   });
 }
+
+// ---------- safari_wait_for_new_tab reads list_tabs in either shape ----------
+
+// The extension's list_tabs reply names each tab by its safeUrl (origin + path) and has no
+// `url`, while the AppleScript fallback's has the raw `url`. The handler read `url` alone: with
+// the extension answering it keyed every tab `${index}:undefined`, never waited out a popup's
+// about:blank, threw on urlContains, and reported and tracked the tab as "undefined". Served by
+// AppleScript, the raw URL, query string included, reached the result and the ownership file.
+const POPUP_URL = "https://login.example.com/oauth/authorize?client_id=app1&state=s3cr3t";
+const POPUP_PAGE = "https://login.example.com/oauth/authorize";
+const SOURCES = [
+  { name: "the extension", uses: ["list_tabs", "switch_tab"] },
+  { name: "AppleScript", uses: [] },
+];
+
+function popupSession(source, popup) {
+  const { window, safari } = session({ pops: true, popup: { marker: null, ...popup } });
+  appleScriptTabs(safari, window);
+  return { window, safari, server: loadServer(safari, extension(window, source.uses)) };
+}
+
+for (const source of SOURCES) {
+  test(`safari_wait_for_new_tab, tabs listed by ${source.name}: urlContains finds the popup, reported and tracked by origin + path`, async () => {
+    const { window, safari, server } = popupSession(source, { url: POPUP_URL });
+    const { content } = await server.safari_wait_for_new_tab({ timeout: 3000, urlContains: "/oauth/authorize" });
+    assert.ok(content[0].text.endsWith(`(${POPUP_PAGE})`), content[0].text);
+    assert.equal(safari.getActiveTabURL(), POPUP_PAGE);
+    assert.deepEqual([...own._openedTabs.values()].map((t) => t.url), [A_URL, POPUP_PAGE]);
+    assert.ok(![...own._ownedTabURLs].some((u) => u.includes("s3cr3t")), "the query string reached the ownership file");
+    window.tabs.splice(0, 1); // the user closes their tab, so the popup is tab 2 now
+    assert.equal(await safari.resolveActiveTab(), 2);
+  });
+
+  test(`safari_wait_for_new_tab, tabs listed by ${source.name}: a popup that opens on about:blank is reported at the page it loads`, async () => {
+    const { server } = popupSession(source, { url: "about:blank", next: POPUP_URL });
+    const { content } = await server.safari_wait_for_new_tab({ timeout: 3000 });
+    assert.ok(content[0].text.endsWith(`(${POPUP_PAGE})`), content[0].text);
+  });
+
+  test(`safari_wait_for_new_tab, tabs listed by ${source.name}: urlContains never matches the query string`, async () => {
+    const { server } = popupSession(source, { url: POPUP_URL });
+    const { content } = await server.safari_wait_for_new_tab({ timeout: 600, urlContains: "state=s3cr3t" });
+    assert.equal(content[0].text, "TIMEOUT: no new tab appeared");
+  });
+}
+
+test("safari_wait_for_new_tab, tabs listed by the extension: a popup that reports no URL is not matched by urlContains", async () => {
+  // Safari withholds tab.url from the extension on a site it has no permission for.
+  const { server } = popupSession(SOURCES[0], { url: undefined });
+  const { content } = await server.safari_wait_for_new_tab({ timeout: 600, urlContains: "/oauth/authorize" });
+  assert.equal(content[0].text, "TIMEOUT: no new tab appeared");
+});

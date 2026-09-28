@@ -3241,10 +3241,15 @@ server.tool(
   "Wait for a new tab to appear (e.g. after OAuth login click opens popup). Automatically switches to the new tab.",
   {
     timeout: z.coerce.number().optional().describe("Timeout in ms (default: 10000)"),
-    urlContains: z.string().optional().describe("Only match new tabs whose URL contains this string"),
+    urlContains: z.string().optional().describe("Only match new tabs whose origin + path contains this string (the query string and fragment are not compared)"),
   },
   async ({ timeout, urlContains }) => {
     const timeoutMs = timeout || 10000;
+    // The extension lists each tab by its safeUrl (origin + path) and sends no `url`; the
+    // AppleScript fallback sends the raw `url`. _sanitizeTabResult reduces both to safeUrl, so
+    // urlContains matches the same text whichever one answered, and a popup's query string
+    // (OAuth state, codes) reaches neither the result nor the ownership file.
+    const listTabs = async () => _sanitizeTabResult(await extensionOrFallback("list_tabs", {}, () => safari.listTabs()));
     // Switch to the new tab and own it for THIS session, else the next interaction trips the
     // tab-safety guard. Its marker names it only if AppleScript made the switch (and stamped
     // it); the extension answers with the tab's receipt instead.
@@ -3255,46 +3260,41 @@ server.tool(
         () => { viaAppleScript = true; return safari.switchTab(t.index); }
       ));
       safari.setActiveTabIndex(t.index);
-      safari.setActiveTabURL(t.url);
-      if (!viaAppleScript) safari.setActiveTabFromExtension(t.index, t.url);
-      _trackTab(t.index, t.url, `${SESSION_ID}:${currentSessionId()}`, viaAppleScript ? safari.getActiveTabMarker() : "", switched?.receipt);
+      safari.setActiveTabURL(t.safeUrl);
+      if (!viaAppleScript) safari.setActiveTabFromExtension(t.index, t.safeUrl);
+      _trackTab(t.index, t.safeUrl, `${SESSION_ID}:${currentSessionId()}`, viaAppleScript ? safari.getActiveTabMarker() : "", switched?.receipt);
       _setActiveReceipt(switched?.receipt);
-      return { content: [{ type: "text", text: `Found new tab: ${t.title} (${t.url})` }] };
+      return { content: [{ type: "text", text: `Found new tab: ${t.title || ""} (${t.safeUrl || "unknown"})` }] };
     };
-    // Get current tab list
-    const beforeRaw = await extensionOrFallback("list_tabs", {}, () => safari.listTabs());
-    const beforeTabs = typeof beforeRaw === 'string' ? JSON.parse(beforeRaw) : beforeRaw;
-    const beforeIds = new Set(beforeTabs.map(t => `${t.index}:${t.url}`));
+    const beforeTabs = await listTabs();
+    const beforeIds = new Set(beforeTabs.map(t => `${t.index}:${t.safeUrl}`));
     const beforeCount = beforeTabs.length;
 
     // Poll for new tab — detect by count increase + new entries (handles about:blank tabs)
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 500));
-      const nowRaw = await extensionOrFallback("list_tabs", {}, () => safari.listTabs());
-      const nowTabs = typeof nowRaw === 'string' ? JSON.parse(nowRaw) : nowRaw;
+      const nowTabs = await listTabs();
       if (nowTabs.length > beforeCount) {
         // Find the new tab(s) — could be about:blank initially (OAuth popups)
         for (const tab of nowTabs) {
-          if (!beforeIds.has(`${tab.index}:${tab.url}`)) {
+          if (!beforeIds.has(`${tab.index}:${tab.safeUrl}`)) {
             // Wait for about:blank to resolve to actual URL — dynamic polling instead of fixed delay
-            if (tab.url === 'about:blank') {
+            if (tab.safeUrl === 'about:blank') {
               let resolved = null;
               for (let attempt = 0; attempt < 10; attempt++) {
                 await new Promise(r => setTimeout(r, 300)); // 300ms intervals, max 3s total
-                const refreshed = await extensionOrFallback("list_tabs", {}, () => safari.listTabs());
-                const refreshedTabs = typeof refreshed === 'string' ? JSON.parse(refreshed) : refreshed;
-                resolved = refreshedTabs.find(t => t.index === tab.index);
-                if (resolved && resolved.url !== 'about:blank') break;
+                resolved = (await listTabs()).find(t => t.index === tab.index);
+                if (resolved && resolved.safeUrl !== 'about:blank') break;
                 resolved = null;
               }
-              if (resolved && resolved.url !== 'about:blank') {
-                if (urlContains && !resolved.url.includes(urlContains)) continue;
+              if (resolved && resolved.safeUrl !== 'about:blank') {
+                if (urlContains && !resolved.safeUrl?.includes(urlContains)) continue;
                 return await adopt(resolved);
               }
               continue;
             }
-            if (urlContains && !tab.url.includes(urlContains)) continue;
+            if (urlContains && !tab.safeUrl?.includes(urlContains)) continue;
             return await adopt(tab);
           }
         }
