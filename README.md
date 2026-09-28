@@ -368,6 +368,7 @@ What the flag deliberately does *not* do:
 - **It unlocks adoption, not the guards.** Only `safari_switch_tab` adopts, and only the tab you named. An ordinary click or navigate still never lands on whatever tab happens to be in front — the server acts on the tab you pointed it at, not the one you wandered to.
 - **`safari_close_tab` still refuses.** Closing is the one action whose cost you cannot undo, so an adopted tab is writable, never disposable. Close it yourself.
 - **Adoption is session-local.** Nothing is written to the shared ownership file, so it ends with the session rather than leaking to the next process on the machine.
+- **It adopts only through AppleScript.** The Safari MCP extension checks ownership itself and switches only to the session's own tabs, so while it makes the switch, `safari_switch_tab` still refuses your tab and says the flag did not apply. Adoption happens when the switch runs through AppleScript: the extension is not installed, or is turned off.
 
 `safari_doctor` prints the flag's state, and every operation on an adopted tab logs `(user tab, opted-in)` — so "why did it touch my tab" has an answer instead of being a mystery. Default off; set it only for agents you want working inside your own browsing session. Designed in [#92](https://github.com/achiya-automation/safari-mcp/issues/92).
 

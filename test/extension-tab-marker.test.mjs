@@ -34,6 +34,7 @@ beforeEach(() => {
   own._openedTabs.clear();
   own._ownedTabURLs.clear();
   own._ownedTabTimestamps.clear();
+  own._adoptedTabURLs.clear();
 });
 
 const safariSource = readFileSync(new URL("../safari.js", import.meta.url), "utf8");
@@ -160,7 +161,7 @@ function loadServer(safari, extensionOrFallback) {
     "safari", "extensionOrFallback", "SESSION_ID", "currentSessionId", "process", "console",
     "textResult", "errorResult", "_evictOldestTab", "_trackTab", "_untrackTab", "_openedTabs",
     "_ownedTabURLs", "_addOwnedURL", "_markBlankTabOpened", "_isURLOwned", "_trackedAtIndex",
-    "BLANK_TAB_SENTINEL", "allowUserTabs",
+    "BLANK_TAB_SENTINEL", "allowUserTabs", "_adoptUserTab",
     `${indexParts}
     return {
       run: _runExtensionBatchAction,
@@ -173,7 +174,7 @@ function loadServer(safari, extensionOrFallback) {
     safari, extensionOrFallback, "daemon", () => "s1", { env: {} }, { error() {} },
     textResult, errorResult, async () => null, own._trackTab, own._untrackTab, own._openedTabs,
     own._ownedTabURLs, own._addOwnedURL, own._markBlankTabOpened, own._isURLOwned,
-    own._trackedAtIndex, own.BLANK_TAB_SENTINEL, own.allowUserTabs
+    own._trackedAtIndex, own.BLANK_TAB_SENTINEL, own.allowUserTabs, own._adoptUserTab
   );
 }
 
@@ -193,7 +194,10 @@ function extension(window, types) {
     },
     switch_tab: ({ index: i }) => {
       const target = i || b();
-      return { title: "", safeUrl: window.tabs[target - 1].url, receipt: RECEIPT_B, tabIndex: target, owned: true };
+      const tab = window.tabs[target - 1];
+      // _switchTabForSession refuses a tab this session did not open, and a refusal never falls back.
+      if (tab.user) throw new Error(`⚠️ Tab safety: refusing "switch_tab" to tab ${target} (${safeTabUrl(tab.url)}) — not opened by this MCP session. Use safari_new_tab first.`);
+      return { title: "", safeUrl: tab.url, receipt: RECEIPT_B, tabIndex: target, owned: true };
     },
     get_tab_receipt: () => ({ index: b(), safeUrl: B_URL, receipt: RECEIPT_B2 }),
     // _listTabsForSession: each tab's safeUrl, and no `url` at all.
@@ -211,7 +215,7 @@ function extension(window, types) {
 function session({ opens = false, pops = false, popup = { url: B_URL, marker: null } } = {}) {
   const b = popup;
   const window = safariWindow(
-    [{ url: USER_URL, marker: null }, { url: A_URL, marker: A_MARKER }, ...(opens || pops ? [] : [b])],
+    [{ url: USER_URL, marker: null, user: true }, { url: A_URL, marker: A_MARKER }, ...(opens || pops ? [] : [b])],
     pops ? [b] : []
   );
   const safari = loadSafari(window);
@@ -315,4 +319,73 @@ test("safari_wait_for_new_tab, tabs listed by the extension: a popup that report
   const { server } = popupSession(SOURCES[0], { url: undefined });
   const { content } = await server.safari_wait_for_new_tab({ timeout: 600, urlContains: "/oauth/authorize" });
   assert.equal(content[0].text, "TIMEOUT: no new tab appeared");
+});
+
+// ---------- safari_switch_tab checks the tab list in either shape ----------
+
+// Its ownership pre-check read `url`, which only the AppleScript fallback's list_tabs reply has:
+// with the extension answering, the check never ran. The extension still refuses a tab this
+// session did not open, but when its switch_tab failed for any other reason (a timeout, a worker
+// restart) the AppleScript fallback, which checks nothing itself, claimed whatever tab sat at that
+// index. And SAFARI_MCP_ALLOW_USER_TABS (#92) never adopted a tab while the extension listed them.
+const LISTERS = [
+  { name: "the extension", uses: ["list_tabs"] },
+  { name: "AppleScript", uses: [] },
+];
+
+// What the MCP client receives: the SDK reports a thrown error as an isError result.
+const clientSees = (call) => call.catch((e) => ({ isError: true, content: [{ type: "text", text: e.message }] }));
+
+function switchSession(uses, { optIn = false } = {}) {
+  if (optIn) process.env.SAFARI_MCP_ALLOW_USER_TABS = "1";
+  else delete process.env.SAFARI_MCP_ALLOW_USER_TABS;
+  const { window, safari } = session();
+  appleScriptTabs(safari, window);
+  return { window, safari, server: loadServer(safari, extension(window, uses)) };
+}
+after(() => delete process.env.SAFARI_MCP_ALLOW_USER_TABS);
+
+for (const lister of LISTERS) {
+  test(`safari_switch_tab, tabs listed by ${lister.name}: the AppleScript switch refuses a tab this session did not open`, async () => {
+    const { window, safari, server } = switchSession(lister.uses);
+    const { isError, content } = await clientSees(server.safari_switch_tab({ index: 1 }));
+    assert.ok(isError, "switched to the user's tab");
+    assert.match(content[0].text, /refusing switch_tab to index 1 \(https:\/\/mail\.example\.com\/inbox\)/);
+    assert.equal(window.tabs[0].marker, null, "AppleScript stamped the user's tab");
+    assert.equal(await safari.resolveActiveTab(), 2, "the session's tab is still A");
+  });
+
+  test(`safari_switch_tab, tabs listed by ${lister.name}: with SAFARI_MCP_ALLOW_USER_TABS the AppleScript switch adopts the user's tab`, async () => {
+    const { server } = switchSession(lister.uses, { optIn: true });
+    const { content } = await server.safari_switch_tab({ index: 1 });
+    assert.equal(JSON.parse(content[0].text).note, "(user tab, opted-in)", content[0].text);
+    assert.ok(own._isAdoptedURL(USER_URL));
+  });
+}
+
+test("safari_switch_tab, tabs listed by the extension: the AppleScript switch refuses a tab listed without a URL", async () => {
+  // Safari withholds tab.url from an extension on a site it has no permission for.
+  const { window, server } = switchSession(["list_tabs"]);
+  window.tabs[0].url = undefined;
+  assert.ok((await clientSees(server.safari_switch_tab({ index: 1 }))).isError, "switched to a tab of unknown ownership");
+  assert.equal(window.tabs[0].marker, null);
+});
+
+test("safari_switch_tab switched by the extension: a user's tab it refuses is not adopted, and the refusal says why the opt-in did not apply", async () => {
+  const { window, server } = switchSession(["list_tabs", "switch_tab"], { optIn: true });
+  const { isError, content } = await clientSees(server.safari_switch_tab({ index: 1 }));
+  assert.ok(isError);
+  assert.match(content[0].text, /refusing "switch_tab"[\s\S]*SAFARI_MCP_ALLOW_USER_TABS/);
+  assert.equal(own._isAdoptedURL(USER_URL), false, "adopted a tab the switch never reached");
+  assert.equal(window.tabs[0].marker, null);
+});
+
+test("safari_switch_tab switched by the extension: a tab it opened stays reachable after redirecting to another origin", async () => {
+  // The extension owns the tab by its id. The server never registered the new URL, and that is no
+  // reason to refuse a switch the extension itself allows.
+  const { window, server } = switchSession(["list_tabs", "switch_tab"]);
+  window.tabs[2].url = "https://login.other.example/sso";
+  const { isError, content } = await clientSees(server.safari_switch_tab({ index: 3 }));
+  assert.ok(!isError, content[0].text);
+  assert.equal(JSON.parse(content[0].text).tabIndex, 3);
 });

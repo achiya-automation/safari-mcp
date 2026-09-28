@@ -3141,24 +3141,28 @@ server.tool(
       return errorResult("Tab safety: switch_tab index must be a positive integer when provided");
     }
 
-    // Tab ownership check: verify target tab is one we opened
-    let adopted = false;
+    // Tab ownership check, and it binds the AppleScript fallback alone. The Safari extension
+    // makes the switch when it can and checks ownership itself, per session and by tab id —
+    // proof that also holds for a tab of ours whose URL this server never registered (a
+    // cross-origin redirect), so its verdict stands. The fallback checks nothing itself, so what
+    // this check finds binds it: a tab not proven ours is refused there, or adopted when the
+    // opt-in allows (#92).
+    let refusal = "";
+    let adopt = false;
     // `_ownedTabURLs.size > 0` alone skipped this whole lookup for a session that had opened
     // nothing — fine while switch_tab could only reach owned tabs, but adoption (#92) has to
     // work from a cold session, which is precisely the "read the article in my current tab"
     // case the opt-in exists for.
     if (!process.env.SAFARI_PROFILE && (_ownedTabURLs.size > 0 || allowUserTabs())) {
-      // Get target tab's URL via list_tabs before switching
       try {
-        const tabs = await extensionOrFallback(
-          "list_tabs", {},
-          () => safari.listTabs()
-        );
-        const parsed = typeof tabs === 'string' ? JSON.parse(tabs) : tabs;
-        const target = parsed.find(t => t.index === index);
-        if (target && target.url && !_isURLOwned(target.url)) {
+        // The extension lists each tab by its safeUrl (origin + path) and sends no `url`; the
+        // AppleScript fallback sends the raw `url`. Reading `url` alone, this check never ran
+        // while the extension answered. A tab listed without any URL is not proven ours.
+        const tabs = _sanitizeTabResult(await extensionOrFallback("list_tabs", {}, () => safari.listTabs()));
+        const target = tabs.find(t => t.index === index);
+        if (target && !_isURLOwned(target.safeUrl)) {
           // about:blank / missing value tabs are owned if tracked in _openedTabs
-          const isBlankOwned = (target.url === 'about:blank' || target.url === 'missing value') && (!!_trackedAtIndex(index) || _ownedTabURLs.has(BLANK_TAB_SENTINEL));
+          const isBlankOwned = (target.safeUrl === 'about:blank' || target.safeUrl === 'missing value') && (!!_trackedAtIndex(index) || _ownedTabURLs.has(BLANK_TAB_SENTINEL));
           // A tab THIS session opened may have redirected away from the URL we
           // registered (/dashboard -> /login, any 302), so the URL alone stops
           // being proof and the tab became permanently un-switchable. But a
@@ -3170,29 +3174,44 @@ server.tool(
           // would survive the extension's check is lost here, and the AppleScript
           // fallback (which has no ownership check of its own) stays guarded.
           const trackedOrigin = _originOf(_trackedAtIndex(index)?.url);
-          const isTrackedRedirect = !!trackedOrigin && trackedOrigin === _originOf(target.url);
+          const isTrackedRedirect = !!trackedOrigin && trackedOrigin === _originOf(target.safeUrl);
           if (!isBlankOwned && !isTrackedRedirect && allowUserTabs()) {
-            // The opt-in turns this refusal into a deliberate, named adoption (#92). Both
-            // spellings of the URL go in: the tool layer hands callers the query-stripped
-            // form and later compares against it, while list_tabs reported the raw one.
-            _adoptUserTab(target.url);
-            _adoptUserTab(_safeUrlForOutput(target.url));
-            adopted = true;
-            console.error(`[Safari MCP] switch_tab adopted ${_safeUrlForOutput(target.url)} (user tab, opted-in via SAFARI_MCP_ALLOW_USER_TABS)`);
+            // The opt-in turns this refusal into a deliberate, named adoption (#92), recorded
+            // below once AppleScript has actually switched to the tab.
+            adopt = true;
           } else if (!isBlankOwned && !isTrackedRedirect) {
-            const msg = `⚠️ Tab safety: refusing switch_tab to index ${index} (${_safeUrlForOutput(target.url)}) — not opened by this MCP session. Use safari_new_tab to open your own tab, or set SAFARI_MCP_ALLOW_USER_TABS=1 to let switch_tab adopt a tab you already had open.`;
-            console.error(`[Safari MCP] ${msg}`);
-            return errorResult(msg);
+            refusal = `⚠️ Tab safety: refusing switch_tab to index ${index} (${target.safeUrl || "unknown"}) — not opened by this MCP session. Use safari_new_tab to open your own tab, or set SAFARI_MCP_ALLOW_USER_TABS=1 to let switch_tab adopt a tab you already had open.`;
           }
         }
       } catch {}
     }
     let viaAppleScript = false;
-    const result = await extensionOrFallback(
-      "switch_tab", token ? { ...(index ? { index } : {}), receipt: token } : { index },
-      () => { viaAppleScript = true; return safari.switchTab(index); }
-    );
+    let result;
+    try {
+      result = await extensionOrFallback(
+        "switch_tab", token ? { ...(index ? { index } : {}), receipt: token } : { index },
+        () => {
+          if (refusal) {
+            console.error(`[Safari MCP] ${refusal}`);
+            throw new Error(refusal);
+          }
+          viaAppleScript = true;
+          return safari.switchTab(index);
+        }
+      );
+    } catch (err) {
+      // The extension has no notion of adoption: it switches only to this session's own tabs.
+      if (adopt && String(err?.message).includes("Tab safety:")) {
+        err.message += " SAFARI_MCP_ALLOW_USER_TABS did not apply: while the Safari MCP extension makes the switch, it reaches only tabs this session opened. A tab is adopted only when AppleScript makes the switch.";
+      }
+      throw err;
+    }
     const safeResult = _sanitizeTabResult(result);
+    // Adopt the tab AppleScript reached, by its origin + path — the only spelling the tab list
+    // gives now, and the ownership match ignores the query string. After the switch, never
+    // before: an adoption the switch did not reach would leave a user's URL owned by this session.
+    const adopted = adopt && viaAppleScript && _adoptUserTab(safeResult?.safeUrl);
+    if (adopted) console.error(`[Safari MCP] switch_tab adopted ${safeResult.safeUrl} (user tab, opted-in via SAFARI_MCP_ALLOW_USER_TABS)`);
     // Sync safari.js state so AppleScript fallback targets the correct tab
     const resolvedIndex = safeResult?.tabIndex || index;
     if (resolvedIndex) safari.setActiveTabIndex(resolvedIndex);
