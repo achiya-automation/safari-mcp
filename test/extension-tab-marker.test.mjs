@@ -12,6 +12,9 @@
  * before. The next call without a receipt whose extension attempt failed ran its AppleScript
  * fallback on that older tab, and safari_close_tab's fallback closed it.
  *
+ * Such a tab carries no marker until the extension writes one into it (mark_tab), and
+ * safari.js acts on it only where it finds that marker — see extension-tab-proof.test.mjs.
+ *
  * Both sides are the real code: index.js's tool handlers and run_script actions, fed the
  * reply the extension sends, and safari.js's session state, resolveActiveTab() and
  * closeTab(), over a fake Safari window that answers their AppleScript.
@@ -227,18 +230,25 @@ for (const path of PATHS) {
     const { window, safari } = session(path);
     await path.call(loadServer(safari, extension(window, path.uses)));
     assert.equal(window.tabs[2].url, B_URL);
+    // The extension, which knows B by id, writes the session's marker into it.
+    safari.setExtensionTabMarker(async (marker) => {
+      window.tabs.find((t) => t.url === B_URL).marker = marker;
+      return true;
+    });
     assert.equal(await safari.resolveActiveTab(), 3, "resolved to A — the tab AppleScript opened before");
   });
 }
 
-test("safari_close_tab's AppleScript fallback closes the tab the extension opened, and forgets that one", async () => {
+test("safari_close_tab's AppleScript fallback never closes the tab AppleScript opened before, or the user's", async () => {
   const { window, safari } = session({ opens: true });
-  // The extension opens B, then fails the close, which falls over to AppleScript.
+  // The extension opens B, then fails the close, which falls over to AppleScript. Nothing has
+  // proven B there (the extension has not marked it), so the fallback may close nothing at all;
+  // what it must never close is A, which still carried the session's marker.
   const server = loadServer(safari, extension(window, ["new_tab"]));
   await server.safari_new_tab({ url: B_URL });
-  await server.safari_close_tab({});
-  assert.deepEqual(window.tabs.map((t) => t.url), [USER_URL, A_URL], "B closed; A and the user's tab still open");
-  assert.deepEqual([...own._openedTabs.values()].map((t) => t.url), [A_URL], "B's record went with it, A's stayed");
+  await server.safari_close_tab({}).catch(() => {});
+  assert.deepEqual(window.tabs.map((t) => t.url).filter((u) => u !== B_URL), [USER_URL, A_URL], "A or the user's tab closed");
+  assert.ok([...own._openedTabs.values()].some((t) => t.url === A_URL), "A's record went");
 });
 
 // The same paths with the extension down: AppleScript opens or claims the tab and stamps a
