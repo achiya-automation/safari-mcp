@@ -18,7 +18,7 @@ export function planTransport(env = {}) {
   if (flag && flag !== "0") {
     return {
       kind: "http",
-      host: "127.0.0.1", // localhost-only bind — no auth needed, never exposed off-box
+      host: "127.0.0.1", // loopback-only bind — necessary, not sufficient: see isLoopbackRequest()
       port: parseInt(env.SAFARI_MCP_HTTP_PORT || String(DEFAULT_HTTP_PORT), 10),
     };
   }
@@ -48,6 +48,15 @@ export async function startTransport(createMcpServer, env = process.env) {
 
   const httpServer = createServer(async (req, res) => {
     try {
+      const { port } = /** @type {import("node:net").AddressInfo} */ (httpServer.address());
+      if (!isLoopbackRequest(req.headers, port)) {
+        res.statusCode = 403;
+        res.end(
+          JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Forbidden: non-loopback Host or Origin" }, id: null })
+        );
+        return;
+      }
+
       let body;
       if (req.method === "POST") {
         const chunks = [];
@@ -115,6 +124,24 @@ export async function startTransport(createMcpServer, env = process.env) {
       await new Promise((r) => httpServer.close(r));
     },
   };
+}
+
+// DNS-rebinding guard — the MCP spec requires a local HTTP server to validate Origin. Binding to
+// 127.0.0.1 is not enough on its own: a web page whose hostname re-resolves to 127.0.0.1 reaches
+// this port as its *own* origin, and every tool here runs in the user's logged-in Safari. MCP
+// clients are not browsers: they send a loopback Host and no Origin. So the Host must name loopback
+// on the port we are bound to, and an Origin, when a browser sends one, must name the same.
+const LOOPBACK_HOST_PORT = /^(?:127\.0\.0\.1|localhost|\[::1\]):(\d+)$/i;
+export function isLoopbackRequest(headers, port) {
+  const onOurPort = (hostPort) => Number(LOOPBACK_HOST_PORT.exec(hostPort ?? "")?.[1]) === port;
+  if (!onOurPort(headers.host)) return false;
+  if (headers.origin === undefined) return true;
+  try {
+    const { protocol, host } = new URL(headers.origin);
+    return (protocol === "http:" || protocol === "https:") && onOurPort(host);
+  } catch {
+    return false; // "null" and other opaque origins
+  }
 }
 
 // An MCP initialize request may arrive as a single object or (rarely) batched in an array.

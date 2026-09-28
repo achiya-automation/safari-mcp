@@ -12,7 +12,8 @@ import { test } from "node:test";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { startTransport } from "../transport.js";
+import { request } from "node:http";
+import { startTransport, isLoopbackRequest } from "../transport.js";
 
 function makeStubServer() {
   const server = new McpServer({ name: "safari-mcp-test", version: "0.0.0" });
@@ -85,6 +86,58 @@ test("http mode: an unknown session id returns 404 (client re-inits) — not 400
       body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
     });
     assert.equal(noSession.status, 400, "no session id + non-initialize stays 400");
+  } finally {
+    await handle.close();
+  }
+});
+
+test("isLoopbackRequest: a loopback Host on our port, and an Origin only when it names the same", () => {
+  const ok = (headers) => isLoopbackRequest(headers, 9225);
+  for (const host of ["127.0.0.1:9225", "localhost:9225", "LOCALHOST:9225", "[::1]:9225"]) assert.ok(ok({ host }), host);
+  assert.ok(ok({ host: "127.0.0.1:9225", origin: "http://localhost:9225" }), "a loopback page on our own port");
+  assert.ok(!ok({}), "no Host");
+  assert.ok(!ok({ host: "127.0.0.1" }), "no port");
+  assert.ok(!ok({ host: "127.0.0.1:9224" }), "another port");
+  assert.ok(!ok({ host: "attacker.example:9225" }), "a rebinding hostname");
+  assert.ok(!ok({ host: "127.0.0.1.attacker.example:9225" }), "loopback as a subdomain prefix");
+  assert.ok(!ok({ host: "127.0.0.1:9225", origin: "http://attacker.example:9225" }), "foreign Origin");
+  assert.ok(!ok({ host: "127.0.0.1:9225", origin: "http://localhost:6274" }), "another local app's page");
+  assert.ok(!ok({ host: "127.0.0.1:9225", origin: "null" }), "opaque Origin");
+});
+
+test("http mode: a DNS-rebinding request gets 403 before any session exists", async () => {
+  const handle = await startTransport(makeStubServer, { SAFARI_MCP_HTTP: "1", SAFARI_MCP_HTTP_PORT: "9322" });
+  try {
+    const initialize = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "0" } },
+    });
+    // node:http rather than fetch, because fetch will not let a caller choose the Host header.
+    const post = (headers) =>
+      new Promise((resolve, reject) => {
+        const req = request(
+          {
+            host: "127.0.0.1",
+            port: 9322,
+            path: "/mcp",
+            method: "POST",
+            headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...headers },
+          },
+          (res) => {
+            res.resume();
+            resolve(res.statusCode);
+          }
+        );
+        req.on("error", reject);
+        req.end(initialize);
+      });
+    // A page on attacker.example whose DNS now answers 127.0.0.1 sends its own hostname as Host.
+    assert.equal(await post({ Host: "attacker.example:9322" }), 403);
+    assert.equal(await post({ Host: "127.0.0.1:9322", Origin: "http://attacker.example:9322" }), 403);
+    // The same initialize addressed to loopback is served: the guard is not a blanket refusal.
+    assert.equal(await post({ Host: "127.0.0.1:9322" }), 200);
   } finally {
     await handle.close();
   }

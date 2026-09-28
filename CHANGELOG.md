@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.22.1] - 2026-09-28
+
+### Security
+- **The HTTP transport refuses DNS-rebinding requests.** With `SAFARI_MCP_HTTP=1` the server bound to 127.0.0.1 and checked nothing else, and a loopback bind does not stop a web page: a page whose hostname re-resolves to 127.0.0.1 reaches the port as its own origin, can read the replies, and every tool here runs in the user's logged-in Safari. The MCP specification requires a local HTTP server to validate `Origin` for exactly this reason. Every request is now refused with 403, before it is parsed and before any session exists, unless its `Host` names loopback (`127.0.0.1`, `localhost` or `[::1]`) on the port the server is bound to; an `Origin`, which browsers send and MCP clients do not, must name the same. Clients configured as the README shows (`http://127.0.0.1:9225/mcp`) are unaffected. A client that reaches the daemon under another hostname, or through a port forward to a different port, now gets 403. Every version with the HTTP transport (2.15.0 onward) is affected when it runs in HTTP mode; stdio, the default, opens no socket and never had this exposure. `test/transport-http.test.mjs` covers the check and a rebinding `initialize` refused end to end. Reported by [@GodModeAI2025](https://github.com/GodModeAI2025) in [#114](https://github.com/achiya-automation/safari-mcp/pull/114).
+
 ## [2.22.0] - 2026-09-28
 
 ### Added
