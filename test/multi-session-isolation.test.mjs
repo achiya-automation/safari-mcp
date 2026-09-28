@@ -61,30 +61,37 @@ test("a session that owns nothing still reaches the old fallback", () => {
   assert.ok(fn.includes("// PRIORITY 3: Active tab"), "the active-tab fallback must still exist below it");
 });
 
+// Behavioural coverage (another session's older tab is never evicted) lives in
+// tab-cap-eviction.test.mjs; these pin where the scoping happens.
+const evictSource = index.slice(
+  index.indexOf("async function _evictOldestTab("),
+  index.indexOf("// What safari_new_tab tells the caller")
+);
+
 test("the tab cap counts only the calling session's tabs", () => {
   const near = index.slice(
-    index.indexOf("Enforce tab limit"),
+    index.indexOf("Enforce the tab cap"),
     index.indexOf("const rawResult = await extensionOrFallback")
   );
+  assert.ok(near.includes("_evictOldestTab(mySession)"), "the cap must be enforced for the caller's session");
   assert.ok(
-    !/_openedTabs\.size >= MAX_TABS/.test(near),
+    !/_openedTabs\.size >= MAX_TABS/.test(evictSource),
     "cap must not be measured against the process-wide map"
   );
-  assert.ok(near.includes("myTabs"), "cap must be measured against this session's tabs");
+  assert.ok(evictSource.includes("_sessionTabs(sessionId)"), "cap must be measured against this session's tabs");
+  const sessionTabs = ownership.slice(
+    ownership.indexOf("export function _sessionTabs("),
+    ownership.indexOf("export function _trackedAtIndex(")
+  );
   assert.ok(
-    /filter\(.*info\.sessionId/s.test(near),
+    /filter\(.*info\.sessionId/s.test(sessionTabs),
     "the session's tabs must be selected by sessionId"
   );
 });
 
 test("eviction can only close a tab the calling session opened", () => {
-  const near = index.slice(
-    index.indexOf("Enforce tab limit"),
-    index.indexOf("const rawResult = await extensionOrFallback")
-  );
-  const loop = near.slice(near.indexOf("for ("), near.indexOf("if (oldestIdx !== null)"));
   assert.ok(
-    loop.includes("myTabs") && !loop.includes("_openedTabs"),
+    evictSource.includes("_sessionTabs(sessionId)") && !evictSource.includes("_openedTabs"),
     "the oldest-tab scan must iterate this session's tabs, not every tab"
   );
 });

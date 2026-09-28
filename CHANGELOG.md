@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.22.3] - 2026-09-28
+
+### Fixed
+- **The per-session tab cap closes the session's oldest tab by its identity, not by the position it had when it opened.** `safari_new_tab` closed the index recorded at opening and sent the session's *current* receipt with it. In a named profile the extension then refused the close ("receipt and requested index identify different tabs") while `safari_new_tab` still reported the oldest tab as closed; with no current receipt — after a `safari_close_tab` — it closed whichever of the session's tabs sat at that position by then, and a tab the user had closed or moved in between guaranteed it. The geo-audit morning run hit this on 24.9: its receipt→tab mapping broke, and a read came back from another query's tab. The cap now closes the oldest tab through its own receipt (or, for a tab AppleScript opened, its marker) with no position in the command. A tab that has left its receipt's origin is closed after the receipt is rotated; a tab that is already gone, or can no longer be proven ours, only drops out of the count, and nothing is closed in its place. `test/tab-cap-eviction.test.mjs` runs the extension's own receipt resolver and close over a profile window whose tabs the user closes and moves.
+- **`evictedTab` names the tab that was actually closed.** It is now `{ receipt, safeUrl }` — the closed tab's receipt and the origin+path it was opened on — instead of a window position that was stale by then, and it appears only when a tab really closed. The note says the same in words.
+- **The tabs a session opened are tracked by identity.** The record was keyed by window position, so a new tab that landed on a shifted position overwrote a live tab's entry — that tab was never counted or evicted again — and `safari_close_tab` forgot whichever entry matched the current index rather than the tab it closed. Entries are now keyed by receipt or marker, `safari_close_tab` and run_script `closeTab` forget exactly the tab they closed, and a tab the extension opened no longer inherits the marker of an earlier AppleScript tab. The memory-pressure sweep closes the oldest tab the same way; it used to drop an extension-opened tab from the count without closing it.
+- **A switch without a receipt makes that tab current.** run_script `switchTab` by index and `safari_wait_for_new_tab` left the previous tab's receipt in place, so the next receipt-less step went back to the previous tab. A receipt rotated by run_script `getReceipt` keeps resolving under its old name, as it already did after `safari_navigate`.
+
+### Changed
+- **In a named profile, a call that names no tab is refused when the session's current tab has closed and two or more of its tabs are still open.** Such a call went to the extension's guess — its cached tab, else the session's newest — which is how a caller that forgot its receipt read another tab's page. The error names the fix: pass the tab's `receipt`, or pick one with `safari_switch_tab`. Requiring a receipt on every call would break every single-tab flow, so only this ambiguous case is refused: a call without a receipt still goes to the session's current tab (the one it last opened, switched to or named), one remaining tab is not ambiguous, and the default mode without `SAFARI_PROFILE` is unchanged. Closing a tab other than the current one by its receipt now leaves the current tab current instead of clearing it.
+
 ## [2.22.2] - 2026-09-28
 
 ### Fixed

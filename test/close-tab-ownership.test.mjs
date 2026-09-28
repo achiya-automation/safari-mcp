@@ -168,7 +168,7 @@ test("public close accepts an opaque receipt and never treats a full URL as auth
   assert.match(tool, /const token = _receiptToken\(supplied\) \|\| _getActiveReceipt\(\)/);
   assert.match(tool, /if \(supplied && !token\) return errorResult\("Tab safety: invalid tab receipt"\)/);
   assert.match(tool, /"close_tab",\s*token \? \{ receipt: token \} : \{\}/);
-  assert.match(tool, /_setActiveReceipt\(""\)/, "a closed tab's receipt must be forgotten");
+  assert.match(tool, /_clearActiveReceipt\(\)/, "a closed tab's receipt must be forgotten");
   assert.doesNotMatch(tool, /_isExactURLOwned|tabUrl|serverOwnedReceipt/);
 
   const routingStart = index.indexOf("async function extensionOrFallback(");

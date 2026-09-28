@@ -37,8 +37,9 @@ test("a receipt rotated by navigate keeps working under its old name", () => {
 
 test("evicting a session's oldest tab is reported in the new_tab result", () => {
   const body = index.slice(index.indexOf('"safari_new_tab",'), index.indexOf('"safari_close_tab",'));
-  assert.match(body, /evictedTab = oldestIdx;/);
-  assert.match(body, /\{ \.\.\.safeResult, evictedTab, note:/);
+  // What the report says is pinned behaviourally in tab-cap-eviction.test.mjs.
+  assert.match(body, /const evicted = await _evictOldestTab\(mySession\);/);
+  assert.match(body, /\{ \.\.\.safeResult, \.\.\._evictionReport\(evicted\) \}/);
 });
 
 test("the profile-window opener is opt-in, waits for established absence, and is rate-limited", () => {

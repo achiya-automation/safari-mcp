@@ -778,8 +778,12 @@ test("extension reload bypasses all target-tab and receipt resolution", () => {
   );
   assert.match(
     routing,
-    /\["new_tab", "list_tabs", "switch_tab", "reload_extension"\]\.includes\(extensionType\)/,
+    /const attachActiveReceipt = !_UNTARGETED_COMMANDS\.has\(extensionType\);/,
     "reload must never inherit a stale active-tab receipt"
+  );
+  assert.match(
+    index,
+    /const _UNTARGETED_COMMANDS = new Set\(\["new_tab", "list_tabs", "switch_tab", "reload_extension"\]\);/
   );
 });
 

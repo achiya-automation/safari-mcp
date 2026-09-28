@@ -89,6 +89,26 @@ test("trackTab owns the URL + records the tab; untrackTab reverses both", () => 
   assert.equal(own._isURLOwned("https://example.com/page"), false);
 });
 
+test("tabs are tracked by identity: a tab on a shifted position never overwrites a live one", () => {
+  // Keyed by index, the second tab below replaced the first one's entry: that tab was no
+  // longer counted by the cap, and the cap later closed by a position that meant nothing.
+  own._trackTab(3, "https://example.com/a", "s1", "", "receipt_AAAAAAAAAAAAAAAAAAAAAAAA");
+  own._trackTab(3, "https://example.com/b", "s1", "MCP_s1_b");
+  own._trackTab(3, "https://example.com/c", "s2");
+  assert.equal(own._openedTabs.size, 3);
+  assert.equal(own._openedTabs.get("receipt_AAAAAAAAAAAAAAAAAAAAAAAA").url, "https://example.com/a");
+  assert.equal(own._openedTabs.get("MCP_s1_b").index, 3);
+  assert.deepEqual(
+    own._sessionTabs("s1").map(([, info]) => info.url),
+    ["https://example.com/a", "https://example.com/b"],
+    "a session's tabs, oldest first, never another session's"
+  );
+  assert.equal(own._trackedAtIndex(3).url, "https://example.com/c", "the newest tab recorded at that index");
+  assert.equal(own._trackedAtIndex(4), undefined);
+  own._untrackTab("MCP_s1_b");
+  assert.equal(own._openedTabs.has("MCP_s1_b"), false);
+});
+
 test("ownership persists to owned-tabs.json on disk (atomic write)", () => {
   own._addOwnedURL("https://persisted.example/x");
   assert.equal(existsSync(OWNERSHIP_FILE), true);

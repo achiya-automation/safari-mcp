@@ -209,16 +209,37 @@ export function _removeOwnedURL(url) {
   }
 }
 
-export function _trackTab(tabIndex, url, sessionId = "", marker = "") {
+export function _trackTab(tabIndex, url, sessionId = "", marker = "", receipt = "") {
   // sessionId is what keeps the tab cap per-session. In HTTP daemon mode one process
   // serves many Claude sessions, and this map is process-wide: without it, the cap is
   // the SUM of every session's tabs, and the "close the oldest" eviction happily closed
   // a tab another session was still working in.
-  // marker is the tab's identity stamp (window.name / __mcpTabMarker). The index and the
-  // URL both go stale — indices shift, and the tab navigates — so every path that later
-  // CLOSES this tab resolves it through the marker instead (#112).
-  _openedTabs.set(tabIndex, { url: url || "", openedAt: Date.now(), sessionId, marker: marker || "" });
+  // The index and the URL both go stale — indices shift whenever a tab of the window
+  // closes or moves, and the tab navigates — so the entry carries the tab's identity: the
+  // receipt the extension minted for it, or the marker (window.name / __mcpTabMarker)
+  // stamped on a tab AppleScript opened. Every path that later CLOSES this tab resolves it
+  // through that identity (#112), and the entry is keyed by it too: keyed by index, a new
+  // tab that landed on a shifted position overwrote a live tab's entry.
+  _openedTabs.set(receipt || marker || tabIndex, {
+    index: tabIndex, url: url || "", openedAt: Date.now(), sessionId,
+    marker: marker || "", receipt: receipt || "",
+  });
   _addOwnedURL(url);
+}
+
+// This session's tracked tabs as [key, info], oldest first.
+export function _sessionTabs(sessionId) {
+  return [..._openedTabs]
+    .filter(([, info]) => (info.sessionId || "") === sessionId)
+    .sort(([, a], [, b]) => a.openedAt - b.openedAt);
+}
+
+// The newest tab recorded at `index` when it was opened. A hint, never proof: Safari
+// renumbers indices on every close, so a caller must pair it with other evidence.
+export function _trackedAtIndex(index) {
+  let hit;
+  for (const info of _openedTabs.values()) if (info.index === index) hit = info;
+  return hit;
 }
 
 export function _untrackTab(tabIndex) {

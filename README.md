@@ -381,6 +381,7 @@ What the flag deliberately does *not* do:
 | `SAFARI_MCP_HTTP_PORT` | `9225` | Port for that daemon. |
 | `SAFARI_PROFILE` | unset | Bind sessions to a named Safari profile. Unset = your ordinary windows. |
 | `SAFARI_MCP_ALLOW_USER_TABS` | off | Let `safari_switch_tab` adopt a tab **you** already had open, instead of refusing it (see below). |
+| `MCP_MAX_TABS` | `6` | Tabs one session may keep open. Opening one more closes that session's oldest tab, and `safari_new_tab` names it in `evictedTab` (its receipt). |
 | `SAFARI_MCP_RAISE_ON_NAVIGATE` | off | Let navigation bring Safari to the front, and stop the focus guard from putting your previous app back. |
 | `SAFARI_MCP_SCREENSHOT_MAX_WIDTH` | unset | Downscale every `safari_screenshot` to this pixel width (Retina captures are 2× the viewport). Per-call `maxWidth` overrides it. |
 | `SAFARI_MCP_KEEPALIVE_TAB` | off | Keep one daemon-served page open in the profile window so Safari never parks the extension worker between commands. |

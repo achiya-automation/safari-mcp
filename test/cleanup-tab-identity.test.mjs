@@ -150,14 +150,14 @@ test("no close path resolves a tracked tab by URL any more", () => {
     assert.ok(!pattern.test(index), `close-by-URL lookup is back: ${pattern}`);
   }
   assert.ok(
-    /_trackTab\(tabIndex, url, sessionId = "", marker = ""\)/.test(
+    /_trackTab\(tabIndex, url, sessionId = "", marker = "", receipt = ""\)/.test(
       readFileSync(new URL("../ownership-state.js", import.meta.url), "utf8")
     ),
-    "_trackTab must record the identity marker for the close paths to use"
+    "_trackTab must record the tab's identity (marker, receipt) for the close paths to use"
   );
-  const evictionSource = sourceBetween(index, "Tab limit (${MAX_TABS}) reached", "_untrackTab(oldestIdx)");
+  const evictionSource = sourceBetween(index, "async function _closeTrackedTab(info) {", "\n// Per-session tab cap");
   assert.ok(
-    /_verifiedTabIndex/.test(evictionSource),
-    "tab-cap eviction must re-prove the recorded index before closing"
+    /_verifiedTabIndex\(info\)/.test(evictionSource),
+    "tab-cap eviction must re-prove an AppleScript tab by its marker before closing"
   );
 });
