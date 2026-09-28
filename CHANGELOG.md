@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The AppleScript fallback acts on the tab the Safari extension opened or picked, not on the last tab AppleScript opened.** Without `SAFARI_PROFILE`, safari.js finds the session's tab by an identity marker before its index or URL, and only its own AppleScript `newTab`/`switchTab` set one. When the extension served `safari_new_tab`, `safari_switch_tab`, `safari_wait_for_new_tab` or run_script `newTab`/`switchTab`/`getReceipt`, the server moved safari.js to the new tab's index but left the marker naming the tab AppleScript had opened before. The next call without a receipt whose extension attempt failed ran its AppleScript fallback on that older tab, and `safari_close_tab` closed it — even a tab adopted from the user with `SAFARI_MCP_ALLOW_USER_TABS`, which is never closable. A tab the extension opens or picks now replaces the marker, index and URL together, and a URL the server does not track is left unknown instead of naming the previous tab. `safari_close_tab`'s fallback also forgets the tab it actually closed. `test/extension-tab-marker.test.mjs` runs the real server paths and safari.js's tab resolution over a fake Safari window.
+
 ## [2.22.4] - 2026-09-28
 
 ### Changed

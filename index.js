@@ -1938,6 +1938,9 @@ async function _runExtensionBatchAction(action, args = {}) {
       } else {
         _markBlankTabOpened();
       }
+      // safari.js still holds the marker of the last tab AppleScript opened; its fallback
+      // would go back there.
+      if (!viaAppleScript) safari.setActiveTabFromExtension(value?.tabIndex, trackUrl);
       return value;
     }
 
@@ -1953,14 +1956,19 @@ async function _runExtensionBatchAction(action, args = {}) {
       if (index !== undefined && (!Number.isInteger(index) || index < 1)) {
         throw new Error("switchTab index must be a positive integer when provided");
       }
+      let viaAppleScript = false;
       const raw = await extensionOrFallback(
         "switch_tab",
         receipt ? { ...(index ? { index } : {}), receipt } : { index },
-        () => safari.switchTab(index)
+        () => { viaAppleScript = true; return safari.switchTab(index); }
       );
       const value = _sanitizeTabResult(raw);
       const resolvedIndex = value?.tabIndex || index;
       if (resolvedIndex) safari.setActiveTabIndex(resolvedIndex);
+      // Point the AppleScript fallback at this tab, not the last one AppleScript claimed. Its
+      // URL is left unknown rather than set to the reported one: this path never registered
+      // that URL, so the ownership guard would start refusing the steps after it.
+      if (!viaAppleScript && value && typeof value === "object") safari.setActiveTabFromExtension(resolvedIndex, null);
       // A switch by index that returns no receipt still makes that tab the current one.
       // Keeping the previous tab's receipt sent every later step back to the previous tab.
       if (value && typeof value === "object") _setActiveReceipt(value.receipt || receipt);
@@ -1979,7 +1987,9 @@ async function _runExtensionBatchAction(action, args = {}) {
         () => { throw new Error("getReceipt requires the verified Safari extension"); }
       ));
       const safeValue = _sanitizeTabResult(value);
-      if (safeValue?.index) safari.setActiveTabIndex(safeValue.index);
+      // The rotated tab is now the current one. Its URL stays unknown in safari.js: a receipt
+      // is rotated because the tab left the origin this session registered.
+      if (safeValue?.index) safari.setActiveTabFromExtension(safeValue.index, null);
       if (safeValue?.receipt) {
         // Rotation retires the old token. Keep it resolving to the new one, as navigate does,
         // so the tab stays reachable — and closable by the tab cap — by the name it was opened with.
@@ -3068,6 +3078,9 @@ server.tool(
       _addOwnedURL(trackUrl);
     }
     if (!requestedUrl) _markBlankTabOpened();
+    // safari.js still holds the marker (and, for a blank tab, the URL) of the previous tab;
+    // its AppleScript fallback would go back there.
+    if (!viaAppleScript) safari.setActiveTabFromExtension(safeResult?.tabIndex, requestedUrl);
     // The eviction used to be stderr-only, so a session learned about its closed tab from
     // the next "receipt … stale" error. Say it in the response instead.
     const out = evicted && safeResult && typeof safeResult === "object"
@@ -3096,8 +3109,9 @@ server.tool(
       token ? { receipt: token } : {},
       () => { viaAppleScript = true; return safari.closeTab(); }
     );
-    // AppleScript closed the tab carrying the session's marker; the extension, the receipt's.
-    _untrackClosedTab(viaAppleScript ? { marker } : { receipt: token });
+    // The extension closed the receipt's tab. AppleScript closed the session's current one: the
+    // tab carrying its marker, or the current receipt's when the extension picked that tab.
+    _untrackClosedTab(viaAppleScript ? (marker ? { marker } : { receipt: _getActiveReceipt() }) : { receipt: token });
     // Closing another tab by its receipt leaves the current one current.
     if (viaAppleScript || closesCurrent) _clearActiveReceipt();
     return textResult(result);
@@ -3173,15 +3187,20 @@ server.tool(
         }
       } catch {}
     }
+    let viaAppleScript = false;
     const result = await extensionOrFallback(
       "switch_tab", token ? { ...(index ? { index } : {}), receipt: token } : { index },
-      () => safari.switchTab(index)
+      () => { viaAppleScript = true; return safari.switchTab(index); }
     );
     const safeResult = _sanitizeTabResult(result);
     // Sync safari.js state so AppleScript fallback targets the correct tab
     const resolvedIndex = safeResult?.tabIndex || index;
     if (resolvedIndex) safari.setActiveTabIndex(resolvedIndex);
     if (safeResult?.safeUrl) safari.setActiveTabURL(safeResult.safeUrl);
+    // …including the marker, which still names the last tab AppleScript claimed.
+    if (!viaAppleScript && safeResult && typeof safeResult === "object") {
+      safari.setActiveTabFromExtension(resolvedIndex, safeResult.safeUrl);
+    }
     if (safeResult?.receipt || token) _setActiveReceipt(safeResult?.receipt || token);
     // A switch by INDEX gets no receipt back, and the session was still holding the one it
     // minted for the PREVIOUS tab. Every later command auto-attaches that receipt, so the
@@ -3237,6 +3256,7 @@ server.tool(
       ));
       safari.setActiveTabIndex(t.index);
       safari.setActiveTabURL(t.url);
+      if (!viaAppleScript) safari.setActiveTabFromExtension(t.index, t.url);
       _trackTab(t.index, t.url, `${SESSION_ID}:${currentSessionId()}`, viaAppleScript ? safari.getActiveTabMarker() : "", switched?.receipt);
       _setActiveReceipt(switched?.receipt);
       return { content: [{ type: "text", text: `Found new tab: ${t.title} (${t.url})` }] };

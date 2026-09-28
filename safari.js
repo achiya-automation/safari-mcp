@@ -739,6 +739,19 @@ export function setActiveTabURL(url) { _st().activeTabURL = url; _st().lastResol
 
 export function getActiveTabMarker() { return _st().activeTabMarker; }
 
+// index.js calls this when the Safari extension, not this module, opened or picked the
+// session's tab. Track that tab by the index and URL the extension reported; a URL it did not
+// report stays unknown rather than naming the previous tab. The marker has to go: it names the
+// last tab AppleScript opened or claimed, and resolveActiveTab() tries it before the index and
+// URL, so every later AppleScript fallback, closeTab included, went back to that older tab.
+export function setActiveTabFromExtension(idx, url) {
+  const s = _st();
+  s.activeTabIndex = idx || null;
+  s.activeTabURL = url || null;
+  s.activeTabMarker = null;
+  s.lastResolveTime = Date.now();
+}
+
 // Find the tab carrying an EXACT identity marker. Returns its index, or null when the
 // marker is on no tab — or when the scan itself could not be completed.
 //
