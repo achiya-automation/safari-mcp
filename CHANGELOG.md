@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.22.2] - 2026-09-28
+
+### Fixed
+- **Native input refuses to run on a locked screen instead of reporting success.** On a locked Mac — the lid shut while the machine is kept awake, or the lock screen up — every CGEvent lands on loginwindow: `safari_native_click`, `safari_native_type`, `safari_native_keyboard` and `safari_native_hover` said "clicked" / "typed" while nothing reached Safari, and injected keystrokes could reach the lock screen's password field. Every raw CGEvent sender now checks the session first and fails with one `SCREEN_LOCKED` error that names the in-page tools (`safari_click`, `safari_fill`, `safari_type_text`, `safari_press_key`), which keep working while the screen is locked. `test/screen-lock-gate.test.mjs` pins the gate on every native path.
+- **`safari_upload_file` no longer reports a file dialog that never opened as an upload.** The native file-dialog path returned "Uploaded via native file dialog" with `sheet=false, input.files=0`; that is now an error. The path is gated on the lock too, and the page's file input — restyled into an invisible full-size overlay so the dialog can be opened — is restored even when the click or the dialog fails, instead of being left behind to swallow clicks.
+- **`verifyPreview` waits out a locked screen instead of escalating.** A locked screen occludes every window, Safari throttles the page, and a site can take 30–90 s to render the preview. With the screen locked the upload now polls for the preview for up to 90 s rather than judging after 1.4 s and escalating to a dialog that cannot open there; a result that still has no preview starts with `NO PREVIEW`.
+
 ## [2.22.1] - 2026-09-28
 
 ### Security

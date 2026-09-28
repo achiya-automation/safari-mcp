@@ -1060,6 +1060,26 @@ function _helperPreflight(timeout = 3000) {
   }));
 }
 
+// ========== SCREEN LOCK GATE ==========
+// A locked screen (the lid shut on an awake Mac, or the lock screen up) routes every OS-level
+// event to loginwindow: CGEvent clicks and keys land on the lock screen — keystrokes even in its
+// password field — while the native tools used to report "clicked"/"typed". In-page tools keep
+// working while locked, so every native path fails fast here and points there instead.
+export const SCREEN_LOCKED_MSG =
+  "SCREEN_LOCKED: the Mac's screen is locked, so OS-level (native) input would land on the lock screen " +
+  "instead of Safari. In-page tools still work while locked: use safari_click / safari_fill / " +
+  "safari_type_text / safari_press_key, and safari_upload_file without forceNative.";
+
+export async function isScreenLocked() {
+  return execFileAsync("/bin/sh", ["-c",
+    "ioreg -n Root -d1 -r -a 2>/dev/null | grep -c CGSSessionScreenIsLocked || true"])
+    .then((r) => String(r.stdout).trim() !== "0").catch(() => false);
+}
+
+export async function assertScreenUnlocked(probe = isScreenLocked) {
+  if (await probe()) throw new Error(SCREEN_LOCKED_MSG);
+}
+
 // ========== NATIVE CLICK VIA CGEVENT ==========
 // Sends a CGEvent click command to the Swift helper daemon.
 // This produces isTrusted: true events — bypasses WAF protection (G2, etc.)
@@ -1071,7 +1091,8 @@ function _helperNativeClick(x, y, doubleClick = false, windowId = 0, timeout = 5
   return _withTargetTabFronted(() => _helperNativeClickRaw(x, y, doubleClick, windowId, timeout));
 }
 
-function _helperNativeClickRaw(x, y, doubleClick = false, windowId = 0, timeout = 5000) {
+async function _helperNativeClickRaw(x, y, doubleClick = false, windowId = 0, timeout = 5000) {
+  await assertScreenUnlocked();
   return _withHelperLock(() => new Promise((resolve, reject) => {
     if (!_helperProc) startHelper();
     if (!_helperProc || !_helperProc.stdin || !_helperProc.stdin.writable) {
@@ -1118,7 +1139,8 @@ function _helperNativeClickRaw(x, y, doubleClick = false, windowId = 0, timeout 
 
 // Sends a CGEvent hover command to the Swift helper daemon.
 // Moves the cursor to (x, y), dwells to let tooltips render, optionally restores cursor.
-function _helperNativeHover(x, y, windowId = 0, dwellMs = 500, restoreMouse = true, timeout = 10000) {
+async function _helperNativeHover(x, y, windowId = 0, dwellMs = 500, restoreMouse = true, timeout = 10000) {
+  await assertScreenUnlocked();
   return _withHelperLock(() => new Promise((resolve, reject) => {
     if (!_helperProc) startHelper();
     if (!_helperProc || !_helperProc.stdin || !_helperProc.stdin.writable) {
@@ -1168,7 +1190,8 @@ function _helperNativeKeyboard(keyCode, flags = [], windowId = 0, timeout = 5000
   return _withTargetTabFronted(() => _helperNativeKeyboardRaw(keyCode, flags, windowId, timeout));
 }
 
-function _helperNativeKeyboardRaw(keyCode, flags = [], windowId = 0, timeout = 5000) {
+async function _helperNativeKeyboardRaw(keyCode, flags = [], windowId = 0, timeout = 5000) {
+  await assertScreenUnlocked();
   return _withHelperLock(() => new Promise((resolve, reject) => {
     if (!_helperProc) startHelper();
     if (!_helperProc || !_helperProc.stdin || !_helperProc.stdin.writable) {
@@ -3620,10 +3643,7 @@ async function _screenshotFronted({ fullPage }) {
       try {
         // A locked screen captures as solid black. Say so instead of returning a
         // black rectangle the caller has to guess at.
-        const locked = await execFileAsync("/bin/sh", ["-c",
-          "ioreg -n Root -d1 -r -a 2>/dev/null | grep -c CGSSessionScreenIsLocked || true"])
-          .then((r) => String(r.stdout).trim() !== "0").catch(() => false);
-        if (locked) {
+        if (await isScreenLocked()) {
           throw new Error("SCREEN_LOCKED");
         }
         const boundsRaw = await osascript(
@@ -4568,12 +4588,21 @@ export async function uploadFile({ selector, filePath, forceNative = false, veri
   let ghostPickup = false;
   if (verifyPreview && !forceNative && /verified [1-9]\d* file/i.test(result)) {
     const before = Number((result.match(/\[previews=(-?\d+)\]/) || [])[1] ?? -1);
-    await new Promise((r) => setTimeout(r, 1400));
-    const after = Number(
+    const countPreviews = async () => Number(
       await runJS(
         `(function(){try{var n=document.querySelectorAll('img[src^="blob:"], img[src^="data:image"], video[src^="blob:"]').length;var all=document.querySelectorAll('div,span,a,figure');for(var i=0;i<all.length;i++){var b=all[i].style&&all[i].style.backgroundImage||'';if(b.indexOf('blob:')>-1||b.indexOf('data:image')>-1)n++;}return n;}catch(_){return -1;}})()`
       ).catch(() => -1)
     );
+    // Locked screen: every window is occluded, Safari throttles the page, and the site can take
+    // 30–90 s to render the preview (GBP, 26.9.2026) — while the native-dialog escalation cannot
+    // run at all. So poll for up to 90 s instead of judging after 1.4 s.
+    const locked = await isScreenLocked();
+    const deadline = Date.now() + (locked && before >= 0 ? 90000 : 0);
+    let after;
+    do {
+      await new Promise((r) => setTimeout(r, locked ? 2000 : 1400));
+      after = await countPreviews();
+    } while (Date.now() < deadline && !(before >= 0 && after > before));
     if (before >= 0 && after >= 0 && after <= before) {
       ghostPickup = true;
       console.error(`[Safari MCP] upload_file: ghost pickup on ${sel} (previews ${before}→${after}) — escalating to native dialog`);
@@ -4585,7 +4614,7 @@ export async function uploadFile({ selector, filePath, forceNative = false, veri
       finalResult = await _nativeFileUpload(sel, resolvedPath, safeName);
       if (ghostPickup) finalResult = `${finalResult} [escalated: synthetic pickup produced no preview]`;
     } catch (nativeErr) {
-      finalResult = `${result} | Native file-dialog ${forceNative ? '(forced)' : '(ghost-pickup escalation)'} failed: ${nativeErr.message}`;
+      finalResult = `${ghostPickup ? "NO PREVIEW — the page never showed the file. " : ""}${result} | Native file-dialog ${forceNative ? '(forced)' : '(ghost-pickup escalation)'} failed: ${nativeErr.message}`;
     }
   } else if (/verified 0 file|Upload attempted|el\.files is empty/i.test(result)) {
     try {
@@ -4607,6 +4636,8 @@ export async function uploadFile({ selector, filePath, forceNative = false, veri
 // drives the dialog via System Events (Cmd+Shift+G → path → Return → Return). `sel` is
 // already escJsSingleQuote-escaped by the caller.
 async function _nativeFileUpload(sel, absPath, safeName) {
+  // Gate first: step 1 restyles the input into an invisible full-size overlay.
+  await assertScreenUnlocked();
   // 1. Make the input clickable (hidden inputs have no hit-box) and read its viewport centre.
   const coordsJson = await runJS(
     `(function(){var el=document.querySelector('${sel}');if(!el){var all=document.querySelectorAll('*');for(var i=0;i<all.length;i++){var sr=all[i].shadowRoot;if(sr){el=sr.querySelector('${sel}');if(el)break;}}}if(!el)return JSON.stringify({error:'Element not found: ${sel}'});el.setAttribute('data-mcp-oldstyle',el.getAttribute('style')||'');el.style.cssText='position:fixed !important;top:42% !important;left:38% !important;width:320px !important;height:120px !important;opacity:0.02 !important;z-index:2147483647 !important;display:block !important;visibility:visible !important;pointer-events:auto !important';var r=el.getBoundingClientRect();return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)});})()`
@@ -4615,6 +4646,27 @@ async function _nativeFileUpload(sel, absPath, safeName) {
   try { c = JSON.parse(coordsJson); } catch { throw new Error("coord parse failed: " + coordsJson); }
   if (c.error) throw new Error(c.error);
 
+  let dlgStatus;
+  let filesLen;
+  try {
+    dlgStatus = await _clickInputAndDriveDialog(c, absPath);
+  } finally {
+    // 4. Restore the input's original style — also when the click or the dialog threw, or the
+    //    page keeps an invisible full-size overlay that swallows clicks.
+    filesLen = await runJS(
+      `(function(){var el=document.querySelector('${sel}');if(!el)return 'gone';var old=el.getAttribute('data-mcp-oldstyle');if(old!==null){if(old){el.setAttribute('style',old);}else{el.removeAttribute('style');}el.removeAttribute('data-mcp-oldstyle');}return String(el.files?el.files.length:0);})()`
+    ).catch(() => "?");
+  }
+  // A dialog that never opened selected nothing; reporting "Uploaded" here sent callers on as if it had.
+  if (/sheet=false/.test(dlgStatus)) {
+    throw new Error(`the OS file dialog never opened (${dlgStatus}, input.files=${filesLen}) — nothing was selected`);
+  }
+  return `Uploaded via native file dialog (isTrusted): ${safeName} — input.files=${filesLen}, ${dlgStatus}. Real OS selection; accepted by isTrusted-gated handlers (GitHub etc.). Verify with safari_snapshot.`;
+}
+
+// Steps 2–3 of _nativeFileUpload: a native click on the restyled input opens the NSOpenPanel,
+// then System Events drives it. Returns the dialog status ("sheet=true|false" or "osaerr:…").
+async function _clickInputAndDriveDialog(c, absPath) {
   // 2. Native (CGEvent, isTrusted:true) click on the input → opens the OS file dialog.
   const geo = await _getSafariWindowGeometry();
   if (!geo.windowId) throw new Error("no Safari window id (cannot native-click without focus steal)");
@@ -4635,7 +4687,7 @@ async function _nativeFileUpload(sel, absPath, safeName) {
   // Activate + drive the dialog in ONE osascript so Safari stays frontmost throughout (a
   // separate activate call would be undone by osascript()'s focus-guard restore). Generous
   // timeout: the sheet-wait + Cmd+Shift+G + typing a long path can exceed the 10s default.
-  const dlgStatus = await osascript(
+  const status = await osascript(
     `tell application "Safari" to activate
     delay 0.3
     tell application "System Events"
@@ -4659,13 +4711,8 @@ async function _nativeFileUpload(sel, absPath, safeName) {
     end tell`,
     { timeout: 30000 }
   ).catch((e) => "osaerr:" + e.message);
-
-  // 4. Restore the input's original style, then report the resulting file count.
   await new Promise((r) => setTimeout(r, 900));
-  const filesLen = await runJS(
-    `(function(){var el=document.querySelector('${sel}');if(!el)return 'gone';var old=el.getAttribute('data-mcp-oldstyle');if(old!==null){if(old){el.setAttribute('style',old);}else{el.removeAttribute('style');}el.removeAttribute('data-mcp-oldstyle');}return String(el.files?el.files.length:0);})()`
-  ).catch(() => "?");
-  return `Uploaded via native file dialog (isTrusted): ${safeName} — input.files=${filesLen}, ${dlgStatus}. Real OS selection; accepted by isTrusted-gated handlers (GitHub etc.). Verify with safari_snapshot.`;
+  return status;
 }
 
 // ========== PASTE IMAGE FROM FILE ==========
