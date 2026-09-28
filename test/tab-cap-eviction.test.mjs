@@ -483,12 +483,9 @@ test("closing another tab by its receipt leaves the current tab current", () => 
   const start = index.indexOf('server.tool(\n  "safari_close_tab"');
   const tool = index.slice(start, index.indexOf("\n);", start));
   assert.match(tool, /const closesCurrent = !token \|\| token === _getActiveReceipt\(\);/);
-  // AppleScript closes the current tab: the marked one, or, when the extension picked it (no
-  // marker — test/extension-tab-marker.test.mjs), the current receipt's.
-  assert.match(
-    tool,
-    /_untrackClosedTab\(viaAppleScript \? \(marker \? \{ marker \} : \{ receipt: _getActiveReceipt\(\) \}\) : \{ receipt: token \}\);/
-  );
+  // AppleScript closes only the tab carrying the session's marker: a close that names a
+  // receipt never falls back to it (test/fallback-tab-proof.test.mjs).
+  assert.match(tool, /_untrackClosedTab\(viaAppleScript \? \{ marker \} : \{ receipt: token \}\);/);
   assert.match(tool, /if \(viaAppleScript \|\| closesCurrent\) _clearActiveReceipt\(\);/);
   assert.doesNotMatch(tool, /_untrackTab\(activeIdx\)/, "an index names nothing once a tab has closed");
 

@@ -135,12 +135,17 @@ test("the proven-ownership helper fails closed to null", () => {
   const start = safari.indexOf("async function _provenOwnTabIndex(");
   assert.ok(start > 0, "_provenOwnTabIndex should own this decision in one place");
   const body = safari.slice(start, safari.indexOf("\n}", start));
+  // findTabByMarker() answers null for no marker, a marker on no tab, or a scan that failed.
   assert.match(
     body,
-    /resolveActiveTab\(\)/,
-    "ownership is proven by re-resolving the identity marker, not by trusting a stale index"
+    /findTabByMarker\(_st\(\)\.activeTabMarker\)/,
+    "ownership is proven by the identity marker, not by trusting a stale index"
   );
-  assert.match(body, /\|\| null/, "an unresolved tab must read as null, never as an index");
+  assert.doesNotMatch(
+    body,
+    /resolveActiveTab/,
+    "resolveActiveTab() falls back to a URL prefix, a domain or the bare index: guesses, not proof (#112)"
+  );
 });
 
 test("close_tab is not exempt from the shared tab-ownership assertion", () => {

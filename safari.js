@@ -3965,16 +3965,22 @@ export async function newTab(url = "") {
 
 // A tab index this session can prove it owns, or null. Destructive paths only: they may
 // never guess, so "can't prove it" has to read as null rather than as the front document.
-// `resolveActiveTab()` re-finds the tab through its identity marker (surviving the index
-// shifts of #54) and fails closed to null when the marker is on no tab at all.
+// The proof is the identity marker, found wherever the tab is now (surviving the index
+// shifts of #54): the rule the tab cap and shutdown cleanup already follow (#112). Not
+// resolveActiveTab(), which can answer without one — a URL prefix, a domain, the bare index.
 async function _provenOwnTabIndex() {
-  return (await resolveActiveTab()) || null;
+  return findTabByMarker(_st().activeTabMarker);
 }
 
-// `explicitIndex` — the caller naming the tab, the same opt-out convention the identity
-// guard uses. Internal cleanup resolves its own indices out of the opened-tab table and
-// passes them here; everything else must prove ownership.
+// `explicitIndex` — a tab the caller already proved is ours. Internal cleanup resolves its
+// own indices out of the opened-tab table by their markers and passes them here. An index a
+// caller merely named proves nothing (closeOwnTab); everything else must prove ownership.
 export async function closeTab(explicitIndex) {
+  // The index is written into AppleScript source below, so nothing but a tab number may get
+  // there: a string index from run_script carried statements of its own, `do shell script` too.
+  if (explicitIndex !== undefined && !(Number.isInteger(explicitIndex) && explicitIndex > 0)) {
+    throw new Error("closeTab: explicitIndex must be a positive integer");
+  }
   await refreshTargetWindow();
 
   // ── Guard: close nothing this session cannot prove it owns. There is deliberately no
@@ -4036,8 +4042,25 @@ export async function closeTab(explicitIndex) {
   return "Tab closed";
 }
 
+// A close that names its tab by index: run_script's closeTab. That index is the caller's,
+// not a tab this module proved. Handed to closeTab() as `explicitIndex`, it closed whatever
+// tab sat there, the user's included, while the ownership guard had checked the current tab.
+// Only the tab carrying this session's marker closes here, and only when it is the one named.
+export async function closeOwnTab(index) {
+  if (index != null && Number(index) !== (await _provenOwnTabIndex())) {
+    throw new Error(
+      `Tab safety: refusing to close tab ${index} — AppleScript proves a tab only by the marker ` +
+      `this session stamped on it, and tab ${index} does not carry it.`
+    );
+  }
+  return closeTab();
+}
+
 export async function switchTab(index) {
   const idx = Number(index);
+  // A switch by receipt alone used to arrive here with no index at all, and claimed tab NaN
+  // under a marker stamped on no tab.
+  if (!Number.isInteger(idx) || idx < 1) throw new Error("switchTab needs the tab's index (a positive integer)");
   _st().activeTabIndex = idx;
   // Claiming this tab: stamp it with a FRESH identity marker so resolveActiveTab can
   // re-find it after the user shifts tab indices. A fresh marker (not a reused one)
@@ -5189,7 +5212,7 @@ export async function runScript({ steps, onStep }) {
         navigate: (a) => navigate(a.url),
         reload: (a) => reload(a.hard ?? a.hardReload ?? false),
         newTab: (a) => newTab(a.url || ""),
-        closeTab: (a) => closeTab(a.index),
+        closeTab: (a) => closeOwnTab(a.index),
         switchTab: (a) => switchTab(a.index),
         navigateAndRead: (a) => navigateAndRead(a.url, a),
         click, doubleClick, rightClick, fill, clearField, typeText,

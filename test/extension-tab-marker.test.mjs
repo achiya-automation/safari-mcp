@@ -231,14 +231,15 @@ for (const path of PATHS) {
   });
 }
 
-test("safari_close_tab's AppleScript fallback closes the tab the extension opened, and forgets that one", async () => {
+test("safari_close_tab's AppleScript fallback leaves the tab the extension opened to the extension", async () => {
   const { window, safari } = session({ opens: true });
-  // The extension opens B, then fails the close, which falls over to AppleScript.
+  // The extension opens B, then fails the close. B's receipt names it, and only the extension
+  // can tell which tab a receipt names, so AppleScript closes nothing (fallback-tab-proof.test).
   const server = loadServer(safari, extension(window, ["new_tab"]));
   await server.safari_new_tab({ url: B_URL });
-  await server.safari_close_tab({});
-  assert.deepEqual(window.tabs.map((t) => t.url), [USER_URL, A_URL], "B closed; A and the user's tab still open");
-  assert.deepEqual([...own._openedTabs.values()].map((t) => t.url), [A_URL], "B's record went with it, A's stayed");
+  await assert.rejects(server.safari_close_tab({}), /Tab safety/);
+  assert.deepEqual(window.tabs.map((t) => t.url), [USER_URL, A_URL, B_URL], "no tab closed");
+  assert.deepEqual([...own._openedTabs.values()].map((t) => t.url), [A_URL, B_URL], "both records kept");
 });
 
 // The same paths with the extension down: AppleScript opens or claims the tab and stamps a
