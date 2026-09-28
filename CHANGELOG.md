@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.22.0] - 2026-09-28
+
 ### Added
 - **Opt-in thermal backpressure.** Set `SAFARI_MCP_THERMAL_FILE` to a JSON file whose `_t` is the chip temperature and `_ts` its epoch seconds (for example a thermal monitor's latest sample), and page-work commands wait while the chip is at or above `SAFARI_MCP_THERMAL_MAX` (default 80) — until it is 2° cooler, at most `SAFARI_MCP_THERMAL_WAIT_MS` (default 20000). Many agents working in many tabs then slow down instead of heating the Mac. Closing and listing tabs never wait, and a stale or missing reading holds nothing.
 
