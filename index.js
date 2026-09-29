@@ -2068,7 +2068,6 @@ async function _runExtensionBatchAction(action, args = {}) {
     case "navigate": {
       const url = String(args.url || "");
       if (!url) throw new Error("navigate requires url");
-      _addOwnedURL(url);
       const raw = await extensionOrFallback(
         "navigate", { url, timeout: args.timeout },
         () => safari.navigate(url)
@@ -2079,7 +2078,6 @@ async function _runExtensionBatchAction(action, args = {}) {
     case "navigateAndRead": {
       const url = String(args.url || "");
       if (!url) throw new Error("navigateAndRead requires url");
-      _addOwnedURL(url);
       const raw = await extensionOrFallback(
         "navigate_and_read", { url, maxLength: args.maxLength, timeout: args.timeout },
         async () => { await safari.navigate(url); return safari.readPage({ maxLength: args.maxLength }); }
@@ -2231,8 +2229,8 @@ async function _runExtensionBatchAction(action, args = {}) {
 // Tab-ownership assertion — shared by extensionOrFallback AND the tools that bypass it
 // (safari_run_script, native_*). Throws if the operation would land on a tab this MCP
 // session didn't open. Read-only / tab-management ops (in _noOwnershipCheck) are exempt.
-// Once any tab has been opened via new_tab, ALL subsequent page-mutating ops must target
-// an owned tab — this is what prevents navigating/clicking in the user's tabs.
+// A session with no tab of its own may only read: without one, AppleScript acts on the
+// front document, the tab the user is looking at.
 function _assertTabOwnership(opType, extensionPayload = {}) {
   if (_noOwnershipCheck.has(opType)) return;
   // Closing is the one op the opt-in never unlocks (#92, condition 2). Adoption makes a
@@ -2255,20 +2253,24 @@ function _assertTabOwnership(opType, extensionPayload = {}) {
     console.error(`[Safari MCP] "${opType}" on ${_safeUrlForOutput(currentUrl)} (user tab, opted-in)`);
     return;
   }
-  if (_ownedTabURLs.size === 0 && _openedTabs.size === 0) {
-    // No tabs opened yet — block everything except read-only ops
-    const msg = `⚠️ Tab safety: no tabs opened yet. Call safari_new_tab first before "${opType}".`;
+  // Asked of THIS session: whether it opened, claimed or adopted a tab (safari.js records that per
+  // session, for AppleScript's tabs and the extension's alike), or names one by the receipt passed
+  // with this call — a session with no state of its own yet, such as a subagent or the same agent
+  // after a reconnect. The extension applies the same rule on its own path (handleCommand in
+  // extension/background.js). It was asked of _ownedTabURLs and _openedTabs, which hold every
+  // session's tabs in this process, and through owned-tabs.json every process's, so a tab opened
+  // anywhere on the machine let a session that had none write, into the user's tab.
+  if (!_receiptToken(extensionPayload.receipt) && !safari.hasOwnedTab()) {
+    const msg = `⚠️ Tab safety: refusing "${opType}" — this MCP session has no tab of its own, so it would act on the tab in front, which is the user's. Open one with safari_new_tab, or pass the receipt of a tab you opened, with the call or to safari_switch_tab (a receipt survives reconnects and restarts).`;
     console.error(`[Safari MCP] ${msg}`);
     throw new Error(msg);
   }
-  if (currentUrl && !_isURLOwned(currentUrl)) {
-    // about:blank tabs are owned if we have any tracked tabs (new_tab creates them at about:blank)
-    const isBlankOwned = (currentUrl === 'about:blank' || currentUrl === 'missing value') && (_openedTabs.size > 0 || _ownedTabURLs.has(BLANK_TAB_SENTINEL));
-    if (!isBlankOwned) {
-      const msg = `⚠️ Tab safety: refusing "${opType}" — current tab (${_safeUrlForOutput(currentUrl)}) was not opened by this MCP session. Use safari_new_tab or safari_switch_tab to target your own tab.`;
-      console.error(`[Safari MCP] ${msg}`);
-      throw new Error(msg);
-    }
+  // A blank tab has no URL to own; the current tab of a session that has one is its own.
+  const blank = currentUrl === 'about:blank' || currentUrl === 'missing value';
+  if (currentUrl && !blank && !_isURLOwned(currentUrl)) {
+    const msg = `⚠️ Tab safety: refusing "${opType}" — current tab (${_safeUrlForOutput(currentUrl)}) was not opened by this MCP session. Use safari_new_tab or safari_switch_tab to target your own tab.`;
+    console.error(`[Safari MCP] ${msg}`);
+    throw new Error(msg);
   }
 }
 
@@ -2278,6 +2280,11 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
   _refuseUnnamedTab(extensionType, extensionPayload);
   // Tab-ownership guard — extracted to _assertTabOwnership so run_script / native_* share it.
   _assertTabOwnership(extensionType, extensionPayload);
+  // A navigation claims its destination before it starts, so a load that throws halfway still
+  // leaves the tab reachable (safari_switch_tab recovery). Only once the guard has passed: the
+  // callers used to claim it first, and the destination vouched for itself — on a clean machine
+  // it was the one owned URL the guard looked for, and a refused call left it in owned-tabs.json.
+  if (extensionType === "navigate" || extensionType === "navigate_and_read") _addOwnedURL(extensionPayload.url);
 
   // Safari may terminate an otherwise healthy profile worker between two tool
   // calls. If no command has been sent yet, waiting for its verified reconnect is
@@ -2477,11 +2484,7 @@ server.tool(
       throw new Error(`safari_navigate only opens http(s) URLs in a Safari profile ("${url.slice(0, 40)}" would leave the tab unreachable). To free the tab, use safari_close_tab.`);
     }
     const oldUrl = safari.getActiveTabURL();
-    // Pre-register the destination as owned BEFORE navigating. We are navigating OUR
-    // tab, so the target URL is ours even if navigate() throws mid-load on a slow SPA.
-    // Without this, a slow/failed navigate left the new URL unowned and locked the
-    // switch_tab recovery out — the very recovery the lock error tells you to use.
-    _addOwnedURL(url);
+    // extensionOrFallback claims the destination for this session once its guard passes.
     let result = await extensionOrFallback(
       "navigate", { url, ..._explicitReceipt({ receipt }) },
       () => safari.navigate(url)
@@ -2597,13 +2600,10 @@ server.tool(
     maxLength: z.coerce.number().optional().describe("Max chars to return (default: 50000)"),
     timeout: z.coerce.number().optional().describe("Load timeout in ms (default: 30000)"),
   },
-  async ({ url, maxLength, timeout }) => {
+  async ({ url, maxLength, timeout, receipt }) => {
     const oldUrl = safari.getActiveTabURL();
-    // Pre-register destination as owned BEFORE navigating (see safari_navigate) so a
-    // slow/throwing navigate on a heavy SPA cannot lock switch_tab recovery out.
-    _addOwnedURL(url);
     const result = await extensionOrFallback(
-      "navigate_and_read", { url, maxLength, timeout },
+      "navigate_and_read", { url, maxLength, timeout, ..._explicitReceipt({ receipt }) },
       async () => {
         await safari.navigate(url);
         return safari.readPage({ maxLength });
@@ -2865,8 +2865,11 @@ server.tool(
     value: z.string().describe("Option value or visible label to select"),
   },
   async (args) => {
-    // The engine calls below can bypass extensionOrFallback — assert ownership here.
-    _assertTabOwnership("select_option");
+    // The receipt first: for a caller with no state of its own it is what names the tab, and the
+    // guard has to see it. The engine calls below can bypass extensionOrFallback — assert
+    // ownership here.
+    const pin = _explicitReceipt(args);
+    _assertTabOwnership("select_option", pin);
     // ref path: resolve via mcpFindRef (reaches iframes/shadow DOM) on the AppleScript
     // engine — the extension's select_option handler is selector-only.
     if (args.ref) {
@@ -2874,7 +2877,7 @@ server.tool(
       return { content: [{ type: "text", text: typeof refResult === 'string' ? refResult : JSON.stringify(refResult) }] };
     }
     let result = await extensionOrFallback(
-      "select_option", { selector: args.selector, value: args.value, ..._explicitReceipt(args) },
+      "select_option", { selector: args.selector, value: args.value, ...pin },
       () => safari.selectOption(args)
     );
     // If extension returned "Selected: " with empty/default value, fuzzy match may have failed.
