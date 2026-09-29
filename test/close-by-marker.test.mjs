@@ -134,6 +134,7 @@ function session() {
 // index.js's close paths for tabs this process tracked, over the same safari.js.
 const indexParts = [
   between(indexSource, "async function _closeTrackedTab(info) {", "\n// Per-session tab cap"),
+  between(indexSource, "let _closeQueue = Promise.resolve();", "\n// A URL a call takes"),
   between(indexSource, "async function _cleanupTabs() {", "\n// Periodic memory check"),
 ].join("\n");
 function loadServer(safari, opened) {

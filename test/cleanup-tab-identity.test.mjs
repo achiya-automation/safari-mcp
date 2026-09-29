@@ -26,11 +26,11 @@ function sourceBetween(source, startNeedle, endNeedle) {
   return source.slice(start, end).trim();
 }
 
-const cleanupSource = sourceBetween(
-  index,
-  "async function _cleanupTabs() {",
-  "\n// Periodic memory check"
-);
+// Cleanup runs its closes through the server's close queue.
+const cleanupSource = [
+  sourceBetween(index, "let _closeQueue = Promise.resolve();", "\n// A URL a call takes"),
+  sourceBetween(index, "async function _cleanupTabs() {", "\n// Periodic memory check"),
+].join("\n");
 
 // Build the extracted cleanup over a fake Safari. `tabs` is the live window: each entry is
 // the index, the URL currently loaded, and the marker stamped on that tab (if any).

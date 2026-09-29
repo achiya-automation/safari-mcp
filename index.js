@@ -228,7 +228,7 @@ async function _evictOldestTab(sessionId) {
   let open = mine.length;
   for (const [key, info] of mine) {
     if (open < MAX_TABS) break;
-    const outcome = await _closeTrackedTab(info);
+    const outcome = await _oneCloseAtATime(() => _closeTrackedTab(info));
     // It may still be open: keep counting it and retry it at the next new tab. Close the next
     // only through the extension, which fails fast: an AppleScript close that failed, a page that
     // never answers the marker check, would cost every tracked tab its own timeout.
@@ -267,6 +267,59 @@ function _untrackClosedTab({ receipt = "", marker = "" }) {
   }
 }
 
+// One tab close at a time in this process. closeTabByMarker() checks a tab's marker and closes the
+// tab in one script, but as two AppleEvents, and a close sent in between renumbered the window: the
+// index the check found then named the next tab, the user's included. Two tab-cap evictions at once
+// could do it (safari_new_tab and run_script newTab, in parallel), as could an eviction next to
+// safari_close_tab. An extension close goes by tab id, but it renumbers the window all the same.
+// ponytail: this orders the closes of one server process (every session of an HTTP daemon); a close
+// by another MCP process can still land between those two events. A slow extension close holds up
+// the rest, shutdown cleanup included, which then leaves the tabs open after its 3s.
+let _closeQueue = Promise.resolve();
+function _oneCloseAtATime(close) {
+  const run = _closeQueue.then(() => close());
+  _closeQueue = run.catch(() => {});
+  return run;
+}
+
+// A URL a call takes the session's tab to, and with no scheme its https:// form, which is what
+// safari.js navigate() loads. Strings only: run_script step args are not validated. Closing a tab
+// opened on the URL releases both forms (_claimedForms in ownership-state.js).
+function _claimURL(url) {
+  if (typeof url !== "string" || !url) return;
+  _addOwnedURL(url);
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(url)) _addOwnedURL("https://" + url);
+}
+
+// Open a tab through AppleScript as one of the session's own: its URL claimed, and the tab tracked
+// by the marker safari.newTab() mints for it, so the session's tab cap, shutdown cleanup and the
+// memory sweep count and close it, and a close forgets it. The URL the caller asked for stays the
+// session's current one wherever the page redirected: the site chose the redirect's target.
+// newTab() names the marker (onMarker) as soon as the tab exists, and can still throw after that,
+// when marking or reading the new tab fails; the tab is claimed and tracked then too. Left out, it
+// outlived the cap and cleanup, and the next write was refused in it as "not opened by this MCP
+// session". A newTab() that threw before the tab existed named no marker. The marker newTab()
+// names, not the session's after the call: a parallel call of the same session changes that one,
+// and a switch that adopted the user's tab (SAFARI_MCP_ALLOW_USER_TABS) meanwhile got the user's
+// tab recorded among the ones the cap and cleanup close.
+async function _openTabViaAppleScript(url) {
+  const mySession = `${SESSION_ID}:${currentSessionId()}`;
+  let minted = null;
+  try {
+    return await safari.newTab(url, { onMarker: (marker) => { minted = marker; } });
+  } finally {
+    if (minted) {
+      _trackTab(safari.getActiveTabIndex(), url, mySession, minted); // the index is only a hint
+      if (!url || url === "about:blank") {
+        _markBlankTabOpened();
+      } else {
+        safari.setActiveTabURL(url);
+        _claimURL(url);
+      }
+    }
+  }
+}
+
 // Only the extension can tell which tab a receipt names: AppleScript proves a tab by the
 // marker stamped on it (#112), and a tab the extension opened carries none. A close or switch
 // by receipt whose extension attempt failed fell back to the session's current tab instead,
@@ -296,7 +349,7 @@ async function _cleanupTabs() {
   // with no index would close only this session's active tab (#68).
   for (const info of [..._openedTabs.values()]) {
     try {
-      await safari.closeTabByMarker(info.marker);
+      await _oneCloseAtATime(() => safari.closeTabByMarker(info.marker));
     } catch {}
   }
   _openedTabs.clear();
@@ -362,7 +415,7 @@ async function _closeOldestMCPTab() {
   if (oldestIdx !== null) {
     // By its identity, like the tab cap: an extension-opened tab carries a receipt, not a
     // marker, and a marker-only close forgot it here without freeing anything.
-    await _closeTrackedTab(_openedTabs.get(oldestIdx));
+    await _oneCloseAtATime(() => _closeTrackedTab(_openedTabs.get(oldestIdx)));
     _untrackTab(oldestIdx);
   }
 }
@@ -3132,7 +3185,7 @@ server.tool(
     let viaAppleScript = false;
     const rawResult = await extensionOrFallback(
       "new_tab", { url: requestedUrl },
-      () => { viaAppleScript = true; return safari.newTab(requestedUrl); }
+      () => { viaAppleScript = true; return _openTabViaAppleScript(requestedUrl); }
     );
     // AppleScript fallback returns a JSON string; extension returns an object — normalize
     let result = rawResult;
@@ -3144,9 +3197,8 @@ server.tool(
     // remains internal and is never copied into the MCP response.
     if (safeResult?.tabIndex) {
       safari.setActiveTabIndex(safeResult.tabIndex);
-      // safari.js holds the marker of the last tab AppleScript opened, so it names THIS tab
-      // only when AppleScript just opened it.
-      _trackTab(safeResult.tabIndex, requestedUrl, mySession, viaAppleScript ? safari.getActiveTabMarker() : "", safeResult.receipt);
+      // A tab AppleScript opened is tracked by _openTabViaAppleScript, by its marker.
+      if (!viaAppleScript) _trackTab(safeResult.tabIndex, requestedUrl, mySession, "", safeResult.receipt);
       // The new tab is the current one, with or without a receipt.
       _setActiveReceipt(safeResult.receipt);
     }
@@ -3182,18 +3234,23 @@ server.tool(
     // tab's receipt, and the tab the caller was still working in closed instead of the one it named.
     const token = supplied ? _receiptToken(supplied) : _getActiveReceipt();
     if (supplied && !token) return errorResult("Tab safety: invalid tab receipt");
-    const closesCurrent = !token || token === _getActiveReceipt();
-    const marker = safari.getActiveTabMarker();
+    let closesCurrent = false, marker = null;
     let viaAppleScript = false;
-    const result = await extensionOrFallback(
-      "close_tab",
-      token ? { receipt: token } : {},
-      () => {
-        if (token) throw _receiptNeedsExtension("close_tab");
-        viaAppleScript = true;
-        return safari.closeTab();
-      }
-    );
+    // One close at a time (_oneCloseAtATime). Which tab is current is read when this close's turn
+    // comes: a parallel call can switch tabs while it waits, and AppleScript closes the one current then.
+    const result = await _oneCloseAtATime(() => {
+      closesCurrent = !token || token === _getActiveReceipt();
+      marker = safari.getActiveTabMarker();
+      return extensionOrFallback(
+        "close_tab",
+        token ? { receipt: token } : {},
+        () => {
+          if (token) throw _receiptNeedsExtension("close_tab");
+          viaAppleScript = true;
+          return safari.closeTab();
+        }
+      );
+    });
     // The extension closed the receipt's tab; AppleScript, the tab carrying the session's marker.
     _untrackClosedTab(viaAppleScript ? { marker } : { receipt: token });
     // Closing another tab by its receipt leaves the current one current.
@@ -3725,17 +3782,11 @@ server.tool(
     // AppleScript and loses the verified profile/tab-id boundary; they use the
     // extension-only dispatcher below.
     if (!process.env.SAFARI_PROFILE) {
-      // A URL a step takes the session's tab to, and with no scheme its https:// form, which is
-      // what safari.js navigate() loads. Strings only: step args are not validated.
-      const claimURL = (url) => {
-        if (typeof url !== "string" || !url) return;
-        _addOwnedURL(url);
-        if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(url)) _addOwnedURL("https://" + url);
-      };
+      const mySession = `${SESSION_ID}:${currentSessionId()}`;
       const onStep = (action, stepArgs) => {
         if (action === "navigate" || action === "navigateAndRead") {
           _assertTabOwnership(`run_script:${action}`);
-          claimURL(stepArgs?.url);
+          _claimURL(stepArgs?.url);
           return;
         }
         // These steps run through AppleScript here, which cannot tell which tab a receipt names:
@@ -3772,24 +3823,30 @@ server.tool(
           return _runExtensionBatchAction("switchTab", { index: Number(index) });
         }
       };
-      // A newTab step claims its tab as safari_new_tab does, once the step has opened it. It used
-      // to claim nothing, and safari.newTab() makes the page the tab landed on the session's
-      // current URL, so every write step after newTab{url} was refused on the session's own tab.
-      // The session keeps the URL it asked for as its current one and claims only that: a
-      // redirect's target was chosen by the site, and when the user switches windows during the
-      // load it is the URL of the user's tab.
+      // A newTab step opens its tab as safari_new_tab does: under the session's tab cap, which first
+      // closes the session's oldest tab when it already has MAX_TABS, and as one of the session's
+      // own tabs, claimed and tracked (_openTabViaAppleScript). It used to claim nothing, so every
+      // write step after newTab{url} was refused on the session's own tab, and to track nothing, so
+      // a batch's tabs escaped the cap, shutdown cleanup and the memory sweep.
       const newTab = async ({ url }) => {
-        const requested = String(url || "");
-        const result = await safari.newTab(requested);
-        if (!requested || requested === "about:blank") {
-          _markBlankTabOpened();
-        } else {
-          safari.setActiveTabURL(requested);
-          claimURL(requested);
-        }
-        return result;
+        const evicted = await _evictOldestTab(mySession);
+        const result = await _openTabViaAppleScript(String(url || ""));
+        if (!evicted) return result;
+        // Name the tab the cap closed, as safari_new_tab does.
+        let tab = {};
+        try { tab = JSON.parse(result); } catch {}
+        return { ...tab, ..._evictionReport(evicted) };
       };
-      return textResult(await safari.runScript({ steps, onStep, actions: { switchTab, newTab } }));
+      // A closeTab step forgets the tab it closed, as safari_close_tab does after an AppleScript
+      // close: closeOwnTab() closes only the tab that carries the session's marker. One close at a
+      // time (_oneCloseAtATime).
+      const closeTab = ({ index }) => _oneCloseAtATime(async () => {
+        const marker = safari.getActiveTabMarker();
+        const result = await safari.closeOwnTab(index);
+        _untrackClosedTab({ marker });
+        return result;
+      });
+      return textResult(await safari.runScript({ steps, onStep, actions: { switchTab, newTab, closeTab } }));
     }
 
     // Keep every step in one MCP request/session and route it through

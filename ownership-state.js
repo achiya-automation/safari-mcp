@@ -219,8 +219,18 @@ export function _trackedAtIndex(index) {
   return hit;
 }
 
+// What a tab's claim covers: the URL it was opened on and, when that URL has no scheme, its
+// https:// form, which index.js claims along with it (_claimURL) because that is what loads.
+function _claimedForms(url) {
+  if (!url) return [];
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(url) ? [url] : [url, "https://" + url];
+}
+
 export function _untrackTab(tabIndex) {
   const info = _openedTabs.get(tabIndex);
-  if (info?.url) _removeOwnedURL(info.url);
   _openedTabs.delete(tabIndex);
+  // Release the tab's claim, except what another tracked tab still claims: a close released the URL
+  // two tabs shared, and the next write in the other one, this session's or another's, was refused.
+  const kept = new Set([..._openedTabs.values()].flatMap((other) => _claimedForms(other.url)));
+  for (const url of _claimedForms(info?.url)) if (!kept.has(url)) _removeOwnedURL(url);
 }

@@ -35,6 +35,7 @@ import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import vm from "node:vm";
+import { answerCloseByMarker, answerMarkerScan, isCloseByMarker, isMarkerScan } from "./fake-safari-scripts.mjs";
 
 // ownership-state.js persists to ~/.safari-mcp — point HOME at a throwaway dir first.
 const tmpHome = mkdtempSync(join(tmpdir(), "smcp-fresh-"));
@@ -79,11 +80,12 @@ const RECEIPT = "ReceiptR_" + "r".repeat(24);
 // lands on its value.
 function safariWindow(tabs, front = 1, redirects = {}) {
   const w = { tabs, ran: [] };
+  const pageOf = (tab) => ({ name: tab.marker || "", __mcpTabMarker: tab.pageMarker });
   const url = (i) => tabs[i - 1]?.url || "";
   const site = (u) => { try { return new URL(u).hostname.split(".").slice(-2).join("."); } catch { return u; } };
-  const tabOf = (target) => Number(/^tab (\d+) of front window$/.exec(target)?.[1]) || front;
+  const tabOf = (target) => Number(/^tab (\d+) of (?:front window|window id 1)$/.exec(target)?.[1]) || front;
   const answer = (script) => {
-    const page = script.match(/^tell application "Safari" to do JavaScript "([\s\S]*)" in (tab \d+ of front window|front document)$/);
+    const page = script.match(/^tell application "Safari" to do JavaScript "([\s\S]*)" in (tab \d+ of (?:front window|window id 1)|front document)$/);
     if (page) {
       const i = tabOf(page[2]);
       const tab = tabs[i - 1];
@@ -99,15 +101,8 @@ function safariWindow(tabs, front = 1, redirects = {}) {
         tab.pageMarker = win.__mcpTabMarker;
       }
     }
-    const marker = script.match(/window\.name==='([^']*)'/);
-    if (marker) {
-      // A marker scan: the cached index first when there is one, then right to left.
-      const has = (i) => tabs[i - 1]?.marker === marker[1];
-      const cached = Number(script.match(/in tab (\d+) of w\) is "1"/)?.[1]);
-      if (has(cached)) return String(cached);
-      for (let i = tabs.length; i >= 1; i--) if (has(i)) return String(i);
-      return "0";
-    }
+    // A marker scan, answered as Safari runs it (fake-safari-scripts.mjs), in `window id 1`.
+    if (isMarkerScan(script)) return answerMarkerScan(script, { windowId: 1, tabs, pageOf });
     const prefix = script.match(/starts with "([^"]*)"/);
     if (prefix) {
       // resolveActiveTab's URL strategy: the cached index, a URL prefix right to left, then the
@@ -119,7 +114,7 @@ function safariWindow(tabs, front = 1, redirects = {}) {
       for (let i = tabs.length; i >= 1; i--) if (url(i).includes(domain)) return String(-i);
       return `0:${tabs.length}`;
     }
-    const load = script.match(/^tell application "Safari" to set URL of (tab \d+ of front window|front document) to "([^"]*)"$/);
+    const load = script.match(/^tell application "Safari" to set URL of (tab \d+ of (?:front window|window id 1)|front document) to "([^"]*)"$/);
     if (load) {
       // A new page: __mcpTabMarker goes with the old one, and window.name too across sites.
       const i = tabOf(load[1]);
@@ -133,14 +128,26 @@ function safariWindow(tabs, front = 1, redirects = {}) {
       // newTab() opens a background tab: the user's tab stays in front.
       const url = script.match(/URL:"([^"]*)"/)?.[1] || "about:blank";
       tabs.push({ url: redirects[url] || url, marker: null });
-      return "";
+      return /index of t/.test(script) ? `1:${tabs.length}` : "";
     }
     const close = script.match(/close tab (\d+) of/);
     if (close) return void tabs.splice(Number(close[1]) - 1, 1);
     if (/count of tabs/.test(script)) return String(tabs.length);
     throw new Error(`the fake window does not answer this AppleScript:\n${script}`);
   };
-  w.run = async (script) => answer(script);
+  w.run = async (script) => {
+    if (!isCloseByMarker(script)) return answer(script);
+    // closeTabByMarker, answered as Safari runs it: one script, but two AppleEvents, the check that
+    // finds the tab and `close tab i`. Another close can land between them, as in Safari.
+    let at = -1;
+    const answered = answerCloseByMarker(script, {
+      tabs, pageOf, close: (i) => { at = i - 1; }, blank: (i) => { tabs[i - 1].url = "about:blank"; },
+    });
+    if (answered !== "closed") return answered;
+    await new Promise((resolve) => setImmediate(resolve));
+    tabs.splice(at, 1); // whichever tab is at that index by now
+    return "closed";
+  };
   // Everything that reached tab i: page scripts, reads included, and navigations.
   w.ranIn = (i) => w.ran.filter((r) => r.tab === i);
   return w;
@@ -207,11 +214,12 @@ function loadSafari(window) {
 
 // ---------- index.js, for real ----------
 
-// The receipt helpers, the tab-ownership sets, run_script's batch actions, and
-// extensionOrFallback with its guard.
+// The receipt helpers, the tab tracking (the per-session cap, a close forgetting its tab, shutdown
+// cleanup), the tab-ownership sets, run_script's batch actions, and extensionOrFallback with its guard.
 const indexParts = [
   between(index, "function _originOf(", "\nfunction _isBatchSemanticFailure"),
-  between(index, "function _untrackClosedTab(", "\n// Close all MCP-opened tabs on process exit"),
+  between(index, "async function _closeTrackedTab(info) {", "\n// Periodic memory check"),
+  between(index, "async function _closeOldestMCPTab(", "\nfunction _startMemoryMonitor("),
   between(index, "const _noOwnershipCheck = new Set([", "\n// Origin of a URL"),
   between(index, "async function _runExtensionBatchAction(", "\n// The cookie / localStorage / sessionStorage tools"),
 ].join("\n");
@@ -252,7 +260,7 @@ function loadServer(safari, extension = NO_EXTENSION) {
       commands.push({ type, payload });
       return extension.send(type, payload);
     },
-    _evictOldestTab: async () => null, _trackTab: own._trackTab, _untrackTab: own._untrackTab,
+    MAX_TABS: 6, _sessionTabs: own._sessionTabs, _trackTab: own._trackTab, _untrackTab: own._untrackTab,
     _openedTabs: own._openedTabs, _ownedTabURLs: own._ownedTabURLs, _addOwnedURL: own._addOwnedURL,
     _removeOwnedURL: own._removeOwnedURL, _markBlankTabOpened: own._markBlankTabOpened,
     _isURLOwned: own._isURLOwned, _trackedAtIndex: own._trackedAtIndex,
@@ -266,6 +274,8 @@ function loadServer(safari, extension = NO_EXTENSION) {
     `${indexParts}
     return {
       assertTabOwnership: _assertTabOwnership,
+      cleanupTabs: _cleanupTabs,
+      closeOldestMCPTab: _closeOldestMCPTab,
       ${TOOLS.map((name) => `${name}: ${toolHandler(name)}`).join(",\n")}
     };`
   )(...Object.values(deps));
@@ -585,4 +595,434 @@ test("after a restart, a session re-anchors to its tab by receipt and keeps writ
   assert.doesNotMatch(await outcome(() => server.safari_click({ selector: "#send" })), REFUSED);
   const sent = server.commands.filter((c) => c.type !== "list_tabs"); // switch_tab looks its target up first
   assert.deepEqual(sent.map((c) => [c.type, c.payload.receipt]), [["switch_tab", RECEIPT], ["click", RECEIPT]]);
+});
+
+// ---------- 4. the tabs run_script opens are the session's to count, close and release ----------
+
+// Without SAFARI_PROFILE, run_script's newTab step opened its tab through safari.newTab() and tracked
+// nothing, where safari_new_tab tracks every tab it opens (29.9.26). The per-session tab cap counted
+// none of a batch's tabs, so seven newTab steps and a safari_new_tab left eight tabs where seven
+// safari_new_tab calls leave six. Shutdown cleanup and the memory sweep close only tracked tabs, so a
+// batch's tabs outlived the MCP process, and a closeTab step released nothing: the URL its newTab had
+// claimed stayed in owned-tabs.json. When safari.newTab() threw after the tab existed, neither
+// safari_new_tab nor the step claimed or tracked the tab, though safari.js had already made it the
+// session's current one: the next write was refused in it ("not opened by this MCP session"), and in
+// run_script that refusal replaced the newTab step's own error.
+
+const SESSION = "daemon:fresh"; // SESSION_ID:currentSessionId() for the session under test
+const pageUrl = (n) => `https://dest.example.net/page${n}`;
+const PAGES = [1, 2, 3, 4, 5, 6, 7].map(pageUrl);
+const sessionTabUrls = () => own._sessionTabs(SESSION).map(([, info]) => info.url);
+
+// A batch's step results.
+async function batch(server, steps) {
+  return JSON.parse((await server.safari_run_script({ steps })).content[0].text);
+}
+
+const OPENERS = [
+  {
+    name: "a run_script batch of seven newTab steps",
+    open: (server) => batch(server, PAGES.map((url) => ({ action: "newTab", args: { url } }))),
+  },
+  {
+    name: "seven run_script calls of one newTab step",
+    open: async (server) => { for (const url of PAGES) await batch(server, [{ action: "newTab", args: { url } }]); },
+  },
+  {
+    name: "seven safari_new_tab calls",
+    open: async (server) => { for (const url of PAGES) await server.safari_new_tab({ url }); },
+  },
+];
+
+for (const opener of OPENERS) {
+  test(`${opener.name}, then safari_new_tab, leave the session six tabs, closing the oldest first`, async () => {
+    const { window, server } = await machine("clean");
+    await opener.open(server);
+    assert.deepEqual(window.tabs.map((t) => t.url), [USER_URL, ...PAGES.slice(1)]);
+    await server.safari_new_tab({ url: OTHER_URL });
+    assert.deepEqual(window.tabs.map((t) => t.url), [USER_URL, ...PAGES.slice(2), OTHER_URL]);
+    assert.deepEqual(sessionTabUrls(), [...PAGES.slice(2), OTHER_URL]);
+  });
+}
+
+test("a newTab step that closed the session's oldest tab says so, as safari_new_tab does", async () => {
+  const { server } = await machine("clean");
+  const results = await batch(server, PAGES.map((url) => ({ action: "newTab", args: { url } })));
+  assert.ok(results.every((r) => !r.error), JSON.stringify(results));
+  assert.ok(results.slice(0, 6).every((r) => !r.result.evictedTab), "a step below the cap reported a closed tab");
+  assert.deepEqual(results[6].result.evictedTab, { safeUrl: pageUrl(1) });
+  assert.match(results[6].result.note, /Tab cap 6\/session reached — your oldest tab \(opened on https:\/\/dest\.example\.net\/page1\) was closed/);
+  assert.equal(results[6].result.tabIndex, 7, "the step's own result is still there");
+});
+
+test("shutdown cleanup closes the tabs run_script opened, and only those", async () => {
+  const { window, server } = await machine("clean");
+  await batch(server, [{ action: "newTab", args: { url: OTHER_URL } }, { action: "newTab" }]);
+  assert.equal(window.tabs.length, 3);
+  await server.cleanupTabs();
+  assert.deepEqual(window.tabs.map((t) => t.url), [USER_URL]);
+});
+
+test("a closeTab step releases what its tab's newTab step claimed, and the tab stops counting", async () => {
+  const { window, server } = await machine("clean");
+  const results = await batch(server, [
+    { action: "newTab", args: { url: OTHER_URL } },
+    { action: "newTab", args: { url: DEST } },
+    { action: "closeTab" },
+  ]);
+  assert.ok(results.every((r) => !r.error), JSON.stringify(results));
+  assert.deepEqual(window.tabs.map((t) => t.url), [USER_URL, OTHER_URL]);
+  assert.ok(!own._ownedTabURLs.has(DEST), "the closed tab's URL is still claimed");
+  assert.ok(own._ownedTabURLs.has(OTHER_URL), "the tab still open lost its claim");
+  assert.deepEqual(sessionTabUrls(), [OTHER_URL]);
+});
+
+test("safari_close_tab releases a tab run_script opened", async () => {
+  const { window, server } = await machine("clean");
+  await batch(server, [{ action: "newTab", args: { url: OTHER_URL } }]);
+  assert.doesNotMatch(await outcome(() => server.safari_close_tab({})), REFUSED_ANYWHERE);
+  assert.deepEqual(window.tabs.map((t) => t.url), [USER_URL]);
+  assert.ok(!own._ownedTabURLs.has(OTHER_URL));
+  assert.deepEqual(sessionTabUrls(), []);
+});
+
+// safari.newTab() ends by reading the new tab's title and URL. Here that read runs, but its answer
+// never comes back, as when the AppleEvent times out: by then the tab exists, and safari.js has made
+// it the session's current tab.
+function lastReadTimesOut(window) {
+  return {
+    ...window,
+    run: async (script) => {
+      const answer = await window.run(script);
+      if (/title:document\.title,url:location\.href,tabIndex:/.test(script)) {
+        throw new Error("Safari got an error: AppleEvent timed out.");
+      }
+      return answer;
+    },
+  };
+}
+
+test("a newTab step that fails after opening its tab: the batch goes on there and keeps the step's error", async () => {
+  const window = safariWindow([{ url: USER_URL, marker: null }]);
+  const server = loadServer(loadSafari(lastReadTimesOut(window)));
+  const result = await outcome(() => server.safari_run_script({ steps: [
+    { action: "newTab", args: { url: OTHER_URL } },
+    { action: "click", args: { selector: "#send" } },
+  ] }));
+  assert.doesNotMatch(result, REFUSED);
+  assert.match(result, /AppleEvent timed out/, "the newTab step's own error was lost");
+  assert.ok(window.ranIn(2).some((r) => r.js?.endsWith("/*page:click*/")), "the click did not reach the new tab");
+  assert.deepEqual(window.ranIn(1), []);
+  // The tab is the session's like any other it opened: claimed, counted, closed at shutdown.
+  assert.ok(own._ownedTabURLs.has(OTHER_URL));
+  assert.deepEqual(sessionTabUrls(), [OTHER_URL]);
+  await server.cleanupTabs();
+  assert.deepEqual(window.tabs.map((t) => t.url), [USER_URL]);
+});
+
+test("safari_new_tab that fails after opening its tab: the session's next write goes to that tab", async () => {
+  const window = safariWindow([{ url: USER_URL, marker: null }]);
+  const server = loadServer(loadSafari(lastReadTimesOut(window)));
+  assert.match(await outcome(() => server.safari_new_tab({ url: OTHER_URL })), /AppleEvent timed out/);
+  assert.doesNotMatch(await outcome(() => server.safari_click({ selector: "#send" })), REFUSED);
+  assert.ok(window.ranIn(2).some((r) => r.js?.endsWith("/*page:click*/")), "the click did not reach the new tab");
+  assert.deepEqual(window.ranIn(1), []);
+  assert.deepEqual(sessionTabUrls(), [OTHER_URL]);
+  await server.cleanupTabs();
+  assert.deepEqual(window.tabs.map((t) => t.url), [USER_URL]);
+});
+
+test("a newTab step that opened no tab claims and tracks nothing, in a session that already has a tab", async () => {
+  const window = safariWindow([{ url: USER_URL, marker: null }]);
+  let open = true;
+  const server = loadServer(loadSafari({
+    ...window,
+    run: async (script) => {
+      if (!open && /make new (tab|document)/.test(script)) throw new Error("Safari got an error: AppleEvent timed out.");
+      return window.run(script);
+    },
+  }));
+  await batch(server, [{ action: "newTab", args: { url: OTHER_URL } }]);
+  open = false;
+  const results = await batch(server, [{ action: "newTab", args: { url: DEST } }]);
+  assert.match(results[0].error, /AppleEvent timed out/);
+  assert.equal(window.tabs.length, 2);
+  assert.ok(!own._ownedTabURLs.has(DEST), "a newTab step that opened no tab claimed its URL");
+  assert.deepEqual(sessionTabUrls(), [OTHER_URL], "the session's tab was re-recorded under the URL of a tab that never opened");
+});
+
+test("a newTab step claims nothing when the session's tab closed while it failed to open one", async () => {
+  // Two calls of one session in parallel: safari_close_tab closes the session's tab while the newTab
+  // step's AppleEvent is still out, and that AppleEvent then fails. The session's marker changed during
+  // the step, to none; no tab was opened, so there is nothing to claim or track.
+  const window = safariWindow([{ url: USER_URL, marker: null }]);
+  let answerCreation;
+  const creation = new Promise((resolve) => { answerCreation = resolve; });
+  let hold = false;
+  const server = loadServer(loadSafari({
+    ...window,
+    run: async (script) => {
+      if (hold && /make new (tab|document)/.test(script)) {
+        await creation;
+        throw new Error("Safari got an error: AppleEvent timed out.");
+      }
+      return window.run(script);
+    },
+  }));
+  await batch(server, [{ action: "newTab", args: { url: OTHER_URL } }]);
+  hold = true;
+  const opening = batch(server, [{ action: "newTab", args: { url: DEST } }]);
+  await new Promise((resolve) => setImmediate(resolve)); // the step is waiting on its AppleEvent
+  assert.doesNotMatch(await outcome(() => server.safari_close_tab({})), REFUSED_ANYWHERE);
+  answerCreation();
+  const [step] = await opening;
+  assert.match(step.error, /AppleEvent timed out/);
+  assert.deepEqual(window.tabs.map((t) => t.url), [USER_URL]);
+  assert.ok(!own._ownedTabURLs.has(DEST), "a newTab step that opened no tab claimed its URL");
+  assert.deepEqual(sessionTabUrls(), []);
+});
+
+test("a tab the extension opens is not recorded under the marker of the session's AppleScript tab", async () => {
+  // safari.js keeps the marker of the tab AppleScript opened last. Recorded for a tab the extension
+  // opened, it names that earlier tab, and cleanup or the cap would close it in the new one's place.
+  let opened = 0;
+  const extension = {
+    name: "an extension that fails once",
+    connected: true,
+    send: async (type, payload) => {
+      if (type !== "new_tab") return `${type} done`;
+      if (++opened === 1) throw Object.assign(new Error("Timeout waiting for the extension (new_tab)"), { dispatched: false });
+      return { title: "", safeUrl: payload.url, receipt: RECEIPT, tabIndex: 3 };
+    },
+  };
+  const { server } = await machine("clean", extension);
+  await server.safari_new_tab({ url: OTHER_URL }); // through AppleScript: the session holds its marker
+  await server.safari_new_tab({ url: DEST }); // through the extension
+  const [[, first], [key, second]] = own._sessionTabs(SESSION);
+  assert.match(first.marker, /^MCP_/);
+  assert.deepEqual([key, second.marker], [RECEIPT, ""]);
+});
+
+// ---------- 5. parallel calls of one session ----------
+
+// A session's calls can run at once (subagents share its connection), and each changes the session's
+// tab state in safari.js. Opening a tab and closing one both reach it.
+
+const BANK = "https://bank.example.com/transfer"; // a tab of the user's, right behind the session's oldest
+
+// SAFARI_MCP_ALLOW_USER_TABS: a switch of the same session that adopts the user's tab while a newTab is
+// out changes the session's marker too, to the adoption marker (MCP_A...). The opener took that for its
+// own tab's marker and recorded the user's tab, which the cap, the memory sweep and cleanup close.
+const ADOPTION_RACES = [
+  { when: "the tab's creation fails", hold: /make new tab/, fails: true },
+  { when: "its page is still loading", hold: /"document\.readyState"/, fails: false },
+];
+const OPENS = [
+  { name: "a run_script newTab step", open: (server) => server.safari_run_script({ steps: [{ action: "newTab", args: { url: DEST } }] }) },
+  { name: "safari_new_tab", open: (server) => server.safari_new_tab({ url: DEST }) },
+];
+for (const race of ADOPTION_RACES) {
+  for (const opener of OPENS) {
+    test(`${opener.name} records nothing of the user's tab that a parallel switch adopted while ${race.when}`, async () => {
+      const flag = process.env.SAFARI_MCP_ALLOW_USER_TABS;
+      process.env.SAFARI_MCP_ALLOW_USER_TABS = "1";
+      try {
+        const window = safariWindow([{ url: USER_URL, marker: null }]);
+        let answer;
+        const held = new Promise((resolve) => { answer = resolve; });
+        let holding = true; // the first matching AppleEvent only
+        const server = loadServer(loadSafari({
+          ...window,
+          run: async (script) => {
+            if (holding && race.hold.test(script)) {
+              holding = false;
+              await held;
+              if (race.fails) throw new Error("Safari got an error: AppleEvent timed out.");
+            }
+            return window.run(script);
+          },
+        }));
+        const opening = outcome(() => opener.open(server));
+        await new Promise((resolve) => setImmediate(resolve)); // the opener waits on its AppleEvent
+        assert.match(await outcome(() => server.safari_switch_tab({ index: 1 })), /user tab, opted-in/);
+        answer();
+        await opening;
+        assert.deepEqual(own._sessionTabs(SESSION).filter(([, info]) => info.marker.startsWith("MCP_A")), [], "the adopted tab was recorded");
+        if (race.fails) assert.ok(!own._ownedTabURLs.has(DEST), "a tab that never opened had its URL claimed");
+        await server.cleanupTabs();
+        assert.equal(window.tabs[0].url, USER_URL, "cleanup closed the user's tab");
+      } finally {
+        if (flag === undefined) delete process.env.SAFARI_MCP_ALLOW_USER_TABS;
+        else process.env.SAFARI_MCP_ALLOW_USER_TABS = flag;
+      }
+    });
+  }
+}
+
+// Nothing records an adopted tab among the tabs a session opened; should one get there anyway, the
+// paths that close those tabs still leave it open.
+const ADOPTED = "MCP_Asess0001_adopted";
+for (const path of [
+  { name: "the memory sweep", run: (server) => server.closeOldestMCPTab() },
+  { name: "the tab cap", run: async (server) => { for (const url of PAGES.slice(0, 6)) await server.safari_new_tab({ url }); } },
+  { name: "shutdown cleanup", run: (server) => server.cleanupTabs() },
+]) {
+  test(`${path.name} never closes a tab that carries an adoption marker`, async () => {
+    const { window, server } = await machine("clean");
+    window.tabs[0].marker = ADOPTED;
+    own._trackTab(1, USER_URL, SESSION, ADOPTED); // the oldest record of the session
+    await path.run(server);
+    assert.equal(window.tabs[0].url, USER_URL, `${path.name} closed the adopted tab`);
+    assert.equal(window.tabs[0].marker, ADOPTED);
+  });
+}
+
+// The session has six tabs and the user has a tab right behind the oldest: [USER, page1, BANK,
+// page2..page6]. Each closer below closes page1: an opener through the tab cap, the memory sweep as
+// the oldest tab, cleanup with the rest. A close found page1 by its marker at index 2 and closed
+// index 2 a few AppleEvents later, and a parallel close in between had moved BANK there.
+async function sessionAtTheCap() {
+  const machineState = await machine("clean");
+  for (const url of PAGES.slice(0, 6)) await machineState.server.safari_new_tab({ url });
+  machineState.window.tabs.splice(2, 0, { url: BANK, marker: null });
+  return machineState;
+}
+const CLOSERS = [
+  { name: "a run_script newTab step", run: (server) => batch(server, [{ action: "newTab", args: { url: OTHER_URL } }]) },
+  { name: "safari_new_tab", run: (server) => server.safari_new_tab({ url: DEST }) },
+  { name: "the memory sweep", run: (server) => server.closeOldestMCPTab() },
+  { name: "shutdown cleanup", run: (server) => server.cleanupTabs() },
+];
+for (const [i, first] of CLOSERS.entries()) {
+  for (const second of CLOSERS.slice(i)) {
+    if (first === second && first.name === "shutdown cleanup") continue;
+    test(`${first.name} and ${second.name} at once close the session's oldest tab, never the user's behind it`, async () => {
+      const { window, server } = await sessionAtTheCap();
+      // An opener can still fail here: closes renumber the window under newTab(), which finds its new
+      // tab by index. The user's tab is the point.
+      await Promise.allSettled([first.run(server), second.run(server)]);
+      assert.ok(window.tabs.some((t) => t.url === BANK), "a close landed on the user's tab");
+      assert.ok(!window.tabs.some((t) => t.url === pageUrl(1)), "the session's oldest tab is still open");
+    });
+  }
+}
+
+// The current tab sits before the oldest, so closing it moves the oldest, and the tab behind it.
+for (const close of [
+  { name: "safari_close_tab", run: (server) => server.safari_close_tab({}) },
+  { name: "a run_script closeTab step", run: (server) => batch(server, [{ action: "closeTab" }]) },
+]) {
+  test(`${close.name} on the current tab and an eviction at once leave the user's tab open`, async () => {
+    const { window, server } = await sessionAtTheCap();
+    window.tabs.splice(1, 0, ...window.tabs.splice(3, 1)); // [USER, page2, page1, BANK, page3..page6]
+    await server.safari_switch_tab({ index: 2 });
+    await Promise.allSettled([close.run(server), server.safari_new_tab({ url: DEST })]);
+    assert.ok(window.tabs.some((t) => t.url === BANK), "a close landed on the user's tab");
+    assert.ok(!window.tabs.some((t) => t.url === pageUrl(1) || t.url === pageUrl(2)), "a close did not happen");
+  });
+}
+
+// ---------- 6. a URL two tabs share ----------
+
+test("closing one of two tabs on the same URL leaves the other one writable", async () => {
+  const { window, server } = await machine("clean");
+  const result = await outcome(() => server.safari_run_script({ steps: [
+    { action: "newTab", args: { url: DEST } },
+    { action: "newTab", args: { url: DEST } },
+    { action: "closeTab" },
+    { action: "switchTab", args: { index: 2 } },
+    { action: "click", args: { selector: "#send" } },
+  ] }));
+  assert.doesNotMatch(result, REFUSED);
+  assert.ok(window.ranIn(2).some((r) => r.js?.endsWith("/*page:click*/")), "the click did not reach the tab left open");
+  assert.ok(own._ownedTabURLs.has(DEST));
+});
+
+test("another session closing its tab on a URL leaves this session's tab on it writable", async () => {
+  const { window, server } = await machine("clean");
+  await server.safari_new_tab({ url: DEST });
+  sid = "other";
+  await batch(server, [{ action: "newTab", args: { url: DEST } }, { action: "closeTab" }]);
+  sid = "fresh";
+  assert.doesNotMatch(await outcome(() => server.safari_click({ selector: "#send" })), REFUSED);
+  assert.ok(window.ranIn(2).some((r) => r.js?.endsWith("/*page:click*/")));
+});
+
+for (const via of [
+  { name: "a closeTab step", open: (s, url) => batch(s, [{ action: "newTab", args: { url } }]), close: (s) => batch(s, [{ action: "closeTab" }]) },
+  { name: "safari_close_tab", open: (s, url) => s.safari_new_tab({ url }), close: (s) => s.safari_close_tab({}) },
+]) {
+  test(`${via.name} releases both forms a tab opened on a URL with no scheme claimed`, async () => {
+    const { window, server } = await machine("clean");
+    await via.open(server, "dest.example.net/page");
+    assert.ok(own._ownedTabURLs.has("https://dest.example.net/page"));
+    await via.close(server);
+    assert.equal(window.tabs.length, 1);
+    assert.deepEqual([...own._ownedTabURLs], []);
+  });
+}
+
+test("safari_close_tab waiting behind another close keeps the tab that was current when it was called recorded", async () => {
+  // A close waits for its turn (_oneCloseAtATime), and the session's current tab can change meanwhile.
+  // closeTab() closes the tab current when the turn comes, so that is the marker to forget: the one
+  // current at the call is still open, and forgetting it let it escape the cap and cleanup.
+  const window = safariWindow([{ url: USER_URL, marker: null }]);
+  let answer;
+  const held = new Promise((resolve) => { answer = resolve; });
+  let hold = false;
+  const server = loadServer(loadSafari({
+    ...window,
+    run: async (script) => {
+      if (hold && /window\.name==='/.test(script)) { hold = false; await held; } // the sweep's marker scan
+      return window.run(script);
+    },
+  }));
+  for (const url of PAGES.slice(0, 3)) await server.safari_new_tab({ url }); // page3 is current
+  hold = true;
+  const sweeping = server.closeOldestMCPTab(); // page1, waiting on its scan
+  await new Promise((resolve) => setImmediate(resolve));
+  const closing = server.safari_close_tab({}); // waits for the sweep
+  await new Promise((resolve) => setImmediate(resolve));
+  await server.safari_switch_tab({ index: 3 }); // page2 becomes current meanwhile
+  answer();
+  await Promise.all([sweeping, closing]);
+  assert.deepEqual(window.tabs.map((t) => t.url), [USER_URL, pageUrl(3)]);
+  assert.ok(sessionTabUrls().includes(pageUrl(3)), "the tab still open was forgotten");
+});
+
+test("safari_close_tab waiting behind another close keeps the tab the session switched to meanwhile current", async () => {
+  // Closing by the receipt that was current when the call came, it clears the session's current
+  // receipt only if that tab is still the current one when the close runs.
+  const receipts = ["ReceiptO_", "ReceiptA_", "ReceiptB_"].map((r) => r + "x".repeat(24));
+  const [RO, RA, RB] = receipts;
+  let opened = 0;
+  let answerClose;
+  const heldClose = new Promise((resolve) => { answerClose = resolve; });
+  const extension = {
+    name: "a working extension",
+    connected: true,
+    send: async (type, payload) => {
+      if (type === "new_tab") return { title: "", safeUrl: payload.url, receipt: receipts[opened++], tabIndex: 1 + opened };
+      if (type === "switch_tab") {
+        const at = receipts.indexOf(payload.receipt);
+        return { title: "", safeUrl: PAGES[at], receipt: payload.receipt, tabIndex: 2 + at, owned: true };
+      }
+      if (type === "close_tab" && payload.receipt === RO) await heldClose; // the sweep's close, still out
+      return `${type} done`;
+    },
+  };
+  const { server } = await machine("clean", extension);
+  for (const url of PAGES.slice(0, 3)) await server.safari_new_tab({ url });
+  await server.safari_switch_tab({ receipt: RA });
+  const sweeping = server.closeOldestMCPTab(); // the oldest tab, RO
+  await new Promise((resolve) => setImmediate(resolve));
+  const closing = server.safari_close_tab({}); // RA, the current tab when called
+  await new Promise((resolve) => setImmediate(resolve));
+  await server.safari_switch_tab({ receipt: RB }); // meanwhile the session moves on to RB
+  answerClose();
+  await Promise.all([sweeping, closing]);
+  await server.safari_click({ selector: "#send" });
+  const closes = server.commands.filter((c) => c.type === "close_tab").map((c) => c.payload.receipt);
+  assert.deepEqual(closes, [RO, RA]);
+  assert.equal(server.commands.at(-1).payload.receipt, RB, "the session lost the receipt of its current tab");
 });

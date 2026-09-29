@@ -5499,7 +5499,7 @@ export async function runScript({ steps, onStep, actions: overrides = {} }) {
         replaceEditorContent, uploadFile, mockNetworkRoute,
       };
       // index.js takes over an action where it has more to go on (switchTab: the extension;
-      // newTab: the tab ownership it keeps).
+      // newTab and closeTab: the tab ownership it keeps).
       const fn = overrides[action] || actions[action];
       if (!fn) {
         results.push({ action, error: `Unknown action: ${action}` });

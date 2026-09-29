@@ -234,10 +234,13 @@ function loadSafari(extension) {
   };
   return {
     ...state, appleScript,
-    newTab: async (url) => {
+    // Like safari.newTab(), it names the new tab's marker (onMarker) as soon as the tab exists.
+    newTab: async (url, { onMarker } = {}) => {
       appleScript.push("newTab");
       const tab = extension.open(url);
-      return JSON.stringify({ ...claim(tab), tabIndex: extension.tabs.indexOf(tab) + 1 });
+      const page = claim(tab);
+      onMarker?.(tab.marker);
+      return JSON.stringify({ ...page, tabIndex: extension.tabs.indexOf(tab) + 1 });
     },
     switchTab: async (tabIndex) => {
       appleScript.push("switchTab");
