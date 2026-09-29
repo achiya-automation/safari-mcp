@@ -87,7 +87,7 @@ function safariWindow(tabs) {
   const url = (i) => tabs[i - 1]?.url || "";
   const site = (u) => { try { return new URL(u).hostname.split(".").slice(-2).join("."); } catch { return u; } };
   const answer = (script) => {
-    const page = script.match(/^tell application "Safari" to do JavaScript "([\s\S]*)" in tab (\d+) of front window$/);
+    const page = script.match(/^tell application "Safari" to do JavaScript "([\s\S]*)" in tab (\d+) of (?:front window|window id 1)$/);
     if (page) {
       const tab = tabs[Number(page[2]) - 1];
       if (!tab) throw new Error(`Safari got an error: Can't get tab ${page[2]} of window 1.`);
@@ -224,6 +224,7 @@ function loadSafari(window, id = "sess0001") {
     setFocusGuard() {},
     restoreFocusIfStolen: async () => {},
     listTabs: async () => JSON.stringify(window.tabs.map((t, i) => ({ index: i + 1, title: "", url: t.url }))),
+    listWindowTabs: async () => ({ win: "window id 1", tabs: window.tabs.map((t, i) => ({ index: i + 1, title: "", url: t.url })) }),
   });
 }
 

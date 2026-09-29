@@ -3314,14 +3314,38 @@ server.tool(
   },
   async ({ timeout, urlContains }) => {
     const timeoutMs = timeout || 10000;
+    // Every listing says where it came from. AppleScript lists one window, the one its first
+    // listing read (`win`), and a claim through AppleScript goes to that window: listings of
+    // whichever window was in front made a tab of the user's other window look new, and the
+    // claim stamped the session's own marker on it. A listing from the other source starts the
+    // comparison over instead of comparing tabs across them.
+    let win = null;
+    const list = async () => {
+      let via = "extension";
+      const raw = await extensionOrFallback("list_tabs", {}, async () => {
+        via = "applescript";
+        const listed = await safari.listWindowTabs(win);
+        win = listed.win;
+        return listed.tabs;
+      });
+      return { via, tabs: typeof raw === "string" ? JSON.parse(raw) : raw };
+    };
     // Switch to the new tab and own it for THIS session, else the next interaction trips the
     // tab-safety guard. Its marker names it only if AppleScript made the switch (and stamped
-    // it); the extension answers with the tab's receipt instead.
-    const adopt = async (t) => {
+    // it); the extension answers with the tab's receipt instead. AppleScript claims only a tab
+    // its own listing of the pinned window saw: an index the extension listed is a position in
+    // the extension's window, not in the one AppleScript would stamp.
+    const adopt = async (t, via) => {
       let viaAppleScript = false;
       const switched = _sanitizeTabResult(await extensionOrFallback(
         "switch_tab", { index: t.index },
-        () => { viaAppleScript = true; return safari.switchTab(t.index, { claim: true }); }
+        () => {
+          viaAppleScript = true;
+          if (via !== "applescript" || !win) {
+            throw new Error("Tab safety: the new tab was seen by the Safari extension, which could not switch to it, and AppleScript cannot tell which tab of its own window that is. Retry safari_wait_for_new_tab.");
+          }
+          return safari.switchTab(t.index, { claim: true, win });
+        }
       ));
       safari.setActiveTabIndex(t.index);
       safari.setActiveTabURL(t.url);
@@ -3336,40 +3360,41 @@ server.tool(
       return { content: [{ type: "text", text: `Found new tab: ${t.title} (${t.url})` }] };
     };
     // Get current tab list
-    const beforeRaw = await extensionOrFallback("list_tabs", {}, () => safari.listTabs());
-    const beforeTabs = typeof beforeRaw === 'string' ? JSON.parse(beforeRaw) : beforeRaw;
-    const beforeIds = new Set(beforeTabs.map(t => `${t.index}:${t.url}`));
-    const beforeCount = beforeTabs.length;
+    let before = await list();
+    let beforeIds = new Set(before.tabs.map(t => `${t.index}:${t.url}`));
 
     // Poll for new tab — detect by count increase + new entries (handles about:blank tabs)
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 500));
-      const nowRaw = await extensionOrFallback("list_tabs", {}, () => safari.listTabs());
-      const nowTabs = typeof nowRaw === 'string' ? JSON.parse(nowRaw) : nowRaw;
-      if (nowTabs.length > beforeCount) {
+      const now = await list();
+      if (now.via !== before.via) {
+        before = now;
+        beforeIds = new Set(now.tabs.map(t => `${t.index}:${t.url}`));
+        continue;
+      }
+      if (now.tabs.length > before.tabs.length) {
         // Find the new tab(s) — could be about:blank initially (OAuth popups)
-        for (const tab of nowTabs) {
+        for (const tab of now.tabs) {
           if (!beforeIds.has(`${tab.index}:${tab.url}`)) {
             // Wait for about:blank to resolve to actual URL — dynamic polling instead of fixed delay
             if (tab.url === 'about:blank') {
               let resolved = null;
               for (let attempt = 0; attempt < 10; attempt++) {
                 await new Promise(r => setTimeout(r, 300)); // 300ms intervals, max 3s total
-                const refreshed = await extensionOrFallback("list_tabs", {}, () => safari.listTabs());
-                const refreshedTabs = typeof refreshed === 'string' ? JSON.parse(refreshed) : refreshed;
-                resolved = refreshedTabs.find(t => t.index === tab.index);
+                const refreshed = await list();
+                resolved = refreshed.via === now.via ? refreshed.tabs.find(t => t.index === tab.index) : null;
                 if (resolved && resolved.url !== 'about:blank') break;
                 resolved = null;
               }
               if (resolved && resolved.url !== 'about:blank') {
                 if (urlContains && !resolved.url.includes(urlContains)) continue;
-                return await adopt(resolved);
+                return await adopt(resolved, now.via);
               }
               continue;
             }
             if (urlContains && !tab.url.includes(urlContains)) continue;
-            return await adopt(tab);
+            return await adopt(tab, now.via);
           }
         }
       }

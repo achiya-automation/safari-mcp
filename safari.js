@@ -4003,6 +4003,34 @@ export async function listTabs() {
   return JSON.stringify(tabs, null, 2);
 }
 
+// One window's tabs, for a caller that compares listings over time: `win` pins the window
+// (`window id N`), and with none the target window is listed. The answer names the window it
+// listed, so the next listing and a claim address that window. Listings of 'front window' read
+// whichever window was in front at each call, and a tab of one window looked new in the other.
+// Returns { win, tabs: [{ index, title, url }] }.
+export async function listWindowTabs(win) {
+  if (win && !/^window id \d+$/.test(win)) throw new Error("listWindowTabs: win must be a `window id N` reference");
+  await refreshTargetWindow();
+  const result = await osascript(`tell application "Safari"
+  set w to ${win || getTargetWindowRef()}
+  set output to (id of w) as text
+  set tabIndex to 1
+  repeat with t in every tab of w
+    set output to output & linefeed & (tabIndex as text) & (ASCII character 9) & name of t & (ASCII character 9) & URL of t
+    set tabIndex to tabIndex + 1
+  end repeat
+  return output
+end tell`);
+  const [id, ...lines] = String(result).split("\n");
+  return {
+    win: _windowById(id),
+    tabs: lines.filter((line) => line.trim()).map((line) => {
+      const parts = line.split("\t");
+      return { index: parseInt(parts[0]), title: parts[1] || "", url: parts[2] || "" };
+    }),
+  };
+}
+
 // `onMarker(marker)` hears the marker that names the new tab as soon as the tab exists, before
 // anything below can fail: comparing the session's marker before and after the call is misled by
 // a parallel call of the same session.
@@ -4268,12 +4296,14 @@ export async function closeOwnTab(index) {
 // an adoption (#92), stamped with the session's adoption marker. `claim` takes it as the session's
 // own: the tab safari_wait_for_new_tab saw open. Only those callers pass them. A tab that carries the
 // session's adoption marker keeps that family whatever the caller passes, so no switch turns a tab
-// adopted from the user into one the session can close.
-export async function switchTab(index, { adopt = false, claim = false } = {}) {
+// adopted from the user into one the session can close. `win` (`window id N`) names the window the
+// caller saw the tab in; without it, the index is one of the target window.
+export async function switchTab(index, { adopt = false, claim = false, win } = {}) {
   const idx = Number(index);
   // A switch by receipt alone used to arrive here with no index at all, and claimed tab NaN
   // under a marker stamped on no tab.
   if (!Number.isInteger(idx) || idx < 1) throw new Error("switchTab needs the tab's index (a positive integer)");
+  if (win && !/^window id \d+$/.test(win)) throw new Error("switchTab: win must be a `window id N` reference");
   // Claiming this tab: stamp it with a FRESH identity marker so resolveActiveTab can
   // re-find it after the user shifts tab indices. A fresh marker (not a reused one)
   // ensures a previously-claimed tab — which still carries the old marker string —
@@ -4295,7 +4325,7 @@ export async function switchTab(index, { adopt = false, claim = false } = {}) {
     `if(!a&&!o&&!${adopt || claim})return '';var f=a||${adopt}&&!o;` +
     `var r=JSON.stringify({title:document.title,url:location.href,adopted:f});` +
     `if(f)${_buildStampJS(adoptedMarker)};else ${_buildStampJS(marker)};return r;})()`;
-  const script = `tell application "Safari" to do JavaScript "${js.replace(/"/g, '\\"')}" in tab ${idx} of ${getTargetWindowRef()}`;
+  const script = `tell application "Safari" to do JavaScript "${js.replace(/"/g, '\\"')}" in tab ${idx} of ${win || getTargetWindowRef()}`;
   // Fast daemon first; a hiccup retries once through the reliable subprocess (a second run stamps the same marker).
   const result = String(await osascriptFast(script, { timeout: 5000 }).catch(() => osascript(script, { timeout: 8000 }))).trim();
   if (!result) {
