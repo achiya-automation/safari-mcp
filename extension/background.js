@@ -1114,6 +1114,22 @@ async function handleCommand(type, payload) {
       };
     }
 
+    // Puts the MCP session's identity marker on its tab. The server's AppleScript side knows tabs
+    // only by their position in a window, so it acts only on the tab that carries the session's
+    // marker, and a tab this extension opened or picked gets it here, where the tab is known by
+    // its id. Like any write, it reaches only a tab this session owns or a receipt names (the
+    // ownership guard above), never merely the tab in front. A fixed function, unlike evaluate,
+    // so no page CSP can refuse it.
+    case "mark_tab": {
+      const marker = String(payload.marker || "");
+      if (!tabId || !/^MCP_[A-Za-z0-9_]+$/.test(marker)) throw new Error("mark_tab requires a tab and an MCP_ marker");
+      return await execInTab((m) => {
+        window.name = m;
+        window.__mcpTabMarker = m;
+        return window.name === m;
+      }, [marker], tabId);
+    }
+
     case "get_title": {
       return targetTab.title;
     }
