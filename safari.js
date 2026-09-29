@@ -280,7 +280,8 @@ async function _restoreClipboard(savedContent) {
 // wrong (often the user's) tab. Now keyed per MCP session via _st(). Field notes:
 //   activeTabIndex  — null = use front document (default)
 //   activeTabURL    — URL-based tracking (stable even when tabs shift)
-//   hasOwnedTab     — once true (after first safari_new_tab in the session), write ops
+//   hasOwnedTab     — once true (after the session's first tab, whether AppleScript or the
+//                     extension opened or picked it), write ops
 //                     (navigate/click/fill) MUST NOT fall back to "current tab of window"
 //                     (the USER'S tab). The 30s grace window was insufficient — tracking
 //                     can be lost late in a session (e.g. tab ghost recovery in runJS);
@@ -289,6 +290,9 @@ async function _restoreClipboard(savedContent) {
 //   lastTabCount    — track tab count for smart cache invalidation
 //   activeTabMarker — window.__mcpTabMarker; survives same-tab navigation, bulletproof id
 //   markerId        — per-session unique id baked into the marker string
+//   tabFromExtension — the current tab is one the Safari extension opened or picked, so only
+//                     the extension can put the marker on it (see resolveActiveTab)
+//   marking         — that request while it runs, shared by parallel calls
 const _sessions = new Map();
 function _st() {
   const sid = currentSessionId();
@@ -296,7 +300,7 @@ function _st() {
   if (!s) {
     s = { activeTabIndex: null, activeTabURL: null, hasOwnedTab: false,
           lastResolveTime: 0, lastTabCount: null, activeTabMarker: null,
-          markerId: randomUUID().slice(0, 8) };
+          tabFromExtension: false, marking: null, markerId: randomUUID().slice(0, 8) };
     _sessions.set(sid, s);
   }
   return s;
@@ -518,10 +522,20 @@ function _assertNotFallingBackToUserTab(opName) {
   if (_st().hasOwnedTab) {
     throw new Error(
       `Tab tracking lost — refusing to ${opName} via fallback to "current tab of window" (would target the user's active tab). ` +
-      `This session previously opened its own tab via safari_new_tab; re-run safari_new_tab to recover, or call safari_list_tabs and safari_switch_tab to re-anchor to a known tab.`
+      `This session previously opened its own tab via safari_new_tab; re-run safari_new_tab to recover, or call safari_list_tabs and safari_switch_tab to re-anchor to a tab this session opened.`
     );
   }
   // No tab ever owned by this session — fallback to front document is intentional.
+}
+
+// The tab index for a step that names its tab explicitly (a navigation or a poll across one, where
+// the page load clears the marker): this session's tab, proven by its marker, or null for a
+// session that never owned a tab, meaning the front document. An index read straight from the
+// session state named whatever tab had shifted into it.
+async function _sessionTabIndex(opName) {
+  const idx = await resolveActiveTab();
+  _assertNotFallingBackToUserTab(opName);
+  return idx || null;
 }
 
 function getFallbackTarget() {
@@ -739,22 +753,49 @@ export function setActiveTabURL(url) { _st().activeTabURL = url; _st().lastResol
 
 export function getActiveTabMarker() { return _st().activeTabMarker; }
 
-// Find the tab carrying an EXACT identity marker. Returns its index, or null when the
-// marker is on no tab — or when the scan itself could not be completed.
-//
-// resolveActiveTab() resolves *this session's current* tab and falls back to a URL match;
-// this one takes the marker as an argument and has no fallback, because its callers are
-// the destructive ones (shutdown cleanup, tab eviction). They hold a tab recorded minutes
-// earlier: its index has shifted and it may have navigated, so a URL match there can land
-// on a tab the USER opened on the same URL and close that instead (#112, the same
-// principle as #68). No proof of identity means no close.
-export async function findTabByMarker(marker) {
-  if (!marker) return null;
-  const safeMarker = String(marker).replace(/'/g, "\\'");
-  const check = `(function(){try{return (window.name==='${safeMarker}'||window.__mcpTabMarker==='${safeMarker}')?'1':'0'}catch(e){return '0'}})()`;
-  const scanScript = `tell application "Safari"
+// index.js calls this when the Safari extension, not this module, opened or picked the
+// session's tab. The index the extension reports is a position in the extension's window,
+// which need not be AppleScript's front window, and a tab the user closes or drags moves
+// another tab (theirs) into that position. It proves nothing, so the session tracks no index
+// until resolveActiveTab() finds the marker the extension puts on the tab. The URL stays for
+// index.js's ownership checks; one the extension did not report stays unknown rather than
+// naming the previous tab. The old marker has to go: it names the last tab AppleScript opened
+// or claimed. The session owns a tab from here on, as it does after newTab(): once it cannot
+// prove where this one is, the fallbacks refuse instead of running in the front document.
+export function setActiveTabFromExtension(_reportedIndex, url) {
+  const s = _st();
+  s.activeTabIndex = null;
+  s.activeTabURL = url || null;
+  s.activeTabMarker = null;
+  s.marking = null;
+  s.hasOwnedTab = true;
+  s.tabFromExtension = true;
+  s.lastResolveTime = Date.now();
+}
+
+// How index.js has the Safari extension put a marker on the tab it opened or picked:
+// `(marker) => Promise<boolean>`. The extension knows that tab by its id and AppleScript only
+// by its position, so this is the only way such a tab can be proven. Unset, it stays unproven.
+let _markTabViaExtension = null;
+export function setExtensionTabMarker(fn) { _markTabViaExtension = fn; }
+
+// Scan the target window for the tab carrying `marker`, trying tab `hint` first. Returns that
+// tab's index, 0 when the scan completed and no tab carries the marker, or null when the scan
+// could not be completed.
+async function _scanForMarker(marker, hint) {
+  try {
+    const safeMarker = String(marker).replace(/'/g, "\\'");
+    const check = `(function(){try{return (window.name==='${safeMarker}'||window.__mcpTabMarker==='${safeMarker}')?'1':'0'}catch(e){return '0'}})()`;
+    // One AppleScript call loops every tab internally: faster and far more reliable than N
+    // separate daemon round-trips (a daemon hiccup mid-scan used to mis-resolve to the user's tab).
+    const scanScript = `tell application "Safari"
     set w to ${getTargetWindowRef()}
     set n to count of tabs of w
+    ${hint ? `try
+      if n is greater than or equal to ${hint} then
+        if (do JavaScript "${check}" in tab ${hint} of w) is "1" then return ${hint}
+      end if
+    end try` : ''}
     repeat with i from n to 1 by -1
       try
         if (do JavaScript "${check}" in tab i of w) is "1" then return i
@@ -762,64 +803,89 @@ export async function findTabByMarker(marker) {
     end repeat
     return 0
   end tell`;
-  // Fast daemon first; a hiccup retries once through the reliable subprocess.
-  let res = await osascriptFast(scanScript).catch(() => null);
-  if (res === null) res = await osascript(scanScript).catch(() => null);
-  if (res === null) return null;
-  const found = Number(String(res).trim());
-  return found > 0 ? found : null;
+    // Fast daemon first; a hiccup retries once through the reliable subprocess.
+    let res = await osascriptFast(scanScript).catch(() => null);
+    if (res === null) res = await osascript(scanScript).catch(() => null);
+    if (res === null) return null;
+    return Math.max(0, Number(String(res).trim()) || 0);
+  } catch {
+    return null; // the target window is gone (a named profile's window closed)
+  }
 }
 
-// Resolve our tracked URL to current tab index — single combined osascript call
+// Find the tab carrying an EXACT identity marker. Returns its index, or null when the
+// marker is on no tab — or when the scan itself could not be completed.
+//
+// resolveActiveTab() resolves *this session's current* tab, and can have the extension mark it
+// again; this one takes the marker as an argument and has no fallback, because its callers are
+// the destructive ones (shutdown cleanup, tab eviction). They hold a tab recorded minutes
+// earlier: its index has shifted and it may have navigated, so a URL match there can land
+// on a tab the USER opened on the same URL and close that instead (#112, the same
+// principle as #68). No proof of identity means no close.
+export async function findTabByMarker(marker) {
+  if (!marker) return null;
+  return (await _scanForMarker(marker)) || null;
+}
+
+// Page JavaScript that is true when the page carries a marker this session stamped, in window.name
+// or, once a page has taken window.name over, in window.__mcpTabMarker. Every marker the session
+// stamps starts with its markerId: on a tab it opened, on one it switched to or adopted, and on one
+// the extension marked for it (resolveActiveTab). A switch by index has no other proof that the tab
+// is the session's: an index names whatever tab sits there, and the user can have the same URL open.
+function _sessionMarkerTestJS() {
+  return `(function(p){try{return String(window.name).indexOf(p)===0||String(window.__mcpTabMarker).indexOf(p)===0}catch(e){return false}})('MCP_${_st().markerId}_')`;
+}
+
+// The index of this session's tab, or null.
+//
+// A session that has owned a tab acts only on a tab it can prove is its own, and the proof is its
+// identity marker (window.name, or window.__mcpTabMarker after SPA routing), found on the tab now.
+// Nothing else counts. An index is a position: a tab the user closes or drags, or another front
+// window, puts one of their tabs there. A URL can be open in the user's tabs too: a prefix match
+// on a site root, or the domain anywhere in their URL, picked those, and nothing checked the tab
+// again when the script ran. A tab the extension opened or picked starts with no marker, so the
+// extension puts one on it when AppleScript first needs the tab, and again once a cross-site load
+// has cleared window.name. With no proof this returns null, and the callers refuse rather than run
+// in the front document.
+//
+// A session that never owned a tab keeps what it tracks, which in the default mode is nothing:
+// null means the front document, the page the user is looking at.
 async function resolveActiveTab() {
-  if (!_st().activeTabURL && !_st().activeTabMarker) return _st().activeTabIndex;
-
-  // Strategy 1: identity marker — window.name (survives ALL navigation: full loads,
-  // redirects, cross-origin) or window.__mcpTabMarker (survives SPA routing).
-  // One AppleScript call loops every tab internally: faster and far more reliable
-  // than N separate daemon round-trips (a daemon hiccup mid-scan used to silently
-  // mis-resolve to the user's tab).
-  if (_st().activeTabMarker) {
-    try {
-      const safeMarker = _st().activeTabMarker.replace(/'/g, "\\'");
-      const check = `(function(){try{return (window.name==='${safeMarker}'||window.__mcpTabMarker==='${safeMarker}')?'1':'0'}catch(e){return '0'}})()`;
-      const scanScript = `tell application "Safari"
-        set w to ${getTargetWindowRef()}
-        set n to count of tabs of w
-        ${_st().activeTabIndex ? `try
-          if n is greater than or equal to ${_st().activeTabIndex} then
-            if (do JavaScript "${check}" in tab ${_st().activeTabIndex} of w) is "1" then return ${_st().activeTabIndex}
-          end if
-        end try` : ''}
-        repeat with i from n to 1 by -1
-          try
-            if (do JavaScript "${check}" in tab i of w) is "1" then return i
-          end try
-        end repeat
-        return 0
-      end tell`;
-      // Fast daemon first; if it hiccups, retry once via reliable subprocess.
-      let res = await osascriptFast(scanScript).catch(() => null);
-      if (res === null) res = await osascript(scanScript).catch(() => null);
-      if (res !== null) {
-        const found = Number(String(res).trim());
-        if (found > 0) { _st().activeTabIndex = found; return found; }
-        // Reliable scan completed and the marker is on NO tab — it is genuinely
-        // gone (tab closed, or a site overwrote window.name). Drop it; the URL
-        // strategy below is the last chance before we fail safe.
-        _st().activeTabMarker = null;
+  const s = _st();
+  if (s.hasOwnedTab) {
+    let marked = false;
+    for (;;) {
+      if (!s.activeTabMarker && s.tabFromExtension && _markTabViaExtension && !marked) {
+        marked = true;
+        // Parallel calls share one request: a second marker would replace the first on the tab
+        // while the first call still scans for it. If the session moves to another tab meanwhile,
+        // the request is dropped, so the previous tab's marker never becomes the current one's.
+        if (!s.marking) {
+          const marker = `MCP_${s.markerId}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+          const marking = _markTabViaExtension(marker).catch(() => false).then((ok) => {
+            if (s.marking !== marking) return;
+            s.marking = null;
+            if (ok && s.tabFromExtension) s.activeTabMarker = marker;
+          });
+          s.marking = marking;
+        }
+        await s.marking;
       }
-      // res === null → both attempts errored; can't verify — keep marker, fall through.
-    } catch { /* fall through to URL strategy */ }
+      if (!s.activeTabMarker) break;
+      const found = await _scanForMarker(s.activeTabMarker, s.activeTabIndex);
+      if (found) { s.activeTabIndex = found; return found; }
+      // The scan did not complete: keep the marker for the next call, but prove nothing now.
+      if (found === null) break;
+      // No tab carries it: the tab closed, a cross-site load or the page itself replaced
+      // window.name, or it is in another window. Only the extension can mark its tab again.
+      s.activeTabMarker = null;
+    }
+    console.error("[Safari MCP] This session's tab is not proven (no tab in the window carries its marker) — refusing to act on a tab by position or URL");
+    s.activeTabIndex = null;
+    return null;
   }
 
-  if (!_st().activeTabURL) {
-    // No URL to resolve. If this session owns a tab but the marker is gone, we can
-    // no longer positively identify our tab — refuse to return a stale index that
-    // may now point at the user's tab. runJS will throw a clear re-anchor error.
-    if (_st().hasOwnedTab && !_st().activeTabMarker) { _st().activeTabIndex = null; }
-    return _st().activeTabIndex;
-  }
+  if (!s.activeTabURL) return s.activeTabIndex;
 
   try {
     const safeUrl = _st().activeTabURL.replace(/"/g, '\\"');
@@ -847,25 +913,17 @@ async function resolveActiveTab() {
     // Parse result — can be "N" (found) or "0:tabCount" (not found)
     const resultStr = String(result);
     if (resultStr.includes(':')) {
-      // Not found — every exit below fails closed (drops the index); nothing here guesses.
+      // Not found.
       const tabCount = Number(resultStr.split(':')[1]) || 1;
       _st().lastTabCount = tabCount;
       _st().activeTabURL = null;
-      if (_st().hasOwnedTab && !_st().activeTabMarker) {
-        // Identity fully lost: marker gone AND URL matches no tab. Returning the
-        // stale index could silently target the user's tab. Fail safe — drop it.
-        console.error('[Safari MCP] Tab identity lost (marker + URL unresolved) — clearing index to avoid targeting the user\'s tab');
-        _st().activeTabIndex = null;
-        return null;
-      }
       if (_st().activeTabIndex && _st().activeTabIndex > tabCount) {
         // Our index is past the end of the window: the user closed a tab or tore one
         // into its own window, so the index no longer names any tab — least of all ours.
         // This used to clamp to `tabCount` ("tab ghost proactive fix"), which silently
         // retargeted us at the LAST tab in the window — the user's. That predates the
-        // identity marker (clamp: Mar 31, marker: v2.8.3 Apr 14) and was the one exit
-        // here that still guessed. Fail closed like the two branches above; callers
-        // re-anchor via _assertNotFallingBackToUserTab's "re-run safari_new_tab" error.
+        // identity marker (clamp: Mar 31, marker: v2.8.3 Apr 14) and guessed. Fail closed;
+        // callers re-anchor via _assertNotFallingBackToUserTab's "re-run safari_new_tab" error.
         console.error(`[Safari MCP] Tab identity lost (index ${_st().activeTabIndex} > tabCount ${tabCount}) — clearing index to avoid targeting the user's tab`);
         _st().activeTabIndex = null;
         return null;
@@ -1349,7 +1407,12 @@ let _tabFrontedDepth = 0;
 async function _withTargetTabFronted(fn) {
   if (_tabFrontedDepth > 0) return await fn(); // already inside a fronted section
 
-  const idx = _st().activeTabIndex;
+  // Only a tab this session can prove is its own gets the event. Without that proof the event
+  // would land in whatever tab is selected — the user's.
+  const idx = _st().hasOwnedTab ? await resolveActiveTab() : _st().activeTabIndex;
+  if (!idx && _st().hasOwnedTab) {
+    throw new Error("Tab tracking lost — refusing to act in the selected tab (native input, screenshot): it is the user's. Call safari_new_tab to reopen.");
+  }
   if (!idx) return await fn(); // no owned tab — nothing to front
 
   const winRef = getTargetWindowRef();
@@ -1439,21 +1502,21 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
     .replace(/\n/g, " ")
     .replace(/\r/g, "")
     .replace(/\t/g, " ");
-  // Resolve tab: explicit tabIndex > cached index > URL-tracked tab > front document
+  // Resolve tab: explicit tabIndex > the session's tab, proven by its marker > (a session that
+  // never owned a tab) its recently verified or URL-tracked index > front document
   let idx = tabIndex;
-  if (!idx && _st().activeTabIndex && _st().activeTabURL && !_st().activeTabMarker && (Date.now() - _st().lastResolveTime < RESOLVE_CACHE_MS)) {
-    // Recently verified and tab count unchanged — use cached index.
-    // Skipped when we hold a tab marker: a live marker means re-resolving is cheap
-    // (resolveActiveTab checks the cached index first) and closes the ~100ms window in
-    // which a user tab-shift could leave the cached index pointing at the user's tab.
+  if (!idx && !_st().hasOwnedTab && _st().activeTabIndex && _st().activeTabURL && (Date.now() - _st().lastResolveTime < RESOLVE_CACHE_MS)) {
+    // Recently verified and tab count unchanged — use cached index. Never for a session that
+    // has owned a tab: its index counts only once a marker scan has just found the tab there
+    // (resolveActiveTab checks that index first, so re-resolving is cheap), which also closes
+    // the ~100ms window in which a user tab-shift could leave it pointing at the user's tab.
     idx = _st().activeTabIndex;
-  } else if (!idx && (_st().activeTabURL || _st().activeTabMarker)) {
-    // Resolve by URL or marker — the marker scan still finds an owned tab
-    // even after _st().activeTabURL has been cleared by a failed URL lookup.
+  } else if (!idx && (_st().hasOwnedTab || _st().activeTabURL)) {
     const resolved = await resolveActiveTab();
     if (resolved) { idx = resolved; _st().lastResolveTime = Date.now(); }
   }
-  // ALWAYS fall back to _st().activeTabIndex — never clear it from resolve failures
+  // A session that never owned a tab falls back to the index it tracks (usually none: the front
+  // document). An owned session's index is set only by a marker scan, and cleared when one fails.
   if (!idx) idx = _st().activeTabIndex;
   // Once this session owns a tab, never silently run on the user's current tab —
   // regardless of SAFARI_PROFILE. Without a profile getFallbackTarget() returns
@@ -1546,10 +1609,10 @@ async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
   await refreshTargetWindow();
   // Resolve tab the same way runJS does — verify cached index via URL
   let idx = tabIndex;
-  // Match runJS: resolve when EITHER the URL or the tab marker is tracked — after a
-  // redirect clears _st().activeTabURL the marker is still authoritative; skipping the
-  // scan meant large-payload ops (upload/paste) could target a stale index.
-  if (!idx && ((_st().activeTabURL && _st().activeTabURL !== 'about:blank' && _st().activeTabURL !== '') || _st().activeTabMarker)) {
+  // Match runJS: a session that has owned a tab always resolves — only its marker proves where
+  // the tab is, and skipping the scan meant large-payload ops (upload/paste) could target a
+  // stale index.
+  if (!idx && (_st().hasOwnedTab || (_st().activeTabURL && _st().activeTabURL !== 'about:blank'))) {
     const resolved = await resolveActiveTab();
     if (resolved) { idx = resolved; _st().lastResolveTime = Date.now(); }
   }
@@ -1631,15 +1694,12 @@ export async function navigate(url) {
   // Escape backslash first, then quotes; strip CR/LF — a newline would break out of
   // the AppleScript string literal and allow AppleScript injection.
   const safeUrl = targetUrl.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/[\r\n]/g, '');
-    // Resolve tab by URL first (in case indices shifted)
-    if (_st().activeTabURL) await resolveActiveTab();
-    _assertNotFallingBackToUserTab('navigate');
-    // Capture our tab index ONCE. Every internal runJS below targets it explicitly:
-    // re-resolving mid-navigation is unsafe — a cross-origin load transiently wipes
-    // window.name (a browser privacy feature) and the tracked URL is stale until the
-    // new page settles, so resolveActiveTab() would conclude "identity lost" and drop
+    // Capture our tab index ONCE, proven by its marker (indices shift). Every internal runJS
+    // below targets it explicitly: re-resolving mid-navigation is unsafe — a cross-origin load
+    // transiently wipes window.name (a browser privacy feature) and the tracked URL is stale
+    // until the new page settles, so resolveActiveTab() would conclude "identity lost" and drop
     // the very tab we are navigating.
-    const navIndex = _st().activeTabIndex;
+    const navIndex = await _sessionTabIndex('navigate');
     const navTarget = navIndex
       ? `tab ${navIndex} of ${getTargetWindowRef()}`
       : getFallbackTarget();
@@ -1824,7 +1884,7 @@ async function _pollReadyAndRead(navIndex, { maxLength } = {}) {
 
 export async function goBack() {
   await refreshTargetWindow();
-  const navIndex = _st().activeTabIndex;
+  const navIndex = await _sessionTabIndex('goBack');
   // history.back() is synchronous; the page-load wait is polled from Node (see _pollReadyAndRead).
   await runJS("history.back()", { tabIndex: navIndex, timeout: 5000 });
   const result = await _pollReadyAndRead(navIndex);
@@ -1834,7 +1894,7 @@ export async function goBack() {
 
 export async function goForward() {
   await refreshTargetWindow();
-  const navIndex = _st().activeTabIndex;
+  const navIndex = await _sessionTabIndex('goForward');
   await runJS("history.forward()", { tabIndex: navIndex, timeout: 5000 });
   const result = await _pollReadyAndRead(navIndex);
   try { const p = JSON.parse(result); if (p.url) _st().activeTabURL = p.url; } catch {}
@@ -1843,7 +1903,7 @@ export async function goForward() {
 
 export async function reload(hardReload = false) {
   await refreshTargetWindow();
-  const navIndex = _st().activeTabIndex;
+  const navIndex = await _sessionTabIndex('reload');
   // Reload destroys JS context — fire it, then poll readyState from Node.
   await runJS(hardReload ? "location.reload(true)" : "location.reload()", { tabIndex: navIndex });
   await new Promise((r) => setTimeout(r, 100)); // Brief wait for reload to start
@@ -1940,7 +2000,7 @@ async function _injectHelpersfast() {
   // that index) would inject helpers into the USER's tab. resolveActiveTab() scans for our
   // marker and is fail-closed (returns null when identity is lost), so the guard below
   // then throws instead of hitting the user's tab.
-  if (_st().hasOwnedTab && (_st().activeTabURL || _st().activeTabMarker)) {
+  if (_st().hasOwnedTab) {
     const resolved = await resolveActiveTab();
     idx = resolved || null;
   }
@@ -3917,6 +3977,7 @@ export async function newTab(url = "") {
   _st().lastTabCount = Number(tabCount);  // Update tab count cache
   _st().hasOwnedTab = true;               // Permanently true: this session has opened its own tab,
                                      // so write ops must NEVER fall back to the user's current tab.
+  _st().tabFromExtension = false;
   // Set bulletproof tab marker — stamped onto the tab by _stampTab() after load.
   // window.name survives ALL navigation (full loads, redirects, cross-origin);
   // __mcpTabMarker survives SPA routing.
@@ -3948,16 +4009,22 @@ export async function newTab(url = "") {
 
 // A tab index this session can prove it owns, or null. Destructive paths only: they may
 // never guess, so "can't prove it" has to read as null rather than as the front document.
-// `resolveActiveTab()` re-finds the tab through its identity marker (surviving the index
-// shifts of #54) and fails closed to null when the marker is on no tab at all.
+// The proof is the identity marker, found wherever the tab is now (surviving the index
+// shifts of #54): the rule the tab cap and shutdown cleanup already follow (#112). Not
+// resolveActiveTab(), which can answer without one — a URL prefix, a domain, the bare index.
 async function _provenOwnTabIndex() {
-  return (await resolveActiveTab()) || null;
+  return findTabByMarker(_st().activeTabMarker);
 }
 
-// `explicitIndex` — the caller naming the tab, the same opt-out convention the identity
-// guard uses. Internal cleanup resolves its own indices out of the opened-tab table and
-// passes them here; everything else must prove ownership.
+// `explicitIndex` — a tab the caller already proved is ours. Internal cleanup resolves its
+// own indices out of the opened-tab table by their markers and passes them here. An index a
+// caller merely named proves nothing (closeOwnTab); everything else must prove ownership.
 export async function closeTab(explicitIndex) {
+  // The index is written into AppleScript source below, so nothing but a tab number may get
+  // there: a string index from run_script carried statements of its own, `do shell script` too.
+  if (explicitIndex !== undefined && !(Number.isInteger(explicitIndex) && explicitIndex > 0)) {
+    throw new Error("closeTab: explicitIndex must be a positive integer");
+  }
   await refreshTargetWindow();
 
   // ── Guard: close nothing this session cannot prove it owns. There is deliberately no
@@ -3973,7 +4040,7 @@ export async function closeTab(explicitIndex) {
       `Tab tracking lost — refusing to close a tab this session cannot prove it opened ` +
       `(closing "current tab of window" would close the user's active tab). ` +
       `Call safari_new_tab to open a tab this session owns, or safari_list_tabs and ` +
-      `safari_switch_tab to re-anchor to a known one.`
+      `safari_switch_tab to re-anchor to a tab this session opened.`
     );
   }
 
@@ -4011,38 +4078,75 @@ export async function closeTab(explicitIndex) {
     _st().activeTabIndex = null;
     _st().activeTabURL = null;
     // The tab is gone, so its marker is too — keeping it would let a later resolve
-    // match a stale identity.
+    // match a stale identity, or have the extension mark another tab in its place.
     _st().activeTabMarker = null;
+    _st().tabFromExtension = false;
   }
   _st().lastTabCount = null;    // Invalidate — tab count changed
   _st().lastResolveTime = 0;    // Force re-resolve on next operation
   return "Tab closed";
 }
 
-export async function switchTab(index) {
+// A close that names its tab by index: run_script's closeTab. That index is the caller's,
+// not a tab this module proved. Handed to closeTab() as `explicitIndex`, it closed whatever
+// tab sat there, the user's included, while the ownership guard had checked the current tab.
+// Only the tab carrying this session's marker closes here, and only when it is the one named.
+export async function closeOwnTab(index) {
+  if (index != null && Number(index) !== (await _provenOwnTabIndex())) {
+    throw new Error(
+      `Tab safety: refusing to close tab ${index} — AppleScript proves a tab only by the marker ` +
+      `this session stamped on it, and tab ${index} does not carry it.`
+    );
+  }
+  return closeTab();
+}
+
+// `adopt` takes the tab although it carries no marker of this session: an adoption (#92), or the
+// tab safari_wait_for_new_tab saw open. Only those callers pass it.
+export async function switchTab(index, { adopt = false } = {}) {
   const idx = Number(index);
-  _st().activeTabIndex = idx;
+  // A switch by receipt alone used to arrive here with no index at all, and claimed tab NaN
+  // under a marker stamped on no tab.
+  if (!Number.isInteger(idx) || idx < 1) throw new Error("switchTab needs the tab's index (a positive integer)");
   // Claiming this tab: stamp it with a FRESH identity marker so resolveActiveTab can
   // re-find it after the user shifts tab indices. A fresh marker (not a reused one)
   // ensures a previously-claimed tab — which still carries the old marker string —
   // is never mistaken for this one.
-  _st().activeTabMarker = `MCP_${_st().markerId}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-  _st().hasOwnedTab = true;
-  await _stampTab(idx);
+  const marker = `MCP_${_st().markerId}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  // The marker makes the tab the session's own from then on: writes go there, and closeTab() closes
+  // the tab carrying it. It used to go on whatever tab sat at the index, the user's included, since
+  // run_script checked nothing first and safari_switch_tab checks only the tab's URL, which their tab
+  // on a page the session also opened passes. So the tab has to carry a marker of this session
+  // already, and one script in the page checks that, reads the title and URL, and only then stamps:
+  // no tab closed or dragged in between can put another tab under the stamp, and a switch that fails
+  // leaves both the tab and the session state as they were.
   // Do NOT visually switch the tab — it brings the Safari window to foreground
   // and interrupts the user. Visual switching only happens in screenshot() when needed.
   // AppleScript `do JavaScript in tab N` works on background tabs without switching.
-  // Get title+URL from the target tab
-  const result = await runJS(
-    `JSON.stringify({title:document.title,url:location.href})`,
-    { tabIndex: idx }
-  );
-  // Track by URL so we can find this tab even if indices shift
+  const js = `(function(){${adopt ? "" : `if(!${_sessionMarkerTestJS()})return '';`}` +
+    `var r=JSON.stringify({title:document.title,url:location.href});${_buildStampJS(marker)};return r;})()`;
+  const script = `tell application "Safari" to do JavaScript "${js.replace(/"/g, '\\"')}" in tab ${idx} of ${getTargetWindowRef()}`;
+  // Fast daemon first; a hiccup retries once through the reliable subprocess (a second run stamps the same marker).
+  const result = String(await osascriptFast(script, { timeout: 5000 }).catch(() => osascript(script, { timeout: 8000 }))).trim();
+  if (!result) {
+    throw Object.assign(new Error(
+      `Tab safety: refusing to switch to tab ${idx} — it carries no marker of this session, and AppleScript has ` +
+      `no other proof that this session opened it (a URL is none: the same page can be open in one of your tabs). ` +
+      `Open a tab with safari_new_tab, switch to a tab the Safari extension opened once safari_doctor shows the ` +
+      `extension connected, or set SAFARI_MCP_ALLOW_USER_TABS=1 so that safari_switch_tab adopts a tab you already had open.`
+    ), { unproven: true });
+  }
+  let url;
   try {
-    const parsed = JSON.parse(result);
-    _st().activeTabURL = parsed.url || null;
-  } catch {}
-  _st().lastResolveTime = Date.now();
+    url = JSON.parse(result).url || null;
+  } catch {
+    throw new Error(`switchTab: no page script runs in tab ${idx}, so no marker can find it there`);
+  }
+  // Track by URL so we can find this tab even if indices shift
+  Object.assign(_st(), {
+    activeTabIndex: idx, activeTabMarker: marker, activeTabURL: url,
+    hasOwnedTab: true, tabFromExtension: false, lastResolveTime: Date.now(),
+  });
   return result;
 }
 
@@ -5158,7 +5262,7 @@ export function refSelector(ref) {
 // Execute multiple safari.js operations in a single tool call
 // Avoids round-trip overhead of calling tools one by one
 // script is a JSON array of steps: [{action: "navigate", args: {url: "..."}}, {action: "click", args: {selector: "..."}}, ...]
-export async function runScript({ steps, onStep }) {
+export async function runScript({ steps, onStep, actions: overrides = {} }) {
   const results = [];
   for (const step of steps) {
     const { action, args = {} } = step;
@@ -5172,7 +5276,7 @@ export async function runScript({ steps, onStep }) {
         navigate: (a) => navigate(a.url),
         reload: (a) => reload(a.hard ?? a.hardReload ?? false),
         newTab: (a) => newTab(a.url || ""),
-        closeTab: (a) => closeTab(a.index),
+        closeTab: (a) => closeOwnTab(a.index),
         switchTab: (a) => switchTab(a.index),
         navigateAndRead: (a) => navigateAndRead(a.url, a),
         click, doubleClick, rightClick, fill, clearField, typeText,
@@ -5190,7 +5294,8 @@ export async function runScript({ steps, onStep }) {
         nativeClick, nativeHover, nativeType, nativeKeyboard,
         replaceEditorContent, uploadFile, mockNetworkRoute,
       };
-      const fn = actions[action];
+      // index.js takes over an action where it has more to go on (switchTab: the extension).
+      const fn = overrides[action] || actions[action];
       if (!fn) {
         results.push({ action, error: `Unknown action: ${action}` });
         continue;
@@ -5199,6 +5304,9 @@ export async function runScript({ steps, onStep }) {
       results.push({ action, result: typeof result === "string" ? result.substring(0, 2000) : result });
     } catch (err) {
       results.push({ action, error: err.message });
+      // A switch that did not happen stops the batch: the steps after it were meant for that tab,
+      // and would run in the current one.
+      if (action === "switchTab") break;
     }
   }
   return JSON.stringify(results);
@@ -6065,7 +6173,7 @@ export async function scrollToElement({ selector, text, block = "center", timeou
     // `do JavaScript` can't await an in-page delay (see _evaluateAsync).
     const safeText = escJsSingleQuote(text);
     const safeBlock = String(block).replace(/[^a-z]/gi, '') || 'center';
-    const navIndex = _st().activeTabIndex;
+    const navIndex = await _sessionTabIndex('scrollToElement');
     const stepJs =
       `(function(){` +
       `var scrollable=document.querySelector('[class*="grid"],[class*="virtual"],[class*="scroll"],[role="grid"],[role="table"]')||document.scrollingElement||document.documentElement;` +
@@ -6102,9 +6210,7 @@ export async function navigateAndRead(url, { maxLength = 50000 } = {}) {
   // Escape backslash first, then quotes; strip CR/LF — a newline would break out of
   // the AppleScript string literal and allow AppleScript injection.
   const safeUrl = targetUrl.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/[\r\n]/g, '');
-  if (_st().activeTabURL) await resolveActiveTab();
-  _assertNotFallingBackToUserTab('navigateAndRead');
-  const navIndex = _st().activeTabIndex;
+  const navIndex = await _sessionTabIndex('navigateAndRead');
   const navTarget = navIndex ? `tab ${navIndex} of ${getTargetWindowRef()}` : getFallbackTarget();
   await osascriptFast(`tell application "Safari" to set URL of ${navTarget} to "${safeUrl}"`);
   _st().activeTabURL = targetUrl;
@@ -6124,7 +6230,7 @@ export async function clickAndWait({ selector, text, waitFor: waitSelector, time
   const safeSel = selector ? esc(selector) : "";
   const safeText = text ? esc(text) : "";
   const safeWait = waitSelector ? esc(waitSelector) : "";
-  const navIndex = _st().activeTabIndex;
+  const navIndex = await _sessionTabIndex('clickAndWait');
   // Step 1: find + click — fully synchronous, so it runs inside one `do JavaScript`.
   const clickResult = await runJS(
     `(function(){
@@ -6163,7 +6269,7 @@ export async function clickAndWait({ selector, text, waitFor: waitSelector, time
 // Fill form + submit — common for login, search, etc.
 export async function fillAndSubmit({ fields, submitSelector }) {
   await fillForm({ fields });
-  const navIndex = _st().activeTabIndex;
+  const navIndex = await _sessionTabIndex('fillAndSubmit');
   if (submitSelector) {
     const sel = escJsSingleQuote(submitSelector);
     await runJS(

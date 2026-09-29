@@ -7,8 +7,8 @@
  * tabs. The pre-check must therefore require the recorded index AND the origin we
  * opened it on.
  *
- * This matters most in the AppleScript fallback, which performs the switch with no
- * ownership check of its own — there this pre-check is the only guard standing.
+ * The AppleScript fallback also needs the session's marker on the tab it claims, since
+ * a URL cannot tell the session's tab from the user's (test/fallback-tab-proof.test.mjs).
  *
  * Regression test for the 21.08 working-tree patch that relaxed the pre-check to a
  * bare `_openedTabs.has(index)`.
