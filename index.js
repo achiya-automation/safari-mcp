@@ -17,7 +17,7 @@ import {
   _openedTabs, _ownedTabURLs,
   _isURLOwned, _markBlankTabOpened, _addOwnedURL, _removeOwnedURL, _trackTab, _untrackTab,
   _sessionTabs, _trackedAtIndex,
-  allowUserTabs, _adoptUserTab, _isAdoptedURL,
+  allowUserTabs,
 } from "./ownership-state.js";
 import { WebSocketServer } from "ws";
 import { createServer } from "node:http";
@@ -2217,7 +2217,9 @@ function _assertTabOwnership(opType, extensionPayload = {}) {
   // Closing is the one op the opt-in never unlocks (#92, condition 2). Adoption makes a
   // user's tab writable, not disposable — a wrong close costs work that cannot be undone
   // (#68). Checked before every early return so the batch action and the tool share it.
-  if (opType === "close_tab" && _isAdoptedURL(safari.getActiveTabURL())) {
+  // The session's marker on the tab says it was adopted, not its URL: the tab keeps that
+  // marker wherever it navigates, and another tab on the same URL does not carry it.
+  if (opType === "close_tab" && safari.isActiveTabAdopted()) {
     const msg = `⚠️ Tab safety: refusing "close_tab" — this tab was adopted from you via SAFARI_MCP_ALLOW_USER_TABS, not opened by this MCP session. Close it yourself, or open your own tab with safari_new_tab.`;
     console.error(`[Safari MCP] ${msg}`);
     throw new Error(msg);
@@ -2228,7 +2230,7 @@ function _assertTabOwnership(opType, extensionPayload = {}) {
   if (_preferAppleScript && _receiptToken(extensionPayload.receipt || _getActiveReceipt())) return;
   const currentUrl = safari.getActiveTabURL();
   // An adopted tab (#92) is the session's target even though the session opened nothing.
-  if (_isAdoptedURL(currentUrl)) {
+  if (safari.isActiveTabAdopted()) {
     console.error(`[Safari MCP] "${opType}" on ${_safeUrlForOutput(currentUrl)} (user tab, opted-in)`);
     return;
   }
@@ -3204,7 +3206,6 @@ server.tool(
     }
 
     // Tab ownership check: verify target tab is one we opened
-    let adopted = false;
     // `_ownedTabURLs.size > 0` alone skipped this whole lookup for a session that had opened
     // nothing — fine while switch_tab could only reach owned tabs, but adoption (#92) has to
     // work from a cold session, which is precisely the "read the article in my current tab"
@@ -3234,19 +3235,12 @@ server.tool(
           // the session's marker on the tab (safari.js switchTab()).
           const trackedOrigin = _originOf(_trackedAtIndex(index)?.url);
           const isTrackedRedirect = !!trackedOrigin && trackedOrigin === _originOf(target.url);
-          if (!isBlankOwned && !isTrackedRedirect && allowUserTabs()) {
-            // The opt-in turns this refusal into a deliberate, named adoption (#92). Both
-            // spellings of the URL go in: the tool layer hands callers the query-stripped
-            // form and later compares against it, while list_tabs reported the raw one.
-            _adoptUserTab(target.url);
-            _adoptUserTab(_safeUrlForOutput(target.url));
-            adopted = true;
-            console.error(`[Safari MCP] switch_tab adopted ${_safeUrlForOutput(target.url)} (user tab, opted-in via SAFARI_MCP_ALLOW_USER_TABS)`);
-          } else if (!isBlankOwned && !isTrackedRedirect) {
+          if (!isBlankOwned && !isTrackedRedirect && !allowUserTabs()) {
             const msg = `⚠️ Tab safety: refusing switch_tab to index ${index} (${_safeUrlForOutput(target.url)}) — not opened by this MCP session. Use safari_new_tab to open your own tab, or set SAFARI_MCP_ALLOW_USER_TABS=1 to let switch_tab adopt a tab you already had open.`;
             console.error(`[Safari MCP] ${msg}`);
             return errorResult(msg);
           }
+          // With the opt-in the switch goes ahead, and the AppleScript fallback below adopts the tab (#92).
         }
       } catch {}
     }
@@ -3259,22 +3253,19 @@ server.tool(
         try {
           return await safari.switchTab(index);
         } catch (err) {
-          // switchTab() claims only a tab carrying this session's marker. With the opt-in, any other
-          // tab is adopted instead (#92) and recorded as adopted here: the URL check above passes the
-          // user's tab on a URL the session owns without adopting it, which left that tab closable.
+          // switchTab() claims only a tab carrying a marker of this session. With the opt-in, any
+          // other tab is adopted instead (#92): it gets the session's adoption marker, which it
+          // keeps wherever it navigates, and which no close accepts. The URL check above passes
+          // the user's tab on a URL the session owns, so only this marker tells it apart.
           if (!err?.unproven || !allowUserTabs()) throw err;
         }
         const claimed = await safari.switchTab(index, { adopt: true });
-        const claimedUrl = safari.getActiveTabURL();
-        if (claimedUrl) {
-          _adoptUserTab(claimedUrl);
-          _adoptUserTab(_safeUrlForOutput(claimedUrl));
-        }
-        adopted = true;
-        console.error(`[Safari MCP] switch_tab adopted ${_safeUrlForOutput(claimedUrl)} (user tab, opted-in via SAFARI_MCP_ALLOW_USER_TABS)`);
+        console.error(`[Safari MCP] switch_tab adopted ${_safeUrlForOutput(safari.getActiveTabURL())} (user tab, opted-in via SAFARI_MCP_ALLOW_USER_TABS)`);
         return claimed;
       }
     );
+    // Adopted just now, or earlier: switchTab() keeps an adopted tab's marker.
+    const adopted = viaAppleScript && safari.isActiveTabAdopted();
     const safeResult = _sanitizeTabResult(result);
     // Sync safari.js state so AppleScript fallback targets the correct tab
     const resolvedIndex = safeResult?.tabIndex || index;
@@ -3335,12 +3326,17 @@ server.tool(
       let viaAppleScript = false;
       const switched = _sanitizeTabResult(await extensionOrFallback(
         "switch_tab", { index: t.index },
-        () => { viaAppleScript = true; return safari.switchTab(t.index, { adopt: true }); }
+        () => { viaAppleScript = true; return safari.switchTab(t.index, { claim: true }); }
       ));
       safari.setActiveTabIndex(t.index);
       safari.setActiveTabURL(t.url);
       if (!viaAppleScript) safari.setActiveTabFromExtension(t.index, t.url);
-      _trackTab(t.index, t.url, `${SESSION_ID}:${currentSessionId()}`, viaAppleScript ? safari.getActiveTabMarker() : "", switched?.receipt);
+      // A "new" tab can be one adopted from the user that moved or navigated while this waited.
+      // It stays adopted, and recording it among the tabs this session opened would hand it to
+      // the tab cap and the shutdown cleanup, which close those.
+      if (!safari.isActiveTabAdopted()) {
+        _trackTab(t.index, t.url, `${SESSION_ID}:${currentSessionId()}`, viaAppleScript ? safari.getActiveTabMarker() : "", switched?.receipt);
+      }
       _setActiveReceipt(switched?.receipt);
       return { content: [{ type: "text", text: `Found new tab: ${t.title} (${t.url})` }] };
     };

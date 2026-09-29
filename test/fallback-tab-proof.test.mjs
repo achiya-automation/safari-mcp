@@ -19,6 +19,12 @@
  *      step came with no check from run_script, and after only a URL check from safari_switch_tab,
  *      which the user's tab on a page the session also opened passes. Now the tab has to carry a
  *      marker of the session's already, unless safari_switch_tab adopts it (#92).
+ *   6. An adoption was recorded by the tab's URL, while the adopted tab carried the same marker as
+ *      the session's own tabs. Once it navigated to a URL the session owns, the close refusal let
+ *      it through and closeTab() closed the user's tab by that marker; and the adopted URL made the
+ *      session's own tab on it unclosable, in every session of the process. Found by a code review
+ *      probe on 29.9.26. An adopted tab now carries a marker family of its own, MCP_A<markerId>_,
+ *      which no close accepts and every later switch keeps.
  * Without SAFARI_PROFILE, safari_run_script runs its steps through safari.runScript(), which is
  * AppleScript only, and that is where 3, 4 and 5 were live. _runExtensionBatchAction serves named
  * profiles, whose extensionOrFallback never falls back; its AppleScript fallback runs here only
@@ -27,8 +33,8 @@
  *
  * Both sides are the real code: index.js's tool handlers, run_script's step guard and batch
  * actions, and extensionOrFallback with its ownership guard; safari.js's session state,
- * resolveActiveTab(), closeTab(), switchTab() and runScript(), over a fake Safari window that runs
- * their page JavaScript for real.
+ * resolveActiveTab(), navigate(), closeTab(), switchTab() and runScript(), over a fake Safari
+ * window that runs their page JavaScript for real.
  *
  * Run:  node --test test/fallback-tab-proof.test.mjs
  */
@@ -49,7 +55,6 @@ beforeEach(() => {
   own._openedTabs.clear();
   own._ownedTabURLs.clear();
   own._ownedTabTimestamps.clear();
-  own._adoptedTabURLs.clear();
 });
 
 const safariSource = readFileSync(new URL("../safari.js", import.meta.url), "utf8");
@@ -73,19 +78,21 @@ const RECEIPT_B = "ReceiptB_" + "b".repeat(24);
 
 // Tab i is tabs[i - 1]; closing one renumbers every tab after it, as Safari does. `marker` is
 // the tab's window.name. A script for one tab runs its page JavaScript for real, against that
-// tab's window; the marker scans, which loop over every tab in AppleScript, are answered here.
-// `scripts` keeps every AppleScript it was handed, `afterScript` runs once after the next one,
-// and with `failReads` the page throws when a script reads its title, as a page mid-crash can.
+// tab's window, whose page has always finished loading; the marker scans, which loop over every
+// tab in AppleScript, are answered here. `scripts` keeps every AppleScript it was handed,
+// `afterScript` runs once after the next one, and with `failReads` the page throws when a script
+// reads its title, as a page mid-crash can.
 function safariWindow(tabs) {
   const w = { tabs, scripts: [], failReads: false, afterScript: null };
   const url = (i) => tabs[i - 1]?.url || "";
+  const site = (u) => { try { return new URL(u).hostname.split(".").slice(-2).join("."); } catch { return u; } };
   const answer = (script) => {
     const page = script.match(/^tell application "Safari" to do JavaScript "([\s\S]*)" in tab (\d+) of front window$/);
     if (page) {
       const tab = tabs[Number(page[2]) - 1];
       if (!tab) throw new Error(`Safari got an error: Can't get tab ${page[2]} of window 1.`);
       const win = { name: tab.marker || "", __mcpTabMarker: tab.pageMarker };
-      const document = w.failReads ? { get title() { throw new Error("the page broke"); } } : { title: "" };
+      const document = w.failReads ? { get title() { throw new Error("the page broke"); } } : { title: "", readyState: "complete" };
       try {
         return String(vm.runInNewContext(page[1].replace(/\\"/g, '"'), { window: win, document, location: { href: tab.url } }) ?? "");
       } finally {
@@ -112,6 +119,15 @@ function safariWindow(tabs) {
       const domain = script.match(/contains "([^"]*)"/)[1];
       for (let i = tabs.length; i >= 1; i--) if (url(i).includes(domain)) return String(-i);
       return `0:${tabs.length}`;
+    }
+    const load = script.match(/^tell application "Safari" to set URL of tab (\d+) of front window to "([^"]*)"$/);
+    if (load) {
+      // A new page: __mcpTabMarker goes with the old one, and window.name too across sites (Safari
+      // clears it), until navigate() stamps the marker again.
+      const tab = tabs[Number(load[1]) - 1];
+      if (site(tab.url) !== site(load[2])) tab.marker = null;
+      tab.pageMarker = undefined;
+      return void (tab.url = load[2]);
     }
     const close = script.match(/close tab (\d+) of/);
     if (close) return void tabs.splice(Number(close[1]) - 1, 1);
@@ -153,11 +169,14 @@ function extension(window, opened = []) {
 // ---------- safari.js, for real ----------
 
 // The per-session tab state, its accessors, the marker stamp, findTabByMarker(),
-// resolveActiveTab(), closeTab(), switchTab() and runScript().
+// resolveActiveTab(), runJS(), navigate(), closeTab(), switchTab() and runScript().
 const safariParts = [
-  between(safariSource, "const _sessions = new Map();", "\nconst RESOLVE_CACHE_MS"),
+  between(safariSource, "const _sessions = new Map();", "\n// ========== DIAGNOSTIC LOG"),
+  between(safariSource, "function _assertNotFallingBackToUserTab(", "\n// ========== TAB IDENTITY MARKER"),
   between(safariSource, "function _buildStampJS(", "\n// Quick JS execution"),
   between(safariSource, "export function getActiveTabIndex()", "\n// ========== FAST OSASCRIPT"),
+  between(safariSource, "function _tabIdentityGuard(", "\n// ========== NAVIGATION =========="),
+  between(safariSource, "export async function navigate(url) {", "\n// Poll document.readyState from the Node side"),
   between(safariSource, "async function _provenOwnTabIndex()", "\n// ========== WAIT"),
   between(safariSource, "export async function runScript(", "\n// ========== ACCESSIBILITY SNAPSHOT"),
 ].join("\n");
@@ -174,15 +193,16 @@ const tableNames = [...new Set([
   ...actionTable.split("\n").filter((l) => !l.includes(":")).flatMap((l) => l.split(",")),
 ].map((name) => name.trim()).filter(Boolean))];
 
-function loadSafari(window) {
+// `id` is the session's marker id: another one is another MCP session in the same process.
+function loadSafari(window, id = "sess0001") {
   const safari = new Function(
     "currentSessionId", "randomUUID", "osascript", "osascriptFast", "getTargetWindowRef",
-    "refreshTargetWindow", "console", ...tableNames,
+    "refreshTargetWindow", "console", "SAFARI_PROFILE", "raiseWindowForShow", "_injectHelpersfast", ...tableNames,
     `${safariParts.replace(/^export /gm, "")}\nreturn { _st, resolveActiveTab, ${safariExports.join(", ")} };`
   )(
-    () => "s1", () => "sess0001-0000-4000-8000-000000000000", window.run, window.run,
+    () => "s1", () => `${id}-0000-4000-8000-000000000000`, window.run, window.run,
     () => "front window", async () => {},
-    { error() {} }
+    { error() {} }, null, async () => {}, async () => {}
   );
   // What else index.js calls on these paths: focus bookkeeping around each extension command,
   // and list_tabs' AppleScript fallback (safari_switch_tab looks its target up first).
@@ -219,9 +239,8 @@ function loadServer(safari, sendToExtension) {
     process: { env: {} }, console: { error() {} }, textResult, errorResult,
     _evictOldestTab: async () => null, _trackTab: own._trackTab, _untrackTab: own._untrackTab,
     _openedTabs: own._openedTabs, _ownedTabURLs: own._ownedTabURLs, _addOwnedURL: own._addOwnedURL,
-    _markBlankTabOpened: own._markBlankTabOpened, _isURLOwned: own._isURLOwned,
-    _isAdoptedURL: own._isAdoptedURL, _trackedAtIndex: own._trackedAtIndex,
-    allowUserTabs: own.allowUserTabs, _adoptUserTab: own._adoptUserTab,
+    _removeOwnedURL: own._removeOwnedURL, _markBlankTabOpened: own._markBlankTabOpened, _isURLOwned: own._isURLOwned,
+    _trackedAtIndex: own._trackedAtIndex, allowUserTabs: own.allowUserTabs,
     BLANK_TAB_SENTINEL: own.BLANK_TAB_SENTINEL,
     // The default mode, with the extension connected.
     _preferAppleScript: false, _extensionConnected: true, _commandTimeouts: {},
@@ -232,6 +251,7 @@ function loadServer(safari, sendToExtension) {
     return {
       run: _runExtensionBatchAction,
       safari_new_tab: ${toolHandler("safari_new_tab")},
+      safari_navigate: ${toolHandler("safari_navigate")},
       safari_close_tab: ${toolHandler("safari_close_tab")},
       safari_switch_tab: ${toolHandler("safari_switch_tab")},
       safari_wait_for_new_tab: ${toolHandler("safari_wait_for_new_tab")},
@@ -527,7 +547,7 @@ test("with SAFARI_MCP_ALLOW_USER_TABS, switching to the session's own tab adopts
     const s = session();
     const reply = JSON.parse((await s.server.safari_switch_tab({ index: 2 })).content[0].text);
     assert.equal(reply.note, undefined);
-    assert.equal(own._adoptedTabURLs.size, 0);
+    assert.equal(s.safari.isActiveTabAdopted(), false);
   });
 });
 
@@ -570,4 +590,114 @@ test("switchTab() runs no AppleScript for an index that is not a tab number", as
   const s = session();
   await assert.rejects(s.safari.switchTab('1 of front window\ndo shell script "echo INJECTED"\n--'), /switchTab needs/);
   assert.deepEqual(s.window.scripts, []);
+});
+
+// ---------- 6. a tab adopted from the user is never closable, whatever it shows ----------
+
+// Adoption (#92) was recorded by URL, and the close refusal asked whether the current URL was one
+// adopted from the user. closeTab() proves a tab by the marker the adoption stamped on it, the same
+// kind of marker the session's own tabs carry. Once the adopted tab showed a URL the session owns
+// (safari_navigate registers every destination as owned), the refusal let the close through and
+// AppleScript closed the user's tab. The adopted URL also left every tab showing it unclosable, the
+// session's own included, in every session of the process.
+for (const path of CLOSES) {
+  test(`${path.name} never closes a tab adopted from the user, even once it shows a URL the session owns`, async () => {
+    await withUserTabs(async () => {
+      const s = session();
+      s.window.tabs[0].user = true;
+      await s.server.safari_switch_tab({ index: 1 });
+      await s.server.safari_navigate({ url: A_URL });
+      assert.equal(s.window.tabs[0].url, A_URL, "the adopted tab did not navigate");
+      assert.match(await outcome(() => path.close(s.server)), REFUSED);
+      assert.ok(userTabOpen(s.window), "the adopted user tab was closed");
+      assert.equal(s.window.tabs.length, 3, "a tab was closed in its place");
+    });
+  });
+}
+
+test("adopting the user's tab on the session's URL leaves the session's own tab there closable", async () => {
+  await withUserTabs(async () => {
+    const s = sameUrlSession();
+    await s.server.safari_switch_tab({ index: 1 });
+    await s.server.safari_switch_tab({ index: 2 }); // back to A, the session's own tab on that URL
+    await s.server.safari_close_tab({});
+    assert.deepEqual(urls(s.window), [A_URL, B_URL], "the session's own tab A was not closed");
+    assert.ok(userTabOpen(s.window), "the user's tab was closed in A's place");
+  });
+});
+
+test("one session's adoption leaves another session's tab on the same URL closable", async () => {
+  await withUserTabs(async () => {
+    const s = session();
+    s.window.tabs[0].user = true;
+    await s.server.safari_switch_tab({ index: 1 });
+    // Another MCP session of the same process (the HTTP daemon) has its own tab on that page.
+    const other = loadSafari(s.window, "sess0002");
+    s.window.tabs.push({ url: USER_URL, marker: "MCP_sess0002_c" });
+    Object.assign(other._st(), { activeTabIndex: 4, activeTabURL: USER_URL, activeTabMarker: "MCP_sess0002_c", hasOwnedTab: true });
+    own._trackTab(4, USER_URL, "daemon:s2", "MCP_sess0002_c", "");
+    await loadServer(other, extension(s.window)).safari_close_tab({});
+    assert.deepEqual(urls(s.window), [USER_URL, A_URL, B_URL], "the other session's tab was not closed");
+    assert.ok(userTabOpen(s.window), "the adopted user tab was closed");
+  });
+});
+
+// A switch stamps a fresh marker. On a tab adopted from the user it has to stay an adoption marker,
+// or switching away and back would turn the tab into one of the session's own, which closes. The
+// user's tab shows the session's URL here, so no URL check refuses the close either.
+for (const path of SWITCH_BY_INDEX) {
+  test(`${path.name} back to a tab adopted from the user keeps it unclosable`, async () => {
+    await withUserTabs(async () => {
+      const s = sameUrlSession();
+      await s.server.safari_switch_tab({ index: 1 });
+      await s.server.safari_switch_tab({ index: 2 });
+      await path.call(s.server, 1);
+      assert.equal(s.window.tabs[0].marker, s.safari._st().activeTabMarker, "the session is not back on the adopted tab");
+      assert.match(await outcome(() => s.server.safari_close_tab({})), REFUSED);
+      assert.ok(userTabOpen(s.window), "the adopted user tab was closed");
+    });
+  });
+}
+
+test("safari_wait_for_new_tab does not take a tab adopted from the user for one the session opened", async () => {
+  await withUserTabs(async () => {
+    const s = session();
+    s.window.tabs[0].user = true;
+    await s.server.safari_switch_tab({ index: 1 });
+    // While it waits, the adopted tab moves on to another page and a tab opens after it, so the
+    // adopted tab is the first one the list has not seen at its index.
+    setTimeout(() => {
+      s.window.tabs[0].url = "https://mail.example.com/sent";
+      s.window.tabs.push({ url: "https://sso.example.net/authorize", marker: null });
+    }, 50);
+    await s.server.safari_wait_for_new_tab({ timeout: 3000 });
+    assert.equal(s.window.tabs[0].marker, s.safari._st().activeTabMarker, "the wait did not land on the adopted tab");
+    assert.ok(
+      ![...own._openedTabs.values()].some((t) => t.url === "https://mail.example.com/sent"),
+      "the adopted tab was recorded among the tabs the session opened, which the tab cap and shutdown close"
+    );
+    assert.match(await outcome(() => s.server.safari_close_tab({})), REFUSED);
+    assert.ok(userTabOpen(s.window), "the adopted user tab was closed");
+  });
+});
+
+test("closeTab() and closeOwnTab() refuse a tab adopted from the user on their own", async () => {
+  await withUserTabs(async () => {
+    const s = sameUrlSession();
+    await s.server.safari_switch_tab({ index: 1 });
+    await assert.rejects(s.safari.closeTab(), /Tab safety/);
+    await assert.rejects(s.safari.closeOwnTab(1), /Tab safety/);
+    assert.ok(userTabOpen(s.window), "the adopted user tab was closed");
+  });
+});
+
+test("adoption records the user's tab only in the session: no owned URL, nothing in owned-tabs.json", async () => {
+  await withUserTabs(async () => {
+    const s = session();
+    await s.server.safari_switch_tab({ index: 1 });
+    assert.equal(s.safari.isActiveTabAdopted(), true);
+    const onUserPage = (u) => u.startsWith("https://mail.example.com");
+    assert.ok(![...own._ownedTabURLs].some(onUserPage), "the adopted URL is owned by every session of the process");
+    assert.ok(!own._loadOwnershipFile().some((e) => onUserPage(e.url)), "the adopted URL reached owned-tabs.json");
+  });
 });

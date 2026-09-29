@@ -10,21 +10,20 @@
  *      process that has no record of it being adopted, and whose close_tab would allow.
  *   3. close_tab is never unlocked. Adoption makes a tab writable, not disposable (#68).
  *
- * (3) lives in index.js's _assertTabOwnership, which needs the whole server to run, so it
- * is asserted at source level like close-tab-ownership.test.mjs. (1) and (2) are real
- * behaviour against the module.
+ * The adoption itself is a marker family safari.js stamps on the tab (MCP_A<markerId>_) and
+ * keeps in the session's own state: nothing is recorded by URL, so nothing reaches the shared
+ * file or another session. test/fallback-tab-proof.test.mjs runs all three end to end —
+ * adopting, navigating, switching away and back, and every close. This file locks the flag's
+ * parsing, and, at source level like close-tab-ownership.test.mjs, where _assertTabOwnership
+ * refuses the close.
  *
  * Run:  node --test test/adopt-user-tabs.test.mjs
  */
 import assert from "node:assert";
 import { test } from "node:test";
-import { readFileSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { readFileSync } from "node:fs";
 
 const index = readFileSync(new URL("../index.js", import.meta.url), "utf8");
-
-const OWN = "https://example.test/report?id=7";
 
 async function freshModule() {
   // A cache-busting query gives each test its own module state without touching the
@@ -51,77 +50,16 @@ test("the flag is off unless explicitly set, and accepts the usual truthy spelli
   }
 });
 
-test("adoption refuses without the flag, and grants ownership with it", async () => {
-  const m = await freshModule();
-  const previous = process.env.SAFARI_MCP_ALLOW_USER_TABS;
-  try {
-    delete process.env.SAFARI_MCP_ALLOW_USER_TABS;
-    assert.equal(m._adoptUserTab(OWN), false, "no flag → no adoption");
-    assert.equal(m._isURLOwned(OWN), false, "a refused adoption must not own anything");
-
-    process.env.SAFARI_MCP_ALLOW_USER_TABS = "1";
-    assert.equal(m._adoptUserTab(OWN), true);
-    assert.equal(m._isURLOwned(OWN), true, "an adopted tab is the session's target");
-    assert.equal(m._isAdoptedURL(OWN), true);
-    // The tool layer hands callers origin+pathname; both spellings must resolve to the
-    // same adopted document or close_tab's refusal can be walked around.
-    assert.equal(m._isAdoptedURL("https://example.test/report"), true);
-    assert.equal(m._isAdoptedURL("https://elsewhere.test/report"), false);
-
-    // Blank/placeholder tabs carry no identity to adopt.
-    for (const junk of ["", null, "about:blank", "missing value"]) {
-      assert.equal(m._adoptUserTab(junk), false, `${JSON.stringify(junk)} is not adoptable`);
-    }
-  } finally {
-    if (previous === undefined) delete process.env.SAFARI_MCP_ALLOW_USER_TABS;
-    else process.env.SAFARI_MCP_ALLOW_USER_TABS = previous;
-  }
-});
-
-test("an adopted URL is never written to the shared ownership file", async () => {
-  // Point the module at a throwaway HOME so this exercises the real write path instead of
-  // re-deriving the filter, and without touching the user's ~/.safari-mcp.
-  const home = mkdtempSync(join(tmpdir(), "safari-mcp-adopt-"));
-  const previousHome = process.env.HOME;
-  const previousFlag = process.env.SAFARI_MCP_ALLOW_USER_TABS;
-  try {
-    process.env.HOME = home;
-    process.env.SAFARI_MCP_ALLOW_USER_TABS = "1";
-    const m = await freshModule();
-
-    m._adoptUserTab(OWN);
-    // A real save, triggered the way any later tool call would trigger it.
-    m._addOwnedURL("https://ours.test/opened-by-us");
-
-    const persisted = m._loadOwnershipFile().map((e) => e.url);
-    assert.ok(persisted.includes("https://ours.test/opened-by-us"), "a tab we opened is persisted");
-    assert.ok(!persisted.includes(OWN), "an adopted user tab must never reach owned-tabs.json");
-    assert.ok(m._ownedTabURLs.has(OWN), "…while still being owned in memory for this session");
-  } finally {
-    process.env.HOME = previousHome;
-    if (previousFlag === undefined) delete process.env.SAFARI_MCP_ALLOW_USER_TABS;
-    else process.env.SAFARI_MCP_ALLOW_USER_TABS = previousFlag;
-    rmSync(home, { recursive: true, force: true });
-  }
-});
-
-test("_saveOwnershipFile skips adopted URLs at the one place that writes", () => {
-  const state = readFileSync(new URL("../ownership-state.js", import.meta.url), "utf8");
-  assert.match(
-    state,
-    /for \(const url of urls\) \{[\s\S]{0,400}?if \(_adoptedTabURLs\.has\(url\)\) continue;/,
-    "the write loop must skip adopted URLs — _pruneExpiredOwnership saves too"
-  );
-});
-
 test("close_tab is refused on an adopted tab even with the flag on", () => {
+  // By the tab's adoption marker, not its URL: the adopted tab can navigate to a URL the
+  // session owns, and another tab can show the adopted URL.
   assert.match(
     index,
-    /if \(opType === "close_tab" && _isAdoptedURL\(safari\.getActiveTabURL\(\)\)\) \{/,
+    /if \(opType === "close_tab" && safari\.isActiveTabAdopted\(\)\) \{/,
     "close_tab must refuse an adopted tab (#68) — adoption grants writes, not closes"
   );
   const guardStart = index.indexOf('function _assertTabOwnership(');
-  const closeGuard = index.indexOf('opType === "close_tab" && _isAdoptedURL', guardStart);
+  const closeGuard = index.indexOf('opType === "close_tab" && safari.isActiveTabAdopted()', guardStart);
   const earlyReturn = index.indexOf('if (_noOwnershipCheck.has(opType)) return;', guardStart);
   assert.ok(guardStart >= 0 && closeGuard > guardStart, "the refusal belongs inside _assertTabOwnership");
   assert.ok(

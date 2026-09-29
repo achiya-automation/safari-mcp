@@ -263,7 +263,7 @@ function loadServer(safari, sendToExtension) {
     _evictOldestTab: async () => null, _trackTab: own._trackTab, _untrackTab: own._untrackTab,
     _openedTabs: own._openedTabs, _ownedTabURLs: own._ownedTabURLs, _addOwnedURL: own._addOwnedURL,
     _removeOwnedURL: own._removeOwnedURL, _markBlankTabOpened: own._markBlankTabOpened,
-    _isURLOwned: own._isURLOwned, _isAdoptedURL: own._isAdoptedURL, BLANK_TAB_SENTINEL: own.BLANK_TAB_SENTINEL,
+    _isURLOwned: own._isURLOwned, BLANK_TAB_SENTINEL: own.BLANK_TAB_SENTINEL,
     // The default mode, with the extension connected.
     _preferAppleScript: false, _extensionConnected: true, _primaryHasExtension: false,
     _profileExtensionVerified: true, _commandTimeouts: {},

@@ -37,9 +37,9 @@ test("_originOf yields a comparable origin, and nothing comparable for non-URLs"
 });
 
 test("the switch_tab pre-check pairs the tracked index with an origin match", () => {
-  // The adoption opt-in (#92) adds a conjunct to the first arm; the pairing this test
+  // The adoption opt-in (#92) adds a conjunct to the refusal; the pairing this test
   // exists for — tracked index AND matching origin — must survive it unchanged.
-  const guard = /const trackedOrigin = _originOf\(_trackedAtIndex\(index\)\?\.url\);\s*\n\s*const isTrackedRedirect = !!trackedOrigin && trackedOrigin === _originOf\(target\.url\);\s*\n\s*if \(!isBlankOwned && !isTrackedRedirect(?: && allowUserTabs\(\))? *\) \{/;
+  const guard = /const trackedOrigin = _originOf\(_trackedAtIndex\(index\)\?\.url\);\s*\n\s*const isTrackedRedirect = !!trackedOrigin && trackedOrigin === _originOf\(target\.url\);\s*\n\s*if \(!isBlankOwned && !isTrackedRedirect(?: && !?allowUserTabs\(\))? *\) \{/;
   assert.match(
     src,
     guard,
@@ -52,18 +52,22 @@ test("the switch_tab pre-check pairs the tracked index with an origin match", ()
   );
 });
 
-test("adopting an unowned tab is reachable only behind the opt-in flag", () => {
-  // Every route into _adoptUserTab from switch_tab has to sit inside an allowUserTabs()
-  // arm. Without that the opt-in would be decoration and the guard would be gone (#92).
-  const adoptCalls = [...src.matchAll(/_adoptUserTab\(/g)];
+test("adopting an unowned tab is reachable only from safari_switch_tab, behind the opt-in flag", () => {
+  // Without the flag the pre-check refuses, and every switchTab(…, { adopt: true }) sits right
+  // behind an allowUserTabs() check inside safari_switch_tab. Otherwise the opt-in would be
+  // decoration and the guard would be gone (#92).
+  assert.match(
+    src,
+    /if \(!isBlankOwned && !isTrackedRedirect && !allowUserTabs\(\)\) \{[\s\S]{0,600}?return errorResult\(msg\);/,
+    "without the flag, switch_tab's pre-check must refuse a tab the session did not open"
+  );
+  const adoptCalls = [...src.matchAll(/switchTab\([^)]*\{ adopt: true \}\)/g)];
   assert.ok(adoptCalls.length > 0, "switch_tab should be able to adopt when opted in");
-  const gate = /if \(!isBlankOwned && !isTrackedRedirect && allowUserTabs\(\)\) \{[\s\S]{0,900}?\} else if \(!isBlankOwned && !isTrackedRedirect\) \{/;
-  assert.match(src, gate, "adoption must be the flagged arm, with the refusal kept as the else");
+  const from = src.indexOf('server.tool(\n  "safari_switch_tab"');
+  const to = src.indexOf("\n);\n", from);
   for (const m of adoptCalls) {
-    const armStart = src.lastIndexOf("allowUserTabs()", m.index);
-    assert.ok(
-      armStart >= 0 && m.index - armStart < 900,
-      "an _adoptUserTab call escaped the allowUserTabs() arm"
-    );
+    assert.ok(m.index > from && m.index < to, "only safari_switch_tab adopts (#92)");
+    const gate = src.lastIndexOf("allowUserTabs()", m.index);
+    assert.ok(gate > from && m.index - gate < 400, "a switchTab adopt call escaped the allowUserTabs() check");
   }
 });
