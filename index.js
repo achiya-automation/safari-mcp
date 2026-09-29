@@ -1747,7 +1747,9 @@ const _noOwnershipCheck = new Set([
 ]);
 
 // run_script action names (camelCase) that don't require an owned tab — strictly
-// read-only steps, plus newTab/switchTab/listTabs which mirror _noOwnershipCheck.
+// read-only steps, plus newTab/switchTab/listTabs which mirror _noOwnershipCheck
+// (switchTab still has to prove its tab: by the session's marker in safari.js switchTab(),
+// or through the extension, which knows the tabs it opened by their id).
 // Everything that can change page or tab state (navigate, evaluate, reload, goBack,
 // closeTab, ...) is asserted PER STEP while the batch runs (see the run_script
 // handler): a batch can change the active tab mid-run, so a single pre-flight
@@ -3227,8 +3229,9 @@ server.tool(
           // user's tab. Require BOTH — the index we opened AND the origin we
           // opened it on. That mirrors the origin
           // boundary the extension keeps on its own receipts, so nothing that
-          // would survive the extension's check is lost here, and the AppleScript
-          // fallback (which has no ownership check of its own) stays guarded.
+          // would survive the extension's check is lost here. A URL still proves
+          // nothing about WHICH tab this is, so the AppleScript fallback also needs
+          // the session's marker on the tab (safari.js switchTab()).
           const trackedOrigin = _originOf(_trackedAtIndex(index)?.url);
           const isTrackedRedirect = !!trackedOrigin && trackedOrigin === _originOf(target.url);
           if (!isBlankOwned && !isTrackedRedirect && allowUserTabs()) {
@@ -3250,10 +3253,26 @@ server.tool(
     let viaAppleScript = false;
     const result = await extensionOrFallback(
       "switch_tab", token ? { ...(index ? { index } : {}), receipt: token } : { index },
-      () => {
+      async () => {
         if (token) throw _receiptNeedsExtension("switch_tab");
         viaAppleScript = true;
-        return safari.switchTab(index);
+        try {
+          return await safari.switchTab(index);
+        } catch (err) {
+          // switchTab() claims only a tab carrying this session's marker. With the opt-in, any other
+          // tab is adopted instead (#92) and recorded as adopted here: the URL check above passes the
+          // user's tab on a URL the session owns without adopting it, which left that tab closable.
+          if (!err?.unproven || !allowUserTabs()) throw err;
+        }
+        const claimed = await safari.switchTab(index, { adopt: true });
+        const claimedUrl = safari.getActiveTabURL();
+        if (claimedUrl) {
+          _adoptUserTab(claimedUrl);
+          _adoptUserTab(_safeUrlForOutput(claimedUrl));
+        }
+        adopted = true;
+        console.error(`[Safari MCP] switch_tab adopted ${_safeUrlForOutput(claimedUrl)} (user tab, opted-in via SAFARI_MCP_ALLOW_USER_TABS)`);
+        return claimed;
       }
     );
     const safeResult = _sanitizeTabResult(result);
@@ -3316,7 +3335,7 @@ server.tool(
       let viaAppleScript = false;
       const switched = _sanitizeTabResult(await extensionOrFallback(
         "switch_tab", { index: t.index },
-        () => { viaAppleScript = true; return safari.switchTab(t.index); }
+        () => { viaAppleScript = true; return safari.switchTab(t.index, { adopt: true }); }
       ));
       safari.setActiveTabIndex(t.index);
       safari.setActiveTabURL(t.url);
@@ -3690,7 +3709,17 @@ server.tool(
           _assertTabOwnership(action === "closeTab" ? "close_tab" : `run_script:${action}`);
         }
       };
-      return textResult(await safari.runScript({ steps, onStep }));
+      // A tab the extension opened carries a marker only once AppleScript has needed it as the
+      // current tab, so switchTab() cannot prove the others. The extension can, by the tab's id.
+      const switchTab = async ({ index }) => {
+        try {
+          return await safari.switchTab(index);
+        } catch (err) {
+          if (!err?.unproven || !_extensionConnected) throw err;
+          return _runExtensionBatchAction("switchTab", { index: Number(index) });
+        }
+      };
+      return textResult(await safari.runScript({ steps, onStep, actions: { switchTab } }));
     }
 
     // Keep every step in one MCP request/session and route it through

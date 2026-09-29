@@ -522,7 +522,7 @@ function _assertNotFallingBackToUserTab(opName) {
   if (_st().hasOwnedTab) {
     throw new Error(
       `Tab tracking lost — refusing to ${opName} via fallback to "current tab of window" (would target the user's active tab). ` +
-      `This session previously opened its own tab via safari_new_tab; re-run safari_new_tab to recover, or call safari_list_tabs and safari_switch_tab to re-anchor to a known tab.`
+      `This session previously opened its own tab via safari_new_tab; re-run safari_new_tab to recover, or call safari_list_tabs and safari_switch_tab to re-anchor to a tab this session opened.`
     );
   }
   // No tab ever owned by this session — fallback to front document is intentional.
@@ -825,6 +825,15 @@ async function _scanForMarker(marker, hint) {
 export async function findTabByMarker(marker) {
   if (!marker) return null;
   return (await _scanForMarker(marker)) || null;
+}
+
+// Page JavaScript that is true when the page carries a marker this session stamped, in window.name
+// or, once a page has taken window.name over, in window.__mcpTabMarker. Every marker the session
+// stamps starts with its markerId: on a tab it opened, on one it switched to or adopted, and on one
+// the extension marked for it (resolveActiveTab). A switch by index has no other proof that the tab
+// is the session's: an index names whatever tab sits there, and the user can have the same URL open.
+function _sessionMarkerTestJS() {
+  return `(function(p){try{return String(window.name).indexOf(p)===0||String(window.__mcpTabMarker).indexOf(p)===0}catch(e){return false}})('MCP_${_st().markerId}_')`;
 }
 
 // The index of this session's tab, or null.
@@ -4031,7 +4040,7 @@ export async function closeTab(explicitIndex) {
       `Tab tracking lost — refusing to close a tab this session cannot prove it opened ` +
       `(closing "current tab of window" would close the user's active tab). ` +
       `Call safari_new_tab to open a tab this session owns, or safari_list_tabs and ` +
-      `safari_switch_tab to re-anchor to a known one.`
+      `safari_switch_tab to re-anchor to a tab this session opened.`
     );
   }
 
@@ -4092,34 +4101,52 @@ export async function closeOwnTab(index) {
   return closeTab();
 }
 
-export async function switchTab(index) {
+// `adopt` takes the tab although it carries no marker of this session: an adoption (#92), or the
+// tab safari_wait_for_new_tab saw open. Only those callers pass it.
+export async function switchTab(index, { adopt = false } = {}) {
   const idx = Number(index);
   // A switch by receipt alone used to arrive here with no index at all, and claimed tab NaN
   // under a marker stamped on no tab.
   if (!Number.isInteger(idx) || idx < 1) throw new Error("switchTab needs the tab's index (a positive integer)");
-  _st().activeTabIndex = idx;
   // Claiming this tab: stamp it with a FRESH identity marker so resolveActiveTab can
   // re-find it after the user shifts tab indices. A fresh marker (not a reused one)
   // ensures a previously-claimed tab — which still carries the old marker string —
   // is never mistaken for this one.
-  _st().activeTabMarker = `MCP_${_st().markerId}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-  _st().hasOwnedTab = true;
-  _st().tabFromExtension = false;
-  await _stampTab(idx);
+  const marker = `MCP_${_st().markerId}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  // The marker makes the tab the session's own from then on: writes go there, and closeTab() closes
+  // the tab carrying it. It used to go on whatever tab sat at the index, the user's included, since
+  // run_script checked nothing first and safari_switch_tab checks only the tab's URL, which their tab
+  // on a page the session also opened passes. So the tab has to carry a marker of this session
+  // already, and one script in the page checks that, reads the title and URL, and only then stamps:
+  // no tab closed or dragged in between can put another tab under the stamp, and a switch that fails
+  // leaves both the tab and the session state as they were.
   // Do NOT visually switch the tab — it brings the Safari window to foreground
   // and interrupts the user. Visual switching only happens in screenshot() when needed.
   // AppleScript `do JavaScript in tab N` works on background tabs without switching.
-  // Get title+URL from the target tab
-  const result = await runJS(
-    `JSON.stringify({title:document.title,url:location.href})`,
-    { tabIndex: idx }
-  );
-  // Track by URL so we can find this tab even if indices shift
+  const js = `(function(){${adopt ? "" : `if(!${_sessionMarkerTestJS()})return '';`}` +
+    `var r=JSON.stringify({title:document.title,url:location.href});${_buildStampJS(marker)};return r;})()`;
+  const script = `tell application "Safari" to do JavaScript "${js.replace(/"/g, '\\"')}" in tab ${idx} of ${getTargetWindowRef()}`;
+  // Fast daemon first; a hiccup retries once through the reliable subprocess (a second run stamps the same marker).
+  const result = String(await osascriptFast(script, { timeout: 5000 }).catch(() => osascript(script, { timeout: 8000 }))).trim();
+  if (!result) {
+    throw Object.assign(new Error(
+      `Tab safety: refusing to switch to tab ${idx} — it carries no marker of this session, and AppleScript has ` +
+      `no other proof that this session opened it (a URL is none: the same page can be open in one of your tabs). ` +
+      `Open a tab with safari_new_tab, switch to a tab the Safari extension opened once safari_doctor shows the ` +
+      `extension connected, or set SAFARI_MCP_ALLOW_USER_TABS=1 so that safari_switch_tab adopts a tab you already had open.`
+    ), { unproven: true });
+  }
+  let url;
   try {
-    const parsed = JSON.parse(result);
-    _st().activeTabURL = parsed.url || null;
-  } catch {}
-  _st().lastResolveTime = Date.now();
+    url = JSON.parse(result).url || null;
+  } catch {
+    throw new Error(`switchTab: no page script runs in tab ${idx}, so no marker can find it there`);
+  }
+  // Track by URL so we can find this tab even if indices shift
+  Object.assign(_st(), {
+    activeTabIndex: idx, activeTabMarker: marker, activeTabURL: url,
+    hasOwnedTab: true, tabFromExtension: false, lastResolveTime: Date.now(),
+  });
   return result;
 }
 
@@ -5235,7 +5262,7 @@ export function refSelector(ref) {
 // Execute multiple safari.js operations in a single tool call
 // Avoids round-trip overhead of calling tools one by one
 // script is a JSON array of steps: [{action: "navigate", args: {url: "..."}}, {action: "click", args: {selector: "..."}}, ...]
-export async function runScript({ steps, onStep }) {
+export async function runScript({ steps, onStep, actions: overrides = {} }) {
   const results = [];
   for (const step of steps) {
     const { action, args = {} } = step;
@@ -5267,7 +5294,8 @@ export async function runScript({ steps, onStep }) {
         nativeClick, nativeHover, nativeType, nativeKeyboard,
         replaceEditorContent, uploadFile, mockNetworkRoute,
       };
-      const fn = actions[action];
+      // index.js takes over an action where it has more to go on (switchTab: the extension).
+      const fn = overrides[action] || actions[action];
       if (!fn) {
         results.push({ action, error: `Unknown action: ${action}` });
         continue;
@@ -5276,6 +5304,9 @@ export async function runScript({ steps, onStep }) {
       results.push({ action, result: typeof result === "string" ? result.substring(0, 2000) : result });
     } catch (err) {
       results.push({ action, error: err.message });
+      // A switch that did not happen stops the batch: the steps after it were meant for that tab,
+      // and would run in the current one.
+      if (action === "switchTab") break;
     }
   }
   return JSON.stringify(results);

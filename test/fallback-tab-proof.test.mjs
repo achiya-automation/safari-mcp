@@ -14,15 +14,21 @@
  *      which skips the proof, while the ownership guard checked the current tab, not that one.
  *   4. A switch by receipt alone fell back to switchTab(undefined): it claimed tab NaN, under a
  *      fresh marker stamped on no tab.
+ *   5. A switch by index claimed whatever tab sat there, the user's included: switchTab() stamped
+ *      the session's marker on it, and from then on the marker made it the session's own tab. The
+ *      step came with no check from run_script, and after only a URL check from safari_switch_tab,
+ *      which the user's tab on a page the session also opened passes. Now the tab has to carry a
+ *      marker of the session's already, unless safari_switch_tab adopts it (#92).
  * Without SAFARI_PROFILE, safari_run_script runs its steps through safari.runScript(), which is
- * AppleScript only, and that is where 3 and 4 were live. _runExtensionBatchAction serves named
+ * AppleScript only, and that is where 3, 4 and 5 were live. _runExtensionBatchAction serves named
  * profiles, whose extensionOrFallback never falls back; its AppleScript fallback runs here only
  * so that it keeps the same rules. The same closeTab step also wrote a string index into its
  * AppleScript as it came (`do shell script` included), and closed a tab adopted from the user.
  *
  * Both sides are the real code: index.js's tool handlers, run_script's step guard and batch
  * actions, and extensionOrFallback with its ownership guard; safari.js's session state,
- * resolveActiveTab(), closeTab(), switchTab() and runScript(), over a fake Safari window.
+ * resolveActiveTab(), closeTab(), switchTab() and runScript(), over a fake Safari window that runs
+ * their page JavaScript for real.
  *
  * Run:  node --test test/fallback-tab-proof.test.mjs
  */
@@ -31,6 +37,7 @@ import { test, beforeEach, after } from "node:test";
 import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import vm from "node:vm";
 
 // ownership-state.js persists to ~/.safari-mcp — point HOME at a throwaway dir first.
 const tmpHome = mkdtempSync(join(tmpdir(), "smcp-proof-"));
@@ -65,16 +72,26 @@ const RECEIPT_B = "ReceiptB_" + "b".repeat(24);
 // ---------- a Safari window that answers safari.js's AppleScript ----------
 
 // Tab i is tabs[i - 1]; closing one renumbers every tab after it, as Safari does. `marker` is
-// the tab's window.name. `scripts` keeps every AppleScript it was handed.
+// the tab's window.name. A script for one tab runs its page JavaScript for real, against that
+// tab's window; the marker scans, which loop over every tab in AppleScript, are answered here.
+// `scripts` keeps every AppleScript it was handed, `afterScript` runs once after the next one,
+// and with `failReads` the page throws when a script reads its title, as a page mid-crash can.
 function safariWindow(tabs) {
-  const scripts = [];
+  const w = { tabs, scripts: [], failReads: false, afterScript: null };
   const url = (i) => tabs[i - 1]?.url || "";
-  const run = async (script) => {
-    scripts.push(script);
-    const stamp = script.match(/window\.name='([^']*)'/);
-    if (stamp) {
-      tabs[Number(script.match(/in tab (\d+) of/)[1]) - 1].marker = stamp[1];
-      return "1";
+  const answer = (script) => {
+    const page = script.match(/^tell application "Safari" to do JavaScript "([\s\S]*)" in tab (\d+) of front window$/);
+    if (page) {
+      const tab = tabs[Number(page[2]) - 1];
+      if (!tab) throw new Error(`Safari got an error: Can't get tab ${page[2]} of window 1.`);
+      const win = { name: tab.marker || "", __mcpTabMarker: tab.pageMarker };
+      const document = w.failReads ? { get title() { throw new Error("the page broke"); } } : { title: "" };
+      try {
+        return String(vm.runInNewContext(page[1].replace(/\\"/g, '"'), { window: win, document, location: { href: tab.url } }) ?? "");
+      } finally {
+        tab.marker = win.name || null;
+        tab.pageMarker = win.__mcpTabMarker;
+      }
     }
     const marker = script.match(/window\.name==='([^']*)'/);
     if (marker) {
@@ -101,16 +118,33 @@ function safariWindow(tabs) {
     if (/count of tabs/.test(script)) return String(tabs.length);
     throw new Error(`the fake window does not answer this AppleScript:\n${script}`);
   };
-  return { tabs, run, scripts };
+  w.run = async (script) => {
+    w.scripts.push(script);
+    try {
+      return answer(script);
+    } finally {
+      const hook = w.afterScript;
+      w.afterScript = null;
+      hook?.();
+    }
+  };
+  return w;
 }
 
 // The extension's end of the bridge: it opens tabs, with a receipt for an http(s) page and none
-// for a blank one. Every other command times out, which sends index.js to its AppleScript fallback.
-function extension(window) {
+// for a blank one. Given the tabs it opened for the session, it also switches to them by index, and
+// refuses any other tab, as _switchTabForSession does. Every other command times out, which sends
+// index.js to its AppleScript fallback.
+function extension(window, opened = []) {
   return async (type, payload) => {
     if (type === "new_tab") {
       window.tabs.push({ url: payload.url || "about:blank", marker: null });
       return { title: "", safeUrl: payload.url, ...(payload.url ? { receipt: RECEIPT_B } : {}), tabIndex: window.tabs.length };
+    }
+    if (type === "switch_tab" && opened.length) {
+      const tab = window.tabs[payload.index - 1];
+      if (!opened.includes(tab)) throw new Error(`\u26a0\ufe0f Tab safety: refusing "switch_tab" to tab ${payload.index} \u2014 not opened by this MCP session.`);
+      return { title: "", safeUrl: tab.url, receipt: RECEIPT_B, tabIndex: payload.index, owned: true };
     }
     throw new Error(`Timeout waiting for the extension (${type})`);
   };
@@ -143,13 +177,11 @@ const tableNames = [...new Set([
 function loadSafari(window) {
   const safari = new Function(
     "currentSessionId", "randomUUID", "osascript", "osascriptFast", "getTargetWindowRef",
-    "refreshTargetWindow", "runJS", "console", ...tableNames,
+    "refreshTargetWindow", "console", ...tableNames,
     `${safariParts.replace(/^export /gm, "")}\nreturn { _st, resolveActiveTab, ${safariExports.join(", ")} };`
   )(
     () => "s1", () => "sess0001-0000-4000-8000-000000000000", window.run, window.run,
     () => "front window", async () => {},
-    // switchTab() reads the title and URL of the tab it claimed.
-    async (_js, { tabIndex }) => JSON.stringify({ title: "", url: window.tabs[tabIndex - 1]?.url || "" }),
     { error() {} }
   );
   // What else index.js calls on these paths: focus bookkeeping around each extension command,
@@ -202,6 +234,7 @@ function loadServer(safari, sendToExtension) {
       safari_new_tab: ${toolHandler("safari_new_tab")},
       safari_close_tab: ${toolHandler("safari_close_tab")},
       safari_switch_tab: ${toolHandler("safari_switch_tab")},
+      safari_wait_for_new_tab: ${toolHandler("safari_wait_for_new_tab")},
       safari_run_script: ${toolHandler("safari_run_script")},
     };`
   )(...Object.values(deps));
@@ -377,17 +410,164 @@ test("run_script closeTab refuses a tab adopted from the user, as safari_close_t
   }
 });
 
-test("run_script switchTab by index still claims that tab under a marker it stamps", async () => {
-  const s = session();
-  await s.server.safari_run_script({ steps: [{ action: "switchTab", args: { index: 3 } }] });
-  assert.equal(s.window.tabs[2].marker, s.safari._st().activeTabMarker);
-  assert.equal(await s.safari.resolveActiveTab(), 3);
-});
-
 test("safari_close_tab's AppleScript fallback still closes the marked tab after the user shifts it", async () => {
   const s = session();
   s.window.tabs.splice(0, 1); // the user closes their tab: A is tab 1 now
   await s.server.safari_close_tab({});
   assert.deepEqual(urls(s.window), [B_URL]);
   assert.deepEqual([...own._openedTabs.values()].map((t) => t.url), [B_URL], "A's record went with it");
+});
+
+// ---------- 5. a switch by index claims only a tab the session can show is its own ----------
+
+// switchTab() claims the tab at an index by stamping the session's marker on it, and from then on
+// that marker is what makes the tab the session's own: writes go there, and closeTab() closes the
+// tab carrying it. run_script switchTab got there with no check at all, and safari_switch_tab's
+// fallback after a check of the target's URL, which the user's tab on a URL the session had opened
+// passes. Here the user's tab 1 sits on the URL of the session's tab A.
+function sameUrlSession() {
+  const s = session();
+  Object.assign(s.window.tabs[0], { url: A_URL, user: true });
+  return s;
+}
+const userTabOpen = (window) => window.tabs.some((t) => t.user);
+
+async function withUserTabs(fn) {
+  const flag = process.env.SAFARI_MCP_ALLOW_USER_TABS;
+  process.env.SAFARI_MCP_ALLOW_USER_TABS = "1";
+  try {
+    return await fn();
+  } finally {
+    if (flag === undefined) delete process.env.SAFARI_MCP_ALLOW_USER_TABS;
+    else process.env.SAFARI_MCP_ALLOW_USER_TABS = flag;
+  }
+}
+
+const SWITCH_BY_INDEX = [
+  { name: "safari_switch_tab", call: (s, index) => s.safari_switch_tab({ index }) },
+  { name: "run_script switchTab", call: (s, index) => s.safari_run_script({ steps: [{ action: "switchTab", args: { index } }] }) },
+  { name: "_runExtensionBatchAction switchTab", call: (s, index) => s.run("switchTab", { index }) },
+];
+for (const path of SWITCH_BY_INDEX) {
+  test(`${path.name} by index does not claim the user's tab on the URL of the session's tab`, async () => {
+    const s = sameUrlSession();
+    assert.match(await outcome(() => path.call(s.server, 1)), REFUSED);
+    assertStillOnA(s);
+    // What the claim led to: the close through AppleScript took the tab carrying the marker.
+    await s.server.safari_close_tab({});
+    assert.ok(userTabOpen(s.window), "the user's tab was closed");
+  });
+
+  test(`${path.name} by index still claims the session's own tabs, wherever the user moved them`, async () => {
+    const s = session();
+    s.window.tabs[2].marker = "MCP_sess0001_b"; // the extension marked B when AppleScript first needed it
+    s.window.tabs.splice(0, 1); // the user closes their tab: A is tab 1 now, B tab 2
+    await path.call(s.server, 2);
+    assert.equal(await s.safari.resolveActiveTab(), 2);
+    // Back to A, which carries an earlier marker of the session's, not the current one.
+    await path.call(s.server, 1);
+    assert.equal(await s.safari.resolveActiveTab(), 1);
+  });
+}
+
+test("run_script switchTab does not claim a tab the extension opened and never marked", async () => {
+  const s = session();
+  // B is the session's, but only the extension can tell: its receipt names it, and it carries no marker.
+  const steps = [{ action: "switchTab", args: { index: 3 } }];
+  assert.match(await outcome(() => s.server.safari_run_script({ steps })), REFUSED);
+  assertStillOnA(s);
+});
+
+test("run_script switchTab does not claim a tab another MCP session marked", async () => {
+  const s = session();
+  s.window.tabs[0].marker = "MCP_othr0002_x"; // the prefix is per session, not "MCP_" (#76)
+  const steps = [{ action: "switchTab", args: { index: 1 } }];
+  assert.match(await outcome(() => s.server.safari_run_script({ steps })), REFUSED);
+  assert.equal(s.window.tabs[0].marker, "MCP_othr0002_x");
+  assert.equal(s.safari._st().activeTabMarker, A_MARKER);
+});
+
+test("a refused run_script switchTab stops the batch before its next step", async () => {
+  const s = session();
+  const steps = [{ action: "switchTab", args: { index: 1 } }, { action: "closeTab" }];
+  assert.match(await outcome(() => s.server.safari_run_script({ steps })), REFUSED);
+  assert.deepEqual(urls(s.window), [USER_URL, A_URL, B_URL], "the closeTab meant for tab 1 closed A");
+});
+
+test("with SAFARI_MCP_ALLOW_USER_TABS, safari_switch_tab adopts the user's tab on the session's URL, and close_tab refuses it", async () => {
+  await withUserTabs(async () => {
+    const s = sameUrlSession();
+    const reply = JSON.parse((await s.server.safari_switch_tab({ index: 1 })).content[0].text);
+    assert.equal(reply.note, "(user tab, opted-in)");
+    assert.equal(s.window.tabs[0].marker, s.safari._st().activeTabMarker, "the session does not work in the adopted tab");
+    assert.match(await outcome(() => s.server.safari_close_tab({})), REFUSED);
+    assert.ok(userTabOpen(s.window), "the adopted user tab was closed");
+  });
+});
+
+test("run_script switchTab adopts nothing, even with SAFARI_MCP_ALLOW_USER_TABS: only safari_switch_tab adopts (#92)", async () => {
+  await withUserTabs(async () => {
+    const s = session();
+    const steps = [{ action: "switchTab", args: { index: 1 } }];
+    assert.match(await outcome(() => s.server.safari_run_script({ steps })), REFUSED);
+    assertStillOnA(s);
+  });
+});
+
+test("safari_wait_for_new_tab still claims the tab it saw open", async () => {
+  const s = session();
+  const popup = { url: "https://sso.example.net/authorize", marker: null };
+  setTimeout(() => s.window.tabs.push(popup), 50);
+  await s.server.safari_wait_for_new_tab({ timeout: 3000 });
+  assert.equal(popup.marker, s.safari._st().activeTabMarker);
+});
+
+test("with SAFARI_MCP_ALLOW_USER_TABS, switching to the session's own tab adopts nothing", async () => {
+  await withUserTabs(async () => {
+    const s = session();
+    const reply = JSON.parse((await s.server.safari_switch_tab({ index: 2 })).content[0].text);
+    assert.equal(reply.note, undefined);
+    assert.equal(own._adoptedTabURLs.size, 0);
+  });
+});
+
+test("run_script switchTab asks the extension about a tab only the extension can prove", async () => {
+  const s = session();
+  // The extension opened B and knows it by its id; AppleScript sees a tab with no marker.
+  const server = loadServer(s.safari, extension(s.window, [s.window.tabs[2]]));
+  const switchTo = (index) => server.safari_run_script({ steps: [{ action: "switchTab", args: { index } }] });
+  assert.doesNotMatch(await outcome(() => switchTo(3)), REFUSED);
+  assert.equal(s.safari._st().tabFromExtension, true, "the session is not on B");
+  assert.equal(s.window.tabs[2].marker, null, "AppleScript stamped a tab it could not prove");
+  // The extension refuses what it did not open.
+  assert.match(await outcome(() => switchTo(1)), REFUSED);
+  assert.equal(s.window.tabs[0].marker, null);
+});
+
+test("a switch that fails while it reads the tab leaves no marker there and the session where it was", async () => {
+  await withUserTabs(async () => {
+    const s = sameUrlSession();
+    s.window.failReads = true;
+    await assert.rejects(s.server.safari_switch_tab({ index: 1 }));
+    s.window.failReads = false;
+    assertStillOnA(s);
+    await s.server.safari_close_tab({});
+    assert.ok(userTabOpen(s.window), "the user's tab was closed");
+  });
+});
+
+test("a switch claims the tab it proved, even when the tabs shift right after the proof", async () => {
+  const s = session();
+  // The user closes their tab just after the first script Safari runs for the switch: B moves
+  // into index 2, where A was.
+  s.window.afterScript = () => s.window.tabs.splice(0, 1);
+  await s.server.safari_run_script({ steps: [{ action: "switchTab", args: { index: 2 } }] });
+  assert.equal(s.window.tabs[1].marker, null, "B was stamped in A's place");
+  assert.equal(await s.safari.resolveActiveTab(), 1, "the session is not on A");
+});
+
+test("switchTab() runs no AppleScript for an index that is not a tab number", async () => {
+  const s = session();
+  await assert.rejects(s.safari.switchTab('1 of front window\ndo shell script "echo INJECTED"\n--'), /switchTab needs/);
+  assert.deepEqual(s.window.scripts, []);
 });
