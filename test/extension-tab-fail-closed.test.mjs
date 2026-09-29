@@ -16,9 +16,10 @@
  * evaluate) ran its JavaScript there. The identity guard runJS prefixes did not stop it: with
  * no marker of its own, the session refuses only tabs another MCP session marked.
  *
- * Both sides are the real code: extensionOrFallback with its ownership guard, the tool
- * handlers and run_script actions, and safari.js's session state and runJS, over a fake
- * Safari window that runs the identity guard the way Safari would.
+ * Both sides are the real code: extensionOrFallback with its ownership guard and the hook that
+ * has the extension mark its tab, the tool handlers and run_script actions, and safari.js's
+ * session state and runJS, over a fake Safari window that runs the identity guard the way
+ * Safari would.
  *
  * Run:  node --test test/extension-tab-fail-closed.test.mjs
  */
@@ -76,6 +77,12 @@ function safariWindow(tabs) {
       ran.push(tab.url);
       return tab.url;
     }
+    const scan = script.match(/window\.name==='([^']*)'/);
+    if (scan) {
+      // resolveActiveTab's marker scan: the tab that carries the session's marker, right to left.
+      for (let i = tabs.length; i >= 1; i--) if (tabs[i - 1].name === scan[1]) return String(i);
+      return "0";
+    }
     const prefix = script.match(/starts with "([^"]*)"/);
     if (prefix) {
       // resolveActiveTab's URL strategy: the cached index, a URL prefix right to left, then the
@@ -92,9 +99,10 @@ function safariWindow(tabs) {
   return { tabs, ran, run };
 }
 
-// The extension's end of the bridge: it opens and closes tabs in that window, and every other
-// command fails in a way that sends index.js to its AppleScript fallback — an evaluate comes
-// back CSP-blocked, anything else times out.
+// The extension's end of the bridge: it opens and closes tabs in that window, and writes the
+// session's marker into the tab a receipt names (mark_tab), which is how safari.js proves that
+// tab before acting on it. Every other command fails in a way that sends index.js to its
+// AppleScript fallback — an evaluate comes back CSP-blocked, anything else times out.
 function extension(window) {
   const byReceipt = new Map();
   return async (type, payload) => {
@@ -105,9 +113,13 @@ function extension(window) {
       window.tabs.push(tab);
       return { title: "", safeUrl: payload.url, receipt, tabIndex: window.tabs.length };
     }
-    if (type === "close_tab") {
+    if (type === "close_tab" || type === "mark_tab") {
       const tab = byReceipt.get(payload.receipt);
-      if (!tab) throw new Error("Tab safety: receipt did not resolve to a live tab");
+      if (!tab || !window.tabs.includes(tab)) throw new Error("Tab safety: receipt did not resolve to a live tab");
+      if (type === "mark_tab") {
+        tab.name = payload.marker;
+        return true;
+      }
       window.tabs.splice(window.tabs.indexOf(tab), 1);
       return "Tab closed";
     }
@@ -149,12 +161,14 @@ function loadSafari(window) {
 
 // ---------- index.js, for real ----------
 
-// The receipt helpers, extensionOrFallback with its ownership guard, and run_script's actions.
+// The receipt helpers, extensionOrFallback with its ownership guard, run_script's actions, and
+// the hook that has the extension mark its tab for safari.js.
 const indexParts = [
   between(index, "function _originOf(", "\nfunction _isBatchSemanticFailure"),
   between(index, "function _untrackClosedTab(", "\n// Close all MCP-opened tabs on process exit"),
   between(index, "const _noOwnershipCheck = new Set([", "\n// run_script action names"),
   between(index, "async function _runExtensionBatchAction(", "\n// The cookie / localStorage / sessionStorage tools"),
+  between(index, "// safari.js lets AppleScript act only on a tab", "\n// Read version from package.json"),
 ].join("\n");
 
 // The handler a server.tool(...) call registers.
@@ -174,7 +188,8 @@ function loadServer(safari, sendToExtension) {
     _markBlankTabOpened: own._markBlankTabOpened, _isURLOwned: own._isURLOwned,
     _isAdoptedURL: own._isAdoptedURL, BLANK_TAB_SENTINEL: own.BLANK_TAB_SENTINEL,
     // The default mode, with the extension connected.
-    _preferAppleScript: false, _extensionConnected: true, _commandTimeouts: {},
+    _preferAppleScript: false, _extensionConnected: true, _primaryHasExtension: false,
+    _profileExtensionVerified: true, _commandTimeouts: {},
   };
   return new Function(
     ...Object.keys(deps),

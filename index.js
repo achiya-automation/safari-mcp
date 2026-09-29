@@ -1556,7 +1556,7 @@ function _handleExtensionResponse(msg, respondingWorkerId = "") {
 const _THERMAL_FILE = process.env.SAFARI_MCP_THERMAL_FILE || "";
 const _THERMAL_MAX = parseFloat(process.env.SAFARI_MCP_THERMAL_MAX || "80");
 const _THERMAL_WAIT_MS = parseInt(process.env.SAFARI_MCP_THERMAL_WAIT_MS || "20000", 10);
-const _THERMAL_FREE = new Set(["close_tab", "list_tabs", "get_tab_receipt", "get_tab_locus", "switch_tab", "reload_extension"]);
+const _THERMAL_FREE = new Set(["close_tab", "list_tabs", "get_tab_receipt", "get_tab_locus", "mark_tab", "switch_tab", "reload_extension"]);
 
 function _chipTemp() {
   try {
@@ -1839,6 +1839,11 @@ function _receiptToken(value) {
 function _explicitReceipt(args) {
   const token = _receiptToken(args?.receipt || "");
   if (!token) return {};
+  // A receipt that names another tab makes that tab the current one, so safari.js has to follow.
+  // Otherwise its AppleScript fallback ran in the tab the session had before, or, for a session
+  // re-initialised after a reconnect (no tab of its own yet), in the front document: the tab the
+  // user is looking at. The extension marks the receipt's tab when AppleScript first needs it.
+  if (token !== _getActiveReceipt()) safari.setActiveTabFromExtension(null, null);
   _setActiveReceipt(token);
   return { receipt: token };
 }
@@ -2391,6 +2396,32 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
 // `Safari profile "X" window not found` while list_tabs, run_script and evaluate kept
 // working (geo-audit, 2026-09-20). The fallback safari.js hands us is its original runJS.
 safari.setPageJSRunner((script, fallback) => extensionOrFallback("evaluate", { script }, fallback));
+
+// safari.js lets AppleScript act only on a tab that carries this session's identity marker. A tab
+// the extension opened or picked has none, and its index or URL does not say which tab it is now
+// (a tab the user closed or dragged, another front window, their own tab on the same site), so
+// the extension, which knows the tab by its id, writes a fresh marker there: safari.js asks when
+// AppleScript first needs the tab, and again once a cross-site load has cleared window.name.
+// mark_tab writes it from a fixed function, which no page CSP can refuse; an extension built
+// before mark_tab can only use evaluate, which a strict CSP (github.com) does refuse.
+safari.setExtensionTabMarker(async (marker) => {
+  if ((!_extensionConnected && !_primaryHasExtension) || (_preferAppleScript && !_profileExtensionVerified)) return false;
+  // No current tab — it was closed — so nothing to mark.
+  if (!_activeReceipts.has(_receiptSessionKey())) return false;
+  const receipt = _getActiveReceipt();
+  const target = { ...(receipt ? { receipt } : {}), sessionId: `${SESSION_ID}:${currentSessionId()}` };
+  try {
+    return (await sendToExtension("mark_tab", { ...target, marker }, _commandTimeouts.evaluate)) === true;
+  } catch (err) {
+    if (!/Unknown command/.test(String(err?.message || err))) return false;
+  }
+  try {
+    const script = `(window.name=window.__mcpTabMarker=${JSON.stringify(marker)},'1')`;
+    return (await sendToExtension("evaluate", { ...target, script }, _commandTimeouts.evaluate)) === "1";
+  } catch {
+    return false;
+  }
+});
 
 // Read version from package.json to avoid hardcoded mismatch
 const _pkgVersion = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'package.json'), 'utf8')).version;

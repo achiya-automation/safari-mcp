@@ -12,6 +12,9 @@
  * before. The next call without a receipt whose extension attempt failed ran its AppleScript
  * fallback on that older tab, and safari_close_tab's fallback closed it.
  *
+ * Such a tab carries no marker until the extension writes one into it (mark_tab), and
+ * safari.js acts on it only where it finds that marker — see extension-tab-proof.test.mjs.
+ *
  * Both sides are the real code: index.js's tool handlers and run_script actions, fed the
  * reply the extension sends, and safari.js's session state, resolveActiveTab() and
  * closeTab(), over a fake Safari window that answers their AppleScript.
@@ -227,6 +230,11 @@ for (const path of PATHS) {
     const { window, safari } = session(path);
     await path.call(loadServer(safari, extension(window, path.uses)));
     assert.equal(window.tabs[2].url, B_URL);
+    // The extension, which knows B by id, writes the session's marker into it.
+    safari.setExtensionTabMarker(async (marker) => {
+      window.tabs.find((t) => t.url === B_URL).marker = marker;
+      return true;
+    });
     assert.equal(await safari.resolveActiveTab(), 3, "resolved to A — the tab AppleScript opened before");
   });
 }
