@@ -75,8 +75,9 @@ const RECEIPT = "ReceiptR_" + "r".repeat(24);
 // "front document". `marker` is the tab's window.name. A script for one tab runs its page
 // JavaScript for real against that tab's window, whose page has always finished loading; the
 // scans that loop over every tab in AppleScript are answered here. `ran` keeps every page script
-// and navigation with the tab it reached, reads included.
-function safariWindow(tabs, front = 1) {
+// and navigation with the tab it reached, reads included. A tab opened on a URL in `redirects`
+// lands on its value.
+function safariWindow(tabs, front = 1, redirects = {}) {
   const w = { tabs, ran: [] };
   const url = (i) => tabs[i - 1]?.url || "";
   const site = (u) => { try { return new URL(u).hostname.split(".").slice(-2).join("."); } catch { return u; } };
@@ -130,7 +131,8 @@ function safariWindow(tabs, front = 1) {
     }
     if (/make new tab/.test(script)) {
       // newTab() opens a background tab: the user's tab stays in front.
-      tabs.push({ url: script.match(/URL:"([^"]*)"/)?.[1] || "about:blank", marker: null });
+      const url = script.match(/URL:"([^"]*)"/)?.[1] || "about:blank";
+      tabs.push({ url: redirects[url] || url, marker: null });
       return "";
     }
     const close = script.match(/close tab (\d+) of/);
@@ -424,6 +426,98 @@ test("run_script opens a tab and works in it, from a session that had none", asy
   assert.equal(window.tabs[1].url, DEST);
   assert.ok(window.ranIn(2).some((r) => r.js?.endsWith("/*page:click*/")));
   assert.deepEqual(window.ranIn(1), []);
+});
+
+// run_script's newTab step claimed nothing for the tab it opened, where safari_new_tab claims its
+// URL. safari.newTab() makes that URL the session's current one, so the step after newTab{url} was
+// refused on the session's own tab: "current tab (...) was not opened by this MCP session"
+// (29.9.26). A blank tab passed only because it has no URL to check. Once it has opened the tab,
+// the step now claims the URL it asked for and keeps it as the session's current URL, wherever the
+// page then redirected, as safari_new_tab does.
+const NEXT_STEPS = [
+  {
+    step: { action: "navigate", args: { url: DEST } },
+    ranInNewTab: (window) => window.tabs[1].url === DEST,
+  },
+  {
+    step: { action: "click", args: { selector: "#send" } },
+    ranInNewTab: (window) => window.ranIn(2).some((r) => r.js?.endsWith("/*page:click*/")),
+  },
+];
+
+for (const { step, ranInNewTab } of NEXT_STEPS) {
+  test(`run_script opens a tab on a URL, and its ${step.action} step runs in that tab`, async () => {
+    const { window, server } = await machine("clean");
+    const steps = [{ action: "newTab", args: { url: OTHER_URL } }, step];
+    const result = await outcome(() => server.safari_run_script({ steps }));
+    assert.doesNotMatch(result, REFUSED);
+    assert.doesNotMatch(result, /error/i);
+    assert.ok(ranInNewTab(window), `${step.action} did not reach the tab newTab opened`);
+    assert.deepEqual(window.ranIn(1), []);
+  });
+
+  test(`run_script's ${step.action} step runs in the tab newTab opened, after the page redirected`, async () => {
+    const landed = "https://login.example.com/start"; // another origin, as a sign-in redirect lands
+    const window = safariWindow([{ url: USER_URL, marker: null }], 1, { [OTHER_URL]: landed });
+    const server = loadServer(loadSafari(window));
+    const steps = [{ action: "newTab", args: { url: OTHER_URL } }, step];
+    const result = await outcome(() => server.safari_run_script({ steps }));
+    assert.doesNotMatch(result, REFUSED);
+    assert.doesNotMatch(result, /error/i);
+    assert.ok(ranInNewTab(window), `${step.action} did not reach the tab newTab opened`);
+    assert.deepEqual(window.ranIn(1), []);
+    // Like safari_new_tab, the step claims the URL it asked for. The site chose where the redirect
+    // went, so that URL stays unclaimed: owned-tabs.json would vouch for any tab on it.
+    assert.ok(own._ownedTabURLs.has(OTHER_URL));
+    assert.ok(!own._ownedTabURLs.has(landed), "the step claimed a URL the site chose");
+  });
+}
+
+test("a newTab step claims a URL with no scheme in its https:// form too, as a navigate step does", async () => {
+  const { window, server } = await machine("clean");
+  const steps = [
+    { action: "newTab", args: { url: "dest.example.net/page" } },
+    { action: "click", args: { selector: "#send" } },
+  ];
+  assert.doesNotMatch(await outcome(() => server.safari_run_script({ steps })), REFUSED);
+  assert.ok(window.ranIn(2).some((r) => r.js?.endsWith("/*page:click*/")));
+  assert.ok(own._ownedTabURLs.has("dest.example.net/page"));
+  assert.ok(own._ownedTabURLs.has("https://dest.example.net/page"));
+});
+
+test("a navigate step claims a URL with no scheme in its https:// form, which is what it loads", async () => {
+  const { window, server } = await machine("clean");
+  const steps = [
+    { action: "newTab" },
+    { action: "navigate", args: { url: "dest.example.net/page" } },
+    { action: "click", args: { selector: "#send" } },
+  ];
+  assert.doesNotMatch(await outcome(() => server.safari_run_script({ steps })), REFUSED);
+  assert.equal(window.tabs[1].url, "https://dest.example.net/page");
+  assert.ok(window.ranIn(2).some((r) => r.js?.endsWith("/*page:click*/")));
+});
+
+test("a newTab step claims its tab only once the tab exists", async () => {
+  const window = safariWindow([{ url: USER_URL, marker: null }]);
+  let open = false;
+  const server = loadServer(loadSafari({
+    ...window,
+    run: async (script) => {
+      if (!open && /make new (tab|document)/.test(script)) throw new Error("Safari got an error: AppleEvent timed out.");
+      return window.run(script);
+    },
+  }));
+  for (const args of [{}, { url: DEST }]) {
+    const steps = [{ action: "newTab", args }, { action: "click", args: { selector: "#send" } }];
+    assert.match(await outcome(() => server.safari_run_script({ steps })), REFUSED);
+  }
+  assert.equal(window.tabs.length, 1);
+  assert.deepEqual([...own._ownedTabURLs], [], "a newTab step that opened no tab claimed one");
+  assert.deepEqual(window.ranIn(1), []);
+  // Once Safari opens it, a blank tab is claimed the way safari_new_tab claims one.
+  open = true;
+  assert.doesNotMatch(await outcome(() => server.safari_run_script({ steps: [{ action: "newTab" }] })), REFUSED);
+  assert.ok(own._ownedTabURLs.has(own.BLANK_TAB_SENTINEL));
 });
 
 test("SAFARI_MCP_ALLOW_USER_TABS: a session adopts the user's tab with safari_switch_tab and works in it", async () => {

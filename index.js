@@ -3725,15 +3725,17 @@ server.tool(
     // AppleScript and loses the verified profile/tab-id boundary; they use the
     // extension-only dispatcher below.
     if (!process.env.SAFARI_PROFILE) {
+      // A URL a step takes the session's tab to, and with no scheme its https:// form, which is
+      // what safari.js navigate() loads. Strings only: step args are not validated.
+      const claimURL = (url) => {
+        if (typeof url !== "string" || !url) return;
+        _addOwnedURL(url);
+        if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(url)) _addOwnedURL("https://" + url);
+      };
       const onStep = (action, stepArgs) => {
-        if (action === "newTab") { _markBlankTabOpened(); return; }
         if (action === "navigate" || action === "navigateAndRead") {
           _assertTabOwnership(`run_script:${action}`);
-          const url = stepArgs && typeof stepArgs.url === "string" ? stepArgs.url : null;
-          if (url) {
-            _addOwnedURL(url);
-            if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(url)) _addOwnedURL("https://" + url);
-          }
+          claimURL(stepArgs?.url);
           return;
         }
         // These steps run through AppleScript here, which cannot tell which tab a receipt names:
@@ -3770,7 +3772,24 @@ server.tool(
           return _runExtensionBatchAction("switchTab", { index: Number(index) });
         }
       };
-      return textResult(await safari.runScript({ steps, onStep, actions: { switchTab } }));
+      // A newTab step claims its tab as safari_new_tab does, once the step has opened it. It used
+      // to claim nothing, and safari.newTab() makes the page the tab landed on the session's
+      // current URL, so every write step after newTab{url} was refused on the session's own tab.
+      // The session keeps the URL it asked for as its current one and claims only that: a
+      // redirect's target was chosen by the site, and when the user switches windows during the
+      // load it is the URL of the user's tab.
+      const newTab = async ({ url }) => {
+        const requested = String(url || "");
+        const result = await safari.newTab(requested);
+        if (!requested || requested === "about:blank") {
+          _markBlankTabOpened();
+        } else {
+          safari.setActiveTabURL(requested);
+          claimURL(requested);
+        }
+        return result;
+      };
+      return textResult(await safari.runScript({ steps, onStep, actions: { switchTab, newTab } }));
     }
 
     // Keep every step in one MCP request/session and route it through
