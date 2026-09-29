@@ -1736,6 +1736,8 @@ const _noOwnershipCheck = new Set([
 
 // run_script action names (camelCase) that don't require an owned tab — strictly
 // read-only steps, plus newTab/switchTab/listTabs which mirror _noOwnershipCheck.
+// switchTab is exempt from the check on the CURRENT tab only: the run_script handler checks
+// the tab it switches TO, as safari_switch_tab does.
 // Everything that can change page or tab state (navigate, evaluate, reload, goBack,
 // closeTab, ...) is asserted PER STEP while the batch runs (see the run_script
 // handler): a batch can change the active tab mid-run, so a single pre-flight
@@ -1889,6 +1891,56 @@ function _sanitizeTabResult(value) {
     ...(normalized.clicked !== undefined ? { clicked: !!normalized.clicked } : {}),
     ...(normalized.popupOpened !== undefined ? { popupOpened: !!normalized.popupOpened } : {}),
   };
+}
+
+// Whether AppleScript may switch to tab `index`. That switch checks nothing itself: safari.js's
+// switchTab() stamps the session's marker on whatever tab sits at the index and makes it the
+// session's tab. So a tab this session cannot prove it opened is refused, and so is a tab the list
+// does not show, one listed without a URL, and any tab when the list cannot be read.
+// SAFARI_MCP_ALLOW_USER_TABS turns the refusal into an adoption (#92), which the caller records
+// once the switch has reached the tab. `listTabs` may answer in either shape: the extension's
+// `safeUrl` (origin + path, never a `url`) or AppleScript's raw `url`. `op` names the caller.
+//
+// A session that has opened nothing is checked too. The check used to be skipped while this
+// process owned no URL at all, a count that every session and the shared ownership file feed, and
+// AppleScript then switched to whatever tab it was given. The extension refuses a session that
+// owns nothing the same switch. Reading the page in front of the user needs no switch; acting on
+// another of the user's tabs is what the opt-in is for.
+async function _switchTabVerdict(index, listTabs, op = "switch_tab") {
+  if (!Number.isInteger(index) || index < 1) {
+    return { refusal: `⚠️ Tab safety: refusing ${op} — AppleScript switches only to a tab index (a positive integer), and this call names none.`, adopt: false };
+  }
+  const unproven = (why) => ({ refusal: `⚠️ Tab safety: refusing ${op} to index ${index} — ${why}, so nothing proves this session opened it.`, adopt: false });
+  let tabs;
+  try { tabs = _sanitizeTabResult(await listTabs()); } catch (err) { return unproven(`the tab list could not be read (${err?.message || err})`); }
+  const target = Array.isArray(tabs) ? tabs.find(t => t.index === index) : undefined;
+  if (!target) return unproven("the window's tab list does not show it");
+  let refusal = "";
+  let adopt = false;
+  if (!_isURLOwned(target.safeUrl)) {
+    // about:blank / missing value tabs are owned if tracked in _openedTabs
+    const isBlankOwned = (target.safeUrl === 'about:blank' || target.safeUrl === 'missing value') && (!!_trackedAtIndex(index) || _ownedTabURLs.has(BLANK_TAB_SENTINEL));
+    // A tab THIS session opened may have redirected away from the URL we
+    // registered (/dashboard -> /login, any 302), so the URL alone stops
+    // being proof and the tab became permanently un-switchable. But a
+    // recorded index is not proof either: Safari renumbers every index
+    // whenever any tab closes, so a stale one can point straight at a
+    // user's tab. Require BOTH — the index we opened AND the origin we
+    // opened it on. That mirrors the origin
+    // boundary the extension keeps on its own receipts, so nothing that
+    // would survive the extension's check is lost here, and the AppleScript
+    // fallback (which has no ownership check of its own) stays guarded.
+    const trackedOrigin = _originOf(_trackedAtIndex(index)?.url);
+    const isTrackedRedirect = !!trackedOrigin && trackedOrigin === _originOf(target.safeUrl);
+    if (!isBlankOwned && !isTrackedRedirect && allowUserTabs()) {
+      // The opt-in turns this refusal into a deliberate, named adoption (#92), recorded by
+      // the caller once AppleScript has actually switched to the tab.
+      adopt = true;
+    } else if (!isBlankOwned && !isTrackedRedirect) {
+      refusal = `⚠️ Tab safety: refusing ${op} to index ${index} (${target.safeUrl || "unknown"}) — not opened by this MCP session. Use safari_new_tab to open your own tab, or set SAFARI_MCP_ALLOW_USER_TABS=1 and let safari_switch_tab adopt a tab you already had open.`;
+    }
+  }
+  return { refusal, adopt, safeUrl: target.safeUrl };
 }
 
 function _isBatchSemanticFailure(result) {
@@ -3146,45 +3198,10 @@ server.tool(
     // proof that also holds for a tab of ours whose URL this server never registered (a
     // cross-origin redirect), so its verdict stands. The fallback checks nothing itself, so what
     // this check finds binds it: a tab not proven ours is refused there, or adopted when the
-    // opt-in allows (#92).
-    let refusal = "";
-    let adopt = false;
-    // `_ownedTabURLs.size > 0` alone skipped this whole lookup for a session that had opened
-    // nothing — fine while switch_tab could only reach owned tabs, but adoption (#92) has to
-    // work from a cold session, which is precisely the "read the article in my current tab"
-    // case the opt-in exists for.
-    if (!process.env.SAFARI_PROFILE && (_ownedTabURLs.size > 0 || allowUserTabs())) {
-      try {
-        // The extension lists each tab by its safeUrl (origin + path) and sends no `url`; the
-        // AppleScript fallback sends the raw `url`. Reading `url` alone, this check never ran
-        // while the extension answered. A tab listed without any URL is not proven ours.
-        const tabs = _sanitizeTabResult(await extensionOrFallback("list_tabs", {}, () => safari.listTabs()));
-        const target = tabs.find(t => t.index === index);
-        if (target && !_isURLOwned(target.safeUrl)) {
-          // about:blank / missing value tabs are owned if tracked in _openedTabs
-          const isBlankOwned = (target.safeUrl === 'about:blank' || target.safeUrl === 'missing value') && (!!_trackedAtIndex(index) || _ownedTabURLs.has(BLANK_TAB_SENTINEL));
-          // A tab THIS session opened may have redirected away from the URL we
-          // registered (/dashboard -> /login, any 302), so the URL alone stops
-          // being proof and the tab became permanently un-switchable. But a
-          // recorded index is not proof either: Safari renumbers every index
-          // whenever any tab closes, so a stale one can point straight at a
-          // user's tab. Require BOTH — the index we opened AND the origin we
-          // opened it on. That mirrors the origin
-          // boundary the extension keeps on its own receipts, so nothing that
-          // would survive the extension's check is lost here, and the AppleScript
-          // fallback (which has no ownership check of its own) stays guarded.
-          const trackedOrigin = _originOf(_trackedAtIndex(index)?.url);
-          const isTrackedRedirect = !!trackedOrigin && trackedOrigin === _originOf(target.safeUrl);
-          if (!isBlankOwned && !isTrackedRedirect && allowUserTabs()) {
-            // The opt-in turns this refusal into a deliberate, named adoption (#92), recorded
-            // below once AppleScript has actually switched to the tab.
-            adopt = true;
-          } else if (!isBlankOwned && !isTrackedRedirect) {
-            refusal = `⚠️ Tab safety: refusing switch_tab to index ${index} (${target.safeUrl || "unknown"}) — not opened by this MCP session. Use safari_new_tab to open your own tab, or set SAFARI_MCP_ALLOW_USER_TABS=1 to let switch_tab adopt a tab you already had open.`;
-          }
-        }
-      } catch {}
-    }
+    // opt-in allows (#92). A named profile never falls back to AppleScript.
+    const { refusal, adopt } = process.env.SAFARI_PROFILE
+      ? { refusal: "", adopt: false }
+      : await _switchTabVerdict(index, () => extensionOrFallback("list_tabs", {}, () => safari.listTabs()));
     let viaAppleScript = false;
     let result;
     try {
@@ -3610,16 +3627,32 @@ server.tool(
     // AppleScript and loses the verified profile/tab-id boundary; they use the
     // extension-only dispatcher below.
     if (!process.env.SAFARI_PROFILE) {
-      const onStep = (action, stepArgs) => {
-        if (action === "newTab") { _markBlankTabOpened(); return; }
-        if (action === "navigate" || action === "navigateAndRead") {
-          _assertTabOwnership(`run_script:${action}`);
+      const onStep = async (action, stepArgs) => {
+        if (action === "newTab" || action === "navigate" || action === "navigateAndRead") {
+          // The URL a batch opens is its own, as safari_new_tab records it: a switchTab back to
+          // that tab has nothing else to prove it by.
+          if (action === "newTab") _markBlankTabOpened();
+          else _assertTabOwnership(`run_script:${action}`);
           const url = stepArgs && typeof stepArgs.url === "string" ? stepArgs.url : null;
           if (url) {
             _addOwnedURL(url);
             if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(url)) _addOwnedURL("https://" + url);
           }
           return;
+        }
+        // AppleScript makes this switch, and it checks nothing: it gets the check safari_switch_tab
+        // puts on its own AppleScript fallback, against the tab list of the window AppleScript
+        // switches in. Adopting a tab the user already had open stays with that tool (#92).
+        if (action === "switchTab") {
+          const index = Number(stepArgs?.index);
+          const { refusal, adopt, safeUrl } = await _switchTabVerdict(index, () => safari.listTabs(), "run_script:switchTab");
+          const msg = adopt
+            ? `⚠️ Tab safety: refusing run_script:switchTab to index ${index} (${safeUrl || "unknown"}) — not opened by this MCP session. SAFARI_MCP_ALLOW_USER_TABS adopts a tab only through safari_switch_tab: switch to it there, and the batch then works in that tab.`
+            : refusal;
+          if (msg) {
+            console.error(`[Safari MCP] ${msg}`);
+            throw new Error(msg);
+          }
         }
         if (!_RUNSCRIPT_OWNERSHIP_EXEMPT.has(action)) _assertTabOwnership(`run_script:${action}`);
       };

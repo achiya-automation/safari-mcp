@@ -357,6 +357,8 @@ Tab safety: refusing "click" — current tab (https://mail.example.com/inbox) wa
 opened by this MCP session. Use safari_new_tab or safari_switch_tab to target your own tab.
 ```
 
+Switching counts too: `safari_switch_tab` and a `switchTab` step in `safari_run_script` refuse a tab the session did not open, even before it has opened any. A session with no tab of its own still reads the page in front of you without switching.
+
 That default exists because early versions did click into and close people's tabs. But "read the article I'm looking at" and "fill in the form on my screen" are real, and reopening the page loses the session state that made your tab worth using. Set `SAFARI_MCP_ALLOW_USER_TABS=1` and an **explicit** `safari_switch_tab` adopts the tab instead of refusing it; from then on the session works in it like one of its own, and says so:
 
 ```json
@@ -365,7 +367,7 @@ That default exists because early versions did click into and close people's tab
 
 What the flag deliberately does *not* do:
 
-- **It unlocks adoption, not the guards.** Only `safari_switch_tab` adopts, and only the tab you named. An ordinary click or navigate still never lands on whatever tab happens to be in front — the server acts on the tab you pointed it at, not the one you wandered to.
+- **It unlocks adoption, not the guards.** Only `safari_switch_tab` adopts, and only the tab you named. A `switchTab` step in `safari_run_script` refuses your tab and says to adopt it with `safari_switch_tab` first; after that, the batch works in it. An ordinary click or navigate still never lands on whatever tab happens to be in front — the server acts on the tab you pointed it at, not the one you wandered to.
 - **`safari_close_tab` still refuses.** Closing is the one action whose cost you cannot undo, so an adopted tab is writable, never disposable. Close it yourself.
 - **Adoption is session-local.** Nothing is written to the shared ownership file, so it ends with the session rather than leaking to the next process on the machine.
 - **It adopts only through AppleScript.** The Safari MCP extension checks ownership itself and switches only to the session's own tabs, so while it makes the switch, `safari_switch_tab` still refuses your tab and says the flag did not apply. Adoption happens when the switch runs through AppleScript: the extension is not installed, or is turned off.

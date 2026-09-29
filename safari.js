@@ -5177,8 +5177,9 @@ export async function runScript({ steps, onStep }) {
     const { action, args = {} } = step;
     // Safety callback (tab-ownership, wired by index.js) runs OUTSIDE the per-step
     // try/catch: a refusal must abort the whole batch, not be recorded as a step
-    // error and silently continue to the next step.
-    if (onStep) onStep(action, args);
+    // error and silently continue to the next step. Awaited: a switchTab's check
+    // reads the tab list first.
+    if (onStep) await onStep(action, args);
     try {
       // Map action names to safari.js functions
       const actions = {

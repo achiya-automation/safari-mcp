@@ -143,9 +143,11 @@ function appleScriptTabs(safari, window) {
 // ---------- index.js, for real ----------
 
 const indexParts = [
+  between(index, "const _noOwnershipCheck = new Set([", "\n// Origin of a URL, or"),
   between(index, "function _originOf(", "\nfunction _isBatchSemanticFailure"),
   between(index, "function _untrackClosedTab(", "\n// Close all MCP-opened tabs on process exit"),
   between(index, "async function _runExtensionBatchAction(", "\n// Tab-ownership assertion"),
+  between(index, "function _assertTabOwnership(", "\n// Try the profile-verified extension first"),
 ].join("\n");
 
 // The handler a server.tool(...) call registers.
@@ -161,7 +163,7 @@ function loadServer(safari, extensionOrFallback) {
     "safari", "extensionOrFallback", "SESSION_ID", "currentSessionId", "process", "console",
     "textResult", "errorResult", "_evictOldestTab", "_trackTab", "_untrackTab", "_openedTabs",
     "_ownedTabURLs", "_addOwnedURL", "_markBlankTabOpened", "_isURLOwned", "_trackedAtIndex",
-    "BLANK_TAB_SENTINEL", "allowUserTabs", "_adoptUserTab",
+    "BLANK_TAB_SENTINEL", "allowUserTabs", "_adoptUserTab", "_isAdoptedURL", "_preferAppleScript",
     `${indexParts}
     return {
       run: _runExtensionBatchAction,
@@ -169,12 +171,32 @@ function loadServer(safari, extensionOrFallback) {
       safari_switch_tab: ${toolHandler("safari_switch_tab")},
       safari_wait_for_new_tab: ${toolHandler("safari_wait_for_new_tab")},
       safari_close_tab: ${toolHandler("safari_close_tab")},
+      safari_run_script: ${toolHandler("safari_run_script")},
     };`
   )(
     safari, extensionOrFallback, "daemon", () => "s1", { env: {} }, { error() {} },
     textResult, errorResult, async () => null, own._trackTab, own._untrackTab, own._openedTabs,
     own._ownedTabURLs, own._addOwnedURL, own._markBlankTabOpened, own._isURLOwned,
-    own._trackedAtIndex, own.BLANK_TAB_SENTINEL, own.allowUserTabs, own._adoptUserTab
+    own._trackedAtIndex, own.BLANK_TAB_SENTINEL, own.allowUserTabs, own._adoptUserTab,
+    own._isAdoptedURL, false
+  );
+}
+
+// safari.js's runScript, which run_script without SAFARI_PROFILE hands its steps to. Each value in
+// its action map calls the function named like its key (`click,` or `switchTab: (a) =>
+// switchTab(a.index)`), so the keys are all it needs: here, the fake Safari's functions.
+const runScriptSource = between(safariSource, "export async function runScript(", "\n// ========== ACCESSIBILITY SNAPSHOT");
+const runScriptActions = between(runScriptSource, "const actions = {", "};")
+  .split("\n").slice(1)
+  .flatMap((line) => {
+    const code = line.replace(/\/\/.*$/, "");
+    const key = code.match(/^\s*(\w+):/);
+    return key ? [key[1]] : code.split(",").map((s) => s.trim()).filter((s) => /^\w+$/.test(s));
+  });
+
+function loadRunScript(safari) {
+  return new Function(...runScriptActions, `return ${runScriptSource.replace(/^export /, "")};`)(
+    ...runScriptActions.map((name) => (...args) => safari[name](...args))
   );
 }
 
@@ -388,4 +410,134 @@ test("safari_switch_tab switched by the extension: a tab it opened stays reachab
   const { isError, content } = await clientSees(server.safari_switch_tab({ index: 3 }));
   assert.ok(!isError, content[0].text);
   assert.equal(JSON.parse(content[0].text).tabIndex, 3);
+});
+
+// ---------- every AppleScript switch has to prove the tab is the session's ----------
+
+// safari.js's switchTab() checks nothing: it stamps the session's marker on whatever tab sits at
+// the index and makes it the session's tab, so the session's later reads land there. Two paths
+// still reached it without the check above. run_script without SAFARI_PROFILE runs its switchTab
+// step through safari.runScript, which exempts the step from the check on the CURRENT tab, as
+// safari_switch_tab is exempt from it, while nothing checked the tab it switched TO. And
+// safari_switch_tab skipped its check while no tab was owned on the machine, so a session that
+// had opened none could claim any tab through AppleScript; the extension refuses it that switch.
+const USER_URL_2 = "https://bank.example.com/accounts";
+const C_URL = "https://c.example.com/new";
+
+// A session that has opened no tab: the user's two tabs, nothing tracked, nothing owned.
+function coldSession(uses, { optIn = false } = {}) {
+  if (optIn) process.env.SAFARI_MCP_ALLOW_USER_TABS = "1";
+  else delete process.env.SAFARI_MCP_ALLOW_USER_TABS;
+  const window = safariWindow([
+    { url: USER_URL, marker: null, user: true },
+    { url: USER_URL_2, marker: null, user: true },
+  ]);
+  const safari = loadSafari(window);
+  appleScriptTabs(safari, window);
+  return { window, safari, server: loadServer(safari, extension(window, uses)) };
+}
+
+// run_script without SAFARI_PROFILE, through safari.js's runScript, with a readPage that records
+// the tab it read (null: the front document).
+function batch({ window, safari, server }) {
+  const reads = [];
+  safari.readPage = async () => { reads.push(await safari.resolveActiveTab()); return "page"; };
+  safari.runScript = loadRunScript(safari);
+  return { window, safari, reads, run: (steps) => clientSees(server.safari_run_script({ steps })) };
+}
+
+for (const lister of LISTERS) {
+  test(`safari_switch_tab, tabs listed by ${lister.name}: a session that opened no tab does not claim the user's tab through AppleScript`, async () => {
+    const { window, safari, server } = coldSession(lister.uses);
+    const { isError, content } = await clientSees(server.safari_switch_tab({ index: 2 }));
+    assert.ok(isError, "a session that owns nothing switched to the user's tab");
+    assert.match(content[0].text, /refusing switch_tab to index 2 \(https:\/\/bank\.example\.com\/accounts\)/);
+    assert.deepEqual(window.tabs.map((t) => t.marker), [null, null], "AppleScript stamped a user's tab");
+    assert.equal(safari._st().hasOwnedTab, false);
+  });
+
+  test(`safari_switch_tab, tabs listed by ${lister.name}: SAFARI_MCP_ALLOW_USER_TABS still adopts from a session that opened no tab`, async () => {
+    const { server } = coldSession(lister.uses, { optIn: true });
+    const { content } = await server.safari_switch_tab({ index: 2 });
+    assert.equal(JSON.parse(content[0].text).note, "(user tab, opted-in)", content[0].text);
+    assert.ok(own._isAdoptedURL(USER_URL_2));
+  });
+}
+
+test("safari_switch_tab: when the tab list cannot be read, the AppleScript switch claims nothing", async () => {
+  const { window, safari, server } = switchSession([]);
+  safari.listTabs = async () => { throw new Error("AppleEvent timed out"); };
+  const { isError, content } = await clientSees(server.safari_switch_tab({ index: 1 }));
+  assert.ok(isError, "switched without being able to check the tab");
+  assert.match(content[0].text, /refusing switch_tab to index 1 .*AppleEvent timed out/);
+  assert.equal(window.tabs[0].marker, null);
+});
+
+test("safari_switch_tab: an index the window does not list is refused before AppleScript claims it", async () => {
+  const { safari, server } = switchSession([]);
+  const claim = safari.switchTab;
+  let claims = 0;
+  safari.switchTab = (i) => { claims++; return claim(i); };
+  const { isError, content } = await clientSees(server.safari_switch_tab({ index: 9 }));
+  assert.ok(isError);
+  assert.match(content[0].text, /refusing switch_tab to index 9/);
+  assert.equal(claims, 0, "AppleScript switched to a tab nothing listed");
+  assert.equal(await safari.resolveActiveTab(), 2, "the session's tab is still A");
+});
+
+test("run_script switchTab without SAFARI_PROFILE: AppleScript does not claim a tab this session did not open, and the batch stops", async () => {
+  const { window, safari, reads, run } = batch(switchSession([]));
+  const { isError, content } = await run([{ action: "switchTab", args: { index: 1 } }, { action: "readPage" }]);
+  assert.ok(isError, content[0].text);
+  assert.match(content[0].text, /refusing run_script:switchTab to index 1 \(https:\/\/mail\.example\.com\/inbox\)/);
+  assert.equal(window.tabs[0].marker, null, "AppleScript stamped the user's tab");
+  assert.deepEqual(reads, [], "the next step read the user's tab");
+  assert.equal(await safari.resolveActiveTab(), 2, "the session's tab is still A");
+});
+
+test("run_script switchTab without SAFARI_PROFILE: a session that opened no tab does not claim the user's tab", async () => {
+  const { window, reads, run } = batch(coldSession([]));
+  const { isError, content } = await run([{ action: "switchTab", args: { index: 2 } }, { action: "readPage" }]);
+  assert.ok(isError, content[0].text);
+  assert.deepEqual(window.tabs.map((t) => t.marker), [null, null], "AppleScript stamped a user's tab");
+  assert.deepEqual(reads, []);
+});
+
+test("run_script switchTab with SAFARI_MCP_ALLOW_USER_TABS: only safari_switch_tab adopts, so the step refuses and says so", async () => {
+  const { window, reads, run } = batch(switchSession([], { optIn: true }));
+  const { isError, content } = await run([{ action: "switchTab", args: { index: 1 } }, { action: "readPage" }]);
+  assert.ok(isError, content[0].text);
+  assert.match(content[0].text, /adopts a tab only through safari_switch_tab/);
+  assert.equal(own._isAdoptedURL(USER_URL), false, "adopted outside safari_switch_tab");
+  assert.equal(window.tabs[0].marker, null);
+  assert.deepEqual(reads, []);
+});
+
+test("run_script switchTab without SAFARI_PROFILE: the session's own tabs stay reachable, one the batch opened with newTab included", async () => {
+  const { reads, run } = batch(switchSession([]));
+  const { isError, content } = await run([
+    { action: "newTab", args: { url: C_URL } },
+    { action: "switchTab", args: { index: 2 } },
+    { action: "switchTab", args: { index: "4" } },
+    { action: "readPage" },
+  ]);
+  assert.ok(!isError, content[0].text);
+  assert.ok(JSON.parse(content[0].text).every((step) => !step.error), content[0].text);
+  assert.deepEqual(reads, [4], "the batch did not read the tab it opened");
+});
+
+test("run_script switchTab without SAFARI_PROFILE: a step with no tab index never reaches AppleScript's switch", async () => {
+  // AppleScript's switchTab(undefined) made tab NaN the session's tab, under a marker stamped on
+  // no tab at all. AppleScript cannot resolve a receipt either.
+  const { safari, reads, run } = batch(switchSession([]));
+  const claim = safari.switchTab;
+  let claims = 0;
+  safari.switchTab = (i) => { claims++; return claim(i); };
+  for (const args of [{}, { index: "first" }, { receipt: RECEIPT_B }]) {
+    const { isError, content } = await run([{ action: "switchTab", args }, { action: "readPage" }]);
+    assert.ok(isError, `${JSON.stringify(args)}: ${content[0].text}`);
+  }
+  assert.equal(claims, 0, "AppleScript switched without an index");
+  assert.deepEqual(reads, []);
+  assert.equal(await safari.resolveActiveTab(), 2, "the session's tab is still A");
 });
