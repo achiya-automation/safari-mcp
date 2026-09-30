@@ -2019,7 +2019,10 @@ async function _runExtensionBatchAction(action, args = {}) {
 
     case "closeTab": {
       const index = args.index === undefined ? undefined : Number(args.index);
-      const receipt = _receiptToken(args.receipt || args.receiptUrl || args.url || "") || _getActiveReceipt();
+      // As in safari_close_tab: a receipt that is not one is refused, not read as the current tab's.
+      const supplied = args.receipt || args.receiptUrl || args.url || "";
+      const receipt = supplied ? _receiptToken(supplied) : _getActiveReceipt();
+      if (supplied && !receipt) throw new Error("Tab safety: closeTab requires an extension-issued receipt");
       const closesCurrent = !receipt || receipt === _getActiveReceipt();
       const raw = await extensionOrFallback(
         "close_tab", { ...(index ? { index } : {}), ...(receipt ? { receipt } : {}) },
@@ -3148,7 +3151,10 @@ server.tool(
   },
   async ({ receipt, url }) => {
     const supplied = receipt || url || "";
-    const token = _receiptToken(supplied) || _getActiveReceipt();
+    // Only a close that names no receipt closes the current tab. One the server cannot parse
+    // ("<old receipt>", a token cut below 24 characters, a page URL) fell through to the current
+    // tab's receipt, and the tab the caller was still working in closed instead of the one it named.
+    const token = supplied ? _receiptToken(supplied) : _getActiveReceipt();
     if (supplied && !token) return errorResult("Tab safety: invalid tab receipt");
     const closesCurrent = !token || token === _getActiveReceipt();
     const marker = safari.getActiveTabMarker();
