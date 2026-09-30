@@ -44,6 +44,7 @@ import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import vm from "node:vm";
+import { answerCloseByMarker, answerMarkerScan, isCloseByMarker, isMarkerScan } from "./fake-safari-scripts.mjs";
 
 // ownership-state.js persists to ~/.safari-mcp — point HOME at a throwaway dir first.
 const tmpHome = mkdtempSync(join(tmpdir(), "smcp-proof-"));
@@ -100,28 +101,15 @@ function safariWindow(tabs) {
         tab.pageMarker = win.__mcpTabMarker;
       }
     }
-    const closing = /close tab i of w/.test(script) && script.match(/window\.name==='([^']*)'/);
-    if (closing) {
-      // closeTabByMarker: the tab carrying the marker, found and closed in one script (blanked
-      // when it is the window's only tab).
-      const at = tabs.findIndex((t) => t.marker === closing[1] || t.pageMarker === closing[1]);
-      if (at < 0) return "";
-      if (tabs.length === 1) {
-        tabs[0].url = "about:blank";
-        return "blanked";
-      }
-      tabs.splice(at, 1);
-      return "closed";
+    // The marker scan and the one-script close, run as Safari runs them over the one window
+    // (`window id 1`): their marker check reads each tab's page.
+    const pageOf = (t) => ({ name: t.marker || "", __mcpTabMarker: t.pageMarker });
+    if (isCloseByMarker(script)) {
+      return answerCloseByMarker(script, {
+        tabs, pageOf, close: (i) => tabs.splice(i - 1, 1), blank: (i) => { tabs[i - 1].url = "about:blank"; },
+      });
     }
-    const marker = script.match(/window\.name==='([^']*)'/);
-    if (marker) {
-      // A marker scan: the cached index first when there is one, then right to left.
-      const has = (i) => tabs[i - 1]?.marker === marker[1];
-      const cached = Number(script.match(/in tab (\d+) of w\) is "1"/)?.[1]);
-      if (has(cached)) return String(cached);
-      for (let i = tabs.length; i >= 1; i--) if (has(i)) return String(i);
-      return "0";
-    }
+    if (isMarkerScan(script)) return answerMarkerScan(script, { windowId: 1, tabs, pageOf });
     const prefix = script.match(/starts with "([^"]*)"/);
     if (prefix) {
       // resolveActiveTab's URL strategy: the cached index, a URL prefix right to left, then the
@@ -133,7 +121,7 @@ function safariWindow(tabs) {
       for (let i = tabs.length; i >= 1; i--) if (url(i).includes(domain)) return String(-i);
       return `0:${tabs.length}`;
     }
-    const load = script.match(/^tell application "Safari" to set URL of tab (\d+) of front window to "([^"]*)"$/);
+    const load = script.match(/^tell application "Safari" to set URL of tab (\d+) of (?:front window|window id 1) to "([^"]*)"$/);
     if (load) {
       // A new page: __mcpTabMarker goes with the old one, and window.name too across sites (Safari
       // clears it), until navigate() stamps the marker again.
