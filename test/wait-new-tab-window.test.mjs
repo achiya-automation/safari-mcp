@@ -84,6 +84,9 @@ function safari() {
   const answer = (script) => {
     const listing = script.match(/set w to (front window|window id \d+)\n\s*set output to \(id of w\) as text\n/);
     if (listing) {
+      // The id it reports and the tabs it walks must be the same window's.
+      const walks = script.match(/repeat with t in every tab of (.+)\n/)?.[1];
+      if (walks !== "w") throw new Error(`the fake Safari lists the window \`set w\` names, not ${walks}:\n${script}`);
       const w = windowOf(listing[1]);
       return [String(w.id), ...w.tabs.map((t, i) => `${i + 1}\t\t${t.url}`)].join("\n");
     }
@@ -233,7 +236,12 @@ test("AppleScript does not claim a tab only the extension's listing saw", async 
     throw new Error(`Timeout waiting for the extension (${type})`);
   };
   app.front = THEIRS; // tab 3 of the front window is the user's shop tab
-  await assert.rejects(loadServer(s, extension).safari_wait_for_new_tab({ timeout: 3000 }), /Tab safety/);
+  await assert.rejects(loadServer(s, extension).safari_wait_for_new_tab({ timeout: 3000 }), (err) => {
+    assert.match(err.message, /Tab safety/);
+    // A new wait starts from a listing that already has the tab, so it can only time out.
+    assert.doesNotMatch(err.message, /Retry safari_wait_for_new_tab/);
+    return true;
+  });
   assertUserTabsUnmarked(app);
   assert.equal(s._st().activeTabMarker, OURS);
 });
@@ -607,4 +615,27 @@ test("the claim names the URL the listing saw, and one refused as moved does not
   assert.deepEqual(expected, [POPUP, POPUP], "the claim did not name the URL the listing saw");
   assert.equal(popup.marker, s._st().activeTabMarker, "the popup does not carry the session's marker");
 });
+
+// AppleScript answers the first listing, which pins the session's window, and the extension the
+// rest: it lists a new tab, first on about:blank or not, and then cannot switch to it.
+for (const blankFirst of [false, true]) {
+  test(`a tab the extension listed after AppleScript pinned the window is not claimed through AppleScript${blankFirst ? ", from about:blank" : ""}`, async () => {
+    const app = safari();
+    const s = loadSafari(app);
+    app.afterListing = (n) => { if (n === 1) app.windows[0].tabs.push(app.tab("https://news.example.com/")); };
+    let listed = 0;
+    const extension = async (type) => {
+      if (type === "list_tabs" && listed++ > 0) {
+        const rows = [{ index: 1, title: "", safeUrl: X }, { index: 2, title: "", safeUrl: Y }];
+        if (listed > 2) rows.push({ index: 3, title: "", safeUrl: blankFirst && listed === 3 ? "about:blank" : POPUP });
+        return rows;
+      }
+      throw new Error(`Timeout waiting for the extension (${type})`);
+    };
+    await assert.rejects(loadServer(s, extension).safari_wait_for_new_tab({ timeout: 3000 }), /Tab safety/);
+    assert.equal(app.listings, 1, "AppleScript did not answer the first listing, so it pinned no window");
+    assertUserTabsUnmarked(app);
+    assert.equal(s._st().activeTabMarker, OURS);
+  });
+}
 

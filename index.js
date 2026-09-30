@@ -3439,7 +3439,7 @@ server.tool(
         switched = await safari.switchTab(t.index, { claim: true, win, expectUrl: t.url });
       } else {
         switched = await extensionOrFallback("switch_tab", { index: t.index }, () => {
-          throw new Error("Tab safety: the new tab was seen by the Safari extension, which could not switch to it, and AppleScript cannot tell which tab of its own window that is. Retry safari_wait_for_new_tab.");
+          throw new Error("Tab safety: a new tab opened, but the Safari extension could not switch to it and AppleScript cannot tell which tab of its own window that is, so this session did not claim it. The tab stays open, and another safari_wait_for_new_tab will not report it: that call starts from a listing that already has it. Check the extension with safari_doctor.");
         });
       }
       switched = _sanitizeTabResult(switched);
