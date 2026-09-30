@@ -132,9 +132,11 @@ function appleScriptTabs(safari, window) {
     });
     return { title: "", url: tab.url };
   };
-  safari.newTab = async (url) => {
+  safari.newTab = async (url, { onMarker } = {}) => {
     window.tabs.push({ url, marker: null });
-    return JSON.stringify({ ...claim(window.tabs.length), tabIndex: window.tabs.length });
+    const page = claim(window.tabs.length);
+    onMarker?.(window.tabs.at(-1).marker); // as safari.newTab() names the new tab's marker
+    return JSON.stringify({ ...page, tabIndex: window.tabs.length });
   };
   safari.switchTab = async (i) => JSON.stringify(claim(Number(i)));
   safari.listTabs = async () => JSON.stringify(window.list());

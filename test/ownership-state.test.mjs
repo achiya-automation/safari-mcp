@@ -109,6 +109,22 @@ test("tabs are tracked by identity: a tab on a shifted position never overwrites
   assert.equal(own._openedTabs.has("MCP_s1_b"), false);
 });
 
+test("a tab recorded again under its identity keeps one record, and the URL it left is released", () => {
+  // safari_wait_for_new_tab can take a tab of the session's that navigated for the new one, and the
+  // switch keeps that tab's marker. Replacing the record kept the URL it had left claimed for good.
+  own._trackTab(2, "https://example.com/login", "s1", "MCP_s1_a");
+  own._trackTab(3, "https://example.com/other", "s1", "MCP_s1_b");
+  own._trackTab(2, "https://example.com/login?pending=1", "s1", "MCP_s1_a");
+  assert.deepEqual(own._sessionTabs("s1").map(([key]) => key), ["MCP_s1_b", "MCP_s1_a"]);
+  assert.equal(own._ownedTabURLs.has("https://example.com/login"), false, "the URL the tab left is still claimed");
+  own._untrackTab("MCP_s1_a");
+  assert.deepEqual([...own._ownedTabURLs], ["https://example.com/other"]);
+  // A URL another record still claims stays claimed.
+  own._trackTab(4, "https://example.com/other", "s1", "MCP_s1_c");
+  own._trackTab(4, "https://example.com/elsewhere", "s1", "MCP_s1_c");
+  assert.ok(own._ownedTabURLs.has("https://example.com/other"));
+});
+
 test("ownership persists to owned-tabs.json on disk (atomic write)", () => {
   own._addOwnedURL("https://persisted.example/x");
   assert.equal(existsSync(OWNERSHIP_FILE), true);
