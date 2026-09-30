@@ -104,3 +104,46 @@ test("both run paths translate a foreign-tab trip into a terminal fail-closed er
 test("runJSLarge translates a tripped guard into a fail-closed error", () => {
   assert.match(src, /MCP_WRONG_TAB[\s\S]{0,400}Tab tracking lost during runJSLarge/);
 });
+
+// The steps that act on a tab they proved once, in later scripts (a load's probes and re-stamp,
+// `set URL`, a click or a history move), prove it again inside each script: every page script
+// _inTab() runs is built by _provenTabJS(), which checks the tab before anything else runs, or is
+// the marker check itself. See test/newtab-window-proof.test.mjs for the behaviour.
+const bodyOf = (head) => {
+  const from = src.indexOf(head);
+  assert.ok(from >= 0, `could not find ${head}`);
+  const to = src.indexOf("\n}\n", from);
+  return src.slice(from, to);
+};
+
+test("every page script a step runs in the tab it proved checks the tab first", () => {
+  const inTab = bodyOf("async function _inTab(");
+  const sites = [...inTab.matchAll(/do JavaScript "\$\{/g)].map((m) => inTab.slice(m.index + 17, m.index + 17 + 90));
+  assert.ok(sites.length >= 4, `expected _inTab's page scripts, found ${sites.length}`);
+  for (const site of sites) {
+    assert.ok(
+      site.startsWith("byMarker}") ||
+        site.startsWith("_doJSLiteral(_markerCheckJS(tab.marker))}") ||
+        site.startsWith("_doJSLiteral(_provenTabJS(tab.marker, js, { positional: true, stamp, since: tab.since }))}"),
+      `_inTab runs a page script that does not prove the tab first: ${site}`
+    );
+  }
+  assert.match(inTab, /const byMarker = _doJSLiteral\(_provenTabJS\(tab\.marker, js, \{ positional: false, stamp: stamp \|\| markerOnly \}\)\);/);
+  const proven = bodyOf("function _provenTabJS(");
+  const check = proven.indexOf("if(!own&&(!P||");
+  assert.ok(check > 0 && check < proven.indexOf("return 'MCP_OK:'"), "_provenTabJS must refuse before it runs the script");
+});
+
+test("the load steps act on their tab only through _inTab", () => {
+  for (const head of [
+    "export async function navigate(url)", "export async function goBack(", "export async function goForward(",
+    "export async function reload(", "async function _pollReadyAndRead(", "export async function navigateAndRead(",
+    "export async function clickAndWait(", "export async function fillAndSubmit(",
+  ]) {
+    const body = bodyOf(head);
+    assert.doesNotMatch(body, /runJS\([^;]*tabIndex:/, `${head} runs JS at an index it does not prove again`);
+    assert.doesNotMatch(body, /osascript(?:Fast)?\(\s*`tell application "Safari" to set URL/, `${head} sets a URL at an index it does not prove again`);
+  }
+  const newTab = bodyOf("export async function newTab(");
+  assert.doesNotMatch(newTab, /do JavaScript "\$\{js/, "newTab runs page scripts at an index it does not prove again");
+});
