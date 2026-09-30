@@ -3422,23 +3422,27 @@ server.tool(
       });
       return { via, tabs: typeof raw === "string" ? JSON.parse(raw) : raw };
     };
+    // A listed tab's URL: AppleScript lists `url`, the extension `safeUrl` (origin and path).
+    const urlOf = (t) => t.url ?? t.safeUrl;
     // Switch to the new tab and own it for THIS session, else the next interaction trips the
     // tab-safety guard. Its marker names it only if AppleScript made the switch (and stamped
-    // it); the extension answers with the tab's receipt instead. AppleScript claims only a tab
-    // its own listing of the pinned window saw: an index the extension listed is a position in
-    // the extension's window, not in the one AppleScript would stamp.
+    // it); the extension answers with the tab's receipt instead. A tab AppleScript listed is
+    // claimed through AppleScript, in the pinned window, at once: its index is a position there,
+    // not in the extension's window, and waiting out the extension's switch_tab first (30 s
+    // while its worker is busy) left time for another tab to slide under that index. AppleScript
+    // never claims a tab only the extension's listing saw.
     const adopt = async (t, via) => {
-      let viaAppleScript = false;
-      const switched = _sanitizeTabResult(await extensionOrFallback(
-        "switch_tab", { index: t.index },
-        () => {
-          viaAppleScript = true;
-          if (via !== "applescript" || !win) {
-            throw new Error("Tab safety: the new tab was seen by the Safari extension, which could not switch to it, and AppleScript cannot tell which tab of its own window that is. Retry safari_wait_for_new_tab.");
-          }
-          return safari.switchTab(t.index, { claim: true, win });
-        }
-      ));
+      const viaAppleScript = via === "applescript";
+      let switched;
+      if (viaAppleScript) {
+        if (!win) throw new Error("Tab safety: AppleScript did not say which window it listed, so it cannot tell which tab opened. Retry safari_wait_for_new_tab.");
+        switched = await safari.switchTab(t.index, { claim: true, win });
+      } else {
+        switched = await extensionOrFallback("switch_tab", { index: t.index }, () => {
+          throw new Error("Tab safety: the new tab was seen by the Safari extension, which could not switch to it, and AppleScript cannot tell which tab of its own window that is. Retry safari_wait_for_new_tab.");
+        });
+      }
+      switched = _sanitizeTabResult(switched);
       safari.setActiveTabIndex(t.index);
       safari.setActiveTabURL(t.url);
       if (!viaAppleScript) safari.setActiveTabFromExtension(t.index, t.url);
@@ -3449,43 +3453,46 @@ server.tool(
         _trackTab(t.index, t.url, `${SESSION_ID}:${currentSessionId()}`, viaAppleScript ? safari.getActiveTabMarker() : "", switched?.receipt);
       }
       _setActiveReceipt(switched?.receipt);
-      return { content: [{ type: "text", text: `Found new tab: ${t.title} (${t.url})` }] };
+      return { content: [{ type: "text", text: `Found new tab: ${t.title} (${urlOf(t)})` }] };
     };
-    // The tabs that opened since `was`: the ones on a URL no tab of `was` showed, provided every
-    // tab of `was` is still there on its URL, in order. The first `index:url` pair not seen before
-    // was often a tab of the user's that had navigated, or had moved when another closed, and the
-    // claim stamped the session's own marker on it. Null when a tab that was there changed as well,
-    // or one opened on a URL another tab shows: any of them could be the new one.
-    // A listed tab's URL: AppleScript lists `url`, the extension `safeUrl` (origin and path).
-    // ponytail: tabs are told apart by URL alone (AppleScript has no tab id), so a new tab that
-    // opens on the very URL a tab of the user's leaves in the same poll can still pass for it.
-    const urlOf = (t) => t.url ?? t.safeUrl;
-    const inserted = (was, is) => {
+    // Whether every tab of `was` is still there on its URL, in order, in `is`: only then can a tab
+    // `is` added be told from the old ones. The first `index:url` pair not seen before was often a
+    // tab of the user's that had navigated, or had moved when another closed, and the claim stamped
+    // the session's own marker on it.
+    // ponytail: tabs are told apart by URL alone (AppleScript has no tab id and no opener), so any
+    // tab the user opens in the window during the wait counts as new, a new tab that opens on the
+    // very URL a tab of the user's leaves in the same poll can pass for it, and the claim stamps
+    // whatever tab sits at the listed index a script later.
+    const intact = (was, is) => {
       const seen = new Set(was.map(urlOf));
       const kept = is.filter((t) => seen.has(urlOf(t)));
-      return kept.length === was.length && kept.every((t, i) => urlOf(t) === urlOf(was[i]))
-        ? is.filter((t) => !seen.has(urlOf(t)))
-        : null;
+      return kept.length === was.length && kept.every((t, i) => urlOf(t) === urlOf(was[i]));
     };
     // Get current tab list
     let before = await list();
+    // Every URL a baseline showed. A new tab is one on a URL none of them showed, so a tab that
+    // left the window and came back (reopened, or dragged out and in again) is not new either.
+    const shown = new Set(before.tabs.map(urlOf));
 
     // Poll for new tab — detect by count increase + tabs on new URLs
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 500));
       const now = await list();
-      // A listing with no more tabs becomes the baseline, so a tab of the user's that navigated
-      // meanwhile is not new once one opens; so does a listing from the other source.
-      if (now.via !== before.via || now.tabs.length <= before.tabs.length) {
+      // A listing where a tab closed or navigated becomes the baseline, so a tab of the user's that
+      // navigated meanwhile is not new once one opens; so does one from the other source. So does
+      // one where that happened as a tab opened, or a new tab shows an old tab's URL: held against
+      // the older baseline, whichever of the two navigated first looked new, the user's too.
+      if (now.via !== before.via || !intact(before.tabs, now.tabs)) {
         before = now;
+        for (const t of now.tabs) shown.add(urlOf(t));
         continue;
       }
-      for (const tab of inserted(before.tabs, now.tabs) || []) {
+      for (const tab of now.tabs) {
         // A new tab still on about:blank (an OAuth popup before it loads) is claimed at a later
         // poll, once it shows its URL: a later listing found it again by index, and by then that
         // could be another tab.
-        if (urlOf(tab) === 'about:blank') continue;
+        if (urlOf(tab) === 'about:blank' || shown.has(urlOf(tab))) continue;
         if (urlContains && !String(urlOf(tab)).includes(urlContains)) continue;
         try {
           return await adopt(tab, now.via);
