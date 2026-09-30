@@ -338,3 +338,29 @@ test("a tab of the user's that navigates while one opens on a page the window sh
   assert.equal(s._st().activeTabMarker, OURS);
   assert.deepEqual(openedURLs(), []);
 });
+
+test("a tab another session opened meanwhile, which the claim refuses, does not end the wait", async () => {
+  const app = safari();
+  const s = loadSafari(app);
+  const mine = app.windows[0].tabs;
+  const theirs = app.tab("https://other.example.com/", "MCP_sess0002_theirs");
+  // switchTab refuses to claim a tab that carries another session's marker, as the claim does
+  // once it checks for one: the refusal is flagged `otherSession` and changes nothing.
+  const claim = s.switchTab;
+  s.switchTab = async (i, opts) => {
+    if (/^MCP_sess0002_/.test(mine[i - 1]?.marker)) {
+      throw Object.assign(new Error(`Tab safety: refusing to claim tab ${i} — another MCP session's marker is on it`), { otherSession: true });
+    }
+    return claim(i, opts);
+  };
+  app.afterListing = (n) => {
+    if (n === 1) mine.push(theirs);
+    if (n === 3) mine.push(app.tab(POPUP));
+  };
+  const reply = await loadServer(s).safari_wait_for_new_tab({ timeout: 3000 });
+  assert.match(text(reply), /Found new tab/);
+  assert.equal(mine[3].marker, s._st().activeTabMarker, "the popup does not carry the session's marker");
+  assert.equal(theirs.marker, "MCP_sess0002_theirs", "the other session's tab lost its marker");
+  for (const t of userTabs(app).filter((t) => t !== theirs)) assert.equal(t.marker, "", `the user's tab on ${t.url} got a marker`);
+  assert.deepEqual(openedURLs(), [POPUP]);
+});

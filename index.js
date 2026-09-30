@@ -3487,7 +3487,13 @@ server.tool(
         // could be another tab.
         if (urlOf(tab) === 'about:blank') continue;
         if (urlContains && !String(urlOf(tab)).includes(urlContains)) continue;
-        return await adopt(tab, now.via);
+        try {
+          return await adopt(tab, now.via);
+        } catch (err) {
+          // A tab another session opened in this window meanwhile, whose marker the claim refuses
+          // to overwrite (`otherSession`): not this session's, and the one it waits for can still come.
+          if (!err?.otherSession) throw err;
+        }
       }
     }
     return { content: [{ type: "text", text: "TIMEOUT: no new tab appeared" }] };
