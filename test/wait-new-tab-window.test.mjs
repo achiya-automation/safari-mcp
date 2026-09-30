@@ -365,16 +365,9 @@ test("a tab another session opened meanwhile, which the claim refuses, does not 
   const app = safari();
   const s = loadSafari(app);
   const mine = app.windows[0].tabs;
+  // Another session's new tab carries that session's marker: switchTab's claim refuses it
+  // (`otherSession`) and stamps nothing.
   const theirs = app.tab("https://other.example.com/", "MCP_sess0002_theirs");
-  // switchTab refuses to claim a tab that carries another session's marker, as the claim does
-  // once it checks for one: the refusal is flagged `otherSession` and changes nothing.
-  const claim = s.switchTab;
-  s.switchTab = async (i, opts) => {
-    if (/^MCP_sess0002_/.test(mine[i - 1]?.marker)) {
-      throw Object.assign(new Error(`Tab safety: refusing to claim tab ${i} — another MCP session's marker is on it`), { otherSession: true });
-    }
-    return claim(i, opts);
-  };
   app.afterListing = (n) => {
     if (n === 1) mine.push(theirs);
     if (n === 3) mine.push(app.tab(POPUP));
@@ -593,27 +586,31 @@ test("a tab AppleScript listed is claimed through AppleScript, without asking th
   assert.equal(mine[2].marker, s._st().activeTabMarker, "the popup does not carry the session's marker");
 });
 
-test("the claim names the URL the listing saw, and one refused as moved does not end the wait", async () => {
+test("a claim whose index another tab slid under is refused, and the wait claims the popup where it went", async () => {
   const app = safari();
   const s = loadSafari(app);
   const mine = app.windows[0].tabs;
   const popup = app.tab(POPUP);
-  // switchTab refuses a claim whose tab no longer shows `expectUrl` (flagged `moved`), as the claim
-  // does once it checks one; here the first claim finds another tab under the index.
+  const news = app.tab("https://news.example.com/");
+  // The listing sees the popup at 3; before the claim runs, the user opens a tab to its left, so
+  // tab 3 is theirs by then. The claim names the URL the listing saw and refuses (`moved`).
+  app.afterListing = (n) => {
+    if (n === 1) mine.push(popup);
+    if (n === 2) mine.splice(2, 0, news);
+  };
+  const claims = [];
   const claim = s.switchTab;
-  const expected = [];
   s.switchTab = async (i, opts) => {
-    expected.push(opts.expectUrl);
-    if (expected.length === 1) {
-      throw Object.assign(new Error(`Tab safety: refusing to claim tab ${i} — it no longer shows the page the listing saw`), { moved: true });
-    }
+    claims.push([i, opts.expectUrl]);
     return claim(i, opts);
   };
-  app.afterListing = (n) => { if (n === 1) mine.push(popup); };
-  const reply = await loadServer(s).safari_wait_for_new_tab({ timeout: 3000 });
+  const reply = await loadServer(s).safari_wait_for_new_tab({ timeout: 3000, urlContains: "sso.example.net" });
   assert.match(text(reply), /Found new tab/);
-  assert.deepEqual(expected, [POPUP, POPUP], "the claim did not name the URL the listing saw");
+  assert.deepEqual(claims, [[3, POPUP], [4, POPUP]], "the claim did not name the URL the listing saw, or was not refused");
+  assert.equal(news.marker, "", "the user's tab that slid under the index got the session's marker");
   assert.equal(popup.marker, s._st().activeTabMarker, "the popup does not carry the session's marker");
+  assertUserTabsUnmarked(app);
+  assert.deepEqual(openedURLs(), [POPUP]);
 });
 
 // AppleScript answers the first listing, which pins the session's window, and the extension the
