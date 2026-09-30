@@ -31,6 +31,7 @@ import { test, beforeEach, after } from "node:test";
 import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { answerCloseByMarker, answerMarkerScan, isCloseByMarker, isMarkerScan, scriptWindowRef } from "./fake-safari-scripts.mjs";
 
 // ownership-state.js persists to ~/.safari-mcp — point HOME at a throwaway dir first.
 const tmpHome = mkdtempSync(join(tmpdir(), "smcp-proof-"));
@@ -64,6 +65,7 @@ const USER2_URL = "https://news.example.net/today";
 const USER3_URL = "https://docs.example.org/draft";
 const A_URL = "https://a.example.com/start";
 const B_URL = "https://b.example.com/work";
+const OTHER_SITE_URL = "https://b.example.net/work"; // a site of its own: Safari clears window.name on the way
 
 const tab = (url, extra = {}) => ({ url, name: "", ...extra });
 
@@ -75,12 +77,16 @@ const tab = (url, extra = {}) => ({ url, name: "", ...extra });
 function safariApp(...windows) {
   const ran = [], navigated = [], closed = [];
   const front = () => windows[0];
+  // Each window has an id, and a script names a window as 'front window' or `window id N`.
+  windows.forEach((w, k) => { w.id ??= k + 1; });
+  const windowOf = (ref) => (!ref || ref === "front window" ? front() : windows.find((w) => `window id ${w.id}` === ref));
+  const pageOf = (t) => ({ name: t.name });
   const selected = () => front().find((t) => t.current) || front()[0];
   const site = (url) => { try { return new URL(url).hostname.split(".").slice(-2).join("."); } catch { return url; } };
   const run = async (script) => {
-    const js = script.match(/^tell application "Safari" to do JavaScript "([\s\S]*)" in (?:tab (\d+) of front window|front document)$/);
+    const js = script.match(/^tell application "Safari" to do JavaScript "([\s\S]*)" in (?:tab (\d+) of (front window|window id \d+)|front document)$/);
     if (js) {
-      const target = js[2] ? front()[Number(js[2]) - 1] : selected();
+      const target = js[2] ? windowOf(js[3])?.[Number(js[2]) - 1] : selected();
       if (!target) throw new Error(`AppleScript error: Safari got an error: Can’t get tab ${js[2]} of window 1. (-1728)`);
       // The identity guard runJS prefixes: the tab must carry the session's marker, or, when the
       // session holds none, must not carry another session's.
@@ -95,27 +101,17 @@ function safariApp(...windows) {
       if (js[1].includes("JSON.stringify({title:document.title,url:location.href")) return JSON.stringify({ title: "", url: target.url });
       return target.url;
     }
-    const closing = /close tab i of w/.test(script) && script.match(/window\.name==='([^']*)'/);
-    if (closing) {
-      // closeTabByMarker: the front window's tab carrying the marker, found and closed in one
-      // script (blanked when it is the window's only tab).
-      const at = front().findIndex((t) => t.name === closing[1]);
-      if (at < 0) return "";
-      if (front().length === 1) {
-        front()[0].url = "about:blank";
-        return "blanked";
-      }
-      closed.push(...front().splice(at, 1));
-      return "closed";
+    // The marker scan and the one-script close, run as Safari runs them over the window they
+    // name: their marker check reads each tab's page.
+    if (isCloseByMarker(script)) {
+      const w = windowOf(scriptWindowRef(script));
+      return answerCloseByMarker(script, {
+        tabs: w, pageOf, close: (i) => closed.push(...w.splice(i - 1, 1)), blank: (i) => { w[i - 1].url = "about:blank"; },
+      });
     }
-    const scan = script.match(/window\.name==='([^']*)'/);
-    if (scan) {
-      // A marker scan of the front window: the hinted tab first, then right to left.
-      const has = (i) => front()[i - 1]?.name === scan[1];
-      const hint = Number(script.match(/in tab (\d+) of w\) is "1"/)?.[1]);
-      if (has(hint)) return String(hint);
-      for (let i = front().length; i >= 1; i--) if (has(i)) return String(i);
-      return "0";
+    if (isMarkerScan(script)) {
+      const w = windowOf(scriptWindowRef(script));
+      return answerMarkerScan(script, { windowId: w.id, tabs: w, pageOf });
     }
     const prefix = script.match(/starts with "([^"]*)"/);
     if (prefix) {
@@ -130,11 +126,11 @@ function safariApp(...windows) {
       for (let i = front().length; i >= 1; i--) if (url(i).includes(domain)) return String(-i);
       return `0:${front().length}`;
     }
-    const nav = script.match(/^tell application "Safari" to set URL of tab (\d+) of front window to "([^"]*)"$/);
+    const nav = script.match(/^tell application "Safari" to set URL of tab (\d+) of (front window|window id \d+) to "([^"]*)"$/);
     if (nav) {
-      const target = front()[Number(nav[1]) - 1];
-      if (site(target.url) !== site(nav[2])) target.name = ""; // Safari clears window.name on a cross-site load
-      target.url = nav[2];
+      const target = windowOf(nav[2])[Number(nav[1]) - 1];
+      if (site(target.url) !== site(nav[3])) target.name = ""; // Safari clears window.name on a cross-site load
+      target.url = nav[3];
       navigated.push(target);
       return "";
     }
@@ -344,10 +340,11 @@ test("native input, runJSLarge and navigate act on the proven tab, not on the us
   assert.equal(fronted, mine, "the native event went to another tab");
   assert.equal(browser.front().find((t) => t.current)?.url, USER2_URL, "the user's selected tab was not given back");
   assert.deepEqual(await safari.runJSLarge("document.title"), A_URL);
-  await server.safari_navigate({ url: B_URL });
+  await server.safari_navigate({ url: OTHER_SITE_URL });
   assert.deepEqual(browser.navigated, [mine]);
-  assert.equal(mine.url, B_URL);
+  assert.equal(mine.url, OTHER_SITE_URL);
   // navigate() re-stamps its marker after the cross-site load cleared window.name.
+  assert.equal(mine.name, safari._st().activeTabMarker, "navigate() did not re-stamp the tab it loaded");
   await server.safari_read_page({});
   assert.equal(browser.ran.at(-1), mine);
 });

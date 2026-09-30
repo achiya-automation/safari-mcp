@@ -26,6 +26,7 @@ import { test, beforeEach, after } from "node:test";
 import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { answerCloseByMarker, answerMarkerScan, isCloseByMarker, isMarkerScan } from "./fake-safari-scripts.mjs";
 
 // ownership-state.js persists to ~/.safari-mcp — point HOME at a throwaway dir first.
 const tmpHome = mkdtempSync(join(tmpdir(), "smcp-marker-"));
@@ -65,28 +66,15 @@ const RECEIPT_B2 = "ReceiptB2_" + "c".repeat(24);
 function safariWindow(tabs, later = []) {
   const url = (i) => tabs[i - 1]?.url || "";
   const run = async (script) => {
-    const closing = /close tab i of w/.test(script) && script.match(/window\.name==='([^']*)'/);
-    if (closing) {
-      // closeTabByMarker: the tab carrying the marker, found and closed in one script (blanked
-      // when it is the window's only tab).
-      const at = tabs.findIndex((t) => t.marker === closing[1]);
-      if (at < 0) return "";
-      if (tabs.length === 1) {
-        tabs[0].url = "about:blank";
-        return "blanked";
-      }
-      tabs.splice(at, 1);
-      return "closed";
+    // The marker scan and the one-script close over the one window (`window id 1`), run as Safari
+    // runs them: their marker check reads each tab's page.
+    const pageOf = (t) => ({ name: t.marker || "" });
+    if (isCloseByMarker(script)) {
+      return answerCloseByMarker(script, {
+        tabs, pageOf, close: (i) => tabs.splice(i - 1, 1), blank: (i) => { tabs[i - 1].url = "about:blank"; },
+      });
     }
-    const marker = script.match(/window\.name==='([^']*)'/);
-    if (marker) {
-      // resolveActiveTab's marker scan: the cached index first, then right to left.
-      const has = (i) => tabs[i - 1]?.marker === marker[1];
-      const cached = Number(script.match(/in tab (\d+) of w\) is "1"/)?.[1]);
-      if (has(cached)) return String(cached);
-      for (let i = tabs.length; i >= 1; i--) if (has(i)) return String(i);
-      return "0";
-    }
+    if (isMarkerScan(script)) return answerMarkerScan(script, { windowId: 1, tabs, pageOf });
     const prefix = script.match(/starts with "([^"]*)"/);
     if (prefix) {
       // Its URL strategy: the cached index, a URL prefix right to left, then the domain

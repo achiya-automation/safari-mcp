@@ -23,6 +23,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
+import { answerCloseByMarker, answerMarkerScan, isCloseByMarker, isMarkerScan, scriptWindowRef } from "./fake-safari-scripts.mjs";
 
 const safariSource = readFileSync(new URL("../safari.js", import.meta.url), "utf8");
 const indexSource = readFileSync(new URL("../index.js", import.meta.url), "utf8");
@@ -40,12 +41,17 @@ const MARKER = "MCP_sess0001_mine";
 
 // ---------- a Safari with two windows ----------
 
-// Each window is { id, tabs }; tab i is tabs[i - 1], and a tab is { url, marker } with `marker` its
-// window.name. Page scripts run for real against that; the marker scan and the one-script close are
-// answered here, as Safari runs them. `closed` keeps every tab a script closed, `afterScript` runs
-// after every script.
+// Each window is { id, tabs }; tab i is tabs[i - 1], and a tab is { url, marker, pageMarker } with
+// `marker` its window.name and `pageMarker` its window.__mcpTabMarker. Page scripts run for real
+// against that, and so does the marker check the scan and the one-script close embed
+// (fake-safari-scripts.mjs). `closed` keeps every tab a script closed, `afterScript` runs after every
+// script.
 function safari() {
-  const tab = (url, marker = "") => ({ url, marker });
+  const tab = (url, marker = "", pageMarker) => ({ url, marker, pageMarker });
+  // `throws`: a page whose window.name cannot be read (the check's catch answers for it).
+  const pageOf = (t) => (t.throws
+    ? { get name() { throw new Error("blocked"); }, get __mcpTabMarker() { throw new Error("blocked"); } }
+    : { name: t.marker, __mcpTabMarker: t.pageMarker });
   const app = {
     front: MINE, closed: [], scripts: [], afterScript: null, tab,
     windows: [
@@ -59,23 +65,17 @@ function safari() {
     return w;
   };
   const answer = (script) => {
-    const closing = /close tab i of w/.test(script) && script.match(/window\.name==='([^']*)'/);
-    if (closing) {
-      const w = windowOf(script.match(/set w to (front window|window id \d+)/)[1]);
-      const at = w.tabs.findIndex((t) => t.marker === closing[1]);
-      if (at < 0) return "";
-      if (w.tabs.length === 1) {
-        w.tabs[0].url = "about:blank";
-        return "blanked";
-      }
-      app.closed.push(...w.tabs.splice(at, 1));
-      return "closed";
+    if (isCloseByMarker(script)) {
+      const w = windowOf(scriptWindowRef(script));
+      return answerCloseByMarker(script, {
+        tabs: w.tabs, pageOf,
+        close: (i) => app.closed.push(...w.tabs.splice(i - 1, 1)),
+        blank: (i) => { w.tabs[i - 1].url = "about:blank"; },
+      });
     }
-    const scan = script.match(/window\.name==='([^']*)'/);
-    if (scan) {
-      const w = windowOf(script.match(/set w to (front window|window id \d+)/)[1]);
-      const i = w.tabs.findIndex((t) => t.marker === scan[1]) + 1;
-      return `${w.id}:${i}`;
+    if (isMarkerScan(script)) {
+      const w = windowOf(scriptWindowRef(script));
+      return answerMarkerScan(script, { windowId: w.id, tabs: w.tabs, pageOf });
     }
     const page = script.match(/^tell application "Safari" to do JavaScript "([\s\S]*)" in tab (\d+) of (front window|window id \d+)$/);
     if (page) {
@@ -166,6 +166,24 @@ for (const user of USER) {
   });
 }
 
+test("closeTab() closes the session's tab that carries its marker only in __mcpTabMarker", async () => {
+  // A page took window.name over; the marker stamped with it survives in __mcpTabMarker.
+  const { app, s } = session();
+  Object.assign(app.windows[0].tabs[2], { marker: "app-state", pageMarker: MARKER });
+  assert.equal(await s.findTabByMarker(MARKER), 3, "the marker scan missed the tab");
+  assert.equal(await s.closeTab(), "Tab closed");
+  assert.deepEqual(app.closed.map((t) => t.url), ["https://a.example.org/"]);
+  assert.deepEqual(app.urls(MINE), ["https://mail.example.com/", "https://docs.example.com/", "https://bank.example.com/"]);
+});
+
+test("closeTab() passes over a page it cannot read and closes the session's tab", async () => {
+  // The user's rightmost tab is a page whose window.name cannot be read; the close checks it first.
+  const { app, s } = session();
+  app.windows[0].tabs[3].throws = true;
+  assert.equal(await s.closeTab(), "Tab closed");
+  assert.deepEqual(app.closed.map((t) => t.url), ["https://a.example.org/"]);
+});
+
 test("closeOwnTab(index) closes the tab it names only as the tab carrying the session's marker", async () => {
   const { app, s } = session();
   await assert.rejects(s.closeOwnTab(4), /Tab safety/);
@@ -178,8 +196,16 @@ test("the window's last tab is blanked, not closed", async () => {
   const { app, s } = session();
   app.windows[0].tabs = [app.tab("https://a.example.org/", MARKER)];
   assert.match(await s.closeTab(), /last tab blanked/);
+  assert.equal(app.windows[0].tabs.length, 1, "the window's last tab was closed");
   assert.deepEqual(app.urls(MINE), ["about:blank"]);
   assert.deepEqual(app.closed, []);
+});
+
+test("a window with one tab of the user's is left alone when it does not carry the marker", async () => {
+  const { app, s } = session();
+  app.windows[0].tabs = [app.tab("https://bank.example.com/")];
+  await assert.rejects(s.closeTab(), /Tab tracking lost/);
+  assert.deepEqual(app.urls(MINE), ["https://bank.example.com/"]);
 });
 
 test("closeTab() closes nothing when no tab carries the session's marker", async () => {

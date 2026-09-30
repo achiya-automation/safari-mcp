@@ -28,6 +28,7 @@ import { test, beforeEach, after } from "node:test";
 import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { answerMarkerScan, isMarkerScan } from "./fake-safari-scripts.mjs";
 
 // ownership-state.js persists to ~/.safari-mcp — point HOME at a throwaway dir first.
 const tmpHome = mkdtempSync(join(tmpdir(), "smcp-failclosed-"));
@@ -64,7 +65,7 @@ function safariWindow(tabs) {
   const ran = [];
   const url = (i) => tabs[i - 1]?.url || "";
   const run = async (script) => {
-    const js = script.match(/^tell application "Safari" to do JavaScript "([\s\S]*)" in (?:tab (\d+) of front window|front document)$/);
+    const js = script.match(/^tell application "Safari" to do JavaScript "([\s\S]*)" in (?:tab (\d+) of (?:front window|window id 1)|front document)$/);
     if (js) {
       const tab = js[2] ? tabs[Number(js[2]) - 1] : tabs.find((t) => t.front);
       if (!tab) throw new Error(`AppleScript error: Safari got an error: Can’t get tab ${js[2]} of window 1. (-1728)`);
@@ -77,12 +78,8 @@ function safariWindow(tabs) {
       ran.push(tab.url);
       return tab.url;
     }
-    const scan = script.match(/window\.name==='([^']*)'/);
-    if (scan) {
-      // resolveActiveTab's marker scan: the tab that carries the session's marker, right to left.
-      for (let i = tabs.length; i >= 1; i--) if (tabs[i - 1].name === scan[1]) return String(i);
-      return "0";
-    }
+    // resolveActiveTab's marker scan over the one window (`window id 1`), run as Safari runs it.
+    if (isMarkerScan(script)) return answerMarkerScan(script, { windowId: 1, tabs, pageOf: (t) => ({ name: t.name }) });
     const prefix = script.match(/starts with "([^"]*)"/);
     if (prefix) {
       // resolveActiveTab's URL strategy: the cached index, a URL prefix right to left, then the

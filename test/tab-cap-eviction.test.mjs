@@ -345,12 +345,13 @@ test("below the cap nothing is closed", async () => {
 test("with the extension unavailable a receipt tab is kept, never guessed at through AppleScript", async () => {
   const p = makeProfile();
   const [q1] = openTabs(p, SESSION, 6);
-  const safari = {
-    closeTabByMarker: async () => assert.fail("AppleScript must not close a receipt tab"),
-  };
+  // A stub that throws would be swallowed by _closeTrackedTab's catch; this one records the call.
+  const closes = [];
+  const safari = { closeTabByMarker: async (marker) => { closes.push(marker); return null; } };
   const server = makeServer({ send: () => assert.fail("not connected"), extension: false, profile: false, safari });
 
   assert.equal(await server._evictOldestTab(SESSION), null);
+  assert.deepEqual(closes, [], "AppleScript was asked to close a receipt tab");
   assert.equal(own._openedTabs.has(q1.receipt), true);
 });
 
@@ -399,11 +400,11 @@ test("an AppleScript close that fails stops the cap there, and keeps every tab t
 
 test("a named profile never closes through AppleScript, even for a marked tab", async () => {
   own._trackTab(1, "https://example.com/1", SESSION, "MCP_s1_1");
-  const safari = {
-    closeTabByMarker: async () => assert.fail("no AppleScript close in a profile"),
-  };
+  const closes = [];
+  const safari = { closeTabByMarker: async (marker) => { closes.push(marker); return "closed"; } };
   const server = makeServer({ send: () => assert.fail("no receipt to send"), profile: true, safari, maxTabs: 1 });
   assert.equal(await server._evictOldestTab(SESSION), null);
+  assert.deepEqual(closes, [], "a named profile closed a tab through AppleScript");
 });
 
 test("a close by receipt forgets exactly that tab, under any of its names", async () => {

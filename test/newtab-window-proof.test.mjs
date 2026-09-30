@@ -31,6 +31,7 @@ import { test } from "node:test";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import { escAppleScriptString } from "../injected-escape.js";
+import { answerMarkerScan, isMarkerScan, scriptWindowRef } from "./fake-safari-scripts.mjs";
 
 const safariSource = readFileSync(new URL("../safari.js", import.meta.url), "utf8");
 
@@ -99,11 +100,12 @@ function safari(windows, front) {
       title: app.blockedOnce.includes(t.url) ? "Safari cannot open the page" : `title of ${t.url}`,
       readyState: "complete", body: { innerText: `text of ${t.url}` }, addEventListener() {},
       querySelector: (sel) => (sel === "#go" ? link : null),
+      scrollingElement: { scrollTop: 0, scrollBy() {} }, createTreeWalker: () => ({ nextNode: () => false }),
     };
     const location = { href: t.url, reload() { move = "reload"; } };
     const history = { back() { move = "back"; }, forward() { move = "forward"; } };
     try {
-      return String(vm.runInNewContext(js, { window: page, document, location, history }) ?? "");
+      return String(vm.runInNewContext(js, { window: page, document, location, history, NodeFilter: { SHOW_TEXT: 4 } }) ?? "");
     } finally {
       Object.assign(t, { name: page.name, marker: page.__mcpTabMarker, spoof: !!page.__mcpVisSpoof, helpers: page.__mcpHelpers, written: page.__written });
       if (move === "reload") load(t, t.url, 1);
@@ -125,17 +127,10 @@ function safari(windows, front) {
       const w = windowOf(page[3] || "front window");
       return runPage(tabOf(w, page[2] ? Number(page[2]) : 1), page[1].replace(/\\(["\\])/g, "$1"));
     }
-    const marker = script.match(/window\.name==='([^']*)'/);
-    if (marker) {
-      // A marker scan of one window: the hinted tab first, then right to left. The answer is the
-      // return statement that fires, evaluated as written.
-      const w = windowOf(script.match(/set w to (front window|window id \d+)/)[1]);
-      const has = (i) => w.tabs[i - 1]?.name === marker[1] || w.tabs[i - 1]?.marker === marker[1];
-      const hint = Number(script.match(/in tab (\d+) of w\) is "1"/)?.[1]);
-      const wid = /\n\s*set wid to \(id of w\) as text\n/.test(script);
-      if (has(hint)) return new RegExp(`then return wid & ":${hint}"`).test(script) && wid ? `${w.id}:${hint}` : String(hint);
-      for (let i = w.tabs.length; i >= 1; i--) if (has(i)) return /then return wid & ":" & i\n/.test(script) && wid ? `${w.id}:${i}` : String(i);
-      return /return wid & ":0"\n/.test(script) && wid ? `${w.id}:0` : "0";
+    if (isMarkerScan(script)) {
+      // A marker scan of one window, run as Safari runs it: its marker check reads each tab's page.
+      const w = windowOf(scriptWindowRef(script));
+      return answerMarkerScan(script, { windowId: w.id, tabs: w.tabs, pageOf: (t) => ({ name: t.name, __mcpTabMarker: t.marker }) });
     }
     const made = script.match(/set w to (front window|window id \d+)\n[\s\S]*make new tab(?: with properties \{URL:"([^"]*)"\})?\n/);
     if (made) {
@@ -184,26 +179,37 @@ const safariParts = [
   between(safariSource, "function _assertNotFallingBackToUserTab(", "\n// ========== TAB IDENTITY MARKER"),
   between(safariSource, "function _buildStampJS(", "\n// Quick JS execution"),
   between(safariSource, "export function getActiveTabIndex()", "\n// ========== FAST OSASCRIPT"),
-  between(safariSource, "function _tabIdentityGuard(", "\n// Run large JavaScript via temp file"),
+  between(safariSource, "function _tabIdentityGuard(", "\n// ========== NAVIGATION =========="),
   between(safariSource, "const RAISE_ON_NAVIGATE", "\n// ========== PAGE INFO =========="),
   between(safariSource, "async function _injectHelpersfast()", "\n// Ensure helpers are injected"),
   between(safariSource, "export async function newTab(", "\n// A tab index this session can prove it owns"),
-  between(safariSource, "export async function navigateAndRead(", "\n// Fill form + submit"),
+  between(safariSource, "export async function navigateAndRead(", "\n// Full page analysis"),
+  between(safariSource, "export async function scrollToElement(", "\n// ========== COMBO TOOLS"),
 ].join("\n");
 const safariExports = [...safariParts.matchAll(/^export (?:async )?function (\w+)/gm)].map((m) => m[1]);
 
-function loadSafari(app) {
+// `fast` stands in for the persistent helper (osascriptFast), `app.run` for the osascript subprocess.
+function loadSafari(app, { fast = app.run } = {}) {
   // Timers fire at once: the load polls wait on nothing here.
   const setTimeout = (fn) => setImmediate(fn);
+  // runJSLarge() writes its AppleScript to a file and runs it with the osascript binary.
+  const files = new Map();
+  const io = {
+    writeFile: async (path, text) => { files.set(path, text); },
+    unlink: async (path) => { files.delete(path); },
+    execFileAsync: async (_cmd, [path]) => ({ stdout: await app.run(files.get(path)) }),
+    tmpdir: () => "/tmp", join: (...parts) => parts.join("/"),
+    _focusGuardActive: true, _helperGetFrontApp: async () => null, restoreFocusIfStolen: async () => {},
+  };
   return new Function(
     "currentSessionId", "randomUUID", "osascript", "osascriptFast", "getTargetWindowRef",
     "refreshTargetWindow", "console", "SAFARI_PROFILE", "escAppleScriptString", "escJsSingleQuote",
-    "_HELPERS_ESCAPED", "setTimeout",
-    `${safariParts.replace(/^export /gm, "")}\nreturn { _st, runJS, _stampTab, ${safariExports.join(", ")} };`
+    "_HELPERS_ESCAPED", "setTimeout", "fillForm", ...Object.keys(io),
+    `${safariParts.replace(/^export /gm, "")}\nreturn { _st, runJS, runJSLarge, _stampTab, _injectHelpersfast, ${safariExports.join(", ")} };`
   )(
-    () => "s1", () => "sess0001-0000-4000-8000-000000000000", app.run, app.run, () => "front window",
+    () => "s1", () => "sess0001-0000-4000-8000-000000000000", app.run, fast, () => "front window",
     async () => {}, { error() {} }, null, escAppleScriptString, (s) => String(s).replace(/'/g, "\\'"),
-    "window.__mcpHelpers=1", setTimeout
+    "window.__mcpHelpers=1", setTimeout, async () => "filled", ...Object.values(io)
   );
 }
 
@@ -346,8 +352,13 @@ const LOADS = [
   { name: "reload", when: "once the load has started", after: /location\.reload\(\)/, run: (s) => s.reload(), lands: DEST, stamps: true },
   { name: "goBack", when: "right after the marker scan", after: /set wid to/, run: (s) => s.goBack(), lands: START },
   { name: "goForward", when: "right after the marker scan", after: /set wid to/, run: (s) => s.goForward(), lands: NEXT, extra: { forward: [NEXT] } },
-  { name: "navigateAndRead", when: "right after the marker scan", after: /set wid to/, run: (s) => s.navigateAndRead(NEXT), lands: NEXT },
+  // The page never leaves DEST, so navigate() re-reads the URL before it gives up.
+  { name: "navigate", when: "before it re-reads a URL that never changed", after: /set wid to/, run: (s) => s.navigate(NEXT), lands: DEST, extra: { stuck: 2 }, rejects: /navigate failed: page stayed on/ },
+  { name: "navigateAndRead", when: "right after the marker scan", after: /set wid to/, run: (s) => s.navigateAndRead(NEXT), lands: NEXT, ran: /window\.onbeforeunload=null/ },
   { name: "clickAndWait", when: "right after the marker scan", after: /set wid to/, run: (s) => s.clickAndWait({ selector: "#go" }), lands: NEXT },
+  { name: "clickAndWait", when: "while it waits for an element", after: /set wid to/, run: (s) => s.clickAndWait({ selector: "#go", waitFor: "#go" }), lands: NEXT, ran: /document\.querySelector\('#go'\)\?'1':''/ },
+  { name: "fillAndSubmit", when: "right after it submits", after: /if\(el\)el\.click\(\)/, run: (s) => s.fillAndSubmit({ fields: {}, submitSelector: "#go" }), lands: NEXT },
+  { name: "scrollToElement", when: "right after the marker scan", after: /set wid to/, run: (s) => s.scrollToElement({ text: "nowhere" }), lands: DEST, ran: /SCROLL:/ },
 ];
 for (const step of LOADS) {
   test(`${step.name} keeps its steps in the session's tab when another window comes to the front ${step.when}`, async () => {
@@ -362,10 +373,13 @@ for (const step of LOADS) {
         if (app.scripts.filter((x) => /set URL of/.test(x)).length === 2) app.blockedOnce = [];
       };
     }
-    await step.run(s);
+    if (step.rejects) await assert.rejects(step.run(s), step.rejects);
+    else await step.run(s);
     assert.equal(app.front, THEIRS, "the test never brought the user's window to the front");
     assertUntouched(app, [ours], before);
     assert.equal(ours.url, step.lands);
+    if (step.ran) assert.ok(ours.ran.some((js) => step.ran.test(js)), `the step's own script never reached the session's tab`);
+    assert.equal(s._st().activeTabMarker, MARKER, "the step dropped the session's marker");
     if (step.stamps) {
       assert.equal(ours.name, MARKER, "the session's tab lost its marker");
       assert.ok(ours.spoof, "the session's tab was not re-stamped after the load");
@@ -436,6 +450,29 @@ test("a write runs in the tab its scan proved when another window comes to the f
   await s.runJS("window.__written=1");
   assert.equal(ours.written, 1, "the write missed the tab its scan proved");
   assertUntouched(app, [ours], before);
+});
+
+test("the helper injection runs in the tab its own scan proved when another window comes to the front in between", async () => {
+  const { app, s, ours, before } = withOwnTab();
+  bringAfter(app, /set wid to/);
+  await s._injectHelpersfast();
+  assert.equal(ours.helpers, 1, "the click helpers missed the tab the scan proved");
+  assertUntouched(app, [ours], before);
+});
+
+test("newTab stamps its tab through the subprocess when the helper fails the stamp once", async () => {
+  const app = userWindows();
+  let failed = 0;
+  const fast = async (script) => {
+    if (/tabIndex:\d+\}\);\}\)\(\)" in tab /.test(script) && !failed++) throw new Error("safari-helper timeout");
+    return app.run(script);
+  };
+  const s = loadSafari(app, { fast });
+  const info = JSON.parse(await s.newTab(DEST));
+  const ours = tabsOf(app, MINE)[1];
+  assert.equal(failed, 1, "the helper never failed the stamp");
+  assert.equal(ours.name, s._st().activeTabMarker, "the retried stamp did not mark the new tab");
+  assert.equal(info.url, DEST);
 });
 
 test("a stamp without the window its tab was proven in marks nothing", async () => {
