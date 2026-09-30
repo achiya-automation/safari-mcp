@@ -834,9 +834,11 @@ async function _scanForMarker(marker, hint) {
     let res = await osascriptFast(scanScript).catch(() => null);
     if (res === null) res = await osascript(scanScript).catch(() => null);
     if (res === null) return null;
-    // "<window id>:<index>". An answer with no window id pins no window.
-    const m = /^(?:(\d+):)?(\d+)$/.exec(String(res).trim());
-    return m ? { idx: Number(m[2]), win: _windowById(m[1]) } : { idx: 0, win: null };
+    // "<window id>:<index>". An answer without the window it scanned proves nothing: the index
+    // would name a tab of whichever window is in front for the next script.
+    const m = /^(\d+):(\d+)$/.exec(String(res).trim());
+    const win = m && _windowById(m[1]);
+    return win ? { idx: Number(m[2]), win } : null;
   } catch {
     return null; // the target window is gone (a named profile's window closed)
   }

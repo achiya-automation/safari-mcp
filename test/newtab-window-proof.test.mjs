@@ -475,6 +475,29 @@ test("newTab stamps its tab through the subprocess when the helper fails the sta
   assert.equal(info.url, DEST);
 });
 
+test("a scan that answers without the window it scanned proves nothing", async () => {
+  const { app, s, ours, before } = withOwnTab();
+  // Every scan answer loses its window id; the user's window comes forward right after the scan.
+  const bare = async (script) => {
+    const answer = await app.run(script);
+    return isMarkerScan(script) ? answer.split(":")[1] : answer;
+  };
+  const t = loadSafari(app, { fast: bare });
+  Object.assign(t._st(), s._st());
+  bringAfter(app, /set wid to/);
+  await assert.rejects(t.navigate(NEXT), /Tab tracking lost/);
+  assertUntouched(app, [ours], before);
+  assert.equal(t._st().activeTabMarker, MARKER, "a scan that proved nothing dropped the marker");
+});
+
+test("a large payload runs in the tab its scan proved when another window comes to the front in between", async () => {
+  const { app, s, ours, before } = withOwnTab();
+  bringAfter(app, /set wid to/);
+  await s.runJSLarge("window.__written=1");
+  assert.equal(ours.written, 1, "the payload missed the tab its scan proved");
+  assertUntouched(app, [ours], before);
+});
+
 test("a stamp without the window its tab was proven in marks nothing", async () => {
   const { app, s, ours } = withOwnTab();
   ours.name = "";
