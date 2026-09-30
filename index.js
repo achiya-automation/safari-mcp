@@ -3466,7 +3466,9 @@ server.tool(
     // the session's own marker on it.
     // ponytail: tabs are told apart by URL alone (AppleScript has no tab id and no opener), so any
     // tab the user opens in the window during the wait counts as new, a new tab that opens on the
-    // very URL a tab of the user's leaves in the same poll can pass for it, and the claim stamps
+    // very URL a tab of the user's leaves in the same poll can pass for it (as can a tab of the
+    // user's that lands on the URL of a new tab closing next to it, while another tab opens further
+    // along, which leaves the same listings as that new tab staying put), and the claim stamps
     // whatever tab sits at the listed index a script later unless switchTab checks `expectUrl`.
     const intact = (was, is) => {
       const seen = new Set(was.map(urlOf));
@@ -3477,7 +3479,9 @@ server.tool(
     // fewer tabs than before, and in its place while the other tabs only navigated (as many tabs as
     // before), or still there while the others only closed (the rest on their URLs, in order) and
     // none next to it. A tab that went next to a new one could instead have landed on its URL as the
-    // new one went, and a tab that joins it on its URL could be taken for it. Null when unsure.
+    // new one went, and a tab that joins it on its URL could be taken for it; a neighbour counts as
+    // still there only while as many tabs as before show its URL, or a twin could stand in for it.
+    // Null when unsure.
     const stillNew = (last, urls, is) => {
       const count = (tabs, u) => tabs.filter((t) => urlOf(t) === u).length;
       const at = (tabs, u) => tabs.findIndex((t) => urlOf(t) === u);
@@ -3486,7 +3490,8 @@ server.tool(
       const there = new Set();
       let j = 0;
       last.forEach((t, k) => { if (j < is.length && urlOf(is[j]) === urlOf(t)) { there.add(k); j++; } });
-      const neighbours = (u) => [at(last, u) - 1, at(last, u) + 1].every((k) => k < 0 || k >= last.length || there.has(k));
+      const stays = (k) => count(is, urlOf(last[k])) === count(last, urlOf(last[k]));
+      const neighbours = (u) => [at(last, u) - 1, at(last, u) + 1].every((k) => k < 0 || k >= last.length || (there.has(k) && stays(k)));
       return j === is.length && urls.every(neighbours) ? urls.map((u) => is[at(is, u)]) : null;
     };
     // Get current tab list
