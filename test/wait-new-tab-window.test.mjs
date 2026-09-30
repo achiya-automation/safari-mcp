@@ -70,7 +70,7 @@ const POPUP = "https://sso.example.net/authorize";
 function safari() {
   const tab = (url, marker = "") => ({ url, marker });
   const app = {
-    front: MINE, listings: 0, afterListing: () => {}, tab,
+    front: MINE, listings: 0, pages: 0, afterListing: () => {}, tab,
     windows: [
       { id: MINE, tabs: [tab("https://mail.example.com/"), tab("https://app.example.org/login", OURS)] },
       { id: THEIRS, tabs: [tab("https://docs.example.com/"), tab("https://bank.example.com/"), tab("https://shop.example.com/")] },
@@ -94,6 +94,7 @@ function safari() {
     if (legacy) return windowOf(legacy[1]).tabs.map((t, i) => `${i + 1}\t\t${t.url}`).join("\n");
     const page = script.match(/^tell application "Safari" to do JavaScript "([\s\S]*)" in tab (\d+) of (front window|window id \d+)$/);
     if (page) {
+      app.pages++;
       const t = windowOf(page[3]).tabs[Number(page[2]) - 1];
       if (!t) throw new Error(`Safari got an error: Can’t get tab ${page[2]}. (-1719)`);
       const win = { name: t.marker };
@@ -168,7 +169,7 @@ function loadServer(safari, extension = async (type) => { throw new Error(`Timeo
   };
   return new Function(
     ...Object.keys(deps),
-    `${indexParts}\nreturn { safari_wait_for_new_tab: ${toolHandler("safari_wait_for_new_tab")} };`
+    `${indexParts}\nreturn { safari_wait_for_new_tab: ${toolHandler("safari_wait_for_new_tab")}, _getActiveReceipt, _setActiveReceipt };`
   )(...Object.values(deps));
 }
 
@@ -185,7 +186,7 @@ test("while it waits, the user's other window coming forward makes none of their
   const s = loadSafari(app);
   app.afterListing = (n) => { if (n === 1) app.front = THEIRS; };
   const reply = await loadServer(s).safari_wait_for_new_tab({ timeout: 3000 });
-  assert.match(text(reply), /TIMEOUT/);
+  assert.equal(text(reply), "TIMEOUT: no new tab appeared");
   assertUserTabsUnmarked(app);
   assert.equal(s._st().activeTabMarker, OURS, "the session moved to a tab it did not open");
   assert.deepEqual([...own._openedTabs.values()], [], "a tab of the user's was recorded as one the session opened");
@@ -218,7 +219,7 @@ test("a listing from the extension is not compared with one from AppleScript", a
     throw new Error(`Timeout waiting for the extension (${type})`);
   };
   const reply = await loadServer(s, extension).safari_wait_for_new_tab({ timeout: 3000 });
-  assert.match(text(reply), /TIMEOUT/);
+  assert.equal(text(reply), "TIMEOUT: no new tab appeared", "a listing with more tabs from the other source read as a tab opening");
   assertUserTabsUnmarked(app);
   assert.equal(s._st().activeTabMarker, OURS);
 });
@@ -237,11 +238,12 @@ test("AppleScript does not claim a tab only the extension's listing saw", async 
   };
   app.front = THEIRS; // tab 3 of the front window is the user's shop tab
   await assert.rejects(loadServer(s, extension).safari_wait_for_new_tab({ timeout: 3000 }), (err) => {
-    assert.match(err.message, /Tab safety/);
+    assert.match(err.message, /^Tab safety: a new tab opened, but the Safari extension could not switch to it/);
     // A new wait starts from a listing that already has the tab, so it can only time out.
     assert.doesNotMatch(err.message, /Retry safari_wait_for_new_tab/);
     return true;
   });
+  assert.equal(app.pages, 0, "AppleScript ran a claim in a tab of the window in front");
   assertUserTabsUnmarked(app);
   assert.equal(s._st().activeTabMarker, OURS);
 });
@@ -275,7 +277,8 @@ test("a tab of the user's that navigates in the poll a tab opens in makes neithe
     mine.push(app.tab(POPUP));
   };
   const reply = await loadServer(s).safari_wait_for_new_tab({ timeout: 3000 });
-  assert.match(text(reply), /TIMEOUT/);
+  // A tab opened and stays open unclaimed: a new wait would not report it.
+  assert.match(text(reply), /^TIMEOUT: a tab opened during the wait/);
   assertUserTabsUnmarked(app);
   assert.equal(s._st().activeTabMarker, OURS);
   assert.deepEqual(openedURLs(), []);
@@ -311,7 +314,7 @@ for (const c of SAME_PAGE) {
   });
 }
 
-test("a tab of the user's that slides into the place of a popup still on about:blank is not claimed", async () => {
+test("a popup still on about:blank is claimed where it went when a tab to its left closes, not the tab that slid into its place", async () => {
   const app = safari();
   const s = loadSafari(app);
   const mine = app.windows[0].tabs;
@@ -323,10 +326,10 @@ test("a tab of the user's that slides into the place of a popup still on about:b
     if (n === 4) popup.url = POPUP;
   };
   const reply = await loadServer(s).safari_wait_for_new_tab({ timeout: 3000 });
-  assert.match(text(reply), /TIMEOUT/);
+  assert.match(text(reply), /Found new tab/);
+  assert.equal(popup.marker, s._st().activeTabMarker, "the popup does not carry the session's marker");
   assertUserTabsUnmarked(app);
-  assert.equal(s._st().activeTabMarker, OURS);
-  assert.deepEqual(openedURLs(), []);
+  assert.deepEqual(openedURLs(), [POPUP]);
 });
 
 test("a popup that opens on about:blank is claimed once it shows its URL", async () => {
@@ -445,9 +448,11 @@ test("a tab of the user's that navigates while a popup loads is never taken for 
     if (n === 2) user.url = INBOX;
     if (n === 3) popup.url = POPUP;
   };
-  await loadServer(s).safari_wait_for_new_tab({ timeout: 3000 });
+  const reply = await loadServer(s).safari_wait_for_new_tab({ timeout: 3000 });
+  assert.match(text(reply), /Found new tab/);
+  assert.equal(popup.marker, s._st().activeTabMarker, "the popup does not carry the session's marker");
   assert.equal(user.marker, "", "the user's tab got the session's marker");
-  assert.ok(!openedURLs().includes(INBOX), "the user's tab was recorded as one the session opened");
+  assert.deepEqual(openedURLs(), [POPUP]);
 });
 
 test("a popup that opens after a tab of the user's closed is claimed", async () => {
@@ -503,7 +508,11 @@ test("an AppleScript listing that does not say which window it read claims nothi
   const s = loadSafari(app);
   const mine = app.windows[0].tabs;
   app.afterListing = (n) => { if (n === 1) mine.push(app.tab(POPUP)); };
-  await assert.rejects(loadServer(s).safari_wait_for_new_tab({ timeout: 3000 }), /Tab safety/);
+  await assert.rejects(loadServer(s).safari_wait_for_new_tab({ timeout: 3000 }), (err) => {
+    assert.match(err.message, /^Tab safety: AppleScript did not say which window it listed/);
+    assert.doesNotMatch(err.message, /Retry safari_wait_for_new_tab/);
+    return true;
+  });
   assert.equal(mine[2].marker, "", "a tab was claimed in a window no listing named");
   assert.equal(s._st().activeTabMarker, OURS);
 });
@@ -524,7 +533,8 @@ test("urlContains skips new tabs on other pages, and one still on about:blank, i
 // ---------- the extension's listings ----------
 
 // An extension that lists `tabs()` as the real one does (`safeUrl`, no `url`) and switches to
-// whatever index it is asked for, recording it.
+// whatever index it is asked for, recording it: the real one switches only to a tab the session
+// owns (one it opened), and refuses a popup the page opened, as a test below shows.
 function listingExtension(tabs) {
   const switched = [];
   const extension = async (type, payload) => {
@@ -629,10 +639,268 @@ for (const blankFirst of [false, true]) {
       }
       throw new Error(`Timeout waiting for the extension (${type})`);
     };
-    await assert.rejects(loadServer(s, extension).safari_wait_for_new_tab({ timeout: 3000 }), /Tab safety/);
+    await assert.rejects(loadServer(s, extension).safari_wait_for_new_tab({ timeout: 3000 }), /Tab safety: a new tab opened, but the Safari extension could not switch to it/);
     assert.equal(app.listings, 1, "AppleScript did not answer the first listing, so it pinned no window");
+    assert.equal(app.pages, 0, "AppleScript ran a claim in the pinned window");
     assertUserTabsUnmarked(app);
     assert.equal(s._st().activeTabMarker, OURS);
   });
 }
+
+// ---------- a new tab not claimed yet, while other tabs change ----------
+
+const AUTH_START = "https://app.example.org/auth/start";
+
+test("a popup urlContains rules out for now stays new while a tab of the user's navigates, and is claimed once it matches", async () => {
+  const app = safari();
+  const s = loadSafari(app);
+  const mine = app.windows[0].tabs;
+  const popup = app.tab(AUTH_START);
+  app.afterListing = (n) => {
+    if (n === 1) mine.push(popup);
+    if (n === 3) mine[0].url = INBOX;
+    if (n === 5) popup.url = POPUP;
+  };
+  const reply = await loadServer(s).safari_wait_for_new_tab({ timeout: 5000, urlContains: "sso.example.net" });
+  assert.match(text(reply), /Found new tab/);
+  assert.equal(popup.marker, s._st().activeTabMarker, "the popup does not carry the session's marker");
+  assertUserTabsUnmarked(app);
+  assert.deepEqual(openedURLs(), [POPUP]);
+});
+
+test("a popup still on about:blank stays new while the session's own tab navigates", async () => {
+  const app = safari();
+  const s = loadSafari(app);
+  const mine = app.windows[0].tabs;
+  const popup = app.tab("about:blank");
+  app.afterListing = (n) => {
+    if (n === 1) mine.push(popup);
+    if (n === 2) mine[1].url = "https://app.example.org/login?pending=1";
+    if (n === 3) popup.url = POPUP;
+  };
+  const reply = await loadServer(s).safari_wait_for_new_tab({ timeout: 3000 });
+  assert.match(text(reply), /Found new tab/);
+  assert.equal(popup.marker, s._st().activeTabMarker, "the popup does not carry the session's marker");
+  assertUserTabsUnmarked(app);
+});
+
+test("a popup on about:blank that a tab of the user's joins on about:blank cannot be told apart, and nothing is claimed", async () => {
+  const app = safari();
+  const s = loadSafari(app);
+  const mine = app.windows[0].tabs;
+  const popup = app.tab("about:blank");
+  app.afterListing = (n) => {
+    if (n === 1) mine.push(popup);
+    if (n === 2) mine[0].url = "about:blank";
+    if (n === 3) popup.url = POPUP;
+  };
+  const reply = await loadServer(s).safari_wait_for_new_tab({ timeout: 3000 });
+  assert.match(text(reply), /^TIMEOUT: a tab opened during the wait/);
+  assertUserTabsUnmarked(app);
+  assert.equal(popup.marker, "");
+  assert.deepEqual(openedURLs(), []);
+});
+
+test("a popup that closes as a tab of the user's lands on its URL leaves the user's tab old", async () => {
+  const app = safari();
+  const s = loadSafari(app);
+  const mine = app.windows[0].tabs;
+  const user = mine[0];
+  app.afterListing = (n) => {
+    if (n === 1) mine.push(app.tab(AUTH_START));
+    if (n === 2) {
+      mine.pop(); // the popup closes
+      user.url = AUTH_START; // as the user's tab lands on the page it showed
+    }
+    if (n === 3) user.url = POPUP; // and then moves on to a page urlContains matches
+  };
+  const reply = await loadServer(s).safari_wait_for_new_tab({ timeout: 3000, urlContains: "sso.example.net" });
+  assert.match(text(reply), /TIMEOUT/);
+  assert.equal(user.marker, "", "the user's tab got the session's marker");
+  assert.deepEqual(openedURLs(), []);
+});
+
+// ---------- what a claim records ----------
+
+test("a claim through AppleScript records the popup by its marker and clears the receipt of the tab before", async () => {
+  const app = safari();
+  const s = loadSafari(app);
+  const mine = app.windows[0].tabs;
+  const popup = app.tab(POPUP);
+  app.afterListing = (n) => { if (n === 1) mine.push(popup); };
+  const server = loadServer(s);
+  server._setActiveReceipt("Receipt_" + "o".repeat(24));
+  await server.safari_wait_for_new_tab({ timeout: 3000 });
+  assert.deepEqual(
+    [...own._openedTabs].map(([key, t]) => [key, t.marker, t.receipt, t.sessionId, t.url]),
+    [[popup.marker, popup.marker, "", "daemon:s1", POPUP]]
+  );
+  assert.equal(server._getActiveReceipt(), "", "the receipt of the tab before still names the session's tab");
+});
+
+test("a claim the extension serves records the tab by its receipt and leaves its URL unknown", async () => {
+  const s = loadSafari(safari());
+  let listed = 0;
+  const { extension } = listingExtension(() => (listed++ < 1 ? [X, Y] : [X, Y, POPUP]));
+  const server = loadServer(s, extension);
+  await server.safari_wait_for_new_tab({ timeout: 3000 });
+  const receipt = "Receipt_" + "p".repeat(24);
+  assert.deepEqual([...own._openedTabs].map(([key, t]) => [key, t.marker, t.receipt]), [[receipt, "", receipt]]);
+  assert.equal(server._getActiveReceipt(), receipt);
+  assert.equal(s.getActiveTabURL(), null);
+});
+
+// ---------- the extension's switch ----------
+
+test("the extension's refusal of a popup the page opened ends the wait, with no AppleScript claim", async () => {
+  const app = safari();
+  const s = loadSafari(app);
+  let listed = 0;
+  const asked = [];
+  const extension = async (type, payload) => {
+    if (type === "list_tabs") return (listed++ < 1 ? [X, Y] : [X, Y, POPUP]).map((u, i) => ({ index: i + 1, title: "", safeUrl: u }));
+    if (type === "switch_tab") {
+      asked.push(payload.index);
+      throw new Error("⚠️ Tab safety: refusing \"switch_tab\" to tab 104 (https://sso.example.net/authorize) — not opened by this MCP session. Use safari_new_tab first.");
+    }
+    throw new Error(`Timeout waiting for the extension (${type})`);
+  };
+  await assert.rejects(loadServer(s, extension).safari_wait_for_new_tab({ timeout: 3000 }), /not opened by this MCP session/);
+  assert.deepEqual(asked, [3]);
+  assert.equal(app.pages, 0, "AppleScript ran a claim");
+  assert.deepEqual(openedURLs(), []);
+});
+
+for (const [name, wrong] of [
+  ["answers that no tab is there", "Tab not found at index 3"],
+  ["switches to another tab of the session's", { title: "", safeUrl: "https://older.example.com/", receipt: "Receipt_" + "q".repeat(24), tabIndex: 3, owned: true }],
+]) {
+  test(`an extension switch that ${name} is not taken for the new tab`, async () => {
+    const s = loadSafari(safari());
+    let listed = 0;
+    const receipt = "Receipt_" + "p".repeat(24);
+    const answers = [];
+    const extension = async (type, payload) => {
+      if (type === "list_tabs") return (listed++ < 1 ? [X, Y] : [X, Y, POPUP]).map((u, i) => ({ index: i + 1, title: "", safeUrl: u }));
+      if (type === "switch_tab") {
+        answers.push(payload.index);
+        return answers.length === 1 ? wrong : { title: "", safeUrl: POPUP, receipt, tabIndex: payload.index, owned: true };
+      }
+      throw new Error(`Timeout waiting for the extension (${type})`);
+    };
+    const reply = await loadServer(s, extension).safari_wait_for_new_tab({ timeout: 3000 });
+    assert.match(text(reply), /Found new tab/);
+    assert.deepEqual(answers, [3, 3], "the first switch was taken for the new tab");
+    assert.deepEqual([...own._openedTabs.keys()], [receipt], "the switch that went wrong was recorded");
+  });
+}
+
+test("a popup still on about:blank stays new through two changes of other tabs in a row", async () => {
+  const app = safari();
+  const s = loadSafari(app);
+  const mine = app.windows[0].tabs;
+  const popup = app.tab("about:blank");
+  app.afterListing = (n) => {
+    if (n === 1) mine.push(popup);
+    if (n === 2) mine[0].url = INBOX;
+    if (n === 3) mine[1].url = "https://app.example.org/login?pending=1";
+    if (n === 4) popup.url = POPUP;
+  };
+  const reply = await loadServer(s).safari_wait_for_new_tab({ timeout: 3000 });
+  assert.match(text(reply), /Found new tab/);
+  assert.equal(popup.marker, s._st().activeTabMarker, "the popup does not carry the session's marker");
+  assertUserTabsUnmarked(app);
+});
+
+test("a claim refused because a tab to the popup's left closed is made again where the popup went", async () => {
+  const app = safari();
+  const s = loadSafari(app);
+  const mine = app.windows[0].tabs;
+  const news = app.tab("https://news.example.com/");
+  mine.push(news);
+  const popup = app.tab(POPUP);
+  app.afterListing = (n) => {
+    if (n === 1) mine.splice(2, 0, popup); // listed next as tab 3, before the user's news tab
+    if (n === 2) mine.shift(); // and before the claim runs, the user's mail tab closes: news is tab 3
+  };
+  const reply = await loadServer(s).safari_wait_for_new_tab({ timeout: 3000 });
+  assert.match(text(reply), /Found new tab/);
+  assert.equal(news.marker, "", "the user's tab that slid under the index got the session's marker");
+  assert.equal(popup.marker, s._st().activeTabMarker, "the popup does not carry the session's marker");
+  assert.deepEqual(openedURLs(), [POPUP]);
+});
+
+test("a tab that opens but that urlContains never matches ends in the reply that a tab opened", async () => {
+  const app = safari();
+  const s = loadSafari(app);
+  app.afterListing = (n) => { if (n === 1) app.windows[0].tabs.push(app.tab("https://ads.example.com/")); };
+  const reply = await loadServer(s).safari_wait_for_new_tab({ timeout: 3000, urlContains: "sso.example.net" });
+  assert.match(text(reply), /^TIMEOUT: a tab opened during the wait/);
+  assertUserTabsUnmarked(app);
+});
+
+test("a popup still on about:blank stays new when a tab of the user's closes and then another navigates", async () => {
+  const app = safari();
+  const s = loadSafari(app);
+  const mine = app.windows[0].tabs;
+  const news = app.tab("https://news.example.com/");
+  mine.push(news);
+  const popup = app.tab("about:blank");
+  app.afterListing = (n) => {
+    if (n === 1) mine.splice(2, 0, popup);
+    if (n === 2) mine.shift(); // the user's mail tab closes
+    if (n === 3) news.url = "https://news.example.com/story";
+    if (n === 4) popup.url = POPUP;
+  };
+  const reply = await loadServer(s).safari_wait_for_new_tab({ timeout: 3000 });
+  assert.match(text(reply), /Found new tab/);
+  assert.equal(popup.marker, s._st().activeTabMarker, "the popup does not carry the session's marker");
+  assertUserTabsUnmarked(app);
+});
+
+test("a popup that closes as a tab of the user's lands on its URL and another tab opens leaves the user's tab old", async () => {
+  const app = safari();
+  const s = loadSafari(app);
+  const mine = app.windows[0].tabs;
+  const user = mine[0];
+  app.afterListing = (n) => {
+    if (n === 1) mine.push(app.tab(AUTH_START));
+    if (n === 2) {
+      mine.pop(); // the popup closes,
+      user.url = AUTH_START; // the user's tab lands on the page it showed,
+      mine.push(app.tab("https://ads.example.com/")); // and a tab opens: as many tabs as before
+    }
+    if (n === 3) user.url = POPUP;
+  };
+  const reply = await loadServer(s).safari_wait_for_new_tab({ timeout: 3000, urlContains: "sso.example.net" });
+  assert.match(text(reply), /TIMEOUT/);
+  assert.equal(user.marker, "", "the user's tab got the session's marker");
+  assert.deepEqual(openedURLs(), []);
+});
+
+test("a popup seen in AppleScript's listing is taken into the baseline when the extension takes over the listing", async () => {
+  const app = safari();
+  const s = loadSafari(app);
+  const mine = app.windows[0].tabs;
+  const popup = app.tab("about:blank");
+  let listed = 0;
+  const extension = async (type, payload) => {
+    if (type === "list_tabs") {
+      // AppleScript answers the first two listings, the extension the rest; the popup loads just
+      // after the extension first lists it, still on about:blank.
+      if (++listed <= 2) throw new Error("Timeout waiting for the extension (list_tabs)");
+      const rows = mine.map((t, i) => ({ index: i + 1, title: "", safeUrl: t.url }));
+      if (listed === 3) popup.url = POPUP;
+      return rows;
+    }
+    if (type === "switch_tab") return { title: "", safeUrl: mine[payload.index - 1].url, receipt: "Receipt_" + "p".repeat(24), tabIndex: payload.index, owned: true };
+    throw new Error(`Timeout waiting for the extension (${type})`);
+  };
+  app.afterListing = (n) => { if (n === 1) mine.push(popup); };
+  const reply = await loadServer(s, extension).safari_wait_for_new_tab({ timeout: 3000 });
+  // The two sources number and name tabs differently: a tab one of them saw as new starts over as old.
+  assert.match(text(reply), /TIMEOUT/);
+  assert.equal(app.listings, 2);
+  assert.deepEqual(openedURLs(), []);
+});
 

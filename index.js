@@ -3435,14 +3435,19 @@ server.tool(
       const viaAppleScript = via === "applescript";
       let switched;
       if (viaAppleScript) {
-        if (!win) throw new Error("Tab safety: AppleScript did not say which window it listed, so it cannot tell which tab opened. Retry safari_wait_for_new_tab.");
-        switched = await safari.switchTab(t.index, { claim: true, win, expectUrl: t.url });
+        if (!win) throw new Error("Tab safety: AppleScript did not say which window it listed, so it cannot tell which tab opened, and this session claimed none. The tab stays open, and another safari_wait_for_new_tab will not report it: that call starts from a listing that already has it.");
+        switched = _sanitizeTabResult(await safari.switchTab(t.index, { claim: true, win, expectUrl: t.url }));
       } else {
-        switched = await extensionOrFallback("switch_tab", { index: t.index }, () => {
+        switched = _sanitizeTabResult(await extensionOrFallback("switch_tab", { index: t.index }, () => {
           throw new Error("Tab safety: a new tab opened, but the Safari extension could not switch to it and AppleScript cannot tell which tab of its own window that is, so this session did not claim it. The tab stays open, and another safari_wait_for_new_tab will not report it: that call starts from a listing that already has it. Check the extension with safari_doctor.");
-        });
+        }));
+        // The extension switches to whatever tab sits at the index when it runs the command, and
+        // answers "Tab not found" as if it had switched: a tab that closed or moved in between
+        // handed the session another tab of its own, or none, under the new tab's name.
+        if (switched?.safeUrl !== _safeUrlForOutput(urlOf(t))) {
+          throw Object.assign(new Error("Tab safety: the Safari extension switched to another tab than the one the listing saw (a tab closed or moved in between), so this session did not claim it."), { moved: true });
+        }
       }
-      switched = _sanitizeTabResult(switched);
       safari.setActiveTabIndex(t.index);
       safari.setActiveTabURL(t.url);
       if (!viaAppleScript) safari.setActiveTabFromExtension(t.index, t.url);
@@ -3468,11 +3473,27 @@ server.tool(
       const kept = is.filter((t) => seen.has(urlOf(t)));
       return kept.length === was.length && kept.every((t, i) => urlOf(t) === urlOf(was[i]));
     };
+    // Where the new tabs `last` showed are in `is`: each still on its URL and in its place while
+    // the other tabs only navigated (as many tabs as before), or still there while the others
+    // only closed (the rest on their URLs, in order). Null when that does not hold.
+    const stillNew = (last, urls, is) => {
+      const at = (tabs, u) => tabs.findIndex((t) => urlOf(t) === u);
+      let j = 0;
+      for (const t of last) if (j < is.length && urlOf(is[j]) === urlOf(t)) j++;
+      const moved = is.length === last.length
+        ? urls.some((u) => at(is, u) !== at(last, u))
+        : j < is.length || urls.some((u) => at(is, u) < 0);
+      return moved ? null : urls.map((u) => is[at(is, u)]);
+    };
     // Get current tab list
     let before = await list();
     // Every URL a baseline showed. A new tab is one on a URL none of them showed, so a tab that
     // left the window and came back (reopened, or dragged out and in again) is not new either.
     const shown = new Set(before.tabs.map(urlOf));
+    // The new tabs not claimed yet (still on about:blank, not matching urlContains, or refused),
+    // by URL, and the listing that showed them; and whether any tab opened at all.
+    let pending = { last: before.tabs, urls: [] };
+    let opened = false;
 
     // Poll for new tab — detect by count increase + tabs on new URLs
     const deadline = Date.now() + timeoutMs;
@@ -3480,14 +3501,24 @@ server.tool(
       await new Promise(r => setTimeout(r, 500));
       const now = await list();
       // A listing where a tab closed or navigated becomes the baseline, so a tab of the user's that
-      // navigated meanwhile is not new once one opens; so does one from the other source. So does
-      // one where that happened as a tab opened, or a new tab shows an old tab's URL: held against
-      // the older baseline, whichever of the two navigated first looked new, the user's too.
+      // navigated meanwhile is not new once one opens; so does one from the other source. A new
+      // tab not claimed yet stays out of it while the other tabs only navigated in place or only
+      // closed: taken into it, it was never new again, and the wait timed out on a popup that
+      // was still loading when another tab changed. Any other change, or one as a tab opened,
+      // takes every tab in: held against the older baseline, whichever of two tabs that changed
+      // navigated first looked new, the user's too.
       if (now.via !== before.via || !intact(before.tabs, now.tabs)) {
-        before = now;
-        for (const t of now.tabs) shown.add(urlOf(t));
+        const same = now.via === before.via;
+        const kept = !pending.urls.length ? [] : same ? stillNew(pending.last, pending.urls, now.tabs) : null;
+        if (same && now.tabs.length > before.tabs.length) opened = true;
+        before = { ...now, tabs: now.tabs.filter((t) => !kept?.includes(t)) };
+        for (const t of before.tabs) shown.add(urlOf(t));
+        pending = { last: now.tabs, urls: kept ? pending.urls : [] };
         continue;
       }
+      const old = new Set(before.tabs.map(urlOf));
+      pending = { last: now.tabs, urls: now.tabs.map(urlOf).filter((u) => !old.has(u)) };
+      if (pending.urls.length) opened = true;
       for (const tab of now.tabs) {
         // A new tab still on about:blank (an OAuth popup before it loads) is claimed at a later
         // poll, once it shows its URL: a later listing found it again by index, and by then that
@@ -3505,7 +3536,9 @@ server.tool(
         }
       }
     }
-    return { content: [{ type: "text", text: "TIMEOUT: no new tab appeared" }] };
+    return { content: [{ type: "text", text: opened
+      ? "TIMEOUT: a tab opened during the wait, but none this call could claim: it could not be told apart from a tab that changed at the same time, urlContains ruled it out, or its claim was refused. It stays open, and another safari_wait_for_new_tab will not report it: open it again during a new wait, or ask the user."
+      : "TIMEOUT: no new tab appeared" }] };
   }
 );
 
