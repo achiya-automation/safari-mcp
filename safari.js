@@ -880,6 +880,13 @@ function _markerWithPrefixJS(prefix) {
   return `(function(p){function m(v){v=String(v);return v.indexOf(p)===0&&/^[A-Za-z0-9_]+$/.test(v)?v:''}try{return m(window.name)||m(window.__mcpTabMarker)}catch(e){return ''}})('${prefix}')`;
 }
 
+// Page JavaScript that is true when the page carries a marker of another MCP session: one starting
+// with MCP_ but with neither of this session's prefixes, `own` (MCP_<markerId>_) and `adopted`
+// (MCP_A<markerId>_). Another client of the HTTP daemon, or a server before a restart, stamped it.
+function _otherSessionMarkerTestJS(own, adopted) {
+  return `(function(p,q){function t(v){v=String(v);return v.indexOf('MCP_')===0&&v.indexOf(p)!==0&&v.indexOf(q)!==0}try{return t(window.name)||t(window.__mcpTabMarker)}catch(e){return false}})('${own}','${adopted}')`;
+}
+
 // The index of this session's tab, or null. See _resolveSessionTab().
 async function resolveActiveTab() {
   return (await _resolveSessionTab()).idx;
@@ -4339,14 +4346,25 @@ export async function switchTab(index, { adopt = false, claim = false, win } = {
   // and interrupts the user. Visual switching only happens in screenshot() when needed.
   // AppleScript `do JavaScript in tab N` works on background tabs without switching.
   // `a`: the tab carries the session's adoption marker, `o`: one of its own markers, `w`: that marker
-  // when it is a whole one (_markerWithPrefixJS), `k`: the marker the tab keeps or gets.
-  const js = `(function(){var a=${_markerPrefixTestJS(_adoptedMarkerPrefix())},o=${_markerPrefixTestJS(ownPrefix)},w=${_markerWithPrefixJS(ownPrefix)};` +
+  // when it is a whole one (_markerWithPrefixJS), `k`: the marker the tab keeps or gets. A claim takes
+  // no tab another MCP session marked (`x`): its marker would give way to this session's own, which
+  // the tab cap, the sweep, cleanup and closes act on, and the other session would lose the tab, or a
+  // tab it adopted from the user would become closable.
+  const js = `(function(){var a=${_markerPrefixTestJS(_adoptedMarkerPrefix())},o=${_markerPrefixTestJS(ownPrefix)},w=${_markerWithPrefixJS(ownPrefix)},` +
+    `x=${_otherSessionMarkerTestJS(ownPrefix, _adoptedMarkerPrefix())};if(${claim}&&x)return 'other';` +
     `if(!a&&!o&&!${adopt || claim})return '';var f=a||${adopt}&&!o,k=f?'${adoptedMarker}':w||'${marker}';` +
     `var r=JSON.stringify({title:document.title,url:location.href,adopted:f,marker:k});` +
     `${_buildStampJS({ expr: "k" })};return r;})()`;
   const script = `tell application "Safari" to do JavaScript "${js.replace(/"/g, '\\"')}" in tab ${idx} of ${win || getTargetWindowRef()}`;
   // Fast daemon first; a hiccup retries once through the reliable subprocess (a second run stamps the same marker).
   const result = String(await osascriptFast(script, { timeout: 5000 }).catch(() => osascript(script, { timeout: 8000 }))).trim();
+  // `otherSession` lets safari_wait_for_new_tab pass over the tab and keep waiting for its own.
+  if (result === "other") {
+    throw Object.assign(new Error(
+      `Tab safety: refusing to claim tab ${idx} — another MCP session's marker is on it (a tab it opened, or one it ` +
+      `adopted from you), and a claim never takes a tab from another session.`
+    ), { otherSession: true });
+  }
   if (!result) {
     throw Object.assign(new Error(
       `Tab safety: refusing to switch to tab ${idx} — it carries no marker of this session, and AppleScript has ` +

@@ -1221,3 +1221,34 @@ for (const forged of [
     assert.ok(!scripts.some((s) => s.includes(forged.marker)), "a marker the page answered with reached AppleScript");
   });
 }
+
+// safari_wait_for_new_tab claims the tab it saw open (switchTab with `claim`), and the claim stamped the
+// session's own marker over one another MCP session had put there (30.9.26): that session lost its tab,
+// and a tab it had adopted from the user lost the adoption marker that keeps it from being closed, so
+// the claiming session's tab cap, sweep, cleanup or safari_close_tab could close the user's tab.
+for (const other of [
+  { name: "another session's tab", marker: "MCP_othr0002_x" },
+  { name: "a tab another session adopted from the user", marker: "MCP_Aothr0002_x" },
+]) {
+  for (const where of [
+    { name: "in window.name", tab: (m) => ({ marker: m, pageMarker: undefined }) }, // the page loaded another page of its site since
+    { name: "in __mcpTabMarker", tab: (m) => ({ marker: "app-state", pageMarker: m }) }, // the page took window.name over
+  ]) {
+    test(`a claim does not take ${other.name}, its marker ${where.name}`, async () => {
+      const { window, safari, server } = await machine("clean");
+      await server.safari_new_tab({ url: OTHER_URL });
+      const current = safari.getActiveTabMarker();
+      const tab = { url: DEST, ...where.tab(other.marker) };
+      window.tabs.push(tab);
+      const before = { ...tab };
+      // Flagged, so safari_wait_for_new_tab passes over the tab and keeps waiting for its own.
+      await assert.rejects(safari.switchTab(3, { claim: true }),
+        (err) => /Tab safety: refusing to claim tab 3/.test(err.message) && err.otherSession === true);
+      assert.deepEqual(tab, before, "the claim changed the other session's tab");
+      assert.equal(safari.getActiveTabMarker(), current, "the session moved to the tab it did not claim");
+      // The session's own tab is still claimed, and keeps its marker.
+      await safari.switchTab(2, { claim: true });
+      assert.equal(safari.getActiveTabMarker(), current);
+    });
+  }
+}
