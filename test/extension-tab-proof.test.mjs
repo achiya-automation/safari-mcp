@@ -31,7 +31,10 @@ import { test, beforeEach, after } from "node:test";
 import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { answerCloseByMarker, answerMarkerScan, isCloseByMarker, isMarkerScan, scriptWindowRef } from "./fake-safari-scripts.mjs";
+import vm from "node:vm";
+import {
+  answerCloseByMarker, answerMarkerScan, answerTabScript, isCloseByMarker, isMarkerScan, isTabScript, scriptWindowRef,
+} from "./fake-safari-scripts.mjs";
 
 // ownership-state.js persists to ~/.safari-mcp — point HOME at a throwaway dir first.
 const tmpHome = mkdtempSync(join(tmpdir(), "smcp-proof-"));
@@ -71,18 +74,40 @@ const tab = (url, extra = {}) => ({ url, name: "", ...extra });
 
 // ---------- Safari, answering safari.js's AppleScript ----------
 
-// Safari's windows, the front one first, each a list of tabs. A tab's `name` is its window.name
-// and `current` marks the tab selected in its window. `ran` records every tab a script ran in;
-// `navigated` and `closed` every tab AppleScript loaded a URL into or closed.
+// Safari's windows, the front one first, each a list of tabs. A tab's `name` is its window.name,
+// `marker` its window.__mcpTabMarker, and `current` marks the tab selected in its window. `ran`
+// records every tab a script ran in (a load step's script in the tab it proved counts only where
+// the page proved it); `navigated` and `closed` every tab AppleScript loaded a URL into or closed.
 function safariApp(...windows) {
   const ran = [], navigated = [], closed = [];
   const front = () => windows[0];
   // Each window has an id, and a script names a window as 'front window' or `window id N`.
   windows.forEach((w, k) => { w.id ??= k + 1; });
   const windowOf = (ref) => (!ref || ref === "front window" ? front() : windows.find((w) => `window id ${w.id}` === ref));
-  const pageOf = (t) => ({ name: t.name });
+  const pageOf = (t) => ({ name: t.name, __mcpTabMarker: t.marker });
   const selected = () => front().find((t) => t.current) || front()[0];
   const site = (url) => { try { return new URL(url).hostname.split(".").slice(-2).join("."); } catch { return url; } };
+  // A new page in `target`: __mcpTabMarker goes with the old one, window.name too across sites.
+  const load = (target, url) => {
+    if (site(target.url) !== site(url)) target.name = ""; // Safari clears window.name on a cross-site load
+    target.marker = undefined;
+    target.url = url;
+    target.born = Date.now(); // the new document's performance.timeOrigin
+    navigated.push(target);
+  };
+  // A load step's script in the tab it proved (safari.js _inTab), whose page has finished loading.
+  const runPage = (target, js) => {
+    const page = { name: target.name, __mcpTabMarker: target.marker };
+    const document = { readyState: "complete", title: "", addEventListener() {} };
+    try {
+      const performance = { timeOrigin: target.born ?? 0 };
+      const value = String(vm.runInNewContext(js, { window: page, document, location: { href: target.url }, performance }) ?? "");
+      if (value.startsWith("MCP_OK:")) ran.push(target);
+      return value;
+    } finally {
+      Object.assign(target, { name: page.name, marker: page.__mcpTabMarker });
+    }
+  };
   const run = async (script) => {
     const js = script.match(/^tell application "Safari" to do JavaScript "([\s\S]*)" in (?:tab (\d+) of (front window|window id \d+)|front document)$/);
     if (js) {
@@ -113,6 +138,13 @@ function safariApp(...windows) {
       const w = windowOf(scriptWindowRef(script));
       return answerMarkerScan(script, { windowId: w.id, tabs: w, pageOf });
     }
+    if (isTabScript(script)) {
+      const w = windowOf(scriptWindowRef(script));
+      return answerTabScript(script, {
+        windowId: w.id, tabs: w, pageOf, run: runPage, setURL: load,
+        urlOf: (t) => t.url, visibleOf: (t) => (w.find((x) => x.current) || w[0]) === t,
+      });
+    }
     const prefix = script.match(/starts with "([^"]*)"/);
     if (prefix) {
       // resolveActiveTab's URL lookup, which every session used before a marker was required:
@@ -128,10 +160,7 @@ function safariApp(...windows) {
     }
     const nav = script.match(/^tell application "Safari" to set URL of tab (\d+) of (front window|window id \d+) to "([^"]*)"$/);
     if (nav) {
-      const target = windowOf(nav[2])[Number(nav[1]) - 1];
-      if (site(target.url) !== site(nav[3])) target.name = ""; // Safari clears window.name on a cross-site load
-      target.url = nav[3];
-      navigated.push(target);
+      load(windowOf(nav[2])[Number(nav[1]) - 1], nav[3]);
       return "";
     }
     if (/return \(count of tabs of front window\)$/.test(script)) return String(front().length);

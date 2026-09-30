@@ -529,15 +529,18 @@ function _assertNotFallingBackToUserTab(opName) {
 }
 
 // The tab for a step that names its tab explicitly (a navigation or a poll across one, where the
-// page load clears the marker), as { idx, win }: this session's tab, proven by its marker, with
-// the window the proof found it in, or idx null for a session that never owned a tab, meaning the
-// front document. An index read straight from the session state named whatever tab had shifted
-// into it, and one addressed to 'front window' in each later script named that index in whatever
-// window the user had brought to the front meanwhile.
+// page load clears the marker), as { idx, win, marker, fp, op } for _inTab(): this session's tab,
+// proven by its marker, with the window the proof found it in and the marker that proved it, or idx
+// null for a session that never owned a tab, meaning the front document. An index read straight
+// from the session state named whatever tab had shifted into it, and one addressed to 'front
+// window' in each later script named that index in whatever window the user had brought to the
+// front meanwhile. The marker is the one the scan found, not the session's after the scan's await:
+// a parallel call of the same session can change that one. No fingerprint yet: the step's first
+// script proves the tab by its marker, and `since` is set just before the step starts its load.
 async function _sessionTab(opName) {
-  const { idx, win } = await _resolveSessionTab();
+  const { idx, win, marker } = await _resolveSessionTab();
   _assertNotFallingBackToUserTab(opName);
-  return { idx: idx || null, win };
+  return { idx: idx || null, win, marker: idx && win ? marker || null : null, fp: null, since: 0, op: opName };
 }
 
 function getFallbackTarget() {
@@ -576,22 +579,211 @@ function _buildStampJS(marker) {
     + "return '1';})()";
 }
 
-// Stamp identity marker + visibility spoof onto a specific tab: tab `idx` of `win`, the window
-// the caller's proof found the tab in (see _windowById). No window, no stamp: on 'front window'
-// the marker went to the tab at that index in whatever window the user had brought forward.
-// Identity-critical: a missed stamp loses the tab marker, so this is NOT best-effort —
-// a daemon hiccup falls back to the reliable osascript subprocess.
-async function _stampTab(idx, win) {
-  if (!idx || !win || !_st().activeTabMarker) return;
-  const js = _buildStampJS(_st().activeTabMarker).replace(/"/g, '\\"');
-  const script = `tell application "Safari" to do JavaScript "${js}" in tab ${idx} of ${win}`;
-  try {
-    await osascriptFast(script, { timeout: 5000 });
-  } catch {
-    // Daemon hiccup — retry via the reliable subprocess. Stamping is identity-critical
-    // (a missed stamp loses the tab marker), so it must not be silently best-effort.
-    await osascript(script, { timeout: 8000 }).catch(() => {});
+// Stamp identity marker + visibility spoof onto the tab a step proved (see _sessionTab), in the
+// script that proves it again (_inTab). No proven window, no stamp: on 'front window' the marker
+// went to the tab at that index in whatever window the user had brought forward, and a tab no
+// script can prove is not stamped at all: the step fails instead. Identity-critical: a missed
+// stamp loses the tab marker, so this is NOT best-effort — a daemon hiccup falls back to the
+// reliable osascript subprocess.
+async function _stampTab(tab) {
+  if (!tab?.idx || !tab.win || !tab.marker) return;
+  const stamp = (opts) => _inTab(tab, "''", { stamp: "always", ...opts });
+  await stamp({ timeout: 5000 })
+    .catch((err) => { if (err.tabUnproven) throw err; return stamp({ timeout: 8000, subprocess: true }); })
+    .catch((err) => { if (err.tabUnproven) throw err; });
+}
+
+// ========== PROVING THE TAB INSIDE EACH SCRIPT OF A STEP ==========
+// A step proves the session's tab once, by the marker scan or the script that made the tab, then
+// acts on `tab N of window id W` in more scripts: a load's probes and re-stamp, navigate's
+// `set URL`, a click or a history move. AppleScript has no tab id, and a tab opened, closed or moved
+// before it in that window (a link opened in a new tab from an earlier tab, a tab closed to its
+// left and another opened, another session's tab cap closing its oldest tab) renumbers the window,
+// so by the next script tab N can be the user's. Each of those scripts proves the tab again,
+// inside itself, before it touches it:
+//  1. the tab at N carries the session's marker, checked in the same `do JavaScript` that acts; or
+//  2. another tab of the window carries it: the tab moved, and the script acts there instead; or
+//  3. no tab of the window carries it, and the page at N is a document the step's own load brought:
+//     created after the step started its load (`since`; a cross-site load clears window.name, any
+//     load __mcpTabMarker), in a window that still looks the way the last script that proved the
+//     tab saw it: the same window, tab count and selected-or-not state of tab N, and the same URLs
+//     in the three tabs before it (compared considering case).
+// Step 3 never takes a page carrying another session's marker, and never serves a script that runs
+// before the step's load (`markerOnly`), whose page still carries the marker. The load polls stamp
+// the marker back as soon as a script proves the page, so step 3 bridges the scripts between a load
+// and the next poll. A page where no script runs answers missing value, which proves nothing.
+// Failing all three, the script touches no tab and answers _TAB_UNPROVEN, and the step fails with
+// "Tab tracking lost". The fingerprint catches a tab inserted anywhere before the session's tab or
+// closed anywhere (the count), a tab closed to its left and another opened (the URLs before it
+// shift), and a tab in another selected-or-not state landing in its place.
+// ponytail: false positive — a tab opened, closed or selected in that window, or a URL change in
+// one of the three tabs before the session's, between a load that cleared the marker and the next
+// poll, fails the step closed; so does a cross-origin load that started more than a second before
+// the step's write (a previous call's click, the page's own redirect) and commits while
+// clickAndWait or fillAndSubmit waits, and a page the back/forward cache restores that the session
+// never stamped (one from before it took the tab). A Cmd+T or another session's new tab at any other
+// time does not: the marker decides. Miss — in that gap, while the window's fingerprint matches,
+// any page at N whose document started loading after the step's write less a second passes: a tab
+// created in the session's place, or one shifted into it (the session's tab closed or dragged
+// right), including one that reloaded. The age test compares Node's wall clock with WebKit's
+// timeOrigin, which WebKit derives at each read from a clock that stops in sleep: a wall-clock step
+// back of more than a second during a step refuses the session's page, and a sleep or forward step
+// of S lets a document up to S + 1 s older pass. And the proof and the action are two Apple events
+// of one script (as in closeTabByMarker), so a tab moved in the milliseconds between them still
+// shifts it.
+const _TAB_UNPROVEN = "MCP_TAB_UNPROVEN";
+const _TAB_BUSY = "MCP_TAB_BUSY";
+
+// The AppleScript handler that reads the fingerprint of window `w` as its tab `i` sees it, or ""
+// when the window has no tab i: "<window id>|<tab count>|<tab i selected>|<URL>|<URL>|<URL>", the URLs
+// of the up to three tabs before tab i (missing value as "", cut at 200 characters). No linefeed.
+// The window id keeps a script that osascript() retargets to another window from matching.
+const _FINGERPRINT_HANDLER = `on mcpFp(w, i)
+	tell application "Safari"
+		set n to count of tabs of w
+		if i > n then return ""
+		set fp to ((id of w) as text) & "|" & (n as text) & "|" & ((visible of tab i of w) as text)
+		repeat with j from i - 3 to i - 1
+			if j > 0 then
+				set u to URL of tab j of w
+				if u is missing value then set u to ""
+				if (length of u) > 200 then set u to text 1 thru 200 of u
+				set fp to fp & "|" & u
+			end if
+		end repeat
+		return fp
+	end tell
+end mcpFp`;
+
+// The page JavaScript an _inTab() script runs: `js`, once the page proves the tab, answering
+// "MCP_OK:" and its value as text ("MCP_OK:" alone when `js` throws, as runJS answered "" for a page
+// script that threw: the tab is proven, and the script must not run it again elsewhere);
+// _TAB_UNPROVEN, before anything else runs, when the page carries neither field of `marker` and
+// either the fingerprint did not prove the tab (`positional` false), or the page carries another
+// session's marker, or its document is older than `since` less a second of clock slack.
+// `stamp` true stamps a page that lacks __mcpTabMarker (a document a load just brought), "always"
+// stamps it in any case.
+function _provenTabJS(marker, js, { positional, stamp, since = 0 }) {
+  const m = String(marker).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const stampJS = stamp === "always" ? `${_buildStampJS(marker)};` : stamp ? `if(c!==M){${_buildStampJS(marker)};}` : "";
+  const born = positional ? `var t=0;try{t=performance.timeOrigin||performance.timing.navigationStart||0}catch(e){}` : "";
+  const older = positional ? `||!(t>=${Number(since) - 1000})` : "";
+  return `(function(P){var M='${m}',n='',c='',own=false;` +
+    `try{n=String(window.name);c=String(window.__mcpTabMarker);own=n===M||c===M}catch(e){}${born}` +
+    `if(!own&&(!P||n.indexOf('MCP_')===0||c.indexOf('MCP_')===0${older}))return '${_TAB_UNPROVEN}';` +
+    `${stampJS}try{return 'MCP_OK:'+String(${js})}catch(e){return 'MCP_OK:'}})(${positional ? 1 : 0})`;
+}
+
+// JavaScript for a double-quoted `do JavaScript "..."` literal, escaped as runJS escapes it.
+function _doJSLiteral(js) {
+  return js
+    .replace(/^\s*\/\/[^\n]*$/gm, '')  // Strip // comment-only lines before flattening
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, " ")
+    .replace(/\r/g, "")
+    .replace(/\t/g, " ");
+}
+
+function _tabUnprovenError(op) {
+  const err = new Error(
+    `Tab tracking lost — ${op} could not prove the session's tab: no tab of its window carries this session's ` +
+    `marker, and nothing else proves which tab it is (a tab was opened, closed or moved in that window, a load ` +
+    `had just cleared the marker, or the page runs no script). ${op} touched no tab after that. If it had already ` +
+    `loaded a URL, clicked, submitted or moved in history, that happened in the session's tab: check the result ` +
+    `before repeating it. Call safari_new_tab to open a fresh tab.`
+  );
+  err.tabUnproven = true;
+  return err;
+}
+
+// Run `js` in the tab a step proved, `tab` = { idx, win, marker, fp, since, op } (see _sessionTab),
+// in one AppleScript that proves the tab again first, as described above, and answer its value.
+// `tab.idx` follows the tab to wherever the proof found it, and `tab.fp` becomes the fingerprint read
+// there. `markerOnly`: only the marker proves the tab (steps 1 and 2), for the scripts that run
+// before the step's page loads, whose page still carries it; step 3 also needs a fingerprint an
+// earlier script of the step read and the time the step started its load. `then(target)`:
+// AppleScript run on the proven tab after `js`, as in `set URL of ${target} to "…"`. A session that
+// never owned a tab has no marker: its step runs as before, in the tab it tracks or the front
+// document.
+async function _inTab(tab, js, { markerOnly = false, stamp = false, then = null, timeout = 5000, subprocess = false } = {}) {
+  const run = subprocess ? osascript : osascriptFast;
+  if (!tab.idx || !tab.win || !tab.marker) {
+    // A session that owns a tab gets all three from the scan that proved it; missing one, nothing
+    // proves the tab, and the old way (by index, or the front document) would guess.
+    if (_st().hasOwnedTab) throw _tabUnprovenError(tab.op);
+    if (then) {
+      const target = tab.idx ? `tab ${tab.idx} of ${tab.win || getTargetWindowRef()}` : getFallbackTarget();
+      return run(`tell application "Safari" to ${then(target)}`, { timeout });
+    }
+    return runJS(js, { tabIndex: tab.idx, win: tab.win, timeout });
   }
+  // A script that runs before the step's load stamps the page it is about to leave, once the marker
+  // has proved it: a page the back/forward cache brings back later then carries __mcpTabMarker
+  // (window.name may not survive the restore), and its old document proves it where step 3 cannot.
+  const byMarker = _doJSLiteral(_provenTabJS(tab.marker, js, { positional: false, stamp: stamp || markerOnly }));
+  const positional = markerOnly || !tab.fp || !tab.since ? "" : `		else if not skipped then
+			set k to ${tab.idx}
+			considering case
+				if my mcpFp(w, ${tab.idx}) is "${String(tab.fp).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}" then set r to do JavaScript "${_doJSLiteral(_provenTabJS(tab.marker, js, { positional: true, stamp, since: tab.since }))}" in tab ${tab.idx} of w
+			end considering
+`;
+  // The first `do JavaScript` goes to whatever tab sits at N: an error or a reply with no value
+  // there falls through to the search, as a refusal does, but a timeout ends the script within the
+  // call's own budget, so a script Node gave up on never goes on to act minutes later. Each check of
+  // the search is bounded, so a tab that does not answer (a pending dialog, a hung page) costs a
+  // second, not the script. A tab to the right of N that did not answer may be the session's tab
+  // moved there, which the fingerprint cannot see: then step 3 is not taken, and the script answers
+  // _TAB_BUSY, which the load polls retry.
+  const script = `${_FINGERPRINT_HANDLER}
+tell application "Safari"
+	set w to ${tab.win}
+	set k to ${tab.idx}
+	set r to missing value
+	if k is less than or equal to (count of tabs of w) then
+		try
+			with timeout of ${Math.max(1, Math.ceil(timeout / 1000))} seconds
+				set r to (do JavaScript "${byMarker}" in tab k of w) as text
+			end timeout
+		on error errMsg number errNum
+			if errNum is -1712 then error errMsg number errNum
+		end try
+	end if
+	if r does not start with "MCP_OK:" then
+		set k to 0
+		set skipped to false
+		repeat with i from (count of tabs of w) to 1 by -1
+			try
+				with timeout of 1 second
+					if (do JavaScript "${_doJSLiteral(_markerCheckJS(tab.marker))}" in tab i of w) is "1" then
+						set k to i
+						exit repeat
+					end if
+				end timeout
+			on error number errNum
+				if errNum is -1712 and i > ${tab.idx} then set skipped to true
+			end try
+		end repeat
+		if k > 0 then
+			set r to do JavaScript "${byMarker}" in tab k of w
+${positional}		end if
+		if r does not start with "MCP_OK:" then
+			if skipped then return "${_TAB_BUSY}"
+			return "${_TAB_UNPROVEN}"
+		end if
+	end if
+${then ? `	${then("tab k of w")}\n` : ""}	return (k as text) & linefeed & (my mcpFp(w, k)) & linefeed & r
+end tell`;
+  const res = String(await run(script, { timeout }));
+  if (res === _TAB_BUSY) {
+    throw new Error(`${tab.op}: a tab of the session's window did not answer, so its tab cannot be proven yet; retry`);
+  }
+  // "<index>\n<fingerprint>\nMCP_OK:<value>", positively; anything else proves nothing.
+  const proven = /^(\d+)\n([^\n]*)\nMCP_OK:([\s\S]*)$/.exec(res);
+  if (!proven) throw _tabUnprovenError(tab.op);
+  tab.idx = Number(proven[1]);
+  tab.fp = proven[2];
+  return proven[3];
 }
 
 // Quick JS execution — exposed for smart-wait checks in index.js
@@ -862,6 +1054,36 @@ export async function findTabByMarker(marker) {
   return (await _scanForMarker(marker))?.idx || null;
 }
 
+// The window safari_wait_for_new_tab watches when AppleScript lists it: the one this session's tab
+// is in, proven by its marker in the target window as every step proves it, or null for a session
+// that has no tab of its own yet. The window in front was the user's whenever theirs was in front:
+// the wait missed the popup the session's page opened and claimed a tab the user opened there. So a
+// session whose tab is not proven there is refused, and no scan here drops its marker.
+export async function sessionTabWindow() {
+  const s = _st();
+  if (!s.hasOwnedTab) return null;
+  if (!s.activeTabMarker) {
+    throw new Error(
+      "Tab safety: AppleScript has no marker to find this session's tab by (the Safari extension opened it and has " +
+      "not marked it, or this session lost track of it), so it cannot tell which window to watch for the new tab. " +
+      "Check the extension with safari_doctor, re-anchor with safari_list_tabs and safari_switch_tab, or open a tab with safari_new_tab."
+    );
+  }
+  const found = await _scanForMarker(s.activeTabMarker, s.activeTabIndex);
+  if (found?.idx) return found.win;
+  if (!found) {
+    // The scan answers null for every AppleScript error: name the one no retry gets past.
+    if (!(await isSafariRunning())) throw safariNotRunningError();
+    throw new Error("Tab safety: Safari did not finish the scan for this session's tab (busy, or its window gone), so this wait claimed nothing.");
+  }
+  throw new Error(
+    "Tab safety: this session's tab is not in the Safari window in front, so AppleScript cannot tell which window to " +
+    "watch for the new tab, and watching the one in front could claim a tab of yours. Check the Safari extension with " +
+    "safari_doctor; without it, the window with this session's tab has to be in front (if it is, re-anchor with " +
+    "safari_switch_tab or open a tab with safari_new_tab)."
+  );
+}
+
 // Page JavaScript that is true when the page carries a marker starting with `prefix`, in window.name
 // or, once a page has taken window.name over, in window.__mcpTabMarker. Every marker the session
 // stamps starts with its markerId: MCP_<markerId>_ on a tab it opened, on one it switched to, and on
@@ -929,13 +1151,16 @@ async function _resolveSessionTab() {
         await s.marking;
       }
       if (!s.activeTabMarker) break;
-      const found = await _scanForMarker(s.activeTabMarker, s.activeTabIndex);
-      if (found?.idx) { s.activeTabIndex = found.idx; return found; }
+      // The marker this scan looks for proves the tab, whatever a parallel call of the session
+      // makes of s.activeTabMarker while the scan runs.
+      const marker = s.activeTabMarker;
+      const found = await _scanForMarker(marker, s.activeTabIndex);
+      if (found?.idx) { s.activeTabIndex = found.idx; return { ...found, marker }; }
       // The scan did not complete: keep the marker for the next call, but prove nothing now.
       if (!found) break;
       // No tab carries it: the tab closed, a cross-site load or the page itself replaced
       // window.name, or it is in another window. Only the extension can mark its tab again.
-      s.activeTabMarker = null;
+      if (s.activeTabMarker === marker) s.activeTabMarker = null;
     }
     console.error("[Safari MCP] This session's tab is not proven (no tab in the window carries its marker) — refusing to act on a tab by position or URL");
     s.activeTabIndex = null;
@@ -1759,37 +1984,37 @@ export async function navigate(url) {
   // Escape backslash first, then quotes; strip CR/LF — a newline would break out of
   // the AppleScript string literal and allow AppleScript injection.
   const safeUrl = targetUrl.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/[\r\n]/g, '');
-    // Capture our tab index ONCE, proven by its marker (indices shift), with the window the proof
-    // found it in. Every internal runJS below targets both explicitly: re-resolving mid-navigation
-    // is unsafe — a cross-origin load transiently wipes window.name (a browser privacy feature)
-    // and the tracked URL is stale until the new page settles, so resolveActiveTab() would
-    // conclude "identity lost" and drop the very tab we are navigating — and 'front window' would
-    // put every later step, `set URL` and the marker stamp included, in a window the user brought
-    // forward meanwhile.
-    const { idx: navIndex, win: navWin } = await _sessionTab('navigate');
-    const navTarget = navIndex
-      ? `tab ${navIndex} of ${navWin || getTargetWindowRef()}`
-      : getFallbackTarget();
+    // Prove our tab ONCE by its marker (indices shift), with the window the proof found it in, and
+    // pin every script below to that tab of that window: re-resolving mid-navigation is unsafe — a
+    // cross-origin load transiently wipes window.name (a browser privacy feature) and the tracked
+    // URL is stale until the new page settles, so resolveActiveTab() would conclude "identity lost"
+    // and drop the very tab we are navigating — and 'front window' would put every later step,
+    // `set URL` and the marker stamp included, in a window the user brought forward meanwhile.
+    // A position is not an identity either: each script proves the tab again before it touches it
+    // (_inTab), by the marker while the old page still carries it — so a tab opened or closed
+    // before ours is followed, never navigated — and across the load by the marker it stamps back.
+    const tab = await _sessionTab('navigate');
+    const setURL = (u) => (target) => `set URL of ${target} to "${u}"`;
     // Step 0: Suppress onbeforeunload dialogs (prevents blocking navigation)
-    await runJS("window.onbeforeunload=null", { tabIndex: navIndex, win: navWin, timeout: 2000 }).catch(() => {});
+    await _inTab(tab, "window.onbeforeunload=null", { markerOnly: true, timeout: 2000 }).catch(() => {});
 
     // Pre-navigation URL, captured before Step 1. Lets the post-load check below
     // detect a `set URL` that silently no-ops (a cold or crashed Swift daemon):
     // the readyState poll would otherwise just see the OLD page still loaded.
-    const preNavUrl = await runJS('location.href', { tabIndex: navIndex, win: navWin, timeout: 3000 }).catch(() => '');
+    const preNavUrl = await _inTab(tab, 'location.href', { markerOnly: true, timeout: 3000 }).catch(() => '');
 
-    // Step 1: Set URL via fast daemon (~5ms) — don't block daemon with polling
-    await osascriptFast(
-      `tell application "Safari" to set URL of ${navTarget} to "${safeUrl}"`,
-      { timeout: 10000 }
-    );
+    // Step 1: Set URL via fast daemon (~5ms) — don't block daemon with polling. In the script that
+    // checks the page still carries the session's marker: the tab it sets is the session's. From
+    // here on, a page without the marker is taken by position only when its document is newer.
+    tab.since = Date.now();
+    await _inTab(tab, "''", { markerOnly: true, then: setURL(safeUrl), timeout: 10000 });
 
     // Optimistically track the destination NOW. The async load below can take seconds
     // on a heavy SPA; if any step throws mid-load, resolveActiveTab() can still re-find
     // this tab by URL instead of clearing the index and locking the session out of its
     // own tab. Corrected to the real landed URL once the page settles (below).
     _st().activeTabURL = targetUrl;
-    _st().activeTabIndex = navIndex;
+    _st().activeTabIndex = tab.idx;
     _st().lastResolveTime = Date.now();
 
     // about:blank and any already-loaded page report readyState 'complete' the instant
@@ -1807,16 +2032,19 @@ export async function navigate(url) {
     const _probeUrl = (json) => { try { return JSON.parse(json).url || ''; } catch { return ''; } };
 
     // Step 2: Poll readyState synchronously from Node.js side
-    // (AppleScript do JavaScript doesn't await async Promises — returns immediately)
+    // (AppleScript do JavaScript doesn't await async Promises — returns immediately).
+    // Every poll stamps a page that lost the marker, so a load leaves the tab unmarked for one
+    // poll at most; a tab no poll can prove ends the navigation (it is not "still loading").
     let result = '{}';
     for (let poll = 0; poll < 80; poll++) {
       await new Promise(r => setTimeout(r, 200));
       try {
-        const state = await runJS('document.readyState', { tabIndex: navIndex, win: navWin, timeout: 5000 });
+        const state = await _inTab(tab, 'document.readyState', { stamp: true, timeout: 5000 });
         if (state === 'complete' || state === 'interactive') {
-          result = await runJS(
+          result = await _inTab(
+            tab,
             `JSON.stringify({title:document.title,url:location.href,blocked:document.title.includes('cannot open')||document.title.includes('\u05D0\u05D9\u05DF \u05D0\u05E4\u05E9\u05E8\u05D5\u05EA')})`,
-            { tabIndex: navIndex, win: navWin, timeout: 5000 }
+            { stamp: true, timeout: 5000 }
           );
           if (_settled(state, _probeUrl(result))) {
             if (state === 'complete') break;
@@ -1825,7 +2053,10 @@ export async function navigate(url) {
           }
           // else: new URL not in effect yet (stale/blank page) — keep polling
         }
-      } catch { /* page still loading, retry */ }
+      } catch (err) {
+        if (err.tabUnproven) throw err;
+        /* page still loading, retry */
+      }
     }
 
     // If the fast `set URL` above silently no-opped (cold/crashed daemon), the poll
@@ -1834,26 +2065,33 @@ export async function navigate(url) {
     let landedUrl = _probeUrl(result);
     if (preNavUrl && preNavUrl !== targetUrl && (!landedUrl || landedUrl === preNavUrl || landedUrl === 'about:blank')) {
       console.error('[Safari MCP] navigate: fast set-URL did not take effect — retrying via osascript subprocess');
-      await osascript(`tell application "Safari" to set URL of ${navTarget} to "${safeUrl}"`, { timeout: 12000 });
+      // The page never left, so it still carries the marker, which alone may prove where it is.
+      await _inTab(tab, "''", { markerOnly: true, then: setURL(safeUrl), timeout: 12000, subprocess: true });
       for (let rpoll = 0; rpoll < 80; rpoll++) {
         await new Promise(res => setTimeout(res, 200));
         try {
-          const state = await runJS('document.readyState', { tabIndex: navIndex, win: navWin, timeout: 5000 });
+          const state = await _inTab(tab, 'document.readyState', { stamp: true, timeout: 5000 });
           if (state === 'complete' || state === 'interactive') {
-            const probe = await runJS('JSON.stringify({title:document.title,url:location.href})', { tabIndex: navIndex, win: navWin, timeout: 5000 });
+            const probe = await _inTab(tab, 'JSON.stringify({title:document.title,url:location.href})', { stamp: true, timeout: 5000 });
             if (_settled(state, _probeUrl(probe))) {
               result = probe;
               if (state === 'complete') break;
               if (rpoll > 10) break;
             }
           }
-        } catch { /* page still loading, retry */ }
+        } catch (err) {
+          if (err.tabUnproven) throw err;
+          /* page still loading, retry */
+        }
       }
       // Last chance: the daemon may have applied the set URL only AFTER our polls ran.
       // Re-read the live URL directly before declaring failure.
       let retryUrl = _probeUrl(result);
       if (!retryUrl || retryUrl === preNavUrl || retryUrl === 'about:blank') {
-        const liveUrl = await runJS('location.href', { tabIndex: navIndex, win: navWin, timeout: 5000 }).catch(() => '');
+        const liveUrl = await _inTab(tab, 'location.href', { stamp: true, timeout: 5000 }).catch((err) => {
+          if (err.tabUnproven) throw err;
+          return '';
+        });
         if (liveUrl && liveUrl !== preNavUrl && liveUrl !== 'about:blank') {
           result = JSON.stringify({ title: '', url: liveUrl });
           retryUrl = liveUrl;
@@ -1864,7 +2102,7 @@ export async function navigate(url) {
         // Preserve tab tracking (index + the page actually showing) so the session can
         // recover via switch_tab / re-navigate instead of being locked out of its tab.
         _st().activeTabURL = preNavUrl;
-        _st().activeTabIndex = navIndex;
+        _st().activeTabIndex = tab.idx;
         _st().lastResolveTime = Date.now();
         throw new Error(`navigate failed: page stayed on ${preNavUrl} — Safari "set URL" to ${targetUrl} had no effect (Safari automation/daemon issue, retry exhausted)`);
       }
@@ -1875,21 +2113,23 @@ export async function navigate(url) {
       const parsed = JSON.parse(result);
       if (parsed.blocked && url.startsWith("http://")) {
         const httpUrl = url.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/[\r\n]/g, '');
-        await osascriptFast(
-          `tell application "Safari" to set URL of ${navTarget} to "${httpUrl}"`
-        );
-        // Poll readyState for HTTP retry — target navIndex explicitly (no re-resolve)
+        // The poll that read the blocked page stamped it: the marker alone may prove where it is.
+        await _inTab(tab, "''", { markerOnly: true, then: setURL(httpUrl), timeout: 10000 });
+        // Poll readyState for HTTP retry — the tab the step proved (no re-resolve)
         let retryResult = '{}';
         for (let rp = 0; rp < 40; rp++) {
           await new Promise(r => setTimeout(r, 300));
           try {
-            const rs = await runJS('document.readyState', { tabIndex: navIndex, win: navWin, timeout: 5000 });
+            const rs = await _inTab(tab, 'document.readyState', { stamp: true, timeout: 5000 });
             if (rs === 'complete' || rs === 'interactive') {
-              retryResult = await runJS('JSON.stringify({title:document.title,url:location.href})', { tabIndex: navIndex, win: navWin, timeout: 5000 });
+              retryResult = await _inTab(tab, 'JSON.stringify({title:document.title,url:location.href})', { stamp: true, timeout: 5000 });
               if (rs === 'complete') break;
               if (rp > 8) break;
             }
-          } catch { /* retry */ }
+          } catch (err) {
+            if (err.tabUnproven) throw err;
+            /* retry */
+          }
         }
         const retry = retryResult;
         // Update URL tracking with actual URL after HTTP retry
@@ -1897,13 +2137,15 @@ export async function navigate(url) {
           const retryParsed = JSON.parse(retry);
           if (retryParsed.url) _st().activeTabURL = retryParsed.url;
         } catch {}
-        _st().activeTabIndex = navIndex;
+        _st().activeTabIndex = tab.idx;
         _st().lastResolveTime = Date.now();
-        await _stampTab(navIndex, navWin);
-        _injectHelpersAfterLoad(navIndex, navWin);
+        await _stampTab(tab);
+        _injectHelpersAfterLoad(tab.idx, tab.win);
         return retry;
       }
-    } catch (_) {}
+    } catch (err) {
+      if (err?.tabUnproven) throw err;
+    }
 
     // Update URL tracking after navigation (non-blocked path)
     try {
@@ -1912,15 +2154,15 @@ export async function navigate(url) {
     } catch {
       _st().activeTabURL = targetUrl;
     }
-    _st().activeTabIndex = navIndex;
+    _st().activeTabIndex = tab.idx;
     _st().lastResolveTime = Date.now();
 
     // Re-stamp identity marker + visibility spoof onto the settled page. A cross-origin
     // navigation clears window.name, and any full load wipes __mcpTabMarker and the
     // visibility spoof — re-stamping keeps resolveActiveTab able to find this tab and
     // keeps the page rendering even while backgrounded.
-    await _stampTab(navIndex, navWin);
-    _injectHelpersAfterLoad(navIndex, navWin);
+    await _stampTab(tab);
+    _injectHelpersAfterLoad(tab.idx, tab.win);
 
     return result;
 }
@@ -1941,8 +2183,11 @@ function _injectHelpersAfterLoad(idx, win) {
 // Poll document.readyState from the Node side and return {title,url[,text]} once the
 // page settles. `do JavaScript` returns immediately and never awaits an async IIFE
 // (see _evaluateAsync), so any in-page `await` loop is fire-and-forget — page-load
-// waits MUST be driven from Node. Shared by goBack/goForward/reload/navigateAndRead.
-async function _pollReadyAndRead(navIndex, { maxLength, win: navWin } = {}) {
+// waits MUST be driven from Node. Shared by goBack/goForward/reload/navigateAndRead/fillAndSubmit.
+// Runs in the tab the step proved (`tab`, see _sessionTab), and every poll proves it again and
+// stamps a page that lost the marker (_inTab), so the step keeps its tab across a cross-site load
+// and the window's fingerprint stands in for the marker for one poll at most.
+async function _pollReadyAndRead(tab, { maxLength } = {}) {
   const readExpr = maxLength != null
     ? `JSON.stringify({title:document.title,url:location.href,text:document.body?document.body.innerText.substring(0,${Number(maxLength)}):''})`
     : `JSON.stringify({title:document.title,url:location.href})`;
@@ -1950,46 +2195,57 @@ async function _pollReadyAndRead(navIndex, { maxLength, win: navWin } = {}) {
   for (let poll = 0; poll < 60; poll++) {
     await new Promise(r => setTimeout(r, poll < 10 ? 200 : 500));
     try {
-      const state = await runJS('document.readyState', { tabIndex: navIndex, win: navWin, timeout: 5000 });
+      const state = await _inTab(tab, 'document.readyState', { stamp: true, timeout: 5000 });
       if (state === 'complete' || state === 'interactive') {
-        result = await runJS(readExpr, { tabIndex: navIndex, win: navWin, timeout: 5000 });
+        result = await _inTab(tab, readExpr, { stamp: true, timeout: 5000 });
         if (state === 'complete') break;
         if (poll > 10) break; // interactive after ~2s is good enough
       }
-    } catch { /* page still loading, retry */ }
+    } catch (err) {
+      if (err.tabUnproven) throw err;
+      /* page still loading, retry */
+    }
   }
   return result;
 }
 
 export async function goBack() {
   await refreshTargetWindow();
-  const { idx: navIndex, win: navWin } = await _sessionTab('goBack');
+  const tab = await _sessionTab('goBack');
   // history.back() is synchronous; the page-load wait is polled from Node (see _pollReadyAndRead).
-  await runJS("history.back()", { tabIndex: navIndex, win: navWin, timeout: 5000 });
-  const result = await _pollReadyAndRead(navIndex, { win: navWin });
+  // It runs in the page that still carries the session's marker, checked in the same script.
+  tab.since = Date.now();
+  await _inTab(tab, "history.back()", { markerOnly: true, timeout: 5000 });
+  const result = await _pollReadyAndRead(tab);
   try { const p = JSON.parse(result); if (p.url) _st().activeTabURL = p.url; } catch {}
+  // A page the back/forward cache restored keeps __mcpTabMarker but not always window.name: stamp
+  // both, as reload() does, so a later same-site load does not lose the marker.
+  await _stampTab(tab);
   return result;
 }
 
 export async function goForward() {
   await refreshTargetWindow();
-  const { idx: navIndex, win: navWin } = await _sessionTab('goForward');
-  await runJS("history.forward()", { tabIndex: navIndex, win: navWin, timeout: 5000 });
-  const result = await _pollReadyAndRead(navIndex, { win: navWin });
+  const tab = await _sessionTab('goForward');
+  tab.since = Date.now();
+  await _inTab(tab, "history.forward()", { markerOnly: true, timeout: 5000 });
+  const result = await _pollReadyAndRead(tab);
   try { const p = JSON.parse(result); if (p.url) _st().activeTabURL = p.url; } catch {}
+  await _stampTab(tab);
   return result;
 }
 
 export async function reload(hardReload = false) {
   await refreshTargetWindow();
-  const { idx: navIndex, win: navWin } = await _sessionTab('reload');
+  const tab = await _sessionTab('reload');
   // Reload destroys JS context — fire it, then poll readyState from Node.
-  await runJS(hardReload ? "location.reload(true)" : "location.reload()", { tabIndex: navIndex, win: navWin });
+  tab.since = Date.now();
+  await _inTab(tab, hardReload ? "location.reload(true)" : "location.reload()", { markerOnly: true, timeout: 15000 });
   await new Promise((r) => setTimeout(r, 100)); // Brief wait for reload to start
-  const result = await _pollReadyAndRead(navIndex, { win: navWin });
+  const result = await _pollReadyAndRead(tab);
   try { const p = JSON.parse(result); if (p.url) _st().activeTabURL = p.url; } catch {}
   // A reload destroys the JS context — re-stamp marker + visibility spoof.
-  await _stampTab(navIndex, navWin);
+  await _stampTab(tab);
   return result;
 }
 
@@ -4058,21 +4314,43 @@ end tell`);
 export async function newTab(url = "", { onMarker } = {}) {
   await refreshTargetWindow();
   const safeUrl = escAppleScriptString(url); // url defaults to "" → escAppleScriptString("") === ""
-  const props = url ? ` with properties {URL:"${safeUrl}"}` : "";
-  // The script that makes the tab reports where it put it: its window's id and its index there,
-  // read off the tab it made. Until the marker is on it nothing else names the tab, so every
-  // script below addresses that window by id. A later `count of tabs` named the tab the user had
-  // just opened, and 'front window' names whichever window is in front when each script runs: one
-  // the user brought forward while the page loaded took the probes, the marker and the URL read,
-  // and with the marker every later write, into their tab. The report is "" when the tab was made
-  // but its place could not be read, which must not send the catch below to make another.
+  // A blank tab opens on about:blank, not on Safari's new-tab page (the Start Page runs no page
+  // script, so no marker could ever prove the tab); `url` stays "", so nothing waits for a load.
+  const props = ` with properties {URL:"${url ? safeUrl : "about:blank"}"}`;
+  // Bulletproof tab marker. window.name survives ALL navigation (full loads, redirects,
+  // cross-origin); __mcpTabMarker survives SPA routing. Minted before the tab exists so the script
+  // that makes it can stamp it, but it becomes the session's marker (onMarker, the state below) only
+  // once the tab exists, so a scan run meanwhile never looks for one no tab carries yet.
+  const marker = `MCP_${_st().markerId}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  // The script that makes the tab reports where it put it: its window's id, its index there, read
+  // off the tab it made, and the window's fingerprint as that tab sees it (see _inTab), the proof of
+  // the tab until a marker is on it. Until then nothing else names the tab, so every script below
+  // addresses that window by id. A later `count of tabs` named the tab the user had just opened, and
+  // 'front window' names whichever window is in front when each script runs: one the user brought
+  // forward while the page loaded took the probes, the marker and the URL read, and with the marker
+  // every later write, into their tab. The report is "" when the tab was made but its place could not
+  // be read, which must not send the catch below to make another; that tab gets no marker either.
+  // Then the script stamps the marker on the tab, so a tab the user or another session opens next to
+  // it before the next script runs is told from it by the marker, not by position. `t` is a position
+  // too, so the stamp takes only a page as fresh as the one just made: about:blank, carrying no
+  // window.name and no marker. The stamp is bounded, and the script's timeout covers it: a new tab
+  // slow to answer must not make the catch below open a second tab.
   const report = `  try
-    return ((id of w) as text) & ":" & ((index of t) as text)
+    set rep to ((id of w) as text) & ":" & ((index of t) as text) & linefeed & (my mcpFp(w, index of t))
+  on error
+    return ""
   end try
-  return ""`;
+  try
+    with timeout of 2 seconds
+      do JavaScript "${_doJSLiteral(`(location.href==='about:blank'&&!window.name&&!window.__mcpTabMarker)?${_buildStampJS(marker)}:''`)}" in t
+    end timeout
+  end try
+  return rep`;
+  const since = Date.now();
   let made;
   try {
-    made = await osascript(`tell application "Safari"
+    made = await osascript(`${_FINGERPRINT_HANDLER}
+tell application "Safari"
   set w to ${getTargetWindowRef()}
   tell w
     set userTab to current tab
@@ -4080,26 +4358,28 @@ export async function newTab(url = "", { onMarker } = {}) {
     set current tab to userTab
   end tell
 ${report}
-end tell`);
+end tell`, { timeout: 13000 });
   } catch {
     if (SAFARI_PROFILE) {
       // Profile mode: create tab inside the profile window, never use make new document (opens in front/personal window)
-      made = await osascript(`tell application "Safari"
+      made = await osascript(`${_FINGERPRINT_HANDLER}
+tell application "Safari"
   set w to ${getTargetWindowRef()}
   tell w to set t to make new tab${props}
 ${report}
-end tell`);
+end tell`, { timeout: 13000 });
     } else {
       // No window to open a tab in: a new window, whose tab is the new document.
-      made = await osascript(`tell application "Safari"
+      made = await osascript(`${_FINGERPRINT_HANDLER}
+tell application "Safari"
   make new document${props}
   set w to front window
   set t to current tab of w
 ${report}
-end tell`);
+end tell`, { timeout: 13000 });
     }
   }
-  const at = /^(\d+):(\d+)$/.exec(String(made).trim());
+  const at = /^(\d+):(\d+)\n([^\n]+)$/.exec(String(made).trim());
   const win = at && _windowById(at[1]);
   const idx = at ? Number(at[2]) : 0;
   // Permanently true: this session has opened its own tab, so write ops must NEVER fall back to
@@ -4111,44 +4391,55 @@ end tell`);
       "cannot tell it from your tabs and marked none. Call safari_new_tab again."
     );
   }
-  // Bulletproof tab marker, stamped onto the tab after load. window.name survives ALL navigation
-  // (full loads, redirects, cross-origin); __mcpTabMarker survives SPA routing. It becomes the
-  // session's marker below, so a scan run meanwhile never looks for one no tab carries yet.
-  const marker = `MCP_${_st().markerId}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
   onMarker?.(marker);
-  const inNewTab = (js) =>
-    `tell application "Safari" to do JavaScript "${js.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}" in tab ${idx} of ${win}`;
-  // Wait for page load if URL given. Poll readyState from the Node side — Safari's
-  // `do JavaScript` does NOT await async IIFEs, so an in-page wait loop returns
-  // immediately without waiting. Stamping before the page settles loses the marker.
-  if (url) {
-    for (let i = 0; i < 50; i++) {
-      await new Promise(r => setTimeout(r, 200));
-      try {
-        const st = await osascriptFast(inNewTab('document.readyState'), { timeout: 5000 });
-        const href = await osascriptFast(inNewTab('location.href'), { timeout: 5000 });
-        if ((st === 'complete' || st === 'interactive') && href && href !== 'about:blank') break;
-      } catch { /* tab still loading */ }
-    }
-  } else {
-    await new Promise(r => setTimeout(r, 200));
-  }
-  // Stamp identity marker + visibility spoof onto the loaded document, and read the page, in one
-  // script. Identity-critical, like _stampTab(): a daemon hiccup retries through the reliable
-  // subprocess, and stamping the same marker twice is harmless.
-  const stampAndRead = inNewTab(
-    `(function(){${_buildStampJS(marker)};return JSON.stringify({title:document.title,url:location.href,tabIndex:${idx}});})()`
-  );
+  // Every script below proves the tab again before it touches it (_inTab): by the marker, wherever
+  // the tab is now, or, right after its page replaced the one the marker was on, by the window
+  // looking as it did. A probe that finds a page without the marker stamps it back.
+  const tab = { idx, win, marker, fp: at[3], since, op: "newTab" };
+  let info = null;
   let failure = null;
-  const info = await osascriptFast(stampAndRead, { timeout: 5000 })
-    .catch(() => osascript(stampAndRead, { timeout: 15000 }))
-    .catch((err) => { failure = err; return null; });
+  try {
+    // Wait for page load if URL given. Poll readyState from the Node side — Safari's
+    // `do JavaScript` does NOT await async IIFEs, so an in-page wait loop returns
+    // immediately without waiting.
+    if (url) {
+      for (let i = 0; i < 50; i++) {
+        await new Promise(r => setTimeout(r, 200));
+        try {
+          const probe = await _inTab(tab, "document.readyState+' '+location.href", { stamp: true });
+          const cut = probe.indexOf(" ");
+          const st = probe.slice(0, cut);
+          const href = probe.slice(cut + 1);
+          if ((st === 'complete' || st === 'interactive') && href && href !== 'about:blank') break;
+        } catch (err) {
+          if (err.tabUnproven) throw err;
+          /* tab still loading */
+        }
+      }
+    } else {
+      await new Promise(r => setTimeout(r, 200));
+    }
+    // Stamp identity marker + visibility spoof onto the loaded document, and read the page, in one
+    // script. Identity-critical, like _stampTab(): a daemon hiccup retries through the reliable
+    // subprocess, and stamping the same marker twice is harmless.
+    const stampAndRead = (opts) =>
+      _inTab(tab, "JSON.stringify({title:document.title,url:location.href})", { stamp: "always", ...opts });
+    const page = JSON.parse(await stampAndRead({ timeout: 5000 }).catch((err) => {
+      if (err.tabUnproven) throw err;
+      return stampAndRead({ timeout: 15000, subprocess: true });
+    }));
+    info = JSON.stringify({ title: page.title, url: page.url, tabIndex: tab.idx });
+  } catch (err) {
+    failure = err;
+  }
   // The session's current tab from here on, whether or not the stamp got through: only the
-  // marker, found on the tab, proves it is this one.
+  // marker, found on the tab, proves it is this one. A tab no script could prove keeps no new
+  // marker, and nothing is stamped on the tab that took its place.
   Object.assign(_st(), {
-    activeTabIndex: idx, activeTabURL: url || null, activeTabMarker: marker,
+    activeTabIndex: tab.idx, activeTabURL: url || null, activeTabMarker: marker,
     tabFromExtension: false, lastResolveTime: Date.now(),
   });
+  if (failure?.tabUnproven) throw failure;
   if (info === null) {
     throw new Error(
       "Tab tracking lost — the new tab could not be marked as this session's, so nothing proves which " +
@@ -6430,7 +6721,7 @@ export async function scrollToElement({ selector, text, block = "center", timeou
     // `do JavaScript` can't await an in-page delay (see _evaluateAsync).
     const safeText = escJsSingleQuote(text);
     const safeBlock = String(block).replace(/[^a-z]/gi, '') || 'center';
-    const { idx: navIndex, win: navWin } = await _sessionTab('scrollToElement');
+    const tab = await _sessionTab('scrollToElement');
     const stepJs =
       `(function(){` +
       `var scrollable=document.querySelector('[class*="grid"],[class*="virtual"],[class*="scroll"],[role="grid"],[role="table"]')||document.scrollingElement||document.documentElement;` +
@@ -6440,7 +6731,11 @@ export async function scrollToElement({ selector, text, block = "center", timeou
     const deadline = Date.now() + Number(timeout);
     let lastY = -1;
     while (Date.now() < deadline) {
-      const r = await runJS(stepJs, { tabIndex: navIndex, win: navWin, timeout: 5000 }).catch(() => '');
+      // Each step scrolls in the page only once that page proves it is the session's (_inTab).
+      const r = await _inTab(tab, stepJs, { markerOnly: true, timeout: 5000 }).catch((err) => {
+        if (err.tabUnproven) throw err;
+        return '';
+      });
       if (typeof r === 'string' && r.startsWith('Found')) return r;
       if (typeof r === 'string' && r.startsWith('SCROLL:')) {
         const curY = parseInt(r.slice(7), 10);
@@ -6460,20 +6755,20 @@ export async function scrollToElement({ selector, text, block = "center", timeou
 export async function navigateAndRead(url, { maxLength = 50000 } = {}) {
   await raiseWindowForShow();
   await refreshTargetWindow();
-  // Prove the tab once, and address every step to the window the proof found it in (see navigate()).
-  const { idx: navIndex, win: navWin } = await _sessionTab('navigateAndRead');
+  // Prove the tab once, and have every script prove it again before it touches it (see navigate()).
+  const tab = await _sessionTab('navigateAndRead');
   // Suppress onbeforeunload dialogs (same as navigate())
-  await runJS("window.onbeforeunload=null", { tabIndex: navIndex, win: navWin, timeout: 2000 }).catch(() => {});
+  await _inTab(tab, "window.onbeforeunload=null", { markerOnly: true, timeout: 2000 }).catch(() => {});
   let targetUrl = url;
   if (!/^https?:\/\//i.test(targetUrl)) targetUrl = "https://" + targetUrl;
   // Escape backslash first, then quotes; strip CR/LF — a newline would break out of
   // the AppleScript string literal and allow AppleScript injection.
   const safeUrl = targetUrl.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/[\r\n]/g, '');
-  const navTarget = navIndex ? `tab ${navIndex} of ${navWin || getTargetWindowRef()}` : getFallbackTarget();
-  await osascriptFast(`tell application "Safari" to set URL of ${navTarget} to "${safeUrl}"`);
+  tab.since = Date.now();
+  await _inTab(tab, "''", { markerOnly: true, then: (target) => `set URL of ${target} to "${safeUrl}"`, timeout: 10000 });
   _st().activeTabURL = targetUrl;
   // Poll readyState from Node, then read — `do JavaScript` can't await an async IIFE.
-  const navResult = await _pollReadyAndRead(navIndex, { maxLength, win: navWin });
+  const navResult = await _pollReadyAndRead(tab, { maxLength });
   // Update _st().activeTabURL with the actual URL after navigation
   try {
     const parsed = JSON.parse(navResult);
@@ -6488,9 +6783,12 @@ export async function clickAndWait({ selector, text, waitFor: waitSelector, time
   const safeSel = selector ? esc(selector) : "";
   const safeText = text ? esc(text) : "";
   const safeWait = waitSelector ? esc(waitSelector) : "";
-  const { idx: navIndex, win: navWin } = await _sessionTab('clickAndWait');
-  // Step 1: find + click — fully synchronous, so it runs inside one `do JavaScript`.
-  const clickResult = await runJS(
+  const tab = await _sessionTab('clickAndWait');
+  // Step 1: find + click — fully synchronous, so it runs inside one `do JavaScript`, which runs it
+  // only in a page that still carries the session's marker (_inTab).
+  tab.since = Date.now();
+  const clickResult = await _inTab(
+    tab,
     `(function(){
       var el;
       ${safeSel ? `el = document.querySelector('${safeSel}');` : ""}
@@ -6503,7 +6801,7 @@ export async function clickAndWait({ selector, text, waitFor: waitSelector, time
       el.click();
       return JSON.stringify({clicked:el.tagName+' "'+el.textContent.trim().substring(0,50)+'"'});
     })()`,
-    { tabIndex: navIndex, win: navWin, timeout: 10000 }
+    { markerOnly: true, timeout: 10000 }
   );
   let clickedInfo = '';
   try { const c = JSON.parse(clickResult); if (c.error) return clickResult; clickedInfo = c.clicked || ''; } catch {}
@@ -6513,35 +6811,46 @@ export async function clickAndWait({ selector, text, waitFor: waitSelector, time
   while (Date.now() < deadline) {
     try {
       if (safeWait) {
-        if (await runJS(`document.querySelector('${safeWait}')?'1':''`, { tabIndex: navIndex, win: navWin, timeout: 5000 }) === '1') break;
-      } else if (await runJS('document.readyState', { tabIndex: navIndex, win: navWin, timeout: 5000 }) === 'complete') {
+        if (await _inTab(tab, `document.querySelector('${safeWait}')?'1':''`, { stamp: true, timeout: 5000 }) === '1') break;
+      } else if (await _inTab(tab, 'document.readyState', { stamp: true, timeout: 5000 }) === 'complete') {
         break;
       }
-    } catch { /* page navigating */ }
+    } catch (err) {
+      if (err.tabUnproven) throw err;
+      /* page navigating */
+    }
     await new Promise(r => setTimeout(r, 200));
   }
-  const final = await runJS(`JSON.stringify({title:document.title,url:location.href})`, { tabIndex: navIndex, win: navWin, timeout: 5000 });
+  const final = await _inTab(tab, `JSON.stringify({title:document.title,url:location.href})`, { stamp: true, timeout: 5000 });
   try { const p = JSON.parse(final); p.clicked = clickedInfo; return JSON.stringify(p); } catch { return final; }
 }
 
 // Fill form + submit — common for login, search, etc.
 export async function fillAndSubmit({ fields, submitSelector }) {
+  // A load the form's own change or blur events start is the step's own load too.
+  const since = Date.now();
   await fillForm({ fields });
-  const { idx: navIndex, win: navWin } = await _sessionTab('fillAndSubmit');
+  const tab = await _sessionTab('fillAndSubmit');
+  // The submit click runs in the tab the polls below watch, in a page that still carries the
+  // session's marker (_inTab). A click that proved its tab by a scan of its own could submit in the
+  // tab at one index while the polls read the tab at another.
+  tab.since = since;
   if (submitSelector) {
     const sel = escJsSingleQuote(submitSelector);
-    await runJS(
-      `(function(){var el=document.querySelector('${sel}');if(el)el.click();})()`
+    await _inTab(tab,
+      `(function(){var el=document.querySelector('${sel}');if(el)el.click();})()`,
+      { markerOnly: true, timeout: 15000 }
     );
   } else {
     // Auto-find and click submit button
-    await runJS(
-      `(function(){var btn=document.querySelector('[type=submit],button:not([type])');if(btn)btn.click();})()`
+    await _inTab(tab,
+      `(function(){var btn=document.querySelector('[type=submit],button:not([type])');if(btn)btn.click();})()`,
+      { markerOnly: true, timeout: 15000 }
     );
   }
   // Wait for navigation/reload — polled from Node (`do JavaScript` can't await).
   await new Promise(r => setTimeout(r, 300));
-  return _pollReadyAndRead(navIndex, { win: navWin });
+  return _pollReadyAndRead(tab);
 }
 
 // Full page analysis — extracts everything in ONE call
