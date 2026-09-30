@@ -3451,44 +3451,43 @@ server.tool(
       _setActiveReceipt(switched?.receipt);
       return { content: [{ type: "text", text: `Found new tab: ${t.title} (${t.url})` }] };
     };
+    // The tabs that opened since `was`: the ones on a URL no tab of `was` showed, provided every
+    // tab of `was` is still there on its URL, in order. The first `index:url` pair not seen before
+    // was often a tab of the user's that had navigated, or had moved when another closed, and the
+    // claim stamped the session's own marker on it. Null when a tab that was there changed as well,
+    // or one opened on a URL another tab shows: any of them could be the new one.
+    // A listed tab's URL: AppleScript lists `url`, the extension `safeUrl` (origin and path).
+    // ponytail: tabs are told apart by URL alone (AppleScript has no tab id), so a new tab that
+    // opens on the very URL a tab of the user's leaves in the same poll can still pass for it.
+    const urlOf = (t) => t.url ?? t.safeUrl;
+    const inserted = (was, is) => {
+      const seen = new Set(was.map(urlOf));
+      const kept = is.filter((t) => seen.has(urlOf(t)));
+      return kept.length === was.length && kept.every((t, i) => urlOf(t) === urlOf(was[i]))
+        ? is.filter((t) => !seen.has(urlOf(t)))
+        : null;
+    };
     // Get current tab list
     let before = await list();
-    let beforeIds = new Set(before.tabs.map(t => `${t.index}:${t.url}`));
 
-    // Poll for new tab — detect by count increase + new entries (handles about:blank tabs)
+    // Poll for new tab — detect by count increase + tabs on new URLs
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 500));
       const now = await list();
-      if (now.via !== before.via) {
+      // A listing with no more tabs becomes the baseline, so a tab of the user's that navigated
+      // meanwhile is not new once one opens; so does a listing from the other source.
+      if (now.via !== before.via || now.tabs.length <= before.tabs.length) {
         before = now;
-        beforeIds = new Set(now.tabs.map(t => `${t.index}:${t.url}`));
         continue;
       }
-      if (now.tabs.length > before.tabs.length) {
-        // Find the new tab(s) — could be about:blank initially (OAuth popups)
-        for (const tab of now.tabs) {
-          if (!beforeIds.has(`${tab.index}:${tab.url}`)) {
-            // Wait for about:blank to resolve to actual URL — dynamic polling instead of fixed delay
-            if (tab.url === 'about:blank') {
-              let resolved = null;
-              for (let attempt = 0; attempt < 10; attempt++) {
-                await new Promise(r => setTimeout(r, 300)); // 300ms intervals, max 3s total
-                const refreshed = await list();
-                resolved = refreshed.via === now.via ? refreshed.tabs.find(t => t.index === tab.index) : null;
-                if (resolved && resolved.url !== 'about:blank') break;
-                resolved = null;
-              }
-              if (resolved && resolved.url !== 'about:blank') {
-                if (urlContains && !resolved.url.includes(urlContains)) continue;
-                return await adopt(resolved, now.via);
-              }
-              continue;
-            }
-            if (urlContains && !tab.url.includes(urlContains)) continue;
-            return await adopt(tab, now.via);
-          }
-        }
+      for (const tab of inserted(before.tabs, now.tabs) || []) {
+        // A new tab still on about:blank (an OAuth popup before it loads) is claimed at a later
+        // poll, once it shows its URL: a later listing found it again by index, and by then that
+        // could be another tab.
+        if (urlOf(tab) === 'about:blank') continue;
+        if (urlContains && !String(urlOf(tab)).includes(urlContains)) continue;
+        return await adopt(tab, now.via);
       }
     }
     return { content: [{ type: "text", text: "TIMEOUT: no new tab appeared" }] };
