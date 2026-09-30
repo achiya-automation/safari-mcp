@@ -3436,7 +3436,7 @@ server.tool(
       let switched;
       if (viaAppleScript) {
         if (!win) throw new Error("Tab safety: AppleScript did not say which window it listed, so it cannot tell which tab opened. Retry safari_wait_for_new_tab.");
-        switched = await safari.switchTab(t.index, { claim: true, win });
+        switched = await safari.switchTab(t.index, { claim: true, win, expectUrl: t.url });
       } else {
         switched = await extensionOrFallback("switch_tab", { index: t.index }, () => {
           throw new Error("Tab safety: the new tab was seen by the Safari extension, which could not switch to it, and AppleScript cannot tell which tab of its own window that is. Retry safari_wait_for_new_tab.");
@@ -3462,7 +3462,7 @@ server.tool(
     // ponytail: tabs are told apart by URL alone (AppleScript has no tab id and no opener), so any
     // tab the user opens in the window during the wait counts as new, a new tab that opens on the
     // very URL a tab of the user's leaves in the same poll can pass for it, and the claim stamps
-    // whatever tab sits at the listed index a script later.
+    // whatever tab sits at the listed index a script later unless switchTab checks `expectUrl`.
     const intact = (was, is) => {
       const seen = new Set(was.map(urlOf));
       const kept = is.filter((t) => seen.has(urlOf(t)));
@@ -3498,8 +3498,10 @@ server.tool(
           return await adopt(tab, now.via);
         } catch (err) {
           // A tab another session opened in this window meanwhile, whose marker the claim refuses
-          // to overwrite (`otherSession`): not this session's, and the one it waits for can still come.
-          if (!err?.otherSession) throw err;
+          // to overwrite (`otherSession`), or a tab that no longer shows the page the listing saw
+          // (`moved`: one closed in between and slid another under the index). Neither is the
+          // tab this waits for, and a later listing can still show it.
+          if (!err?.otherSession && !err?.moved) throw err;
         }
       }
     }
