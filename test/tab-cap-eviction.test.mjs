@@ -180,7 +180,7 @@ function makeProfile(userUrls = []) {
 const serverSource = [
   between(index, "const _receiptAliases", "// A caller-supplied receipt is the documented way"),
   /function _safeUrlForOutput\(rawUrl\) \{[\s\S]*?\n\}/.exec(index)[0],
-  between(index, "async function _verifiedTabIndex(info) {", "\n// Close all MCP-opened tabs on process exit"),
+  between(index, "async function _closeTrackedTab(info) {", "\n// Close all MCP-opened tabs on process exit"),
 ].join("\n");
 
 function makeServer({ send, profile = true, extension = true, safari = {}, maxTabs = 6 }) {
@@ -346,8 +346,7 @@ test("with the extension unavailable a receipt tab is kept, never guessed at thr
   const p = makeProfile();
   const [q1] = openTabs(p, SESSION, 6);
   const safari = {
-    findTabByMarker: async () => assert.fail("a receipt tab has no marker to look up"),
-    closeTab: async () => assert.fail("AppleScript must not close a receipt tab"),
+    closeTabByMarker: async () => assert.fail("AppleScript must not close a receipt tab"),
   };
   const server = makeServer({ send: () => assert.fail("not connected"), extension: false, profile: false, safari });
 
@@ -365,14 +364,12 @@ test("AppleScript tabs are closed by the marker, wherever they moved", async () 
   window.splice(0, 1); // the user closes their tab: every recorded index is off by one
   window.push(window.splice(0, 1)[0]); // and moves the oldest to the end
   const safari = {
-    async findTabByMarker(marker) {
+    // Finds the tab by its marker and closes it in one step, as the one AppleScript does.
+    async closeTabByMarker(marker) {
       const at = window.findIndex((t) => t.marker === marker);
-      return at >= 0 ? at + 1 : null;
-    },
-    async closeTab(idx) {
-      assert.ok(window[idx - 1], `no tab at ${idx}`);
-      window.splice(idx - 1, 1);
-      return "Tab closed";
+      if (at < 0) return null;
+      window.splice(at, 1);
+      return "closed";
     },
   };
   const server = makeServer({ send: () => assert.fail("no extension"), extension: false, profile: false, safari });
@@ -383,11 +380,27 @@ test("AppleScript tabs are closed by the marker, wherever they moved", async () 
   assert.deepEqual(window.map((t) => t.marker), ["MCP_s1_2", "MCP_s1_3", "MCP_s1_4", "MCP_s1_5", "MCP_s1_6"]);
 });
 
+test("an AppleScript close that fails stops the cap there, and keeps every tab tracked", async () => {
+  // A page that never answers the marker check (a pending alert) makes each close time out: trying
+  // every tracked tab in turn cost each one its own timeout on every safari_new_tab.
+  for (let n = 1; n <= 6; n++) own._trackTab(n, `https://example.com/${n}`, SESSION, `MCP_s1_${n}`);
+  let attempts = 0;
+  const safari = {
+    async closeTabByMarker() {
+      attempts++;
+      throw new Error("AppleScript error: Command failed (timed out)");
+    },
+  };
+  const server = makeServer({ send: () => assert.fail("no extension"), extension: false, profile: false, safari });
+  assert.equal(await server._evictOldestTab(SESSION), null);
+  assert.equal(attempts, 1, "the cap tried the next tab after an AppleScript close failed");
+  assert.equal(own._sessionTabs(SESSION).length, 6, "a tab the close may have left open was untracked");
+});
+
 test("a named profile never closes through AppleScript, even for a marked tab", async () => {
   own._trackTab(1, "https://example.com/1", SESSION, "MCP_s1_1");
   const safari = {
-    findTabByMarker: async () => assert.fail("no AppleScript lookup in a profile"),
-    closeTab: async () => assert.fail("no AppleScript close in a profile"),
+    closeTabByMarker: async () => assert.fail("no AppleScript close in a profile"),
   };
   const server = makeServer({ send: () => assert.fail("no receipt to send"), profile: true, safari, maxTabs: 1 });
   assert.equal(await server._evictOldestTab(SESSION), null);

@@ -799,13 +799,19 @@ function _windowById(id) {
   return Number.isInteger(n) && n > 0 ? `window id ${n}` : null;
 }
 
+// Page JavaScript that answers "1" when the page carries exactly `marker`: in window.name, or in
+// window.__mcpTabMarker once a page has taken window.name over.
+function _markerCheckJS(marker) {
+  const safeMarker = String(marker).replace(/'/g, "\\'");
+  return `(function(){try{return (window.name==='${safeMarker}'||window.__mcpTabMarker==='${safeMarker}')?'1':'0'}catch(e){return '0'}})()`;
+}
+
 // Scan the target window for the tab carrying `marker`, trying tab `hint` first. Returns
 // { idx, win }: that tab's index, 0 when the scan completed and no tab carries the marker, and
 // the window scanned (see _windowById); or null when the scan could not be completed.
 async function _scanForMarker(marker, hint) {
   try {
-    const safeMarker = String(marker).replace(/'/g, "\\'");
-    const check = `(function(){try{return (window.name==='${safeMarker}'||window.__mcpTabMarker==='${safeMarker}')?'1':'0'}catch(e){return '0'}})()`;
+    const check = _markerCheckJS(marker);
     // One AppleScript call loops every tab internally: faster and far more reliable than N
     // separate daemon round-trips (a daemon hiccup mid-scan used to mis-resolve to the user's tab).
     const scanScript = `tell application "Safari"
@@ -840,11 +846,11 @@ async function _scanForMarker(marker, hint) {
 // marker is on no tab — or when the scan itself could not be completed.
 //
 // resolveActiveTab() resolves *this session's current* tab, and can have the extension mark it
-// again; this one takes the marker as an argument and has no fallback, because its callers are
-// the destructive ones (shutdown cleanup, tab eviction). They hold a tab recorded minutes
-// earlier: its index has shifted and it may have navigated, so a URL match there can land
-// on a tab the USER opened on the same URL and close that instead (#112, the same
-// principle as #68). No proof of identity means no close.
+// again; this one takes the marker as an argument and has no fallback. A tab recorded minutes
+// earlier has shifted its index and may have navigated, so a URL match can land on a tab the
+// USER opened on the same URL (#112, the same principle as #68). An index it returns is proof
+// only for the script that found it: a close goes through closeTabByMarker(), which finds the
+// tab in the same script.
 export async function findTabByMarker(marker) {
   if (!marker) return null;
   return (await _scanForMarker(marker))?.idx || null;
@@ -4111,15 +4117,49 @@ end tell`);
 // A tab index this session can prove it owns, or null. Destructive paths only: they may
 // never guess, so "can't prove it" has to read as null rather than as the front document.
 // The proof is the identity marker, found wherever the tab is now (surviving the index
-// shifts of #54): the rule the tab cap and shutdown cleanup already follow (#112). Not
+// shifts of #54): the rule the tab cap and shutdown cleanup follow too (#112). Not
 // resolveActiveTab(), which can answer without one — a URL prefix, a domain, the bare index.
 async function _provenOwnTabIndex() {
   return findTabByMarker(_st().activeTabMarker);
 }
 
-// `explicitIndex` — a tab the caller already proved is ours. Internal cleanup resolves its
-// own indices out of the opened-tab table by their markers and passes them here. An index a
-// caller merely named proves nothing (closeOwnTab); everything else must prove ownership.
+// Close the tab carrying `marker`, found and closed in ONE script. An index one script proved and
+// a later script closed named whatever tab sat there by then: a close in between (another
+// eviction, the extension, the user, a popup) renumbers the window, and another front window
+// renames it, so the close took the user's tab. The window's last tab is blanked instead of closed,
+// as closeTab() does. Returns "closed", "blanked", or null when no tab in the target window carries
+// the marker. A tab adopted from the user (MCP_A…) is never closed (#92).
+// ponytail: the check and `close tab i` are still two Apple events, so a close another process
+// lands between them (two instances cleaning up at once) can still shift the index; closing by a
+// per-call title nonce (`close (every tab of w whose name is …)`) would make it one.
+export async function closeTabByMarker(marker) {
+  if (!marker || String(marker).startsWith("MCP_A")) return null;
+  await refreshTargetWindow();
+  const closed = await osascript(`tell application "Safari"
+  set w to ${getTargetWindowRef()}
+  set n to count of tabs of w
+  repeat with i from n to 1 by -1
+    set hit to false
+    try
+      set hit to ((do JavaScript "${_markerCheckJS(marker)}" in tab i of w) is "1")
+    end try
+    if hit then
+      if n is 1 then
+        set URL of tab i of w to "about:blank"
+        return "blanked"
+      end if
+      close tab i of w
+      return "closed"
+    end if
+  end repeat
+  return ""
+end tell`);
+  return closed === "closed" || closed === "blanked" ? closed : null;
+}
+
+// `explicitIndex` — a tab the caller already proved is ours. An index a caller merely named
+// proves nothing (closeOwnTab), and one proved by an earlier script can name another tab by now:
+// with no index, the session's own tab is proven and closed by its marker in one script.
 export async function closeTab(explicitIndex) {
   // The index is written into AppleScript source below, so nothing but a tab number may get
   // there: a string index from run_script carried statements of its own, `do shell script` too.
@@ -4142,15 +4182,30 @@ export async function closeTab(explicitIndex) {
   // its own is still open. That fail-open destroyed a user's tab (#68, the destructive
   // sibling of #64). An unmarked front document stays readable for a genuinely fresh
   // session, because a bad read costs information; a bad close costs their work.
-  const idx = explicitIndex || (await _provenOwnTabIndex());
-  if (!idx) {
-    throw new Error(
-      `Tab tracking lost — refusing to close a tab this session cannot prove it opened ` +
-      `(closing "current tab of window" would close the user's active tab). ` +
-      `Call safari_new_tab to open a tab this session owns, or safari_list_tabs and ` +
-      `safari_switch_tab to re-anchor to a tab this session opened.`
-    );
+  if (!explicitIndex) {
+    const closed = await closeTabByMarker(_st().activeTabMarker);
+    if (!closed) {
+      throw new Error(
+        `Tab tracking lost — refusing to close a tab this session cannot prove it opened ` +
+        `(closing "current tab of window" would close the user's active tab). ` +
+        `Call safari_new_tab to open a tab this session owns, or safari_list_tabs and ` +
+        `safari_switch_tab to re-anchor to a tab this session opened.`
+      );
+    }
+    _st().activeTabIndex = null;
+    _st().activeTabURL = null;
+    _st().lastTabCount = null;
+    _st().lastResolveTime = 0;
+    if (closed === "blanked") {
+      return "Window's last tab blanked instead of closed (closing it would shut the window / quit Safari)";
+    }
+    // The tab is gone, so its marker is too — keeping it would let a later resolve
+    // match a stale identity, or have the extension mark another tab in its place.
+    _st().activeTabMarker = null;
+    _st().tabFromExtension = false;
+    return "Tab closed";
   }
+  const idx = explicitIndex;
 
   // ── Guard: never close a window's LAST tab. Closing it shuts the window —
   // which quits Safari if it's the only window, AND (for profile-targeted
@@ -4182,7 +4237,7 @@ export async function closeTab(explicitIndex) {
   await osascript(
     `tell application "Safari" to close tab ${idx} of ${getTargetWindowRef()}`
   );
-  if (!explicitIndex || idx === _st().activeTabIndex) {
+  if (idx === _st().activeTabIndex) {
     _st().activeTabIndex = null;
     _st().activeTabURL = null;
     // The tab is gone, so its marker is too — keeping it would let a later resolve

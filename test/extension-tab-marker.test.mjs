@@ -65,6 +65,19 @@ const RECEIPT_B2 = "ReceiptB2_" + "c".repeat(24);
 function safariWindow(tabs, later = []) {
   const url = (i) => tabs[i - 1]?.url || "";
   const run = async (script) => {
+    const closing = /close tab i of w/.test(script) && script.match(/window\.name==='([^']*)'/);
+    if (closing) {
+      // closeTabByMarker: the tab carrying the marker, found and closed in one script (blanked
+      // when it is the window's only tab).
+      const at = tabs.findIndex((t) => t.marker === closing[1]);
+      if (at < 0) return "";
+      if (tabs.length === 1) {
+        tabs[0].url = "about:blank";
+        return "blanked";
+      }
+      tabs.splice(at, 1);
+      return "closed";
+    }
     const marker = script.match(/window\.name==='([^']*)'/);
     if (marker) {
       // resolveActiveTab's marker scan: the cached index first, then right to left.
