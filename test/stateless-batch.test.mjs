@@ -85,7 +85,7 @@ test("partial form misses and zero-effect mutations stop a batch", () => {
 });
 
 test("new/list/switch/getReceipt results strip query and hash while preserving the opaque receipt", () => {
-  const source = extract(index, "function _safeUrlForOutput(", "\nfunction _isBatchSemanticFailure");
+  const source = extract(index, "function _originOf(", "\nfunction _isBatchSemanticFailure");
   const sanitize = Function(`${source}; return _sanitizeTabResult;`)();
   const receipt = "Receipt_ABCDEF123456789012345678";
   const value = sanitize({
