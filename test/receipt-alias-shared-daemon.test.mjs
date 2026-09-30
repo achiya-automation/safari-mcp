@@ -29,6 +29,10 @@
  * a handful of cross-origin navigations in one tab, the receipt the tab was opened with stopped
  * resolving, for the client that kept passing it and for every client holding it as its current one.
  *
+ * A call reads the receipt it names when it starts, and may then wait for the profile's worker.
+ * Another client's rotation in that time retired the receipt: extensionOrFallback now looks it up
+ * again when it sends the command, and a rotation aliases the receipt it actually sent.
+ *
  * Both sides are the real code: the extension's handleCommand preflight, its get_tab_receipt
  * handler, _resolveReceiptTab and _issueTabReceipt over a fake Safari window; index.js's tool
  * handlers, extensionOrFallback with its guards, the batch actions and the mark_tab hook. Two
@@ -42,6 +46,7 @@ import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 // ownership-state.js persists to ~/.safari-mcp — point HOME at a throwaway dir first.
 const tmpHome = mkdtempSync(join(tmpdir(), "smcp-alias-"));
@@ -51,8 +56,12 @@ const { textResult, errorResult } = await import("../response.js");
 after(() => rmSync(tmpHome, { recursive: true, force: true }));
 
 // The MCP session the next call comes from (currentSessionId() in index.js). "agent" and
-// "subagent" are two clients of one daemon.
+// "subagent" are two clients of one daemon. Calls that run at the same time name their session
+// through `as`, as transport.js runs each request in its own AsyncLocalStorage context.
 let sid = "";
+const client = new AsyncLocalStorage();
+const session = () => client.getStore() ?? sid;
+const as = (name, call) => client.run(name, call);
 beforeEach(() => {
   own._openedTabs.clear();
   own._ownedTabURLs.clear();
@@ -220,8 +229,8 @@ function fakeSafari() {
   // safari.js keeps the current tab per MCP session.
   const states = new Map();
   const st = () => {
-    if (!states.has(sid)) states.set(sid, { url: null, index: null, owned: false });
-    return states.get(sid);
+    if (!states.has(session())) states.set(session(), { url: null, index: null, owned: false });
+    return states.get(session());
   };
   let markTab = null; // the hook index.js registers for the AppleScript fallback
   return {
@@ -275,7 +284,7 @@ function setup(mode) {
   const extension = makeExtension();
   const safari = fakeSafari();
   const deps = {
-    safari, SESSION_ID: "daemon", currentSessionId: () => sid,
+    safari, SESSION_ID: "daemon", currentSessionId: session,
     process: { env: mode.profile ? { SAFARI_PROFILE: mode.profile } : {} },
     console: { error() {} }, textResult, errorResult,
     sendToExtension: (type, payload) => extension.send(type, payload),
@@ -518,5 +527,87 @@ for (const mode of MODES) {
     assert.deepEqual(extension.receiptsOf(shop.id).map((r) => r.token), [landed.receipt], "navigate handed back another tab's receipt");
     assert.deepEqual(extension.receiptsOf(docs.id).map((r) => r.token), [docsReceipt], "the docs tab's receipt was re-minted");
     assert.equal(read, CLICKED);
+  });
+}
+
+// ---------- 3. a receipt named when a call starts, rotated while it waits ----------
+
+// Both clients' calls wait for the profile's worker, which Safari suspended; when it is back, the
+// one that started first runs first.
+
+test("in a named profile, a navigate that names no receipt follows a rotation another client made while it waited for the extension", async () => {
+  const { server, extension } = setup(MODES[1]);
+  const { receipt, shop } = await sharedTab(server, extension); // the agent's current tab
+  extension.pageMoves(shop.id, LOGIN);
+
+  server.setVerified(false);
+  const rotation = as("subagent", () => server.safari_run_script({ steps: [{ action: "getReceipt" }] }));
+  const navigation = as("agent", () => server.safari_navigate({ url: THIRD }));
+  server.setVerified(true);
+  const [{ result, error }] = json(await rotation);
+  assert.equal(error, undefined, `getReceipt failed: ${error}`);
+  const navigated = await navigation.then(json, (err) => ({ error: err.message }));
+  assert.equal(navigated.error, undefined, `the navigation was refused: ${navigated.error}`);
+  assert.deepEqual(extension.ran.at(-1), { type: "navigate", tabId: shop.id, url: THIRD });
+  assert.deepEqual(extension.receiptsOf(shop.id).map((r) => r.token), [navigated.receipt]);
+  assert.notEqual(navigated.receipt, result.receipt);
+
+  // Both clients, and the receipt the tab was opened with, still reach the tab.
+  for (const [name, args] of [["subagent", {}], ["agent", {}], ["agent", { receipt }]]) {
+    assert.equal(await as(name, () => outcome(() => server.safari_click({ selector: "#go", ...args }))), CLICKED, `${name} ${JSON.stringify(args)}`);
+    assert.deepEqual(extension.ran.at(-1), { type: "click", tabId: shop.id, url: THIRD });
+  }
+});
+
+test("in a named profile, a getReceipt that waited for the extension rotates the receipt the tab has by then, and the client that rotated it first keeps working", async () => {
+  const { server, extension } = setup(MODES[1]);
+  const { receipt, shop } = await sharedTab(server, extension); // the agent's current tab
+  extension.pageMoves(shop.id, LOGIN);
+
+  server.setVerified(false);
+  const first = as("agent", () => server.safari_run_script({ steps: [{ action: "getReceipt" }] }));
+  const second = as("subagent", () => server.safari_run_script({ steps: [{ action: "getReceipt" }] }));
+  server.setVerified(true);
+  const [a] = json(await first);
+  const [b] = json(await second);
+  assert.equal(a.error, undefined, `the agent's getReceipt failed: ${a.error}`);
+  assert.equal(b.error, undefined, `the subagent's getReceipt failed: ${b.error}`);
+  assert.deepEqual(extension.receiptsOf(shop.id).map((r) => r.token), [b.result.receipt]);
+
+  // Every receipt the tab has had still reaches it, and so does each client's current one.
+  for (const [name, args] of [["agent", {}], ["subagent", {}], ["agent", { receipt }], ["agent", { receipt: a.result.receipt }]]) {
+    assert.equal(await as(name, () => outcome(() => server.safari_click({ selector: "#go", ...args }))), CLICKED, `${name} ${JSON.stringify(args)}`);
+    assert.deepEqual(extension.ran.at(-1), { type: "click", tabId: shop.id, url: LOGIN });
+  }
+});
+
+// The navigation carries the receipt as it resolves when it is sent, so whether it left that
+// receipt's origin is judged by that receipt, not by the one the call started with.
+for (const { name, url, rotates } of [
+  { name: "returns to the origin of the receipt it started with", url: "https://shop.example/checkout", rotates: true },
+  { name: "stays on the origin of the receipt it sent", url: "https://login.example/done", rotates: false },
+]) {
+  test(`in a named profile, a navigate that names no receipt and ${name} after another client rotated it ${rotates ? "rotates" : "keeps"} the receipt it sent`, async () => {
+    const { server, extension } = setup(MODES[1]);
+    const { receipt, shop } = await sharedTab(server, extension); // the agent's current tab
+    extension.pageMoves(shop.id, LOGIN);
+
+    server.setVerified(false);
+    const rotation = as("subagent", () => server.safari_run_script({ steps: [{ action: "getReceipt" }] }));
+    const navigation = as("agent", () => server.safari_navigate({ url }));
+    server.setVerified(true);
+    const [{ result, error }] = json(await rotation);
+    assert.equal(error, undefined, `getReceipt failed: ${error}`);
+    const navigated = await navigation.then(json, (err) => ({ error: err.message }));
+    assert.equal(navigated.error, undefined, `the navigation was refused: ${navigated.error}`);
+    assert.equal(extension.sent.filter((type) => type === "get_tab_receipt").length, rotates ? 2 : 1);
+    const current = rotates ? navigated.receipt : result.receipt;
+    assert.equal(navigated.receipt, rotates ? current : undefined);
+    assert.deepEqual(extension.receiptsOf(shop.id).map((r) => [r.token, r.receiptOrigin]), [[current, new URL(url).origin]]);
+
+    for (const [who, args] of [["subagent", {}], ["agent", {}], ["agent", { receipt }]]) {
+      assert.equal(await as(who, () => outcome(() => server.safari_click({ selector: "#go", ...args }))), CLICKED, `${who} ${JSON.stringify(args)}`);
+      assert.deepEqual(extension.ran.at(-1), { type: "click", tabId: shop.id, url });
+    }
   });
 }
