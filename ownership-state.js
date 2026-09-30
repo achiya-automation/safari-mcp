@@ -197,7 +197,12 @@ export function _trackTab(tabIndex, url, sessionId = "", marker = "", receipt = 
   // stamped on a tab AppleScript opened. Every path that later CLOSES this tab resolves it
   // through that identity (#112), and the entry is keyed by it too: keyed by index, a new
   // tab that landed on a shifted position overwrote a live tab's entry.
-  _openedTabs.set(receipt || marker || tabIndex, {
+  // A tab recorded again under its identity keeps one record, and the old one goes first, with the
+  // URL it claimed: safari_wait_for_new_tab can take one of the session's tabs that navigated for the
+  // new one, and a switch keeps that tab's marker, so no close would release the URL it had left.
+  const key = receipt || marker || tabIndex;
+  if (_openedTabs.has(key)) _untrackTab(key);
+  _openedTabs.set(key, {
     index: tabIndex, url: url || "", openedAt: Date.now(), sessionId,
     marker: marker || "", receipt: receipt || "",
   });

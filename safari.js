@@ -556,11 +556,13 @@ function getFallbackTarget() {
 //                            with the user actively switching tabs our automation tab
 //                            is constantly backgrounded, so without this its content
 //                            never paints.
+// `{ expr }` in place of a marker stamps the marker that page JavaScript evaluates to: switchTab()
+// keeps the marker a tab already carries, which only the page can read.
 function _buildStampJS(marker) {
-  const m = String(marker).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const m = marker?.expr || "'" + String(marker).replace(/\\/g, "\\\\").replace(/'/g, "\\'") + "'";
   return "(function(){"
-    + "try{window.name='" + m + "';}catch(e){}"
-    + "try{window.__mcpTabMarker='" + m + "';}catch(e){}"
+    + "try{window.name=" + m + ";}catch(e){}"
+    + "try{window.__mcpTabMarker=" + m + ";}catch(e){}"
     + "try{if(!window.__mcpVisSpoof){window.__mcpVisSpoof=1;"
     +   "Object.defineProperty(document,'visibilityState',{configurable:true,get:function(){return 'visible';}});"
     +   "Object.defineProperty(document,'hidden',{configurable:true,get:function(){return false;}});"
@@ -868,6 +870,21 @@ export async function findTabByMarker(marker) {
 // and the user can have the same URL open.
 function _markerPrefixTestJS(prefix) {
   return `(function(p){try{return String(window.name).indexOf(p)===0||String(window.__mcpTabMarker).indexOf(p)===0}catch(e){return false}})('${prefix}')`;
+}
+
+// Page JavaScript that evaluates to the marker starting with `prefix` that the page carries, window.name's
+// before window.__mcpTabMarker's, or to '' when it carries none. Only a whole marker counts, letters,
+// digits and `_` as every marker is minted: a page can write anything after the prefix, a quote
+// included, and a marker kept from here goes into the AppleScript source of every later scan.
+function _markerWithPrefixJS(prefix) {
+  return `(function(p){function m(v){v=String(v);return v.indexOf(p)===0&&/^[A-Za-z0-9_]+$/.test(v)?v:''}try{return m(window.name)||m(window.__mcpTabMarker)}catch(e){return ''}})('${prefix}')`;
+}
+
+// Page JavaScript that is true when the page carries a marker of another MCP session: one starting
+// with MCP_ but with neither of this session's prefixes, `own` (MCP_<markerId>_) and `adopted`
+// (MCP_A<markerId>_). Another client of the HTTP daemon, or a server before a restart, stamped it.
+function _otherSessionMarkerTestJS(own, adopted) {
+  return `(function(p,q){function t(v){v=String(v);return v.indexOf('MCP_')===0&&v.indexOf(p)!==0&&v.indexOf(q)!==0}try{return t(window.name)||t(window.__mcpTabMarker)}catch(e){return false}})('${own}','${adopted}')`;
 }
 
 // The index of this session's tab, or null. See _resolveSessionTab().
@@ -4301,18 +4318,25 @@ export async function closeOwnTab(index) {
 // own: the tab safari_wait_for_new_tab saw open. Only those callers pass them. A tab that carries the
 // session's adoption marker keeps that family whatever the caller passes, so no switch turns a tab
 // adopted from the user into one the session can close. `win` (`window id N`) names the window the
-// caller saw the tab in; without it, the index is one of the target window.
-export async function switchTab(index, { adopt = false, claim = false, win } = {}) {
+// caller saw the tab in; without it, the index is one of the target window. `expectUrl` is the URL the
+// caller's listing saw at that index: a tab that closed to its left since slid another tab, the user's
+// included, under the index, so the switch refuses (`moved`) before it stamps anything when the tab
+// shows another page, and the caller lists again.
+export async function switchTab(index, { adopt = false, claim = false, win, expectUrl } = {}) {
   const idx = Number(index);
   // A switch by receipt alone used to arrive here with no index at all, and claimed tab NaN
   // under a marker stamped on no tab.
   if (!Number.isInteger(idx) || idx < 1) throw new Error("switchTab needs the tab's index (a positive integer)");
   if (win && !/^window id \d+$/.test(win)) throw new Error("switchTab: win must be a `window id N` reference");
-  // Claiming this tab: stamp it with a FRESH identity marker so resolveActiveTab can
-  // re-find it after the user shifts tab indices. A fresh marker (not a reused one)
-  // ensures a previously-claimed tab — which still carries the old marker string —
-  // is never mistaken for this one.
-  const marker = `MCP_${_st().markerId}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  // A tab that carries a whole marker of the session's own family (MCP_<markerId>_) keeps it. The
+  // server records a tab AppleScript opened by the marker stamped on it then, and the tab cap, the
+  // memory sweep, shutdown cleanup and a close forgetting its tab all find the tab by that marker: a
+  // fresh one stamped here left the record naming no tab, so the tab escaped all four and its URL
+  // stayed claimed. A tab carrying the session's adoption marker gets a fresh adoption marker at every
+  // switch, and any other tab a FRESH own marker, never one the session stamped before: the tab
+  // carrying that one would be taken for this one. So a switch never puts one marker on two tabs.
+  const ownPrefix = `MCP_${_st().markerId}_`;
+  const marker = `${ownPrefix}${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
   const adoptedMarker = `MCP_A${marker.slice(4)}`;
   // The marker makes the tab the session's own from then on: writes go there, and closeTab() closes
   // the tab carrying it. It used to go on whatever tab sat at the index, the user's included, since
@@ -4324,14 +4348,35 @@ export async function switchTab(index, { adopt = false, claim = false, win } = {
   // Do NOT visually switch the tab — it brings the Safari window to foreground
   // and interrupts the user. Visual switching only happens in screenshot() when needed.
   // AppleScript `do JavaScript in tab N` works on background tabs without switching.
-  // `a`: the tab carries the session's adoption marker, `o`: one of its own markers.
-  const js = `(function(){var a=${_markerPrefixTestJS(_adoptedMarkerPrefix())},o=${_markerPrefixTestJS(`MCP_${_st().markerId}_`)};` +
-    `if(!a&&!o&&!${adopt || claim})return '';var f=a||${adopt}&&!o;` +
-    `var r=JSON.stringify({title:document.title,url:location.href,adopted:f});` +
-    `if(f)${_buildStampJS(adoptedMarker)};else ${_buildStampJS(marker)};return r;})()`;
-  const script = `tell application "Safari" to do JavaScript "${js.replace(/"/g, '\\"')}" in tab ${idx} of ${win || getTargetWindowRef()}`;
+  // `a`: the tab carries the session's adoption marker, `o`: one of its own markers, `w`: that marker
+  // when it is a whole one (_markerWithPrefixJS), `k`: the marker the tab keeps or gets. A claim takes
+  // no tab another MCP session marked (`x`): its marker would give way to this session's own, which
+  // the tab cap, the sweep, cleanup and closes act on, and the other session would lose the tab, or a
+  // tab it adopted from the user would become closable.
+  // JSON.stringify makes the URL a JS string literal whatever it holds; its quotes and backslashes are
+  // escaped once more for AppleScript below.
+  const moved = expectUrl == null ? "" : `if(location.href!==${JSON.stringify(String(expectUrl))})return 'moved';`;
+  const js = `(function(){${moved}var a=${_markerPrefixTestJS(_adoptedMarkerPrefix())},o=${_markerPrefixTestJS(ownPrefix)},w=${_markerWithPrefixJS(ownPrefix)},` +
+    `x=${_otherSessionMarkerTestJS(ownPrefix, _adoptedMarkerPrefix())};if(${claim}&&x)return 'other';` +
+    `if(!a&&!o&&!${adopt || claim})return '';var f=a||${adopt}&&!o,k=f?'${adoptedMarker}':w||'${marker}';` +
+    `var r=JSON.stringify({title:document.title,url:location.href,adopted:f,marker:k});` +
+    `${_buildStampJS({ expr: "k" })};return r;})()`;
+  const script = `tell application "Safari" to do JavaScript "${js.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}" in tab ${idx} of ${win || getTargetWindowRef()}`;
   // Fast daemon first; a hiccup retries once through the reliable subprocess (a second run stamps the same marker).
   const result = String(await osascriptFast(script, { timeout: 5000 }).catch(() => osascript(script, { timeout: 8000 }))).trim();
+  // `moved` and `otherSession` let safari_wait_for_new_tab pass over the tab and keep waiting for its own.
+  if (result === "moved") {
+    throw Object.assign(new Error(
+      `Tab safety: refusing to ${claim ? "claim" : "switch to"} tab ${idx} — it no longer shows the page the listing saw ` +
+      `(a tab closed or moved in between), so it may be another tab.`
+    ), { moved: true });
+  }
+  if (result === "other") {
+    throw Object.assign(new Error(
+      `Tab safety: refusing to claim tab ${idx} — another MCP session's marker is on it (a tab it opened, or one it ` +
+      `adopted from you), and a claim never takes a tab from another session.`
+    ), { otherSession: true });
+  }
   if (!result) {
     throw Object.assign(new Error(
       `Tab safety: refusing to switch to tab ${idx} — it carries no marker of this session, and AppleScript has ` +
@@ -4346,9 +4391,16 @@ export async function switchTab(index, { adopt = false, claim = false, win } = {
   } catch {
     throw new Error(`switchTab: no page script runs in tab ${idx}, so no marker can find it there`);
   }
-  // Track by URL so we can find this tab even if indices shift
+  // The page answered with the marker it kept, and a page can answer anything. Every later scan
+  // writes that marker into AppleScript source, so it has to be one the session could have minted.
+  const kept = page.adopted ? adoptedMarker : String(page.marker);
+  if (!page.adopted && !(kept.startsWith(ownPrefix) && /^\w+$/.test(kept))) {
+    throw new Error(`Tab safety: refusing to switch to tab ${idx} — its page answered with a marker this session never minted`);
+  }
+  // The session finds this tab again by that marker (resolveActiveTab scans for it); the URL is for
+  // index.js's ownership checks.
   Object.assign(_st(), {
-    activeTabIndex: idx, activeTabMarker: page.adopted ? adoptedMarker : marker, activeTabURL: page.url || null,
+    activeTabIndex: idx, activeTabMarker: kept, activeTabURL: page.url || null,
     hasOwnedTab: true, tabFromExtension: false, lastResolveTime: Date.now(),
   });
   return JSON.stringify({ title: page.title, url: page.url });

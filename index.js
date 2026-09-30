@@ -3348,7 +3348,7 @@ server.tool(
         return claimed;
       }
     );
-    // Adopted just now, or earlier: switchTab() keeps an adopted tab's marker.
+    // Adopted just now, or earlier: switchTab() keeps an adopted tab in the adoption family.
     const adopted = viaAppleScript && safari.isActiveTabAdopted();
     const safeResult = _sanitizeTabResult(result);
     // Sync safari.js state so AppleScript fallback targets the correct tab
