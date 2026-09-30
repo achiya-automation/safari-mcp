@@ -1252,3 +1252,31 @@ for (const other of [
     });
   }
 }
+
+// safari_wait_for_new_tab claims the tab at the index its listing saw the new one at. A tab closing to
+// its left in between slid another tab under that index, the user's included, and the claim stamped
+// the session's marker on it (30.9.26). Given the URL the listing saw, the claim refuses first.
+test("a claim refuses the tab at the index once it no longer shows the page the listing saw", async () => {
+  const { window, safari, server } = await machine("clean");
+  await server.safari_new_tab({ url: OTHER_URL });
+  const current = safari.getActiveTabMarker();
+  const popup = "https://sso.example.net/authorize";
+  window.tabs.push({ url: popup, marker: null }, { url: BANK, marker: null }); // the listing saw the popup at 3
+  window.tabs.splice(0, 1); // the user closes the tab to its left: their bank tab is at 3 now
+  await assert.rejects(safari.switchTab(3, { claim: true, expectUrl: popup }),
+    (err) => /Tab safety: refusing to claim tab 3/.test(err.message) && err.moved === true);
+  assert.equal(window.tabs[2].marker, null, "the claim marked the user's tab");
+  assert.equal(safari.getActiveTabMarker(), current);
+  // At the index the popup is at now, the claim goes through.
+  await safari.switchTab(2, { claim: true, expectUrl: popup });
+  assert.equal(window.tabs[1].marker, safari.getActiveTabMarker());
+});
+
+test("a claim compares the page with a listed URL that has a quote and a backslash in it", async () => {
+  const { window, safari, server } = await machine("clean");
+  await server.safari_new_tab({ url: OTHER_URL });
+  const listed = "https://sso.example.net/authorize?next=it's\\here";
+  window.tabs.push({ url: listed, marker: null });
+  await safari.switchTab(3, { claim: true, expectUrl: listed });
+  assert.equal(window.tabs[2].marker, safari.getActiveTabMarker());
+});

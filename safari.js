@@ -4318,8 +4318,11 @@ export async function closeOwnTab(index) {
 // own: the tab safari_wait_for_new_tab saw open. Only those callers pass them. A tab that carries the
 // session's adoption marker keeps that family whatever the caller passes, so no switch turns a tab
 // adopted from the user into one the session can close. `win` (`window id N`) names the window the
-// caller saw the tab in; without it, the index is one of the target window.
-export async function switchTab(index, { adopt = false, claim = false, win } = {}) {
+// caller saw the tab in; without it, the index is one of the target window. `expectUrl` is the URL the
+// caller's listing saw at that index: a tab that closed to its left since slid another tab, the user's
+// included, under the index, so the switch refuses (`moved`) before it stamps anything when the tab
+// shows another page, and the caller lists again.
+export async function switchTab(index, { adopt = false, claim = false, win, expectUrl } = {}) {
   const idx = Number(index);
   // A switch by receipt alone used to arrive here with no index at all, and claimed tab NaN
   // under a marker stamped on no tab.
@@ -4350,15 +4353,24 @@ export async function switchTab(index, { adopt = false, claim = false, win } = {
   // no tab another MCP session marked (`x`): its marker would give way to this session's own, which
   // the tab cap, the sweep, cleanup and closes act on, and the other session would lose the tab, or a
   // tab it adopted from the user would become closable.
-  const js = `(function(){var a=${_markerPrefixTestJS(_adoptedMarkerPrefix())},o=${_markerPrefixTestJS(ownPrefix)},w=${_markerWithPrefixJS(ownPrefix)},` +
+  // JSON.stringify makes the URL a JS string literal whatever it holds; its quotes and backslashes are
+  // escaped once more for AppleScript below.
+  const moved = expectUrl == null ? "" : `if(location.href!==${JSON.stringify(String(expectUrl))})return 'moved';`;
+  const js = `(function(){${moved}var a=${_markerPrefixTestJS(_adoptedMarkerPrefix())},o=${_markerPrefixTestJS(ownPrefix)},w=${_markerWithPrefixJS(ownPrefix)},` +
     `x=${_otherSessionMarkerTestJS(ownPrefix, _adoptedMarkerPrefix())};if(${claim}&&x)return 'other';` +
     `if(!a&&!o&&!${adopt || claim})return '';var f=a||${adopt}&&!o,k=f?'${adoptedMarker}':w||'${marker}';` +
     `var r=JSON.stringify({title:document.title,url:location.href,adopted:f,marker:k});` +
     `${_buildStampJS({ expr: "k" })};return r;})()`;
-  const script = `tell application "Safari" to do JavaScript "${js.replace(/"/g, '\\"')}" in tab ${idx} of ${win || getTargetWindowRef()}`;
+  const script = `tell application "Safari" to do JavaScript "${js.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}" in tab ${idx} of ${win || getTargetWindowRef()}`;
   // Fast daemon first; a hiccup retries once through the reliable subprocess (a second run stamps the same marker).
   const result = String(await osascriptFast(script, { timeout: 5000 }).catch(() => osascript(script, { timeout: 8000 }))).trim();
-  // `otherSession` lets safari_wait_for_new_tab pass over the tab and keep waiting for its own.
+  // `moved` and `otherSession` let safari_wait_for_new_tab pass over the tab and keep waiting for its own.
+  if (result === "moved") {
+    throw Object.assign(new Error(
+      `Tab safety: refusing to ${claim ? "claim" : "switch to"} tab ${idx} — it no longer shows the page the listing saw ` +
+      `(a tab closed or moved in between), so it may be another tab.`
+    ), { moved: true });
+  }
   if (result === "other") {
     throw Object.assign(new Error(
       `Tab safety: refusing to claim tab ${idx} — another MCP session's marker is on it (a tab it opened, or one it ` +
