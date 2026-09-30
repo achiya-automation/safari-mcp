@@ -5496,7 +5496,7 @@ export async function runScript({ steps, onStep, actions: overrides = {} }) {
         nativeClick, nativeHover, nativeType, nativeKeyboard,
         replaceEditorContent, uploadFile, mockNetworkRoute,
       };
-      // index.js takes over an action where it has more to go on (switchTab: the extension).
+      // index.js takes over an action where it has more to go on (switchTab, getReceipt: the extension).
       const fn = overrides[action] || actions[action];
       if (!fn) {
         results.push({ action, error: `Unknown action: ${action}` });
@@ -5507,8 +5507,8 @@ export async function runScript({ steps, onStep, actions: overrides = {} }) {
     } catch (err) {
       results.push({ action, error: err.message });
       // A switch that did not happen stops the batch: the steps after it were meant for that tab,
-      // and would run in the current one.
-      if (action === "switchTab") break;
+      // and would run in the current one. getReceipt switches too, to the tab its receipt names.
+      if (action === "switchTab" || action === "getReceipt") break;
     }
   }
   return JSON.stringify(results);
