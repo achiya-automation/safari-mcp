@@ -3406,16 +3406,18 @@ server.tool(
   },
   async ({ timeout, urlContains }) => {
     const timeoutMs = timeout || 10000;
-    // Every listing says where it came from. AppleScript lists one window, the one its first
-    // listing read (`win`), and a claim through AppleScript goes to that window: listings of
-    // whichever window was in front made a tab of the user's other window look new, and the
-    // claim stamped the session's own marker on it. A listing from the other source starts the
-    // comparison over instead of comparing tabs across them.
+    // Every listing says where it came from. AppleScript lists one window by id (`win`): the one
+    // this session's own tab is in, proven by its marker when AppleScript first lists, and a claim
+    // through AppleScript goes to that window. Listings of whichever window was in front made a
+    // tab of the user's other window look new, and the claim stamped the session's own marker on
+    // it. A listing from the other source starts the comparison over instead of comparing tabs
+    // across them.
     let win = null;
     const list = async () => {
       let via = "extension";
       const raw = await extensionOrFallback("list_tabs", {}, async () => {
         via = "applescript";
+        if (!win) win = await safari.sessionTabWindow();
         const listed = await safari.listWindowTabs(win);
         win = listed.win;
         return listed.tabs;
@@ -3508,7 +3510,12 @@ server.tool(
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 500));
-      const now = await list();
+      const now = await list().catch((err) => {
+        // A listing that fails (the window pin refused, AppleScript failed) takes the wait's record
+        // of a tab that opened with it: say so, as the timeout would.
+        if (opened && err instanceof Error) err.message += " A tab opened during the wait; if it is still open, another safari_wait_for_new_tab will not report it.";
+        throw err;
+      });
       // A listing where a tab closed or navigated becomes the baseline, so a tab of the user's that
       // navigated meanwhile is not new once one opens; so does one from the other source. A new
       // tab not claimed yet stays out of it while the other tabs only navigated in place or only
