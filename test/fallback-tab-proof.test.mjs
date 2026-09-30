@@ -644,7 +644,7 @@ test("one session's adoption leaves another session's tab on the same URL closab
   });
 });
 
-// A switch stamps a fresh marker. On a tab adopted from the user it has to stay an adoption marker,
+// A switch stamps a fresh marker on a tab adopted from the user, and it has to stay an adoption marker,
 // or switching away and back would turn the tab into one of the session's own, which closes. The
 // user's tab shows the session's URL here, so no URL check refuses the close either.
 for (const path of SWITCH_BY_INDEX) {

@@ -987,7 +987,8 @@ test("safari_close_tab waiting behind another close keeps the tab that was curre
   answer();
   await Promise.all([sweeping, closing]);
   assert.deepEqual(window.tabs.map((t) => t.url), [USER_URL, pageUrl(3)]);
-  assert.ok(sessionTabUrls().includes(pageUrl(3)), "the tab still open was forgotten");
+  // The switch kept page2's marker (section 7), so the close forgot page2, and only page2.
+  assert.deepEqual(sessionTabUrls(), [pageUrl(3)], "the close forgot the tab still open, or not the one it closed");
 });
 
 test("safari_close_tab waiting behind another close keeps the tab the session switched to meanwhile current", async () => {
@@ -1026,3 +1027,197 @@ test("safari_close_tab waiting behind another close keeps the tab the session sw
   assert.deepEqual(closes, [RO, RA]);
   assert.equal(server.commands.at(-1).payload.receipt, RB, "the session lost the receipt of its current tab");
 });
+
+// ---------- 7. a tab the session switches to keeps the marker it is recorded by ----------
+
+// The server records a tab AppleScript opened by the marker stamped on it then, and finds it by that
+// marker to close it: the tab cap, the memory sweep, shutdown cleanup, and a close forgetting the tab
+// it closed. A switch by index stamped a fresh marker on the tab even when it already carried one of
+// the session's own (30.9.26), so nothing found the tab by its record any more. Cleanup left it open,
+// the cap and the sweep dropped it from the count as gone and left it open too, and a close forgot
+// nothing, so the record stayed and the URL the tab was opened on stayed claimed.
+
+const SWITCHES = [
+  { name: "safari_switch_tab", to: (server, index) => server.safari_switch_tab({ index }) },
+  { name: "a run_script switchTab step", to: (server, index) => batch(server, [{ action: "switchTab", args: { index } }]) },
+];
+
+// The session opens OTHER_URL (tab 2), then DEST (tab 3), and switches back to tab 2.
+async function switchedBack(sw) {
+  const state = await machine("clean");
+  await state.server.safari_new_tab({ url: OTHER_URL });
+  await state.server.safari_new_tab({ url: DEST });
+  assert.doesNotMatch(await outcome(() => sw.to(state.server, 2)), REFUSED_ANYWHERE);
+  assert.equal(state.safari.getActiveTabMarker(), state.window.tabs[1].marker, "the switch did not land on tab 2");
+  return state;
+}
+
+for (const sw of SWITCHES) {
+  test(`shutdown cleanup closes a tab the session moved back to with ${sw.name}`, async () => {
+    const { window, server } = await switchedBack(sw);
+    await server.cleanupTabs();
+    assert.deepEqual(window.tabs.map((t) => t.url), [USER_URL]);
+  });
+
+  test(`the memory sweep closes the session's oldest tab after ${sw.name} moved to it`, async () => {
+    const { window, server } = await switchedBack(sw);
+    await server.closeOldestMCPTab();
+    assert.deepEqual(window.tabs.map((t) => t.url), [USER_URL, DEST]);
+    assert.deepEqual(sessionTabUrls(), [DEST]);
+  });
+
+  test(`the tab cap closes the session's oldest tab after ${sw.name} moved to it`, async () => {
+    const { window, safari, server } = await machine("clean");
+    for (const url of PAGES.slice(0, 6)) await server.safari_new_tab({ url });
+    await sw.to(server, 2); // page1, the oldest
+    assert.equal(safari.getActiveTabMarker(), window.tabs[1].marker, "the switch did not land on page1");
+    await server.safari_new_tab({ url: OTHER_URL });
+    assert.deepEqual(window.tabs.map((t) => t.url), [USER_URL, ...PAGES.slice(1, 6), OTHER_URL]);
+    assert.deepEqual(sessionTabUrls(), [...PAGES.slice(1, 6), OTHER_URL]);
+  });
+
+  for (const close of [
+    { name: "safari_close_tab", run: (server) => server.safari_close_tab({}) },
+    { name: "a run_script closeTab step", run: (server) => batch(server, [{ action: "closeTab" }]) },
+  ]) {
+    test(`${close.name} after ${sw.name} forgets the tab it closed and releases its URL`, async () => {
+      const { window, server } = await switchedBack(sw);
+      assert.doesNotMatch(await outcome(() => close.run(server)), REFUSED_ANYWHERE);
+      assert.deepEqual(window.tabs.map((t) => t.url), [USER_URL, DEST]);
+      assert.deepEqual(sessionTabUrls(), [DEST], "the closed tab is still recorded");
+      assert.ok(!own._ownedTabURLs.has(OTHER_URL), "the closed tab's URL is still claimed");
+      assert.ok(own._ownedTabURLs.has(DEST));
+    });
+  }
+}
+
+test("moving between the session's tabs by index keeps the marker each one is recorded by", async () => {
+  const { window, safari, server } = await machine("clean");
+  await server.safari_new_tab({ url: OTHER_URL });
+  await server.safari_new_tab({ url: DEST });
+  const recorded = own._sessionTabs(SESSION).map(([, info]) => info.marker);
+  for (const index of [2, 3, 2]) {
+    await server.safari_switch_tab({ index });
+    assert.equal(safari.getActiveTabMarker(), recorded[index - 2]);
+  }
+  assert.deepEqual(window.tabs.map((t) => t.marker), [null, ...recorded]);
+});
+
+// A tab with no marker of the session's, which safari_wait_for_new_tab claims or safari_switch_tab
+// adopts, gets a new one. Stamping the session's current marker there instead would have two tabs
+// carry it, and a scan for it could find either.
+test("a claim marks a tab that carries no marker with a fresh one, not one another tab carries", async () => {
+  const { window, safari, server } = await machine("clean");
+  await server.safari_new_tab({ url: OTHER_URL });
+  window.tabs.push({ url: DEST, marker: null }); // a tab the session's page opened
+  await safari.switchTab(3, { claim: true });
+  const [, mine, claimed] = window.tabs.map((t) => t.marker);
+  assert.equal(claimed, safari.getActiveTabMarker());
+  assert.match(claimed, /^MCP_sess0001_\w+$/);
+  assert.notEqual(claimed, mine);
+});
+
+// The page keeps the marker in window.__mcpTabMarker while it uses window.name for itself, until it
+// loads its next page. The switch puts the marker back in window.name, which that load keeps.
+test("a switch keeps the marker a page left in __mcpTabMarker after taking window.name over, and puts it back", async () => {
+  const { window, server } = await machine("clean");
+  await server.safari_new_tab({ url: OTHER_URL });
+  await server.safari_new_tab({ url: DEST });
+  const tab = window.tabs[1];
+  const recorded = tab.marker;
+  tab.marker = "app-state"; // the page wrote window.name for its own use
+  assert.doesNotMatch(await outcome(() => server.safari_switch_tab({ index: 2 })), REFUSED_ANYWHERE);
+  assert.equal(tab.marker, recorded);
+  tab.pageMarker = undefined; // the page loads another page of its site: window.name survives, __mcpTabMarker does not
+  await server.cleanupTabs();
+  assert.deepEqual(window.tabs.map((t) => t.url), [USER_URL]);
+});
+
+// The marker a switch keeps comes from the page, and every later marker scan writes it into
+// AppleScript source, where a quote ends the string: a page that writes one after the session's
+// prefix (which it can read in its own window.name) would have AppleScript of its own run.
+// It ends in a word character, as a whole marker does, so only the ^ of each check stops it.
+const INJECTED = 'MCP_sess0001_x" & (do shell script "echo INJECTED") & "x';
+
+// A Safari window whose scripts are all kept, with the session and the server that drive it.
+function recordedSession(answer = (script, window) => window.run(script)) {
+  const window = safariWindow([{ url: USER_URL, marker: null }]);
+  const scripts = [];
+  const safari = loadSafari({ ...window, run: async (script) => { scripts.push(script); return answer(script, window); } });
+  return { window, scripts, safari, server: loadServer(safari) };
+}
+const ranInjected = (scripts) => scripts.some((s) => s.includes("do shell script"));
+
+test("a switch keeps the session's own marker, not a quoted one the page wrote after the session's prefix", async () => {
+  const { window, scripts, safari, server } = recordedSession();
+  await server.safari_new_tab({ url: OTHER_URL });
+  await server.safari_new_tab({ url: DEST });
+  const tab = window.tabs[1];
+  const recorded = tab.marker;
+  tab.marker = INJECTED; // __mcpTabMarker still holds the session's marker
+  assert.doesNotMatch(await outcome(() => server.safari_switch_tab({ index: 2 })), REFUSED_ANYWHERE);
+  assert.equal(safari.getActiveTabMarker(), recorded);
+  assert.equal(tab.marker, recorded);
+  assert.doesNotMatch(await outcome(() => server.safari_click({ selector: "#send" })), REFUSED_ANYWHERE);
+  assert.ok(window.ranIn(2).some((r) => r.js?.endsWith("/*page:click*/")));
+  await server.cleanupTabs();
+  assert.deepEqual(window.tabs.map((t) => t.url), [USER_URL]);
+  assert.ok(!ranInjected(scripts), "a marker the page wrote reached AppleScript");
+});
+
+// Its prefix is still the session's, and the switch takes the tab as it did before, with a marker
+// the session mints for it.
+test("a tab whose page wrote a quoted marker after the session's prefix gets a fresh one", async () => {
+  const { window, scripts, safari, server } = recordedSession();
+  await server.safari_new_tab({ url: OTHER_URL });
+  await server.safari_new_tab({ url: DEST });
+  Object.assign(window.tabs[1], { marker: INJECTED, pageMarker: undefined }); // nothing else of the session's on it
+  assert.doesNotMatch(await outcome(() => server.safari_switch_tab({ index: 2 })), REFUSED_ANYWHERE);
+  const marker = safari.getActiveTabMarker();
+  assert.match(marker, /^MCP_sess0001_\w+$/);
+  assert.equal(window.tabs[1].marker, marker);
+  assert.doesNotMatch(await outcome(() => server.safari_click({ selector: "#send" })), REFUSED_ANYWHERE);
+  assert.ok(window.ranIn(2).some((r) => r.js?.endsWith("/*page:click*/")));
+  assert.ok(!ranInjected(scripts), "a marker the page wrote reached AppleScript");
+});
+
+// An adopted tab keeps the adoption family, and the switch marks it with the session's own adoption
+// marker: whatever marker the page answers with next to adopted: true is never used.
+test("a switch whose page answers that it is adopted takes the session's adoption marker, never the page's", async () => {
+  let forge = false;
+  const { scripts, safari, server } = recordedSession((script, win) => (forge && /adopted:/.test(script)
+    ? JSON.stringify({ title: "", url: OTHER_URL, adopted: true, marker: INJECTED })
+    : win.run(script)));
+  await server.safari_new_tab({ url: OTHER_URL });
+  await server.safari_new_tab({ url: DEST });
+  forge = true;
+  for (const sw of SWITCHES) {
+    await outcome(() => sw.to(server, 2));
+    assert.match(safari.getActiveTabMarker(), /^MCP_Asess0001_\w+$/);
+  }
+  await outcome(() => server.safari_click({ selector: "#send" })); // no tab carries that marker: refused
+  await server.cleanupTabs();
+  assert.ok(!scripts.some((s) => s.includes(INJECTED)), "a marker the page answered with reached AppleScript");
+});
+
+// The switch's script runs in the page, which can answer anything.
+for (const forged of [
+  { name: "a quoted marker", marker: INJECTED },
+  { name: "another session's marker", marker: "MCP_othr0002_x" }, // the prefix is per session (#76)
+]) {
+  test(`a switch refuses a tab whose page answers with ${forged.name}`, async () => {
+    let forge = false;
+    const { window, scripts, safari, server } = recordedSession((script, win) => (forge && /adopted:/.test(script)
+      ? JSON.stringify({ title: "", url: OTHER_URL, adopted: false, marker: forged.marker })
+      : win.run(script)));
+    await server.safari_new_tab({ url: OTHER_URL });
+    await server.safari_new_tab({ url: DEST });
+    const current = safari.getActiveTabMarker();
+    forge = true;
+    for (const sw of SWITCHES) assert.match(await outcome(() => sw.to(server, 2)), REFUSED);
+    assert.equal(safari.getActiveTabMarker(), current);
+    await server.safari_click({ selector: "#send" });
+    assert.ok(window.ranIn(3).some((r) => r.js?.endsWith("/*page:click*/")), "the session left its tab");
+    assert.ok(!scripts.some((s) => s.includes(forged.marker)), "a marker the page answered with reached AppleScript");
+  });
+}
