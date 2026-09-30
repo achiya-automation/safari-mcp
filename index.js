@@ -1815,6 +1815,21 @@ function _aliasReceipt(oldToken, newToken) {
   _receiptAliases.set(oldToken, newToken);
   if (_receiptAliases.size > 500) _receiptAliases.delete(_receiptAliases.keys().next().value);
 }
+
+// The origin a receipt is valid on: the page the extension reported with it (_sanitizeTabResult).
+// safari_navigate rotates a receipt only when the tab lands off that origin. Judged by the URL
+// safari.js holds instead (another tab's when the call names its tab by receipt, unknown after a
+// switch the extension served, stale after a navigation it served), a navigate that stayed on the
+// receipt's origin counted as a change and retired the receipt the caller kept.
+const _receiptOrigins = new Map(); // token → origin
+function _noteReceiptOrigin(receipt, url) {
+  const token = _receiptToken(receipt);
+  const origin = _originOf(url);
+  if (!token || !origin) return;
+  _receiptOrigins.set(token, origin);
+  if (_receiptOrigins.size > 500) _receiptOrigins.delete(_receiptOrigins.keys().next().value);
+}
+
 function _receiptToken(value) {
   const raw = String(value || "");
   let token = "";
@@ -1890,6 +1905,8 @@ function _sanitizeTabResult(value) {
   if (!normalized || typeof normalized !== "object") return normalized;
   const safeUrl = _safeUrlForOutput(normalized.safeUrl || normalized.url || normalized.requestedUrl || "");
   const receipt = _receiptToken(normalized.receipt || normalized.receiptUrl || "");
+  // The extension hands every receipt out here, with the page it is valid on.
+  _noteReceiptOrigin(receipt, safeUrl);
   return {
     ...(normalized.index !== undefined ? { index: normalized.index } : {}),
     ...(normalized.tabIndex !== undefined ? { tabIndex: normalized.tabIndex } : {}),
@@ -2477,7 +2494,7 @@ server.tool(
     // hand back the new receipt instead of letting the caller discover the trap.
     const landed = result && typeof result === "object" ? result.url : "";
     const usedReceipt = _receiptToken(receipt || _getActiveReceipt());
-    if (landed && _originOf(landed) !== _originOf(oldUrl) && usedReceipt) {
+    if (landed && _originOf(landed) !== (_receiptOrigins.get(usedReceipt) || _originOf(oldUrl)) && usedReceipt) {
       try {
         const fresh = _sanitizeTabResult(await extensionOrFallback(
           "get_tab_receipt", { ..._explicitReceipt({ receipt }) }, () => null
@@ -3277,10 +3294,13 @@ server.tool(
     // Sync safari.js state so AppleScript fallback targets the correct tab
     const resolvedIndex = safeResult?.tabIndex || index;
     if (resolvedIndex) safari.setActiveTabIndex(resolvedIndex);
-    if (safeResult?.safeUrl) safari.setActiveTabURL(safeResult.safeUrl);
-    // …including the marker, which still names the last tab AppleScript claimed.
+    if (viaAppleScript && safeResult?.safeUrl) safari.setActiveTabURL(safeResult.safeUrl);
+    // …including the marker, which still names the last tab AppleScript claimed. The URL is left
+    // unknown, as run_script's switchTab leaves it: the extension reports where the tab is now,
+    // which after a redirect or a login bounce is a page this session never registered, and the
+    // ownership guard refused every write after it, though the extension had proven the tab by its id.
     if (!viaAppleScript && safeResult && typeof safeResult === "object") {
-      safari.setActiveTabFromExtension(resolvedIndex, safeResult.safeUrl);
+      safari.setActiveTabFromExtension(resolvedIndex, null);
     }
     if (safeResult?.receipt || token) _setActiveReceipt(safeResult?.receipt || token);
     // A switch by INDEX gets no receipt back, and the session was still holding the one it
