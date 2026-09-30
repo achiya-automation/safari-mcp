@@ -132,8 +132,8 @@ function loadSafari(window) {
   );
 }
 
-// AppleScript's newTab()/switchTab()/listTabs(), reduced to what they leave behind: the tab
-// they open or claim carries a fresh marker, and the session tracks it by that marker.
+// AppleScript's newTab(), switchTab(), listTabs() and listWindowTabs(), reduced to what they leave
+// behind: the tab they open or claim carries a fresh marker, and the session tracks it by that marker.
 function appleScriptTabs(safari, window) {
   let minted = 0;
   const claim = (i) => {
@@ -150,6 +150,7 @@ function appleScriptTabs(safari, window) {
   };
   safari.switchTab = async (i) => JSON.stringify(claim(Number(i)));
   safari.listTabs = async () => JSON.stringify(window.list());
+  safari.listWindowTabs = async () => ({ win: "window id 1", tabs: window.list() });
 }
 
 // ---------- index.js, for real ----------
