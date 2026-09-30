@@ -3438,23 +3438,32 @@ server.tool(
       });
       return { via, tabs: typeof raw === "string" ? JSON.parse(raw) : raw };
     };
+    // A listed tab's URL: AppleScript lists `url`, the extension `safeUrl` (origin and path).
+    const urlOf = (t) => t.url ?? t.safeUrl;
     // Switch to the new tab and own it for THIS session, else the next interaction trips the
     // tab-safety guard. Its marker names it only if AppleScript made the switch (and stamped
-    // it); the extension answers with the tab's receipt instead. AppleScript claims only a tab
-    // its own listing of the pinned window saw: an index the extension listed is a position in
-    // the extension's window, not in the one AppleScript would stamp.
+    // it); the extension answers with the tab's receipt instead. A tab AppleScript listed is
+    // claimed through AppleScript, in the pinned window, at once: its index is a position there,
+    // not in the extension's window, and waiting out the extension's switch_tab first (30 s
+    // while its worker is busy) left time for another tab to slide under that index. AppleScript
+    // never claims a tab only the extension's listing saw.
     const adopt = async (t, via) => {
-      let viaAppleScript = false;
-      const switched = _sanitizeTabResult(await extensionOrFallback(
-        "switch_tab", { index: t.index },
-        () => {
-          viaAppleScript = true;
-          if (via !== "applescript" || !win) {
-            throw new Error("Tab safety: the new tab was seen by the Safari extension, which could not switch to it, and AppleScript cannot tell which tab of its own window that is. Retry safari_wait_for_new_tab.");
-          }
-          return safari.switchTab(t.index, { claim: true, win });
+      const viaAppleScript = via === "applescript";
+      let switched;
+      if (viaAppleScript) {
+        if (!win) throw new Error("Tab safety: AppleScript did not say which window it listed, so it cannot tell which tab opened, and this session claimed none. The tab stays open, and another safari_wait_for_new_tab will not report it: that call starts from a listing that already has it.");
+        switched = _sanitizeTabResult(await safari.switchTab(t.index, { claim: true, win, expectUrl: t.url }));
+      } else {
+        switched = _sanitizeTabResult(await extensionOrFallback("switch_tab", { index: t.index }, () => {
+          throw new Error("Tab safety: a new tab opened, but the Safari extension could not switch to it and AppleScript cannot tell which tab of its own window that is, so this session did not claim it. The tab stays open, and another safari_wait_for_new_tab will not report it: that call starts from a listing that already has it. Check the extension with safari_doctor.");
+        }));
+        // The extension switches to whatever tab sits at the index when it runs the command, and
+        // answers "Tab not found" as if it had switched: a tab that closed or moved in between
+        // handed the session another tab of its own, or none, under the new tab's name.
+        if (switched?.safeUrl !== _safeUrlForOutput(urlOf(t))) {
+          throw Object.assign(new Error("Tab safety: the Safari extension switched to another tab than the one the listing saw (a tab closed or moved in between), so this session did not claim it."), { moved: true });
         }
-      ));
+      }
       safari.setActiveTabIndex(t.index);
       safari.setActiveTabURL(t.url);
       if (!viaAppleScript) safari.setActiveTabFromExtension(t.index, t.url);
@@ -3465,49 +3474,97 @@ server.tool(
         _trackTab(t.index, t.url, `${SESSION_ID}:${currentSessionId()}`, viaAppleScript ? safari.getActiveTabMarker() : "", switched?.receipt);
       }
       _setActiveReceipt(switched?.receipt);
-      return { content: [{ type: "text", text: `Found new tab: ${t.title} (${t.url})` }] };
+      return { content: [{ type: "text", text: `Found new tab: ${t.title} (${urlOf(t)})` }] };
+    };
+    // Whether every tab of `was` is still there on its URL, in order, in `is`: only then can a tab
+    // `is` added be told from the old ones. The first `index:url` pair not seen before was often a
+    // tab of the user's that had navigated, or had moved when another closed, and the claim stamped
+    // the session's own marker on it.
+    // ponytail: tabs are told apart by URL alone (AppleScript has no tab id and no opener), so any
+    // tab the user opens in the window during the wait counts as new, a new tab that opens on the
+    // very URL a tab of the user's leaves in the same poll can pass for it (as can a tab of the
+    // user's that lands on the URL of a new tab closing next to it, while another tab opens further
+    // along, which leaves the same listings as that new tab staying put), and the claim stamps
+    // whatever tab sits at the listed index a script later unless switchTab checks `expectUrl`.
+    const intact = (was, is) => {
+      const seen = new Set(was.map(urlOf));
+      const kept = is.filter((t) => seen.has(urlOf(t)));
+      return kept.length === was.length && kept.every((t, i) => urlOf(t) === urlOf(was[i]));
+    };
+    // Where the new tabs `last` showed are in `is`: each still on its URL, shown by no more and no
+    // fewer tabs than before, and in its place while the other tabs only navigated (as many tabs as
+    // before), or still there while the others only closed (the rest on their URLs, in order) and
+    // none next to it. A tab that went next to a new one could instead have landed on its URL as the
+    // new one went, and a tab that joins it on its URL could be taken for it; a neighbour counts as
+    // still there only while as many tabs as before show its URL, or a twin could stand in for it.
+    // Null when unsure.
+    const stillNew = (last, urls, is) => {
+      const count = (tabs, u) => tabs.filter((t) => urlOf(t) === u).length;
+      const at = (tabs, u) => tabs.findIndex((t) => urlOf(t) === u);
+      if (urls.some((u) => count(is, u) !== count(last, u))) return null;
+      if (is.length === last.length) return urls.some((u) => at(is, u) !== at(last, u)) ? null : urls.map((u) => is[at(is, u)]);
+      const there = new Set();
+      let j = 0;
+      last.forEach((t, k) => { if (j < is.length && urlOf(is[j]) === urlOf(t)) { there.add(k); j++; } });
+      const stays = (k) => count(is, urlOf(last[k])) === count(last, urlOf(last[k]));
+      const neighbours = (u) => [at(last, u) - 1, at(last, u) + 1].every((k) => k < 0 || k >= last.length || (there.has(k) && stays(k)));
+      return j === is.length && urls.every(neighbours) ? urls.map((u) => is[at(is, u)]) : null;
     };
     // Get current tab list
     let before = await list();
-    let beforeIds = new Set(before.tabs.map(t => `${t.index}:${t.url}`));
+    // Every URL a baseline showed. A new tab is one on a URL none of them showed, so a tab that
+    // left the window and came back (reopened, or dragged out and in again) is not new either.
+    const shown = new Set(before.tabs.map(urlOf));
+    // The new tabs not claimed yet (still on about:blank, not matching urlContains, or refused),
+    // by URL, and the listing that showed them; and whether any tab opened at all.
+    let pending = { last: before.tabs, urls: [] };
+    let opened = false;
 
-    // Poll for new tab — detect by count increase + new entries (handles about:blank tabs)
+    // Poll for new tab — detect by count increase + tabs on new URLs
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 500));
       const now = await list();
-      if (now.via !== before.via) {
-        before = now;
-        beforeIds = new Set(now.tabs.map(t => `${t.index}:${t.url}`));
+      // A listing where a tab closed or navigated becomes the baseline, so a tab of the user's that
+      // navigated meanwhile is not new once one opens; so does one from the other source. A new
+      // tab not claimed yet stays out of it while the other tabs only navigated in place or only
+      // closed: taken into it, it was never new again, and the wait timed out on a popup that
+      // was still loading when another tab changed. Any other change, or one as a tab opened,
+      // takes every tab in: held against the older baseline, whichever of two tabs that changed
+      // navigated first looked new, the user's too.
+      if (now.via !== before.via || !intact(before.tabs, now.tabs)) {
+        const same = now.via === before.via;
+        const kept = !pending.urls.length ? [] : same ? stillNew(pending.last, pending.urls, now.tabs) : null;
+        // Only AppleScript lists one window by id: the extension can list whichever window is in front.
+        if (same && now.via === "applescript" && now.tabs.length > before.tabs.length) opened = true;
+        before = { ...now, tabs: now.tabs.filter((t) => !kept?.includes(t)) };
+        for (const t of before.tabs) shown.add(urlOf(t));
+        pending = { last: now.tabs, urls: kept ? pending.urls : [] };
         continue;
       }
-      if (now.tabs.length > before.tabs.length) {
-        // Find the new tab(s) — could be about:blank initially (OAuth popups)
-        for (const tab of now.tabs) {
-          if (!beforeIds.has(`${tab.index}:${tab.url}`)) {
-            // Wait for about:blank to resolve to actual URL — dynamic polling instead of fixed delay
-            if (tab.url === 'about:blank') {
-              let resolved = null;
-              for (let attempt = 0; attempt < 10; attempt++) {
-                await new Promise(r => setTimeout(r, 300)); // 300ms intervals, max 3s total
-                const refreshed = await list();
-                resolved = refreshed.via === now.via ? refreshed.tabs.find(t => t.index === tab.index) : null;
-                if (resolved && resolved.url !== 'about:blank') break;
-                resolved = null;
-              }
-              if (resolved && resolved.url !== 'about:blank') {
-                if (urlContains && !resolved.url.includes(urlContains)) continue;
-                return await adopt(resolved, now.via);
-              }
-              continue;
-            }
-            if (urlContains && !tab.url.includes(urlContains)) continue;
-            return await adopt(tab, now.via);
-          }
+      const old = new Set(before.tabs.map(urlOf));
+      pending = { last: now.tabs, urls: now.tabs.map(urlOf).filter((u) => !old.has(u)) };
+      if (pending.urls.length) opened = true;
+      for (const tab of now.tabs) {
+        // A new tab still on about:blank (an OAuth popup before it loads) is claimed at a later
+        // poll, once it shows its URL: a later listing found it again by index, and by then that
+        // could be another tab.
+        if (urlOf(tab) === 'about:blank' || shown.has(urlOf(tab))) continue;
+        if (urlContains && !String(urlOf(tab)).includes(urlContains)) continue;
+        try {
+          return await adopt(tab, now.via);
+        } catch (err) {
+          // A tab another session opened in this window meanwhile, whose marker the claim refuses
+          // to overwrite (`otherSession`), or a tab that no longer shows the page the listing saw
+          // (`moved`: one closed in between and slid another under the index). Neither is the
+          // tab this waits for, and a later listing can still show it.
+          if (!err?.otherSession && !err?.moved) throw err;
         }
       }
     }
-    return { content: [{ type: "text", text: "TIMEOUT: no new tab appeared" }] };
+    return { content: [{ type: "text", text: opened
+      ? "TIMEOUT: a tab opened during the wait, but none this call could claim: it could not be told apart from a tab that changed at the same time, urlContains ruled it out, or its claim was refused. If it is still open, another safari_wait_for_new_tab will not report it: open it again during a new wait, or ask the user."
+      : "TIMEOUT: no new tab appeared" }] };
   }
 );
 

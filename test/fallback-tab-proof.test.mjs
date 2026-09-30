@@ -666,18 +666,26 @@ test("safari_wait_for_new_tab does not take a tab adopted from the user for one 
     const s = session();
     s.window.tabs[0].user = true;
     await s.server.safari_switch_tab({ index: 1 });
-    // While it waits, the adopted tab moves on to another page and a tab opens after it, so the
-    // adopted tab is the first one the list has not seen at its index.
+    // While it waits, the adopted tab moves on to another page and a new tab opens right after it
+    // on the page the adopted tab left. Tabs are told apart by URL alone, so the new one stands in
+    // for the adopted tab and the adopted tab looks new: the one case that still reaches adopt()'s
+    // guard for an adopted tab. If tab identity improves and this stops claiming it, rewrite the
+    // test on purpose rather than let it pass on a TIMEOUT.
     setTimeout(() => {
       s.window.tabs[0].url = "https://mail.example.com/sent";
-      s.window.tabs.push({ url: "https://sso.example.net/authorize", marker: null });
+      s.window.tabs.splice(1, 0, { url: USER_URL, marker: null });
     }, 50);
-    await s.server.safari_wait_for_new_tab({ timeout: 3000 });
+    const reply = await s.server.safari_wait_for_new_tab({ timeout: 3000 });
+    assert.match(reply.content[0].text, /Found new tab/);
     assert.equal(s.window.tabs[0].marker, s.safari._st().activeTabMarker, "the wait did not land on the adopted tab");
+    assert.equal(s.safari.isActiveTabAdopted(), true, "the claim turned the adopted tab into one the session opened");
     assert.ok(
       ![...own._openedTabs.values()].some((t) => t.url === "https://mail.example.com/sent"),
       "the adopted tab was recorded among the tabs the session opened, which the tab cap and shutdown close"
     );
+    const onUserPage = (u) => u.startsWith("https://mail.example.com");
+    assert.ok(![...own._ownedTabURLs].some(onUserPage), "the adopted URL is owned by every session of the process");
+    assert.ok(!own._loadOwnershipFile().some((e) => onUserPage(e.url)), "the adopted URL reached owned-tabs.json");
     assert.match(await outcome(() => s.server.safari_close_tab({})), REFUSED);
     assert.ok(userTabOpen(s.window), "the adopted user tab was closed");
   });
