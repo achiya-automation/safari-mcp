@@ -751,6 +751,8 @@ function _helperActivateApp(bundleId, timeout = 2000) {
 
 export function setFocusGuard(active) { _focusGuardActive = active; }
 export function getActiveTabIndex() { return _st().activeTabIndex; }
+// Whether this session has opened or claimed a tab of its own (index.js asks before a write).
+export function hasOwnedTab() { return _st().hasOwnedTab; }
 export function setActiveTabIndex(idx) { _st().activeTabIndex = idx; }
 export function getActiveTabURL() { return _st().activeTabURL; }
 export function setActiveTabURL(url) { _st().activeTabURL = url; _st().lastResolveTime = Date.now(); }
@@ -5496,7 +5498,8 @@ export async function runScript({ steps, onStep, actions: overrides = {} }) {
         nativeClick, nativeHover, nativeType, nativeKeyboard,
         replaceEditorContent, uploadFile, mockNetworkRoute,
       };
-      // index.js takes over an action where it has more to go on (switchTab: the extension).
+      // index.js takes over an action where it has more to go on (switchTab: the extension;
+      // newTab and closeTab: the tab ownership it keeps).
       const fn = overrides[action] || actions[action];
       if (!fn) {
         results.push({ action, error: `Unknown action: ${action}` });

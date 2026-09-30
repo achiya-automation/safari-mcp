@@ -428,10 +428,22 @@ test("every tracked tab records a marker only when AppleScript opened it", () =>
   // a tab, that marker names an EARLIER tab, and closing "by marker" would close that one.
   const calls = [...index.matchAll(/_trackTab\(([^;]*?)\);/g)].map((m) => m[1]);
   assert.ok(calls.length >= 3, "expected the new_tab, run_script and wait_for_new_tab call sites");
-  for (const args of calls) {
-    assert.match(args, /viaAppleScript \? safari\.getActiveTabMarker\(\) : ""/, `unguarded marker: ${args}`);
+  // One call records a marker by name, _openTabViaAppleScript's; every other call is guarded.
+  const helper = between(index, "async function _openTabViaAppleScript(", "\n}\n");
+  const named = calls.filter((args) => /, minted$/.test(args));
+  assert.equal(named.length, 1, `only _openTabViaAppleScript records \`minted\`: ${named.join(" | ")}`);
+  assert.ok(helper.includes(`_trackTab(${named[0]});`), "the call that records `marker` is not _openTabViaAppleScript's");
+  for (const args of calls.filter((a) => a !== named[0])) {
+    assert.match(args, /viaAppleScript \? safari\.getActiveTabMarker\(\) : ""|, "", /, `unguarded marker: ${args}`);
     assert.match(args, /receipt\)?$/, `the receipt must be recorded too: ${args}`);
   }
+  // The helper records the marker its own newTab() named for the tab it opened, and only when it
+  // named one: never the session's marker after the call, which a parallel switch changes, to an
+  // adopted tab's (#92) included. AppleScript gives the tab no receipt.
+  assert.match(
+    helper,
+    /let minted = null;[\s\S]*safari\.newTab\(url, \{ onMarker: \(marker\) => \{ minted = marker; \} \}\)[\s\S]*if \(minted\) \{\s*_trackTab\(/
+  );
 });
 
 // ---------- receipt-less calls in a named profile ----------
@@ -496,7 +508,7 @@ test("one open tab, another session's tabs, and the default profile never make a
 test("closing another tab by its receipt leaves the current tab current", () => {
   const start = index.indexOf('server.tool(\n  "safari_close_tab"');
   const tool = index.slice(start, index.indexOf("\n);", start));
-  assert.match(tool, /const closesCurrent = !token \|\| token === _getActiveReceipt\(\);/);
+  assert.match(tool, /closesCurrent = !token \|\| token === _getActiveReceipt\(\);/);
   // AppleScript closes only the tab carrying the session's marker: a close that names a
   // receipt never falls back to it (test/fallback-tab-proof.test.mjs).
   assert.match(tool, /_untrackClosedTab\(viaAppleScript \? \{ marker \} : \{ receipt: token \}\);/);
