@@ -1808,7 +1808,9 @@ function _safeUrlForOutput(rawUrl) {
 // Receipts this daemon rotated on the caller's behalf (a cross-origin safari_navigate) stay
 // usable under their old name: callers routinely keep the first receipt they saw and ignore
 // the fresh one in the navigate result (nine consecutive "not valid for this origin" failures
-// in one session on 4.9.26). Whoever held the old capability held the tab.
+// in one session on 4.9.26). Whoever held the old capability held the tab. Every session that
+// held it follows the alias, other clients of an HTTP daemon included (_getActiveReceipt), so an
+// alias may only join two receipts of one tab: each rotation names the receipt it replaces.
 const _receiptAliases = new Map(); // old token → newer token
 function _aliasReceipt(oldToken, newToken) {
   if (!oldToken || !newToken || oldToken === newToken) return;
@@ -1867,8 +1869,10 @@ const _activeReceipts = new Map();
 function _receiptSessionKey() {
   return `${SESSION_ID}:${currentSessionId()}`;
 }
+// Resolved on every read: another client of an HTTP daemon can rotate this session's receipt
+// after it was stored, and the extension then knows only the new one.
 function _getActiveReceipt() {
-  return _activeReceipts.get(_receiptSessionKey()) || "";
+  return _receiptToken(_activeReceipts.get(_receiptSessionKey()));
 }
 function _setActiveReceipt(receipt) {
   _activeReceipts.set(_receiptSessionKey(), _receiptToken(receipt));
@@ -2015,10 +2019,10 @@ async function _runExtensionBatchAction(action, args = {}) {
 
     case "getReceipt": {
       const previous = _receiptToken(args.receipt || "") || _getActiveReceipt();
+      // Named here: extensionOrFallback attaches the session's receipt only after its awaits, and a
+      // call alongside that named another tab got that tab rotated and aliased to `previous`.
       const value = normalize(await extensionOrFallback(
-        "get_tab_receipt", {
-          ...(_receiptToken(args.receipt || "") ? { receipt: _receiptToken(args.receipt) } : {}),
-        },
+        "get_tab_receipt", previous ? { receipt: previous } : {},
         () => { throw new Error("getReceipt requires the verified Safari extension"); }
       ));
       const safeValue = _sanitizeTabResult(value);
@@ -2496,8 +2500,9 @@ server.tool(
     const usedReceipt = _receiptToken(receipt || _getActiveReceipt());
     if (landed && _originOf(landed) !== (_receiptOrigins.get(usedReceipt) || _originOf(oldUrl)) && usedReceipt) {
       try {
+        // Named for the alias below, as run_script getReceipt names it (see _receiptAliases).
         const fresh = _sanitizeTabResult(await extensionOrFallback(
-          "get_tab_receipt", { ..._explicitReceipt({ receipt }) }, () => null
+          "get_tab_receipt", { ..._explicitReceipt({ receipt: usedReceipt }) }, () => null
         ));
         if (fresh?.receipt) {
           _aliasReceipt(usedReceipt, fresh.receipt);
