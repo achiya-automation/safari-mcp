@@ -3473,17 +3473,21 @@ server.tool(
       const kept = is.filter((t) => seen.has(urlOf(t)));
       return kept.length === was.length && kept.every((t, i) => urlOf(t) === urlOf(was[i]));
     };
-    // Where the new tabs `last` showed are in `is`: each still on its URL and in its place while
-    // the other tabs only navigated (as many tabs as before), or still there while the others
-    // only closed (the rest on their URLs, in order). Null when that does not hold.
+    // Where the new tabs `last` showed are in `is`: each still on its URL, shown by no more and no
+    // fewer tabs than before, and in its place while the other tabs only navigated (as many tabs as
+    // before), or still there while the others only closed (the rest on their URLs, in order) and
+    // none next to it. A tab that went next to a new one could instead have landed on its URL as the
+    // new one went, and a tab that joins it on its URL could be taken for it. Null when unsure.
     const stillNew = (last, urls, is) => {
+      const count = (tabs, u) => tabs.filter((t) => urlOf(t) === u).length;
       const at = (tabs, u) => tabs.findIndex((t) => urlOf(t) === u);
+      if (urls.some((u) => count(is, u) !== count(last, u))) return null;
+      if (is.length === last.length) return urls.some((u) => at(is, u) !== at(last, u)) ? null : urls.map((u) => is[at(is, u)]);
+      const there = new Set();
       let j = 0;
-      for (const t of last) if (j < is.length && urlOf(is[j]) === urlOf(t)) j++;
-      const moved = is.length === last.length
-        ? urls.some((u) => at(is, u) !== at(last, u))
-        : j < is.length || urls.some((u) => at(is, u) < 0);
-      return moved ? null : urls.map((u) => is[at(is, u)]);
+      last.forEach((t, k) => { if (j < is.length && urlOf(is[j]) === urlOf(t)) { there.add(k); j++; } });
+      const neighbours = (u) => [at(last, u) - 1, at(last, u) + 1].every((k) => k < 0 || k >= last.length || there.has(k));
+      return j === is.length && urls.every(neighbours) ? urls.map((u) => is[at(is, u)]) : null;
     };
     // Get current tab list
     let before = await list();
@@ -3510,7 +3514,8 @@ server.tool(
       if (now.via !== before.via || !intact(before.tabs, now.tabs)) {
         const same = now.via === before.via;
         const kept = !pending.urls.length ? [] : same ? stillNew(pending.last, pending.urls, now.tabs) : null;
-        if (same && now.tabs.length > before.tabs.length) opened = true;
+        // Only AppleScript lists one window by id: the extension can list whichever window is in front.
+        if (same && now.via === "applescript" && now.tabs.length > before.tabs.length) opened = true;
         before = { ...now, tabs: now.tabs.filter((t) => !kept?.includes(t)) };
         for (const t of before.tabs) shown.add(urlOf(t));
         pending = { last: now.tabs, urls: kept ? pending.urls : [] };
@@ -3537,7 +3542,7 @@ server.tool(
       }
     }
     return { content: [{ type: "text", text: opened
-      ? "TIMEOUT: a tab opened during the wait, but none this call could claim: it could not be told apart from a tab that changed at the same time, urlContains ruled it out, or its claim was refused. It stays open, and another safari_wait_for_new_tab will not report it: open it again during a new wait, or ask the user."
+      ? "TIMEOUT: a tab opened during the wait, but none this call could claim: it could not be told apart from a tab that changed at the same time, urlContains ruled it out, or its claim was refused. If it is still open, another safari_wait_for_new_tab will not report it: open it again during a new wait, or ask the user."
       : "TIMEOUT: no new tab appeared" }] };
   }
 );
