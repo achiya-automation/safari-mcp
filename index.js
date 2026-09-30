@@ -2018,7 +2018,13 @@ async function _runExtensionBatchAction(action, args = {}) {
     }
 
     case "closeTab": {
-      const index = args.index === undefined ? undefined : Number(args.index);
+      const index = args.index == null ? undefined : Number(args.index);
+      // An index that is not a tab number (0, -1, 1.5, "abc") was dropped here or ignored by the
+      // extension, and the close took the current tab. switchTab refuses one, as closeOwnTab does
+      // without a profile.
+      if (index !== undefined && (!Number.isInteger(index) || index < 1)) {
+        throw new Error("Tab safety: closeTab index must be a positive integer when provided");
+      }
       // As in safari_close_tab: a receipt that is not one is refused, not read as the current tab's.
       const supplied = args.receipt || args.receiptUrl || args.url || "";
       const receipt = supplied ? _receiptToken(supplied) : _getActiveReceipt();

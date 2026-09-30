@@ -15,6 +15,10 @@
  * Without SAFARI_PROFILE, run_script's closeTab refuses any receipt before it runs, as AppleScript
  * cannot tell which tab one names (test/fallback-tab-proof.test.mjs).
  *
+ * The same step in a named profile closed the current tab for an `index` that is not a tab number
+ * (0, -1, 1.5, "abc"): the server dropped it or the extension ignored it, and the close carried
+ * only the current tab's receipt.
+ *
  * Both sides are the real code: the extension's handleCommand preflight and close_tab case,
  * _resolveReceiptTab, _issueTabReceipt and _closeTabForSession over a fake Safari window;
  * index.js's safari_new_tab, safari_close_tab and safari_run_script handlers, with
@@ -340,4 +344,33 @@ test("in a named profile, a run_script closeTab step closes the tab its receipt 
   ]);
   assert.deepEqual(extension.urls(), [USER_URL], "DOCS by its receipt, then the current tab, SHOP");
   assert.deepEqual(tracked(), []);
+});
+
+test("in a named profile, a run_script closeTab step whose index is not a tab number is refused, and closes no tab", async () => {
+  const { server, extension } = setup(MODES[1]);
+  await twoTabs(server);
+
+  // 0 or "abc" never reached the extension as an index, and it ignores -1 or 1.5: the close carried
+  // only the current tab's receipt. Without SAFARI_PROFILE, closeOwnTab refuses them all.
+  for (const index of [0, -1, 1.5, "abc", ""]) {
+    const steps = [{ action: "closeTab", args: { index } }, { action: "closeTab" }];
+    const results = json(await server.safari_run_script({ steps }));
+    assert.equal(results.length, 1, `the step after a refused close ran: ${JSON.stringify(results)}`);
+    assert.match(results[0].error, /^Tab safety: closeTab index must be a positive integer/, JSON.stringify(index));
+  }
+  assert.deepEqual(extension.urls(), [USER_URL, DOCS, SHOP], "a tab was closed");
+  assert.deepEqual(extension.types(), ["new_tab", "new_tab"], "a close reached the extension");
+  assert.deepEqual(tracked(), [DOCS, SHOP]);
+
+  // A null index names none, as no index does: the current tab closes...
+  let results = json(await server.safari_run_script({ steps: [{ action: "closeTab", args: { index: null } }] }));
+  assert.deepEqual(results, [{ action: "closeTab", result: "Tab closed" }]);
+  assert.deepEqual(extension.urls(), [USER_URL, DOCS]);
+  assert.deepEqual(tracked(), [DOCS]);
+  // ...and a tab number still closes that tab: BLOG, the current one, is the third.
+  await server.safari_new_tab({ url: BLOG });
+  results = json(await server.safari_run_script({ steps: [{ action: "closeTab", args: { index: 3 } }] }));
+  assert.deepEqual(results, [{ action: "closeTab", result: "Tab closed" }]);
+  assert.deepEqual(extension.urls(), [USER_URL, DOCS]);
+  assert.deepEqual(tracked(), [DOCS]);
 });
