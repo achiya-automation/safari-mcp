@@ -1814,6 +1814,10 @@ function _safeUrlForOutput(rawUrl) {
 const _receiptAliases = new Map(); // old token → newer token
 function _aliasReceipt(oldToken, newToken) {
   if (!oldToken || !newToken || oldToken === newToken) return;
+  // Every older name of the tab points straight at its newest receipt. As a chain of one link per
+  // rotation, a receipt stopped resolving after eight (_receiptToken's hop limit): a handful of
+  // cross-origin navigations in one tab.
+  for (const [older, newer] of _receiptAliases) if (newer === oldToken) _receiptAliases.set(older, newToken);
   _receiptAliases.set(oldToken, newToken);
   if (_receiptAliases.size > 500) _receiptAliases.delete(_receiptAliases.keys().next().value);
 }

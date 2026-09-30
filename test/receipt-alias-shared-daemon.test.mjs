@@ -22,6 +22,10 @@
  * that named another tab got that tab's receipt re-minted, and the alias sent every holder of the
  * first tab's receipt to the second tab, which none of them ever held a receipt for.
  *
+ * Each rotation added one link to the alias chain, and _receiptToken follows at most eight: after
+ * a handful of cross-origin navigations in one tab, the receipt the tab was opened with stopped
+ * resolving, for the client that kept passing it and for every client holding it as its current one.
+ *
  * Both sides are the real code: the extension's handleCommand preflight, its get_tab_receipt
  * handler, _resolveReceiptTab and _issueTabReceipt over a fake Safari window; index.js's tool
  * handlers, extensionOrFallback with its guards, the batch actions and the mark_tab hook. Two
@@ -374,6 +378,25 @@ for (const rotation of ROTATIONS) {
       assert.deepEqual(safari.appleScript, [], "AppleScript touched a tab");
     });
   }
+}
+
+for (const mode of MODES) {
+  test(`${mode.name}: a receipt keeps resolving however often another client has rotated it since`, async () => {
+    const { server, extension } = setup(mode);
+    const { receipt, shop } = await sharedTabAgentLeft(server, extension);
+    // A crawl through one tab: every origin it leaves rotates the tab's receipt. The agent keeps
+    // passing the first receipt it saw, as callers do.
+    const sites = Array.from({ length: 12 }, (_, i) => `https://site${i}.example/`);
+    for (const url of sites) {
+      const landed = json(await server.safari_navigate({ url, receipt }));
+      assert.match(landed.receipt ?? "", RECEIPT, `the navigation to ${url} handed back no receipt`);
+    }
+    assert.equal(extension.receiptsOf(shop.id).length, 1);
+
+    sid = "subagent";
+    assert.equal(await outcome(() => server.safari_click({ selector: "#continue" })), CLICKED);
+    assert.deepEqual(extension.ran.at(-1), { type: "click", tabId: shop.id, url: sites.at(-1) });
+  });
 }
 
 test("without SAFARI_PROFILE, the AppleScript fallback of a client whose receipt another client rotated still gets its tab marked", async () => {
