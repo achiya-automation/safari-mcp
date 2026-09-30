@@ -185,7 +185,8 @@ test("public close accepts an opaque receipt and never treats a full URL as auth
   const tool = index.slice(start, end + 3);
   assert.match(tool, /receipt: z\.string\(\)\.optional\(\)/);
   assert.match(tool, /const supplied = receipt \|\| url \|\| ""/);
-  assert.match(tool, /const token = _receiptToken\(supplied\) \|\| _getActiveReceipt\(\)/);
+  // A receipt that does not parse is refused below; only a close that names none takes the current tab.
+  assert.match(tool, /const token = supplied \? _receiptToken\(supplied\) : _getActiveReceipt\(\)/);
   assert.match(tool, /if \(supplied && !token\) return errorResult\("Tab safety: invalid tab receipt"\)/);
   assert.match(tool, /"close_tab",\s*token \? \{ receipt: token \} : \{\}/);
   assert.match(tool, /_clearActiveReceipt\(\)/, "a closed tab's receipt must be forgotten");
