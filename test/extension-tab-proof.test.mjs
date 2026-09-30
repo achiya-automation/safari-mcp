@@ -95,6 +95,19 @@ function safariApp(...windows) {
       if (js[1].includes("JSON.stringify({title:document.title,url:location.href")) return JSON.stringify({ title: "", url: target.url });
       return target.url;
     }
+    const closing = /close tab i of w/.test(script) && script.match(/window\.name==='([^']*)'/);
+    if (closing) {
+      // closeTabByMarker: the front window's tab carrying the marker, found and closed in one
+      // script (blanked when it is the window's only tab).
+      const at = front().findIndex((t) => t.name === closing[1]);
+      if (at < 0) return "";
+      if (front().length === 1) {
+        front()[0].url = "about:blank";
+        return "blanked";
+      }
+      closed.push(...front().splice(at, 1));
+      return "closed";
+    }
     const scan = script.match(/window\.name==='([^']*)'/);
     if (scan) {
       // A marker scan of the front window: the hinted tab first, then right to left.

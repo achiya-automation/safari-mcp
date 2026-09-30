@@ -170,16 +170,6 @@ const WEBKIT_MEMORY_LIMIT_MB = parseInt(process.env.MCP_WEBKIT_LIMIT_MB || "3000
 // _removeOwnedURL, _trackTab, _untrackTab, BLANK_TAB_SENTINEL) are imported from
 // ownership-state.js at the top of this file.
 
-// Resolve a tab we recorded earlier to its CURRENT index, proving identity by the marker
-// stamped on it. Returns null when the tab carries no marker we can find — the caller then
-// leaves it alone. Never matches by URL: the tab navigates after we open it, and the user
-// can have a tab of their own on the URL we recorded, so a URL match closed THEIR tab
-// (#112). A stray MCP tab left open costs nothing; a closed user tab costs their work.
-async function _verifiedTabIndex(info) {
-  if (!info?.marker) return null;
-  try { return await safari.findTabByMarker(info.marker); } catch { return null; }
-}
-
 // Close one tab this process opened, found by the identity recorded when it was opened:
 // the receipt the extension minted for it, or the AppleScript marker. Never by position.
 // The tab cap used to close the index recorded at opening, and the close also carried the
@@ -213,14 +203,16 @@ async function _closeTrackedTab(info) {
       return msg.includes("Tab safety:") ? "lost" : "failed";
     }
   }
-  // Opened through AppleScript: prove it by its marker. A named profile never closes a tab
-  // through AppleScript.
+  // Opened through AppleScript: prove it by its marker, in the script that closes it. Never by
+  // URL: the tab navigates after we open it, and the user can have a tab of their own on the URL
+  // we recorded, so a URL match closed THEIR tab (#112). Nor by an index an earlier script found:
+  // a close in between renumbered the window, and a stray MCP tab left open costs nothing next
+  // to a closed user tab. A named profile never closes a tab through AppleScript.
+  // A tab blanked instead of closed (its window's last) is open still, but no marker names it any
+  // more: it counts as lost, not as closed.
   if (process.env.SAFARI_PROFILE) return "lost";
-  const idx = await _verifiedTabIndex(info);
-  if (!idx) return "lost";
   try {
-    await safari.closeTab(idx);
-    return "closed";
+    return (await safari.closeTabByMarker(info?.marker)) === "closed" ? "closed" : "lost";
   } catch {
     return "failed";
   }
@@ -237,8 +229,13 @@ async function _evictOldestTab(sessionId) {
   for (const [key, info] of mine) {
     if (open < MAX_TABS) break;
     const outcome = await _closeTrackedTab(info);
-    // It may still be open: keep counting it, retry it at the next new tab, close the next.
-    if (outcome === "failed") continue;
+    // It may still be open: keep counting it and retry it at the next new tab. Close the next
+    // only through the extension, which fails fast: an AppleScript close that failed, a page that
+    // never answers the marker check, would cost every tracked tab its own timeout.
+    if (outcome === "failed") {
+      if (!_receiptToken(info.receipt)) break;
+      continue;
+    }
     _untrackTab(key);
     open--;
     if (outcome === "closed") {
@@ -294,14 +291,12 @@ async function _cleanupTabs() {
     return;
   }
   console.error(`[Safari MCP] Cleanup: closing ${_openedTabs.size} MCP-opened tabs`);
-  // Resolve each tab by its identity marker right before closing it — indices shift after
-  // every closure, and the marker is the only coordinate that survives navigation. Name the
-  // index explicitly: it was just proven ours, and closeTab's own ownership check covers
-  // only this session's active tab (#68).
+  // Find each tab by its identity marker in the script that closes it — indices shift after
+  // every closure, and the marker is the only coordinate that survives navigation. closeTab()
+  // with no index would close only this session's active tab (#68).
   for (const info of [..._openedTabs.values()]) {
     try {
-      const idx = await _verifiedTabIndex(info);
-      if (idx) await safari.closeTab(idx);
+      await safari.closeTabByMarker(info.marker);
     } catch {}
   }
   _openedTabs.clear();

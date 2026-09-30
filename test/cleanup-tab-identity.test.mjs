@@ -28,28 +28,25 @@ function sourceBetween(source, startNeedle, endNeedle) {
 
 const cleanupSource = sourceBetween(
   index,
-  "async function _verifiedTabIndex(info) {",
+  "async function _cleanupTabs() {",
   "\n// Periodic memory check"
 );
 
-// Build the extracted pair over a fake Safari. `tabs` is the live window: each entry is
+// Build the extracted cleanup over a fake Safari. `tabs` is the live window: each entry is
 // the index, the URL currently loaded, and the marker stamped on that tab (if any).
 function makeCleanup({ opened, tabs, env = {} }) {
   const closed = [];
   const _openedTabs = new Map(opened.map((info, i) => [info.recordedIndex ?? i + 1, info]));
   const safari = {
-    async findTabByMarker(marker) {
-      if (!marker) return null;
-      const hit = tabs.find(t => t.marker === marker);
-      return hit ? hit.index : null;
-    },
-    async closeTab(index) {
-      closed.push(index);
-      const at = tabs.findIndex(t => t.index === index);
-      assert.ok(at >= 0, `closeTab called with index ${index}, which is not an open tab`);
-      tabs.splice(at, 1);
+    // Finds the tab by its marker and closes it in one step, as the one AppleScript does.
+    async closeTabByMarker(marker) {
+      const hit = marker ? tabs.find(t => t.marker === marker) : null;
+      if (!hit) return null;
+      closed.push(hit.index);
+      tabs.splice(tabs.indexOf(hit), 1);
       // Safari renumbers: every tab after the closed one shifts down by one.
-      for (const t of tabs) if (t.index > index) t.index -= 1;
+      for (const t of tabs) if (t.index > hit.index) t.index -= 1;
+      return "closed";
     },
     async listTabs() {
       throw new Error("cleanup must not fall back to a URL lookup over listTabs()");
@@ -57,7 +54,7 @@ function makeCleanup({ opened, tabs, env = {} }) {
   };
   const fn = new Function(
     "safari", "_openedTabs", "console", "process",
-    `${cleanupSource}; return { _cleanupTabs, _verifiedTabIndex };`
+    `${cleanupSource}; return { _cleanupTabs };`
   )(safari, _openedTabs, { error() {} }, { env });
   return { ...fn, closed, tabs, _openedTabs };
 }
@@ -157,7 +154,7 @@ test("no close path resolves a tracked tab by URL any more", () => {
   );
   const evictionSource = sourceBetween(index, "async function _closeTrackedTab(info) {", "\n// Per-session tab cap");
   assert.ok(
-    /_verifiedTabIndex\(info\)/.test(evictionSource),
-    "tab-cap eviction must re-prove an AppleScript tab by its marker before closing"
+    /safari\.closeTabByMarker\(info\?\.marker\)/.test(evictionSource),
+    "tab-cap eviction must prove an AppleScript tab by its marker in the script that closes it"
   );
 });

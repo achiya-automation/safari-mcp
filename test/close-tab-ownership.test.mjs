@@ -108,14 +108,29 @@ test("no AppleScript in closeTab targets the front document", () => {
 test("closeTab refuses when it cannot prove which tab is its own", () => {
   assert.match(
     closeTabBody,
-    /const idx = explicitIndex \|\| \(await _provenOwnTabIndex\(\)\)/,
-    "the target must come from an explicit index or from proven ownership"
+    /if \(!explicitIndex\) \{\s*const closed = await closeTabByMarker\(_st\(\)\.activeTabMarker\);/,
+    "with no explicit index, the target must be the tab carrying the session's marker"
   );
   assert.match(
     closeTabBody,
-    /if \(!idx\)[\s\S]{0,200}throw new Error/,
+    /if \(!closed\) \{[\s\S]{0,40}throw new Error/,
     "an unprovable target must throw, not fall through to a close"
   );
+});
+
+test("a close by marker proves the tab and closes it in the same script", () => {
+  // One index proven by a scan and closed by a later script named whatever tab sat there by
+  // then: a close in between renumbers the window, and another front window renames it.
+  const start = safari.indexOf("export async function closeTabByMarker(");
+  assert.ok(start > 0, "closeTabByMarker should exist in safari.js");
+  const body = stripComments(safari.slice(start, safari.indexOf("\n}", start)));
+  const script = /await osascript\(`(tell application "Safari"[\s\S]*?end tell)`\)/.exec(body)?.[1];
+  assert.ok(script, "the find and the close must be one AppleScript");
+  assert.doesNotMatch(script, /current tab of|front document/, "no fallback to the tab in front of the user");
+  const check = script.indexOf("do JavaScript");
+  assert.ok(check > 0 && check < script.indexOf("close tab i of w"), "the marker check runs before the close");
+  assert.ok(check < script.indexOf('set URL of tab i of w to "about:blank"'), "the marker check runs before the blank");
+  assert.match(body, /startsWith\("MCP_A"\)\) return null/, "a tab adopted from the user is never closed (#92)");
 });
 
 test("both destructive AppleScript verbs are pinned to the proven index", () => {
