@@ -34,6 +34,7 @@ import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import vm from "node:vm";
+import { answerMarkerScan, isMarkerScan, scriptWindowRef } from "./fake-safari-scripts.mjs";
 
 // ownership-state.js persists to ~/.safari-mcp — point HOME at a throwaway dir first.
 const tmpHome = mkdtempSync(join(tmpdir(), "smcp-wait-"));
@@ -70,7 +71,7 @@ const POPUP = "https://sso.example.net/authorize";
 function safari() {
   const tab = (url, marker = "") => ({ url, marker });
   const app = {
-    front: MINE, listings: 0, pages: 0, afterListing: () => {}, tab,
+    front: MINE, listings: 0, pages: 0, scans: 0, afterListing: () => {}, afterScan: () => {}, tab,
     windows: [
       { id: MINE, tabs: [tab("https://mail.example.com/"), tab("https://app.example.org/login", OURS)] },
       { id: THEIRS, tabs: [tab("https://docs.example.com/"), tab("https://bank.example.com/"), tab("https://shop.example.com/")] },
@@ -82,6 +83,12 @@ function safari() {
     return w;
   };
   const answer = (script) => {
+    // The marker scan, run as Safari runs it: the page each check reads is the tab's window.name.
+    if (isMarkerScan(script)) {
+      const w = windowOf(scriptWindowRef(script));
+      app.scans++;
+      return answerMarkerScan(script, { windowId: w.id, tabs: w.tabs, pageOf: (t) => ({ name: t.marker }) });
+    }
     const listing = script.match(/set w to (front window|window id \d+)\n\s*set output to \(id of w\) as text\n/);
     if (listing) {
       // The id it reports and the tabs it walks must be the same window's.
@@ -108,7 +115,8 @@ function safari() {
   };
   app.run = async (script) => {
     const result = answer(script);
-    if (/every tab of/.test(script)) app.afterListing(++app.listings);
+    if (isMarkerScan(script)) app.afterScan(app.scans);
+    else if (/every tab of/.test(script)) app.afterListing(++app.listings);
     return result;
   };
   return app;
@@ -128,9 +136,10 @@ const safariExports = [...safariParts.matchAll(/^export (?:async )?function (\w+
 function loadSafari(app) {
   const s = new Function(
     "currentSessionId", "randomUUID", "osascript", "osascriptFast", "getTargetWindowRef",
-    "refreshTargetWindow", "console",
+    "refreshTargetWindow", "console", "isSafariRunning", "safariNotRunningError",
     `${safariParts.replace(/^export /gm, "")}\nreturn { _st, ${safariExports.join(", ")} };`
-  )(() => "s1", () => "sess0001-0000-4000-8000-000000000000", app.run, app.run, () => "front window", async () => {}, { error() {} });
+  )(() => "s1", () => "sess0001-0000-4000-8000-000000000000", app.run, app.run, () => "front window", async () => {}, { error() {} },
+    async () => app.running !== false, () => new Error("Safari is not running. Open Safari manually before using Safari MCP tools."));
   // The session's tab is tab 2 of MINE, opened through AppleScript.
   Object.assign(s._st(), { hasOwnedTab: true, activeTabIndex: 2, activeTabURL: "https://app.example.org/login", activeTabMarker: OURS });
   return Object.assign(s, { saveFrontmostApp: async () => null, setFocusGuard() {}, restoreFocusIfStolen: async () => {} });
@@ -1224,5 +1233,175 @@ test("with two new tabs pending apart, one that closes as the user's tab next to
   const reply = await loadServer(s).safari_wait_for_new_tab({ timeout: 3000, urlContains: "sso.example.net" });
   assert.match(text(reply), /TIMEOUT/);
   assert.equal(user.marker, "", "the user's tab got the session's marker");
+});
+
+// ---------- the window AppleScript watches ----------
+
+test("with the user's window in front when the wait starts, AppleScript watches no window and claims nothing", async () => {
+  const app = safari();
+  const s = loadSafari(app);
+  app.front = THEIRS;
+  app.afterScan = () => app.windows[1].tabs.push(app.tab("https://news.example.com/")); // the user opens a tab
+  await assert.rejects(loadServer(s).safari_wait_for_new_tab({ timeout: 3000 }), /Tab safety: this session's tab is not in the Safari window in front/);
+  assert.equal(app.listings, 0, "a window no marker proved was listed");
+  assertUserTabsUnmarked(app);
+  assert.equal(s._st().activeTabMarker, OURS, "the scan dropped the session's marker");
+});
+
+test("the extension stops answering while the user's window is in front: AppleScript takes over no window", async () => {
+  const app = safari();
+  const s = loadSafari(app);
+  let listed = 0;
+  const extension = async (type) => {
+    if (type === "list_tabs" && listed++ === 0) {
+      app.front = THEIRS; // the user brings their window forward, and the extension goes quiet
+      return [{ index: 1, title: "", safeUrl: "https://mail.example.com/" }, { index: 2, title: "", safeUrl: "https://app.example.org/login" }];
+    }
+    throw new Error(`Timeout waiting for the extension (${type})`);
+  };
+  await assert.rejects(loadServer(s, extension).safari_wait_for_new_tab({ timeout: 3000 }), (err) => {
+    assert.match(err.message, /^Tab safety: this session's tab is not in the Safari window in front/);
+    assert.doesNotMatch(err.message, /A tab opened during the wait/, "the refusal says a tab opened when none did");
+    return true;
+  });
+  assert.equal(app.listings, 0, "AppleScript listed the user's window");
+  assertUserTabsUnmarked(app);
+});
+
+test("a session with a tab of its own but no marker on it claims nothing through AppleScript", async () => {
+  const app = safari();
+  const s = loadSafari(app);
+  s._st().activeTabMarker = null;
+  await assert.rejects(loadServer(s).safari_wait_for_new_tab({ timeout: 3000 }), /Tab safety: AppleScript has no marker to find this session's tab by/);
+  assert.equal(app.scans, 0, "a scan ran for a marker the session does not have");
+  assert.equal(app.listings, 0);
+  assertUserTabsUnmarked(app);
+});
+
+test("a scan that cannot complete claims nothing", async () => {
+  const app = safari();
+  const run = app.run;
+  app.run = async (script) => {
+    if (isMarkerScan(script)) throw new Error("Safari got an error: AppleEvent timed out. (-1712)");
+    return run(script);
+  };
+  const s = loadSafari(app);
+  await assert.rejects(loadServer(s).safari_wait_for_new_tab({ timeout: 3000 }), (err) => {
+    assert.match(err.message, /^Tab safety: Safari did not finish the scan for this session's tab/);
+    assert.doesNotMatch(err.message, /Call it again/);
+    return true;
+  });
+  assert.equal(app.listings, 0);
+  assert.equal(s._st().activeTabMarker, OURS, "a scan that proved nothing dropped the session's marker");
+});
+
+test("a session with no tab of its own yet watches the window in front", async () => {
+  const app = safari();
+  const s = loadSafari(app);
+  Object.assign(s._st(), { hasOwnedTab: false, activeTabMarker: null, activeTabIndex: null });
+  const mine = app.windows[0].tabs;
+  app.afterListing = (n) => { if (n === 1) mine.push(app.tab(POPUP)); };
+  const reply = await loadServer(s).safari_wait_for_new_tab({ timeout: 3000 });
+  assert.match(text(reply), /Found new tab/);
+  assert.equal(app.scans, 0, "a session with no tab of its own has no marker to scan for");
+  assert.equal(mine[2].marker, s._st().activeTabMarker, "the popup does not carry the session's marker");
+});
+
+test("the window the scan proved is the one listed, even when the user's comes to the front right after", async () => {
+  const app = safari();
+  const s = loadSafari(app);
+  const mine = app.windows[0].tabs;
+  app.afterScan = () => { app.front = THEIRS; };
+  app.afterListing = (n) => {
+    if (n === 1) {
+      mine.push(app.tab(POPUP));
+      app.windows[1].tabs.push(app.tab("https://news.example.com/")); // and a tab of theirs opens there
+    }
+  };
+  const reply = await loadServer(s).safari_wait_for_new_tab({ timeout: 3000 });
+  assert.match(text(reply), /Found new tab/);
+  assert.equal(mine[2].marker, s._st().activeTabMarker, "the popup in the session's window does not carry its marker");
+  assertUserTabsUnmarked(app);
+});
+
+test("a wait that saw a tab open and then cannot list any more says the tab opened", async () => {
+  const app = safari();
+  const s = loadSafari(app);
+  const mine = app.windows[0].tabs;
+  let listed = 0;
+  const extension = async (type) => {
+    if (type === "list_tabs" && ++listed <= 2) {
+      const rows = [{ index: 1, title: "", safeUrl: "https://mail.example.com/" }, { index: 2, title: "", safeUrl: "https://app.example.org/login" }];
+      if (listed === 2) {
+        rows.push({ index: 3, title: "", safeUrl: "about:blank" }); // the popup, still loading
+        app.front = THEIRS; // then the user brings their window forward, and the extension goes quiet
+      }
+      return rows;
+    }
+    throw new Error(`Timeout waiting for the extension (${type})`);
+  };
+  mine.push(app.tab("about:blank"));
+  await assert.rejects(loadServer(s, extension).safari_wait_for_new_tab({ timeout: 3000 }), (err) => {
+    assert.match(err.message, /^Tab safety: this session's tab is not in the Safari window in front/);
+    assert.match(err.message, /A tab opened during the wait; if it is still open, another safari_wait_for_new_tab will not report it\.$/);
+    return true;
+  });
+  assert.equal(app.listings, 0, "AppleScript listed the user's window");
+});
+
+test("a scan that fails after the extension saw a tab open says the tab opened, without telling the agent to call again", async () => {
+  const app = safari();
+  const run = app.run;
+  app.run = async (script) => {
+    if (isMarkerScan(script)) throw new Error("Safari got an error: AppleEvent timed out. (-1712)");
+    return run(script);
+  };
+  const s = loadSafari(app);
+  let listed = 0;
+  const extension = async (type) => {
+    if (type === "list_tabs" && ++listed <= 2) {
+      const rows = [{ index: 1, title: "", safeUrl: "https://mail.example.com/" }, { index: 2, title: "", safeUrl: "https://app.example.org/login" }];
+      if (listed === 2) rows.push({ index: 3, title: "", safeUrl: "about:blank" }); // the popup, still loading
+      return rows;
+    }
+    throw new Error(`Timeout waiting for the extension (${type})`);
+  };
+  await assert.rejects(loadServer(s, extension).safari_wait_for_new_tab({ timeout: 3000 }), (err) => {
+    assert.match(err.message, /^Tab safety: Safari did not finish the scan/);
+    assert.match(err.message, /A tab opened during the wait; if it is still open, another safari_wait_for_new_tab will not report it\.$/);
+    assert.doesNotMatch(err.message, /Call it again/);
+    return true;
+  });
+});
+
+test("with Safari not running, a session with a tab of its own is told so", async () => {
+  const app = safari();
+  app.running = false;
+  app.run = async () => { throw new Error("Safari is not running. Open Safari manually before using Safari MCP tools."); };
+  const s = loadSafari(app);
+  await assert.rejects(loadServer(s).safari_wait_for_new_tab({ timeout: 3000 }), /^Error: Safari is not running/);
+});
+
+test("a listing that fails after a tab opened says the tab opened", async () => {
+  const app = safari();
+  const s = loadSafari(app);
+  const mine = app.windows[0].tabs;
+  app.afterListing = (n) => {
+    if (n === 1) mine.push(app.tab("about:blank")); // a popup, still loading
+    if (n === 2) app.windows.shift(); // then the session's window closes
+  };
+  await assert.rejects(loadServer(s).safari_wait_for_new_tab({ timeout: 3000 }), (err) => {
+    assert.match(err.message, /Can.t get window id 11/);
+    assert.match(err.message, /A tab opened during the wait; if it is still open, another safari_wait_for_new_tab will not report it\.$/);
+    return true;
+  });
+});
+
+test("a tab the extension opened and never marked gets the no-marker refusal, with no scan", async () => {
+  const app = safari();
+  const s = loadSafari(app);
+  s.setActiveTabFromExtension(2, "https://app.example.org/login"); // an extension-opened tab: no marker
+  await assert.rejects(loadServer(s).safari_wait_for_new_tab({ timeout: 3000 }), /Tab safety: AppleScript has no marker to find this session's tab by/);
+  assert.equal(app.scans, 0, "a scan ran for a marker the session does not have");
 });
 

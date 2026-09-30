@@ -862,6 +862,36 @@ export async function findTabByMarker(marker) {
   return (await _scanForMarker(marker))?.idx || null;
 }
 
+// The window safari_wait_for_new_tab watches when AppleScript lists it: the one this session's tab
+// is in, proven by its marker in the target window as every step proves it, or null for a session
+// that has no tab of its own yet. The window in front was the user's whenever theirs was in front:
+// the wait missed the popup the session's page opened and claimed a tab the user opened there. So a
+// session whose tab is not proven there is refused, and no scan here drops its marker.
+export async function sessionTabWindow() {
+  const s = _st();
+  if (!s.hasOwnedTab) return null;
+  if (!s.activeTabMarker) {
+    throw new Error(
+      "Tab safety: AppleScript has no marker to find this session's tab by (the Safari extension opened it and has " +
+      "not marked it, or this session lost track of it), so it cannot tell which window to watch for the new tab. " +
+      "Check the extension with safari_doctor, re-anchor with safari_list_tabs and safari_switch_tab, or open a tab with safari_new_tab."
+    );
+  }
+  const found = await _scanForMarker(s.activeTabMarker, s.activeTabIndex);
+  if (found?.idx) return found.win;
+  if (!found) {
+    // The scan answers null for every AppleScript error: name the one no retry gets past.
+    if (!(await isSafariRunning())) throw safariNotRunningError();
+    throw new Error("Tab safety: Safari did not finish the scan for this session's tab (busy, or its window gone), so this wait claimed nothing.");
+  }
+  throw new Error(
+    "Tab safety: this session's tab is not in the Safari window in front, so AppleScript cannot tell which window to " +
+    "watch for the new tab, and watching the one in front could claim a tab of yours. Check the Safari extension with " +
+    "safari_doctor; without it, the window with this session's tab has to be in front (if it is, re-anchor with " +
+    "safari_switch_tab or open a tab with safari_new_tab)."
+  );
+}
+
 // Page JavaScript that is true when the page carries a marker starting with `prefix`, in window.name
 // or, once a page has taken window.name over, in window.__mcpTabMarker. Every marker the session
 // stamps starts with its markerId: MCP_<markerId>_ on a tab it opened, on one it switched to, and on
