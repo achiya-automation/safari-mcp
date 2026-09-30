@@ -2067,12 +2067,20 @@ async function _runExtensionBatchAction(action, args = {}) {
       return _sanitizeTabResult(await extensionOrFallback("list_tabs", {}, () => safari.listTabs()));
 
     case "getReceipt": {
-      const previous = _receiptToken(args.receipt || "") || _getActiveReceipt();
+      // A receipt that is not one (a token cut short, the advice's "<old receipt>" left in) fell
+      // through to the current tab's receipt, and the step rotated that tab instead.
+      if (args.receipt && !_receiptToken(args.receipt)) {
+        throw new Error("Tab safety: getReceipt requires an extension-issued receipt");
+      }
+      const previous = _receiptToken(args.receipt || _getActiveReceipt());
+      // The payload names the receipt aliased below. extensionOrFallback would otherwise attach the
+      // session's receipt as it stands after its own awaits, which a call running alongside can change.
       const value = normalize(await extensionOrFallback(
-        "get_tab_receipt", {
-          ...(_receiptToken(args.receipt || "") ? { receipt: _receiptToken(args.receipt) } : {}),
-        },
-        () => { throw new Error("getReceipt requires the verified Safari extension"); }
+        "get_tab_receipt", previous ? { receipt: previous } : {},
+        () => {
+          throw new Error("getReceipt: the Safari extension did not hand back a new receipt (the server log has its " +
+            "reason; safari_doctor shows whether it is connected). AppleScript touched no tab.");
+        }
       ));
       const safeValue = _sanitizeTabResult(value);
       // The rotated tab is now the current one. Its URL stays unknown in safari.js: a receipt
@@ -2300,6 +2308,12 @@ function _assertTabOwnership(opType, extensionPayload = {}) {
   // presented after a stateless reconnect; only the extension can validate its exact
   // tab binding, freshness, digest, and origin.
   if (_preferAppleScript && _receiptToken(extensionPayload.receipt || _getActiveReceipt())) return;
+  // A rotation that names its receipt touches no page and never falls back to AppleScript, so the
+  // extension alone judges it, as a profile does every receipt. Without a profile, the URL safari.js
+  // holds can be where a redirect took the tab during an AppleScript load, which the session never
+  // registered, or, after safari_navigate, the URL the tab left, which the navigation released: this
+  // check refused the rotation on both.
+  if (opType === "get_tab_receipt" && _receiptToken(extensionPayload.receipt)) return;
   const currentUrl = safari.getActiveTabURL();
   // An adopted tab (#92) is the session's target even though the session opened nothing.
   if (safari.isActiveTabAdopted()) {
@@ -2423,8 +2437,10 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
         // the extension's tab-id proof and could switch to or mutate a user's tab.
         if (String(err?.message || err).includes("Tab safety:")) {
           if (/not valid for this origin/.test(err.message)) {
+            // The receipt goes in "args": the tool's schema drops a key beside "action", and
+            // getReceipt then rotated the session's current tab, or was refused after a reconnect.
             err.message += " Likely cause: the tab moved to another origin after the receipt was minted (redirect/login). " +
-              "Rotate it with safari_run_script [{\"action\":\"getReceipt\",\"receipt\":\"<old receipt>\"}], or reopen with safari_new_tab.";
+              "Rotate it with safari_run_script [{\"action\":\"getReceipt\",\"args\":{\"receipt\":\"<old receipt>\"}}], or reopen with safari_new_tab.";
           }
           throw err;
         }
@@ -3833,7 +3849,7 @@ server.tool(
 
 server.tool(
   "safari_run_script",
-  "Batch Safari actions in one MCP session. Named profiles use the verified extension and support: newTab, switchTab, getReceipt, listTabs, closeTab, navigate, navigateAndRead, readPage, snapshot, getElementInfo, querySelectorAll, waitFor, waitForTime, click, clickAndOpenPopup, fill, fillForm, clearField, typeText, selectOption, pressKey, scroll, scrollTo, scrollToElement, hover, evaluate, reload, goBack, goForward. switchTab accepts an index or an opaque receipt; a valid receipt recovers the exact owned tab across Safari windows without focusing one. clickAndOpenPopup takes exactly one selector or snapshot ref, targets one exact frame, performs one click, captures a blocked HTTP(S) window.open, and opens it as a background tab without focusing Safari; it refuses CAPTCHA/challenge targets and never returns URL query/hash data. Non-profile mode retains the legacy action set; there, closeTab and switchTab take a tab index, not a receipt. Use getReceipt after a cross-origin redirect.",
+  "Batch Safari actions in one MCP session. Named profiles use the verified extension and support: newTab, switchTab, getReceipt, listTabs, closeTab, navigate, navigateAndRead, readPage, snapshot, getElementInfo, querySelectorAll, waitFor, waitForTime, click, clickAndOpenPopup, fill, fillForm, clearField, typeText, selectOption, pressKey, scroll, scrollTo, scrollToElement, hover, evaluate, reload, goBack, goForward. switchTab accepts an index or an opaque receipt; a valid receipt recovers the exact owned tab across Safari windows without focusing one. clickAndOpenPopup takes exactly one selector or snapshot ref, targets one exact frame, performs one click, captures a blocked HTTP(S) window.open, and opens it as a background tab without focusing Safari; it refuses CAPTCHA/challenge targets and never returns URL query/hash data. Non-profile mode retains the legacy action set plus getReceipt; there, closeTab and switchTab take a tab index, not a receipt, and getReceipt needs the tab's receipt in args. After a cross-origin redirect, rotate the tab's receipt with {\"action\":\"getReceipt\",\"args\":{\"receipt\":\"<old receipt>\"}}.",
   {
     steps: z.array(z.object({
       action: z.string().describe("Action name (e.g. 'navigate', 'click', 'fill')"),
@@ -3848,6 +3864,11 @@ server.tool(
     if (!process.env.SAFARI_PROFILE) {
       const mySession = `${SESSION_ID}:${currentSessionId()}`;
       const onStep = (action, stepArgs) => {
+        // getReceipt is guarded in extensionOrFallback, which sees the receipt the step names and leaves
+        // a rotation that names one to the extension. The check below is given no payload, so it would not
+        // see that receipt and would judge the URL safari.js holds: after a redirect during an AppleScript
+        // load, one the session never registered.
+        if (action === "getReceipt") return;
         if (action === "navigate" || action === "navigateAndRead") {
           _assertTabOwnership(`run_script:${action}`);
           _claimURL(stepArgs?.url);
@@ -3910,7 +3931,17 @@ server.tool(
         _untrackClosedTab({ marker });
         return result;
       });
-      return textResult(await safari.runScript({ steps, onStep, actions: { switchTab, newTab, closeTab } }));
+      // Only the extension can rotate a receipt, and the legacy action table had no getReceipt, so
+      // the step the origin refusal advises came back "Unknown action" and the tab stayed stranded.
+      // It has to name its tab here: this batch's AppleScript steps (newTab, switchTab) move to a
+      // tab without touching the session's receipt, which then names a tab the batch has left.
+      const getReceipt = (stepArgs) => {
+        if (!stepArgs?.receipt) {
+          throw new Error("Tab safety: without SAFARI_PROFILE, getReceipt needs the receipt of the tab it rotates, in args.receipt.");
+        }
+        return _runExtensionBatchAction("getReceipt", stepArgs);
+      };
+      return textResult(await safari.runScript({ steps, onStep, actions: { switchTab, newTab, closeTab, getReceipt } }));
     }
 
     // Keep every step in one MCP request/session and route it through
