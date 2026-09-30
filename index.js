@@ -2490,8 +2490,11 @@ server.tool(
     // Without this, a slow/failed navigate left the new URL unowned and locked the
     // switch_tab recovery out — the very recovery the lock error tells you to use.
     _addOwnedURL(url);
+    // Read once, before anything waits: a call alongside that names another tab makes that tab the
+    // session's current one, and the rotation below has to name the tab this call navigated.
+    const usedReceipt = _receiptToken(receipt || _getActiveReceipt());
     let result = await extensionOrFallback(
-      "navigate", { url, ..._explicitReceipt({ receipt }) },
+      "navigate", { url, ..._explicitReceipt({ receipt: usedReceipt }) },
       () => safari.navigate(url)
     );
     // Tab kept its identity, just changed URL — drop the stale old URL from ownership.
@@ -2501,7 +2504,6 @@ server.tool(
     // origin", ~80×/week). The caller chose the destination, so rotating here is safe —
     // hand back the new receipt instead of letting the caller discover the trap.
     const landed = result && typeof result === "object" ? result.url : "";
-    const usedReceipt = _receiptToken(receipt || _getActiveReceipt());
     if (landed && _originOf(landed) !== (_receiptOrigins.get(usedReceipt) || _originOf(oldUrl)) && usedReceipt) {
       try {
         // Named for the alias below, as run_script getReceipt names it (see _receiptAliases).

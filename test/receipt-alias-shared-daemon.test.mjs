@@ -21,6 +21,9 @@
  * then attached the session's receipt as it stood after its own awaits: a call running alongside
  * that named another tab got that tab's receipt re-minted, and the alias sent every holder of the
  * first tab's receipt to the second tab, which none of them ever held a receipt for.
+ * safari_navigate also read the receipt it rotates only once the page had loaded, so a call
+ * alongside during the load got its own tab rotated, and that tab's receipt handed back as the
+ * navigated tab's.
  *
  * Each rotation added one link to the alias chain, and _receiptToken follows at most eight: after
  * a handful of cross-origin navigations in one tab, the receipt the tab was opened with stopped
@@ -171,6 +174,7 @@ function makeExtension() {
         live(target.id).url = payload.url;
         setSessionTab(sessionId, target.id, payload.url);
         ran.push({ type, tabId: target.id, url: payload.url });
+        await hooks.loading; // the page is still loading until the test says otherwise
         hooks.afterNavigate?.();
         return { title: "", url: payload.url };
       case "click":
@@ -489,3 +493,30 @@ test("in a named profile, safari_navigate's rotation aliases the receipt of the 
   assert.deepEqual(extension.receiptsOf(shop.id).map((r) => r.token), [landed.receipt], "navigate handed back another tab's receipt");
   assert.deepEqual(extension.receiptsOf(docs.id).map((r) => r.token), [docsReceipt], "the docs tab's receipt was re-minted");
 });
+
+for (const mode of MODES) {
+  test(`${mode.name}: safari_navigate rotates and hands back the receipt of the tab it navigated, whatever a call alongside names while the page loads`, async () => {
+    const { server, extension } = setup(mode);
+    const { receipt: docsReceipt } = json(await server.safari_new_tab({ url: DOCS }));
+    const docs = extension.tabs.at(-1);
+    const { shop } = await sharedTab(server, extension); // the agent's current tab
+
+    let loaded;
+    extension.hooks.loading = new Promise((resolve) => { loaded = resolve; });
+    const navigation = server.safari_navigate({ url: LOGIN });
+    await settle();
+    // While the page loads, a call alongside works in the docs tab, which makes it the current one.
+    const read = await outcome(() => server.safari_click({ selector: "#read", receipt: docsReceipt }));
+    extension.hooks.loading = null;
+    loaded();
+    const landed = json(await navigation);
+
+    sid = "subagent";
+    const continued = await outcome(() => server.safari_click({ selector: "#continue" }));
+    assert.deepEqual(extension.ran.at(-1), { type: "click", tabId: shop.id, url: LOGIN },
+      `the subagent's call did not reach the tab it held a receipt for: ${continued}`);
+    assert.deepEqual(extension.receiptsOf(shop.id).map((r) => r.token), [landed.receipt], "navigate handed back another tab's receipt");
+    assert.deepEqual(extension.receiptsOf(docs.id).map((r) => r.token), [docsReceipt], "the docs tab's receipt was re-minted");
+    assert.equal(read, CLICKED);
+  });
+}
