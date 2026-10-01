@@ -44,7 +44,7 @@ import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import vm from "node:vm";
-import { answerCloseByMarker, answerMarkerScan, isCloseByMarker, isMarkerScan } from "./fake-safari-scripts.mjs";
+import { answerCloseByMarker, answerMarkerScan, answerTabScript, isCloseByMarker, isMarkerScan, isTabScript } from "./fake-safari-scripts.mjs";
 
 // ownership-state.js persists to ~/.safari-mcp — point HOME at a throwaway dir first.
 const tmpHome = mkdtempSync(join(tmpdir(), "smcp-proof-"));
@@ -80,26 +80,41 @@ const RECEIPT_B = "ReceiptB_" + "b".repeat(24);
 // Tab i is tabs[i - 1]; closing one renumbers every tab after it, as Safari does. `marker` is
 // the tab's window.name. A script for one tab runs its page JavaScript for real, against that
 // tab's window, whose page has always finished loading; the marker scans, which loop over every
-// tab in AppleScript, are answered here. `scripts` keeps every AppleScript it was handed,
+// tab in AppleScript, and the scripts a load step runs in the tab it proved (whose selected tab is
+// the first), are answered here. `scripts` keeps every AppleScript it was handed,
 // `afterScript` runs once after the next one, and with `failReads` the page throws when a script
 // reads its title, as a page mid-crash can.
 function safariWindow(tabs) {
   const w = { tabs, scripts: [], failReads: false, afterScript: null };
   const url = (i) => tabs[i - 1]?.url || "";
   const site = (u) => { try { return new URL(u).hostname.split(".").slice(-2).join("."); } catch { return u; } };
+  const runIn = (tab, js) => {
+    const win = { name: tab.marker || "", __mcpTabMarker: tab.pageMarker };
+    const document = w.failReads
+      ? { get title() { throw new Error("the page broke"); } }
+      : { title: "", readyState: "complete", addEventListener() {} };
+    try {
+      const performance = { timeOrigin: tab.born ?? 0 };
+      return String(vm.runInNewContext(js, { window: win, document, location: { href: tab.url }, performance }) ?? "");
+    } finally {
+      tab.marker = win.name || null;
+      tab.pageMarker = win.__mcpTabMarker;
+    }
+  };
+  // A new page: __mcpTabMarker goes with the old one, and window.name too across sites (Safari
+  // clears it), until navigate() stamps the marker again.
+  const loadInto = (tab, next) => {
+    if (site(tab.url) !== site(next)) tab.marker = null;
+    tab.pageMarker = undefined;
+    tab.url = next;
+    tab.born = Date.now(); // the new document's performance.timeOrigin
+  };
   const answer = (script) => {
     const page = script.match(/^tell application "Safari" to do JavaScript "([\s\S]*)" in tab (\d+) of (?:front window|window id 1)$/);
     if (page) {
       const tab = tabs[Number(page[2]) - 1];
       if (!tab) throw new Error(`Safari got an error: Can't get tab ${page[2]} of window 1.`);
-      const win = { name: tab.marker || "", __mcpTabMarker: tab.pageMarker };
-      const document = w.failReads ? { get title() { throw new Error("the page broke"); } } : { title: "", readyState: "complete" };
-      try {
-        return String(vm.runInNewContext(page[1].replace(/\\"/g, '"'), { window: win, document, location: { href: tab.url } }) ?? "");
-      } finally {
-        tab.marker = win.name || null;
-        tab.pageMarker = win.__mcpTabMarker;
-      }
+      return runIn(tab, page[1].replace(/\\"/g, '"'));
     }
     // The marker scan and the one-script close, run as Safari runs them over the one window
     // (`window id 1`): their marker check reads each tab's page.
@@ -110,6 +125,11 @@ function safariWindow(tabs) {
       });
     }
     if (isMarkerScan(script)) return answerMarkerScan(script, { windowId: 1, tabs, pageOf });
+    if (isTabScript(script)) {
+      return answerTabScript(script, {
+        windowId: 1, tabs, pageOf, run: runIn, setURL: loadInto, urlOf: (t) => t.url, visibleOf: (t) => t === tabs[0],
+      });
+    }
     const prefix = script.match(/starts with "([^"]*)"/);
     if (prefix) {
       // resolveActiveTab's URL strategy: the cached index, a URL prefix right to left, then the
@@ -122,14 +142,7 @@ function safariWindow(tabs) {
       return `0:${tabs.length}`;
     }
     const load = script.match(/^tell application "Safari" to set URL of tab (\d+) of (?:front window|window id 1) to "([^"]*)"$/);
-    if (load) {
-      // A new page: __mcpTabMarker goes with the old one, and window.name too across sites (Safari
-      // clears it), until navigate() stamps the marker again.
-      const tab = tabs[Number(load[1]) - 1];
-      if (site(tab.url) !== site(load[2])) tab.marker = null;
-      tab.pageMarker = undefined;
-      return void (tab.url = load[2]);
-    }
+    if (load) return void loadInto(tabs[Number(load[1]) - 1], load[2]);
     const close = script.match(/close tab (\d+) of/);
     if (close) return void tabs.splice(Number(close[1]) - 1, 1);
     if (/count of tabs/.test(script)) return String(tabs.length);
@@ -644,7 +657,7 @@ test("one session's adoption leaves another session's tab on the same URL closab
   });
 });
 
-// A switch stamps a fresh marker. On a tab adopted from the user it has to stay an adoption marker,
+// A switch stamps a fresh marker on a tab adopted from the user, and it has to stay an adoption marker,
 // or switching away and back would turn the tab into one of the session's own, which closes. The
 // user's tab shows the session's URL here, so no URL check refuses the close either.
 for (const path of SWITCH_BY_INDEX) {
@@ -666,18 +679,26 @@ test("safari_wait_for_new_tab does not take a tab adopted from the user for one 
     const s = session();
     s.window.tabs[0].user = true;
     await s.server.safari_switch_tab({ index: 1 });
-    // While it waits, the adopted tab moves on to another page and a tab opens after it, so the
-    // adopted tab is the first one the list has not seen at its index.
+    // While it waits, the adopted tab moves on to another page and a new tab opens right after it
+    // on the page the adopted tab left. Tabs are told apart by URL alone, so the new one stands in
+    // for the adopted tab and the adopted tab looks new: the one case that still reaches adopt()'s
+    // guard for an adopted tab. If tab identity improves and this stops claiming it, rewrite the
+    // test on purpose rather than let it pass on a TIMEOUT.
     setTimeout(() => {
       s.window.tabs[0].url = "https://mail.example.com/sent";
-      s.window.tabs.push({ url: "https://sso.example.net/authorize", marker: null });
+      s.window.tabs.splice(1, 0, { url: USER_URL, marker: null });
     }, 50);
-    await s.server.safari_wait_for_new_tab({ timeout: 3000 });
+    const reply = await s.server.safari_wait_for_new_tab({ timeout: 3000 });
+    assert.match(reply.content[0].text, /Found new tab/);
     assert.equal(s.window.tabs[0].marker, s.safari._st().activeTabMarker, "the wait did not land on the adopted tab");
+    assert.equal(s.safari.isActiveTabAdopted(), true, "the claim turned the adopted tab into one the session opened");
     assert.ok(
       ![...own._openedTabs.values()].some((t) => t.url === "https://mail.example.com/sent"),
       "the adopted tab was recorded among the tabs the session opened, which the tab cap and shutdown close"
     );
+    const onUserPage = (u) => u.startsWith("https://mail.example.com");
+    assert.ok(![...own._ownedTabURLs].some(onUserPage), "the adopted URL is owned by every session of the process");
+    assert.ok(!own._loadOwnershipFile().some((e) => onUserPage(e.url)), "the adopted URL reached owned-tabs.json");
     assert.match(await outcome(() => s.server.safari_close_tab({})), REFUSED);
     assert.ok(userTabOpen(s.window), "the adopted user tab was closed");
   });

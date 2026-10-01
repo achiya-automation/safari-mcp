@@ -14,9 +14,12 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { findOwnedMatch, pruneExpired, hasDurableReceipt } from "./ownership-match.js";
 
-// MCP opens tabs, but a restart re-triggers "Tab safety: no tabs opened yet" errors forcing
-// a re-open of every tab. Persist the set to a JSON file with a TTL so tabs remain "owned"
-// across process restarts for up to OWNERSHIP_TTL_MS.
+// A restart empties the in-memory sets. Persist the owned URLs to a JSON file with a TTL so, for
+// up to OWNERSHIP_TTL_MS, the page of a tab an MCP session opened stays recognizable: a session
+// that re-anchors to that tab after a restart (by its receipt) still passes the current-tab URL
+// check instead of having to reopen it. The file is shared by every process on the machine, so it
+// says which pages some session opened, never that the caller has a tab — index.js asks that of
+// the session's own state (_assertTabOwnership).
 export const OWNERSHIP_DIR = join(homedir(), ".safari-mcp");
 export const OWNERSHIP_FILE = join(OWNERSHIP_DIR, "owned-tabs.json");
 export const OWNERSHIP_TTL_MS = 30 * 60 * 1000; // 30 minutes — plain URLs (can collide with a user tab)
@@ -77,14 +80,15 @@ export function _saveOwnershipFile(urls, removed = []) {
   }
 }
 
-// Track tabs opened by THIS session (index → {url, openedAt})
+// Tabs opened by the MCP sessions of this process, each recorded with its sessionId (see
+// _trackTab); _sessionTabs() gives one session's.
 export const _openedTabs = new Map();
 
 // ========== TAB OWNERSHIP: prevent operating on user's tabs ==========
-// Tracks URLs of tabs opened by this MCP session.
-// Any tool that modifies a tab (navigate, click, fill, etc.) is blocked
-// unless the current tab was opened via safari_new_tab.
-// Hydrated from ~/.safari-mcp/owned-tabs.json so ownership survives MCP restarts.
+// URLs of tabs opened by the MCP sessions of this process, plus every process's from
+// ~/.safari-mcp/owned-tabs.json, so ownership survives MCP restarts. A tool that modifies a
+// tab (navigate, click, fill, etc.) is refused unless the session's current tab is on one.
+// Being everyone's, the set cannot say whether the caller has a tab at all.
 export const _ownedTabURLs = new Set();
 // Preserve each entry's ORIGINAL timestamp so _saveOwnershipFile doesn't reset it to `now` on
 // every write — otherwise the 30-min TTL never expires anything while a session is active, and
@@ -135,8 +139,8 @@ export function _isExactURLOwned(url) {
 
 // Sentinel persisted when a blank tab (about:blank) is opened by this session.
 // A blank tab has no unique URL to own, but ownership must still survive an MCP
-// process restart (_openedTabs is in-memory only) — otherwise reopening blank
-// tabs falsely trips the "no tabs opened yet" guard. The sentinel is never a
+// process restart (_openedTabs is in-memory only) — otherwise safari_switch_tab's
+// URL check refuses a blank tab that _openedTabs has no entry for. The sentinel is never a
 // real tab URL, so it cannot falsely match a user's page in _isURLOwned().
 export const BLANK_TAB_SENTINEL = "__mcp-blank-tab__";
 
@@ -193,7 +197,12 @@ export function _trackTab(tabIndex, url, sessionId = "", marker = "", receipt = 
   // stamped on a tab AppleScript opened. Every path that later CLOSES this tab resolves it
   // through that identity (#112), and the entry is keyed by it too: keyed by index, a new
   // tab that landed on a shifted position overwrote a live tab's entry.
-  _openedTabs.set(receipt || marker || tabIndex, {
+  // A tab recorded again under its identity keeps one record, and the old one goes first, with the
+  // URL it claimed: safari_wait_for_new_tab can take one of the session's tabs that navigated for the
+  // new one, and a switch keeps that tab's marker, so no close would release the URL it had left.
+  const key = receipt || marker || tabIndex;
+  if (_openedTabs.has(key)) _untrackTab(key);
+  _openedTabs.set(key, {
     index: tabIndex, url: url || "", openedAt: Date.now(), sessionId,
     marker: marker || "", receipt: receipt || "",
   });
@@ -215,8 +224,18 @@ export function _trackedAtIndex(index) {
   return hit;
 }
 
+// What a tab's claim covers: the URL it was opened on and, when that URL has no scheme, its
+// https:// form, which index.js claims along with it (_claimURL) because that is what loads.
+function _claimedForms(url) {
+  if (!url) return [];
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(url) ? [url] : [url, "https://" + url];
+}
+
 export function _untrackTab(tabIndex) {
   const info = _openedTabs.get(tabIndex);
-  if (info?.url) _removeOwnedURL(info.url);
   _openedTabs.delete(tabIndex);
+  // Release the tab's claim, except what another tracked tab still claims: a close released the URL
+  // two tabs shared, and the next write in the other one, this session's or another's, was refused.
+  const kept = new Set([..._openedTabs.values()].flatMap((other) => _claimedForms(other.url)));
+  for (const url of _claimedForms(info?.url)) if (!kept.has(url)) _removeOwnedURL(url);
 }
