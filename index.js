@@ -1861,10 +1861,16 @@ function _safeUrlForOutput(rawUrl) {
 // Receipts this daemon rotated on the caller's behalf (a cross-origin safari_navigate) stay
 // usable under their old name: callers routinely keep the first receipt they saw and ignore
 // the fresh one in the navigate result (nine consecutive "not valid for this origin" failures
-// in one session on 4.9.26). Whoever held the old capability held the tab.
+// in one session on 4.9.26). Whoever held the old capability held the tab. Every session that
+// held it follows the alias, other clients of an HTTP daemon included (_getActiveReceipt), so an
+// alias may only join two receipts of one tab: each rotation names the receipt it replaces.
 const _receiptAliases = new Map(); // old token → newer token
 function _aliasReceipt(oldToken, newToken) {
   if (!oldToken || !newToken || oldToken === newToken) return;
+  // Every older name of the tab points straight at its newest receipt. As a chain of one link per
+  // rotation, a receipt stopped resolving after eight (_receiptToken's hop limit): a handful of
+  // cross-origin navigations in one tab.
+  for (const [older, newer] of _receiptAliases) if (newer === oldToken) _receiptAliases.set(older, newToken);
   _receiptAliases.set(oldToken, newToken);
   if (_receiptAliases.size > 500) _receiptAliases.delete(_receiptAliases.keys().next().value);
 }
@@ -1920,8 +1926,10 @@ const _activeReceipts = new Map();
 function _receiptSessionKey() {
   return `${SESSION_ID}:${currentSessionId()}`;
 }
+// Resolved on every read: another client of an HTTP daemon can rotate this session's receipt
+// after it was stored, and the extension then knows only the new one.
 function _getActiveReceipt() {
-  return _activeReceipts.get(_receiptSessionKey()) || "";
+  return _receiptToken(_activeReceipts.get(_receiptSessionKey()));
 }
 function _setActiveReceipt(receipt) {
   _activeReceipts.set(_receiptSessionKey(), _receiptToken(receipt));
@@ -2089,7 +2097,7 @@ async function _runExtensionBatchAction(action, args = {}) {
       if (safeValue?.receipt) {
         // Rotation retires the old token. Keep it resolving to the new one, as navigate does,
         // so the tab stays reachable — and closable by the tab cap — by the name it was opened with.
-        _aliasReceipt(previous, safeValue.receipt);
+        _aliasReceipt(_receiptToken(previous), safeValue.receipt); // the receipt extensionOrFallback sent
         _setActiveReceipt(safeValue.receipt);
       }
       return safeValue;
@@ -2388,9 +2396,13 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
         const reloadHandoff = extensionType === "reload_extension" && _isExtensionHost
           ? _prepareReloadHttpWorkerHandoff()
           : null;
+        const namedReceipt = _receiptToken(extensionPayload.receipt);
         const payload = {
           ...(attachActiveReceipt && activeReceipt ? { receipt: activeReceipt } : {}),
           ...extensionPayload,
+          // A receipt named when the call started follows a rotation of its tab made while the call
+          // waited above (by another client of an HTTP daemon): an alias joins receipts of one tab.
+          ...(namedReceipt ? { receipt: namedReceipt } : {}),
           ...(reloadHandoff ? { reloadHandoff: reloadHandoff.token } : {}),
           sessionId: `${SESSION_ID}:${currentSessionId()}`,
         };
@@ -2554,8 +2566,11 @@ server.tool(
     }
     const oldUrl = safari.getActiveTabURL();
     // extensionOrFallback claims the destination for this session once its guard passes.
+    // Read once, before anything waits: a call alongside that names another tab makes that tab the
+    // session's current one, and the rotation below has to name the tab this call navigated.
+    const usedReceipt = _receiptToken(receipt || _getActiveReceipt());
     let result = await extensionOrFallback(
-      "navigate", { url, ..._explicitReceipt({ receipt }) },
+      "navigate", { url, ..._explicitReceipt({ receipt: usedReceipt }) },
       () => safari.navigate(url)
     );
     // Tab kept its identity, just changed URL — drop the stale old URL from ownership.
@@ -2565,14 +2580,15 @@ server.tool(
     // origin", ~80×/week). The caller chose the destination, so rotating here is safe —
     // hand back the new receipt instead of letting the caller discover the trap.
     const landed = result && typeof result === "object" ? result.url : "";
-    const usedReceipt = _receiptToken(receipt || _getActiveReceipt());
-    if (landed && _originOf(landed) !== (_receiptOrigins.get(usedReceipt) || _originOf(oldUrl)) && usedReceipt) {
+    // The origin of the receipt the navigation carried: extensionOrFallback sends the newest one.
+    if (landed && _originOf(landed) !== (_receiptOrigins.get(_receiptToken(usedReceipt)) || _originOf(oldUrl)) && usedReceipt) {
       try {
+        // Named for the alias below, as run_script getReceipt names it (see _receiptAliases).
         const fresh = _sanitizeTabResult(await extensionOrFallback(
-          "get_tab_receipt", { ..._explicitReceipt({ receipt }) }, () => null
+          "get_tab_receipt", { ..._explicitReceipt({ receipt: usedReceipt }) }, () => null
         ));
         if (fresh?.receipt) {
-          _aliasReceipt(usedReceipt, fresh.receipt);
+          _aliasReceipt(_receiptToken(usedReceipt), fresh.receipt); // the receipt extensionOrFallback sent
           _setActiveReceipt(fresh.receipt);
           result = { ...result, receipt: fresh.receipt };
         }

@@ -32,7 +32,7 @@ test("a receipt rotated by navigate keeps working under its old name", () => {
   assert.equal(_receiptToken(a), c);
   assert.equal(_receiptToken(c), c);
   assert.equal(_receiptToken("short"), "");
-  assert.match(index, /_aliasReceipt\(usedReceipt, fresh\.receipt\);/);
+  assert.match(index, /_aliasReceipt\(_receiptToken\(usedReceipt\), fresh\.receipt\);/);
 });
 
 test("evicting a session's oldest tab is reported in the new_tab result", () => {
