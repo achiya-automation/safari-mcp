@@ -90,9 +90,10 @@ test("every prose mention of the tool count agrees with the code", () => {
     "README states a tool count that index.js does not register"
   );
 
-  // The share link ships the count too, URL-encoded, and it is the copy that travels.
-  const shared = readme.match(/browse\.%20(\d+)%20tools/);
-  assert.ok(shared && Number(shared[1]) === TOOL_COUNT, "the share-link text states a stale tool count");
+  // A share link ships the count URL-encoded, and it is the copy that travels. The README
+  // need not carry one, but any count it encodes must be the code's.
+  const encoded = [...readme.matchAll(/(\d+)%20tools/g)].map((m) => Number(m[1]));
+  assert.deepEqual(encoded.filter((n) => n !== TOOL_COUNT), [], "a URL-encoded tool count in the README is stale");
 
   const alt = readme.match(/alt="Safari MCP Server — (\d+) native browser automation tools/);
   assert.ok(alt && Number(alt[1]) === TOOL_COUNT, "the social-preview alt text states a stale tool count");
