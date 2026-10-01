@@ -993,18 +993,6 @@ Other macOS MCP servers that complement Safari MCP:
 
 ---
 
-## Like it? Give it a ⭐
-
-If Safari MCP saves you from Chrome overhead, **a star helps others discover it:**
-
-[![Star this repo](https://img.shields.io/github/stars/achiya-automation/safari-mcp?style=social)](https://github.com/achiya-automation/safari-mcp)
-
-[Share on Twitter/X](https://twitter.com/intent/tweet?text=Safari%20MCP%20%E2%80%94%20Stop%20running%20Chrome%20just%20so%20your%20AI%20agent%20can%20browse.%2098%20tools%2C%20native%20Safari%2C%2060%25%20less%20CPU.&url=https%3A%2F%2Fgithub.com%2Fachiya-automation%2Fsafari-mcp) · [Share on LinkedIn](https://www.linkedin.com/sharing/share-offsite/?url=https%3A%2F%2Fgithub.com%2Fachiya-automation%2Fsafari-mcp) · [Write about it](https://dev.to/)
-
-[![Star History Chart](https://api.star-history.com/svg?repos=achiya-automation/safari-mcp&type=Date)](https://star-history.com/#achiya-automation/safari-mcp&Date)
-
----
-
 ## Listed On
 
 [![Glama](https://glama.ai/mcp/servers/achiya-automation/safari-mcp/badges/score.svg)](https://glama.ai/mcp/servers/achiya-automation/safari-mcp) [![MCP Registry](https://img.shields.io/badge/MCP-Registry-purple)](https://registry.modelcontextprotocol.io/) [![MCP Scoreboard](https://mcpscoreboard.com/badge/05977769-8762-4e89-aff3-a0c5776843bb.svg)](https://mcpscoreboard.com/server/05977769-8762-4e89-aff3-a0c5776843bb/) [![CI](https://github.com/achiya-automation/safari-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/achiya-automation/safari-mcp/actions/workflows/ci.yml)
