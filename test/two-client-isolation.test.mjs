@@ -29,7 +29,9 @@ import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import vm from "node:vm";
-import { answerCloseByMarker, answerMarkerScan, isCloseByMarker, isMarkerScan } from "./fake-safari-scripts.mjs";
+import {
+  answerCloseByMarker, answerCreationScript, answerMarkerScan, answerTabScript, isCloseByMarker, isMarkerScan, isTabScript,
+} from "./fake-safari-scripts.mjs";
 
 // ownership-state.js persists to ~/.safari-mcp — point HOME at a throwaway dir first.
 const tmpHome = mkdtempSync(join(tmpdir(), "smcp-isolation-"));
@@ -73,22 +75,45 @@ function safariWindow(tabs, front = 1, redirects = {}) {
   const url = (i) => tabs[i - 1]?.url || "";
   const site = (u) => { try { return new URL(u).hostname.split(".").slice(-2).join("."); } catch { return u; } };
   const tabOf = (target) => Number(/^tab (\d+) of (?:front window|window id 1)$/.exec(target)?.[1]) || front;
+  // Page JavaScript in `tab`, recorded in `ran` unless `keep(value)` says the page refused it.
+  const runIn = (tab, js, keep = () => true) => {
+    const entry = { tab: tabs.indexOf(tab) + 1, js };
+    w.ran.push(entry);
+    const win = { name: tab.marker || "", __mcpTabMarker: tab.pageMarker };
+    const document = { title: "", readyState: "complete", body: { innerText: `text of ${tab.url}` }, addEventListener() {} };
+    let value;
+    try {
+      const performance = { timeOrigin: tab.born ?? 0 };
+      value = String(vm.runInNewContext(js, { window: win, document, location: { href: tab.url }, performance }) ?? "");
+      return value;
+    } finally {
+      tab.marker = win.name || null;
+      tab.pageMarker = win.__mcpTabMarker;
+      if (value !== undefined && !keep(value)) w.ran.splice(w.ran.indexOf(entry), 1);
+    }
+  };
+  // A new page: __mcpTabMarker goes with the old one, and window.name too across sites.
+  const loadInto = (tab, next) => {
+    if (site(tab.url) !== site(next)) tab.marker = null;
+    tab.pageMarker = undefined;
+    w.ran.push({ tab: tabs.indexOf(tab) + 1, navigate: next });
+    tab.url = next;
+    tab.born = Date.now(); // the new document's performance.timeOrigin
+  };
   const answer = (script) => {
     const page = script.match(/^tell application "Safari" to do JavaScript "([\s\S]*)" in (tab \d+ of (?:front window|window id 1)|front document)$/);
     if (page) {
       const i = tabOf(page[2]);
       const tab = tabs[i - 1];
       if (!tab) throw new Error(`Safari got an error: Can't get tab ${i} of window 1.`);
-      const js = page[1].replace(/\\(["\\])/g, "$1");
-      w.ran.push({ tab: i, js });
-      const win = { name: tab.marker || "", __mcpTabMarker: tab.pageMarker };
-      const document = { title: "", readyState: "complete", body: { innerText: `text of ${tab.url}` } };
-      try {
-        return String(vm.runInNewContext(js, { window: win, document, location: { href: tab.url } }) ?? "");
-      } finally {
-        tab.marker = win.name || null;
-        tab.pageMarker = win.__mcpTabMarker;
-      }
+      return runIn(tab, page[1].replace(/\\(["\\])/g, "$1"));
+    }
+    // A load step's script in the tab it proved (safari.js _inTab), whose selected tab is `front`.
+    if (isTabScript(script)) {
+      return answerTabScript(script, {
+        windowId: 1, tabs, pageOf, run: (tab, js) => runIn(tab, js, (v) => v.startsWith("MCP_OK:")), setURL: loadInto,
+        urlOf: (t) => t.url, visibleOf: (t) => tabs.indexOf(t) + 1 === front,
+      });
     }
     // A marker scan, answered as Safari runs it (fake-safari-scripts.mjs), in `window id 1`.
     if (isMarkerScan(script)) return answerMarkerScan(script, { windowId: 1, tabs, pageOf });
@@ -104,20 +129,17 @@ function safariWindow(tabs, front = 1, redirects = {}) {
       return `0:${tabs.length}`;
     }
     const load = script.match(/^tell application "Safari" to set URL of (tab \d+ of (?:front window|window id 1)|front document) to "([^"]*)"$/);
-    if (load) {
-      // A new page: __mcpTabMarker goes with the old one, and window.name too across sites.
-      const i = tabOf(load[1]);
-      const tab = tabs[i - 1];
-      if (site(tab.url) !== site(load[2])) tab.marker = null;
-      tab.pageMarker = undefined;
-      w.ran.push({ tab: i, navigate: load[2] });
-      return void (tab.url = load[2]);
-    }
+    if (load) return void loadInto(tabs[tabOf(load[1]) - 1], load[2]);
     if (/make new tab/.test(script)) {
-      // newTab() opens a background tab: the user's tab stays in front.
+      // newTab() opens a background tab: the user's tab stays in front. The script that makes it
+      // reports where it is and stamps it (fake-safari-scripts.mjs).
       const url = script.match(/URL:"([^"]*)"/)?.[1] || "about:blank";
-      tabs.push({ url: redirects[url] || url, marker: null });
-      return /index of t/.test(script) ? `1:${tabs.length}` : "";
+      const tab = { url: redirects[url] || url, marker: null, born: Date.now() };
+      tabs.push(tab);
+      return answerCreationScript(script, {
+        windowId: 1, tabs, tab, run: (t, js) => runIn(t, js),
+        urlOf: (t) => t.url, visibleOf: (t) => tabs.indexOf(t) + 1 === front,
+      });
     }
     const close = script.match(/close tab (\d+) of/);
     if (close) return void tabs.splice(Number(close[1]) - 1, 1);
