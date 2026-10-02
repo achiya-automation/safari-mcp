@@ -186,6 +186,12 @@ function makeExtension() {
         await hooks.loading; // the page is still loading until the test says otherwise
         hooks.afterNavigate?.();
         return { title: "", url: payload.url };
+      case "navigate_and_read":
+        live(target.id).url = payload.url;
+        setSessionTab(sessionId, target.id, payload.url);
+        ran.push({ type, tabId: target.id, url: payload.url });
+        // The real handler answers with the page as a JSON string.
+        return JSON.stringify({ title: "", url: payload.url, text: "page" });
       case "click":
         ran.push({ type, tabId: target.id, url: live(target.id).url });
         return "Clicked";
@@ -274,7 +280,7 @@ function toolHandler(name) {
   return index.slice(from, index.indexOf("\n);\n", from));
 }
 
-const TOOLS = ["safari_new_tab", "safari_click", "safari_navigate", "safari_close_tab", "safari_run_script"];
+const TOOLS = ["safari_new_tab", "safari_click", "safari_navigate", "safari_navigate_and_read", "safari_close_tab", "safari_run_script"];
 const MODES = [
   { name: "without SAFARI_PROFILE", profile: "" },
   { name: "in a named profile", profile: "Work" },
@@ -343,9 +349,11 @@ async function sharedTabAgentLeft(server, extension) {
 
 // ---------- 1. the other client's calls that name no receipt ----------
 
-// The two ways a client rotates a tab's receipt: safari_navigate to another origin, and the
-// getReceipt step the origin refusal advises once the page itself has taken the tab there.
-// Without SAFARI_PROFILE, run_script has no getReceipt step.
+// The ways a client rotates a tab's receipt: every navigation it asks for to another origin, and
+// the getReceipt step the origin refusal advises once the page itself has taken the tab there.
+// safari_navigate_and_read and run_script's navigate steps used to hand back no receipt, and the
+// tab's next call was refused ("not valid for this origin"). Without SAFARI_PROFILE, run_script
+// runs safari.js's AppleScript actions, which leave receipts alone.
 const ROTATIONS = [
   {
     name: "safari_navigate to another origin",
@@ -354,6 +362,26 @@ const ROTATIONS = [
       return json(await server.safari_navigate({ url, receipt })).receipt;
     },
   },
+  {
+    name: "safari_navigate_and_read to another origin",
+    modes: MODES,
+    async rotate(server, extension, tab, receipt, url) {
+      const page = json(await server.safari_navigate_and_read({ url, receipt }));
+      assert.equal(page.text, "page", "the page went missing from the result");
+      return page.receipt;
+    },
+  },
+  ...["navigate", "navigateAndRead"].map((action) => ({
+    name: `a run_script ${action} step to another origin`,
+    modes: [MODES[1]],
+    async rotate(server, extension, tab, receipt, url) {
+      // The step navigates the session's current tab: the one this receipt names.
+      await server.safari_click({ selector: "#here", receipt });
+      const [{ result, error }] = json(await server.safari_run_script({ steps: [{ action, args: { url } }] }));
+      assert.equal(error, undefined, `${action} failed: ${error}`);
+      return result.receipt;
+    },
+  })),
   {
     name: "run_script getReceipt",
     modes: [MODES[1]],

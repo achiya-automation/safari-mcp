@@ -1983,6 +1983,39 @@ function _sanitizeTabResult(value) {
   };
 }
 
+// A receipt is bound to the origin it was minted on, so a cross-origin navigation the
+// caller itself asked for used to strand every following call ("not valid for this
+// origin", ~80×/week). The caller chose the destination, so rotating here is safe —
+// hand back the new receipt instead of letting the caller discover the trap. Every
+// navigation a caller asks for goes through here: safari_navigate, safari_navigate_and_read
+// and run_script's navigate and navigateAndRead steps. `usedReceipt` is the receipt the
+// navigation carried, read before it waited: a call alongside that names another tab makes
+// that tab the session's current one, and the rotation has to name the tab that navigated.
+// navigate_and_read answers with its page as a JSON string; a rotated result is an object.
+async function _rotateReceiptAfterNavigate(result, usedReceipt, oldUrl) {
+  let page = result;
+  if (typeof page === "string") {
+    try { page = JSON.parse(page); } catch { return result; }
+  }
+  const landed = page && typeof page === "object" ? page.url : "";
+  // The origin of the receipt the navigation carried: extensionOrFallback sends the newest one.
+  if (!landed || !usedReceipt || _originOf(landed) === (_receiptOrigins.get(_receiptToken(usedReceipt)) || _originOf(oldUrl))) {
+    return result;
+  }
+  try {
+    // Named for the alias below, as run_script getReceipt names it (see _receiptAliases).
+    const fresh = _sanitizeTabResult(await extensionOrFallback(
+      "get_tab_receipt", { ..._explicitReceipt({ receipt: usedReceipt }) }, () => null
+    ));
+    if (fresh?.receipt) {
+      _aliasReceipt(_receiptToken(usedReceipt), fresh.receipt); // the receipt extensionOrFallback sent
+      _setActiveReceipt(fresh.receipt);
+      return { ...page, receipt: fresh.receipt };
+    }
+  } catch { /* the navigation itself succeeded — a failed rotation must not fail the tool */ }
+  return result;
+}
+
 function _isBatchSemanticFailure(result) {
   if (Array.isArray(result)) return result.some(_isBatchSemanticFailure);
   if (result && typeof result === "object") return result.ok === false;
@@ -2137,22 +2170,26 @@ async function _runExtensionBatchAction(action, args = {}) {
     case "navigate": {
       const url = String(args.url || "");
       if (!url) throw new Error("navigate requires url");
+      const oldUrl = safari.getActiveTabURL();
+      const usedReceipt = _getActiveReceipt();
       const raw = await extensionOrFallback(
-        "navigate", { url, timeout: args.timeout },
+        "navigate", { url, timeout: args.timeout, ..._explicitReceipt({ receipt: usedReceipt }) },
         () => safari.navigate(url)
       );
-      return syncResultUrl(raw, url);
+      return _rotateReceiptAfterNavigate(syncResultUrl(raw, url), usedReceipt, oldUrl);
     }
 
     case "navigateAndRead": {
       const url = String(args.url || "");
       if (!url) throw new Error("navigateAndRead requires url");
+      const oldUrl = safari.getActiveTabURL();
+      const usedReceipt = _getActiveReceipt();
       const raw = await extensionOrFallback(
-        "navigate_and_read", { url, maxLength: args.maxLength, timeout: args.timeout },
+        "navigate_and_read", { url, maxLength: args.maxLength, timeout: args.timeout, ..._explicitReceipt({ receipt: usedReceipt }) },
         async () => { await safari.navigate(url); return safari.readPage({ maxLength: args.maxLength }); }
       );
       safari.setActiveTabURL(url);
-      return normalize(raw);
+      return _rotateReceiptAfterNavigate(normalize(raw), usedReceipt, oldUrl);
     }
 
     case "readPage":
@@ -2569,32 +2606,13 @@ server.tool(
     // Read once, before anything waits: a call alongside that names another tab makes that tab the
     // session's current one, and the rotation below has to name the tab this call navigated.
     const usedReceipt = _receiptToken(receipt || _getActiveReceipt());
-    let result = await extensionOrFallback(
+    const result = await extensionOrFallback(
       "navigate", { url, ..._explicitReceipt({ receipt: usedReceipt }) },
       () => safari.navigate(url)
     );
     // Tab kept its identity, just changed URL — drop the stale old URL from ownership.
     if (oldUrl && oldUrl !== url && oldUrl !== 'about:blank') _removeOwnedURL(oldUrl);
-    // A receipt is bound to the origin it was minted on, so a cross-origin navigation the
-    // caller itself asked for used to strand every following call ("not valid for this
-    // origin", ~80×/week). The caller chose the destination, so rotating here is safe —
-    // hand back the new receipt instead of letting the caller discover the trap.
-    const landed = result && typeof result === "object" ? result.url : "";
-    // The origin of the receipt the navigation carried: extensionOrFallback sends the newest one.
-    if (landed && _originOf(landed) !== (_receiptOrigins.get(_receiptToken(usedReceipt)) || _originOf(oldUrl)) && usedReceipt) {
-      try {
-        // Named for the alias below, as run_script getReceipt names it (see _receiptAliases).
-        const fresh = _sanitizeTabResult(await extensionOrFallback(
-          "get_tab_receipt", { ..._explicitReceipt({ receipt: usedReceipt }) }, () => null
-        ));
-        if (fresh?.receipt) {
-          _aliasReceipt(_receiptToken(usedReceipt), fresh.receipt); // the receipt extensionOrFallback sent
-          _setActiveReceipt(fresh.receipt);
-          result = { ...result, receipt: fresh.receipt };
-        }
-      } catch { /* the navigation itself succeeded — a failed rotation must not fail the tool */ }
-    }
-    return textResult(result);
+    return textResult(await _rotateReceiptAfterNavigate(result, usedReceipt, oldUrl));
   }
 );
 
@@ -2678,7 +2696,7 @@ server.tool(
 
 server.tool(
   "safari_navigate_and_read",
-  "Navigate to a URL and return the page content in one step — saves 1 full round-trip vs navigate+read_page. Use instead of safari_navigate + safari_read_page.",
+  "Navigate to a URL and return the page content in one step — saves 1 full round-trip vs navigate+read_page. Use instead of safari_navigate + safari_read_page. Like safari_navigate, returns a fresh `receipt` when the origin changed; use that one from then on.",
   {
     receipt: z.string().optional().describe("Tab receipt from safari_new_tab — pins this call to that tab (survives reconnects/subagents)"),
     url: z.string().describe("URL to navigate to"),
@@ -2687,15 +2705,17 @@ server.tool(
   },
   async ({ url, maxLength, timeout, receipt }) => {
     const oldUrl = safari.getActiveTabURL();
+    // Read before anything waits, as safari_navigate does: the rotation names the tab that navigated.
+    const usedReceipt = _receiptToken(receipt || _getActiveReceipt());
     const result = await extensionOrFallback(
-      "navigate_and_read", { url, maxLength, timeout, ..._explicitReceipt({ receipt }) },
+      "navigate_and_read", { url, maxLength, timeout, ..._explicitReceipt({ receipt: usedReceipt }) },
       async () => {
         await safari.navigate(url);
         return safari.readPage({ maxLength });
       }
     );
     if (oldUrl && oldUrl !== url && oldUrl !== 'about:blank') _removeOwnedURL(oldUrl);
-    return textResult(result);
+    return textResult(await _rotateReceiptAfterNavigate(result, usedReceipt, oldUrl));
   }
 );
 
