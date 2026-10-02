@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.22.8] - 2026-10-02
+
+### Fixed
+- **`safari_navigate_and_read` hands back the tab's new receipt when the page lands on another origin, as `safari_navigate` does, and so do run_script's `navigate` and `navigateAndRead` steps in a named profile.** The extension binds a receipt to the origin it was minted on, and only `get_tab_receipt` may move it to another one. `safari_navigate` rotates the receipt after a cross-origin load the caller asked for and returns the new one; the other three navigations did not, so the tab's next call, with the receipt the tab was opened with or with none, was refused ("receipt is not valid for this origin") until the caller ran `getReceipt` itself. All four now go through one rotation: the receipt the navigation carried is read before it waits, aliased to its replacement so callers that keep the old one still reach the tab, and returned in the result.
+
 ## [2.22.7] - 2026-10-01
 
 ### Fixed
