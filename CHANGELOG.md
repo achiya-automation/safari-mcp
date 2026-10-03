@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.22.9] - 2026-10-03
+
+### Fixed
+- **`safari_upload_file` and `safari_paste_image` reach the session's tab when it sits in another window of a named profile, and take a `receipt`.** Both carry the file through AppleScript, which proves the session's tab by its marker and looked for it only in the first window of the profile, while a profile can hold several and the Safari extension opens or picks the tab in any of them. In Google Business Profile the upload failed with "Tab tracking lost during runJSLarge" right after `safari_new_tab`, and again after `safari_switch_tab` with the receipt. Once the first window has no tab carrying the marker, the upload now asks the extension which window holds the tab (`get_tab_locus`, as `safari_native_click` does) and looks there; the marker still has to be found, and it is checked again inside the script. Both tools also accept the `receipt` every other tool takes, so a caller whose MCP session was re-initialised can name its tab.
+- **`safari_upload_file`'s `verifyPreview` counts an SVG `<image>` preview.** Google Business Profile draws its preview as `<svg role=img><image href="blob:…">`, which the count skipped, so a real upload read as a ghost pickup and was escalated to a native file dialog, which added a second copy of the image. The upload script and the recount after it now share one counter.
+
 ## [2.22.8] - 2026-10-02
 
 ### Fixed

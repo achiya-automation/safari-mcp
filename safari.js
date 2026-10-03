@@ -1002,16 +1002,17 @@ function _markerCheckJS(marker) {
   return `(function(){try{return (window.name==='${safeMarker}'||window.__mcpTabMarker==='${safeMarker}')?'1':'0'}catch(e){return '0'}})()`;
 }
 
-// Scan the target window for the tab carrying `marker`, trying tab `hint` first. Returns
-// { idx, win }: that tab's index, 0 when the scan completed and no tab carries the marker, and
-// the window scanned (see _windowById); or null when the scan could not be completed.
-async function _scanForMarker(marker, hint) {
+// Scan the target window (or `inWin`, a `window id N`) for the tab carrying `marker`, trying tab
+// `hint` first. Returns { idx, win }: that tab's index, 0 when the scan completed and no tab
+// carries the marker, and the window scanned (see _windowById); or null when the scan could not
+// be completed.
+async function _scanForMarker(marker, hint, inWin = null) {
   try {
     const check = _markerCheckJS(marker);
     // One AppleScript call loops every tab internally: faster and far more reliable than N
     // separate daemon round-trips (a daemon hiccup mid-scan used to mis-resolve to the user's tab).
     const scanScript = `tell application "Safari"
-    set w to ${getTargetWindowRef()}
+    set w to ${inWin || getTargetWindowRef()}
     set wid to (id of w) as text
     set n to count of tabs of w
     ${hint ? `try
@@ -1129,7 +1130,11 @@ async function resolveActiveTab() {
 //
 // A session that never owned a tab keeps what it tracks, which in the default mode is nothing:
 // null means the front document, the page the user is looking at.
-async function _resolveSessionTab() {
+// `elsewhere`, when given, answers the other windows (`window id N`) the tab may be in, asked
+// only once the target window has no tab carrying the marker. A named profile can hold several
+// windows and the target window is only the first of them, while the extension opens or picks
+// the session's tab in any of them. The marker proves the tab in whichever window it is found.
+async function _resolveSessionTab({ elsewhere = null } = {}) {
   const s = _st();
   if (s.hasOwnedTab) {
     let marked = false;
@@ -1154,7 +1159,13 @@ async function _resolveSessionTab() {
       // The marker this scan looks for proves the tab, whatever a parallel call of the session
       // makes of s.activeTabMarker while the scan runs.
       const marker = s.activeTabMarker;
-      const found = await _scanForMarker(marker, s.activeTabIndex);
+      let found = await _scanForMarker(marker, s.activeTabIndex);
+      if (found && !found.idx && elsewhere) {
+        for (const win of await elsewhere()) {
+          const there = win !== found.win && await _scanForMarker(marker, s.activeTabIndex, win);
+          if (there?.idx) { found = there; break; }
+        }
+      }
       if (found?.idx) { s.activeTabIndex = found.idx; return { ...found, marker }; }
       // The scan did not complete: keep the marker for the next call, but prove nothing now.
       if (!found) break;
@@ -1780,8 +1791,8 @@ function _foreignTabError(where, cause) {
 // Uses osascriptFast (persistent process, ~5ms) for short scripts,
 // falls back to osascript (~80ms) for long scripts that exceed stdin limits
 // An explicit `tabIndex` names a tab of `win` (`window id N`) when the caller proved it there,
-// else of the target window.
-async function runJS(js, { tabIndex, win, timeout = 15000 } = {}) {
+// else of the target window. `elsewhere`: see _resolveSessionTab.
+async function runJS(js, { tabIndex, win, timeout = 15000, elsewhere = null } = {}) {
   await refreshTargetWindow();
   const escaped = js
     .replace(/^\s*\/\/[^\n]*$/gm, '')  // Strip // comment-only lines before flattening
@@ -1801,7 +1812,7 @@ async function runJS(js, { tabIndex, win, timeout = 15000 } = {}) {
     // the ~100ms window in which a user tab-shift could leave it pointing at the user's tab.
     idx = _st().activeTabIndex;
   } else if (!idx && (_st().hasOwnedTab || _st().activeTabURL)) {
-    const resolved = await _resolveSessionTab();
+    const resolved = await _resolveSessionTab({ elsewhere });
     if (resolved.idx) { idx = resolved.idx; idxWin = resolved.win; _st().lastResolveTime = Date.now(); }
   }
   // A session that never owned a tab falls back to the index it tracks (usually none: the front
@@ -1894,7 +1905,7 @@ async function runJS(js, { tabIndex, win, timeout = 15000 } = {}) {
 
 // Run large JavaScript via temp file — bypasses osascript arg length limit (~260KB)
 // Used for operations that embed file data (upload, paste image)
-async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
+async function runJSLarge(js, { tabIndex, timeout = 30000, elsewhere = null } = {}) {
   await refreshTargetWindow();
   // Resolve tab the same way runJS does — verify cached index via URL
   let idx = tabIndex;
@@ -1903,7 +1914,7 @@ async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
   // the tab is, and skipping the scan meant large-payload ops (upload/paste) could target a
   // stale index.
   if (!idx && (_st().hasOwnedTab || (_st().activeTabURL && _st().activeTabURL !== 'about:blank'))) {
-    const resolved = await _resolveSessionTab();
+    const resolved = await _resolveSessionTab({ elsewhere });
     if (resolved.idx) { idx = resolved.idx; idxWin = resolved.win; _st().lastResolveTime = Date.now(); }
   }
   if (!idx) idx = _st().activeTabIndex;
@@ -2592,6 +2603,18 @@ end tell`;
     || (rows.length === 1 ? rows[0] : null);
   if (!hit) return null;
   return { winRef: `window id ${hit[0]}`, winId: Number(hit[0]), tabIndex: idx };
+}
+
+// An `elsewhere` for runJS/runJSLarge (see _resolveSessionTab): the window `locate()` (index.js
+// asking the extension for this session's tab) says holds the tab. Asked at most once, and only
+// when the target window has no tab carrying the marker; no answer leaves the scan as it was.
+function _locusWindows(locate) {
+  if (!locate) return null;
+  let wins = null;
+  return () => (wins ??= Promise.resolve()
+    .then(locate)
+    .then((locus) => (locus ? _pinWindowFromLocus(locus) : null))
+    .then((pinned) => (pinned ? [pinned.winRef] : []), () => []));
 }
 
 // Like _withTargetTabFronted, but for an explicit window+tab. Selects the session's tab
@@ -5062,8 +5085,22 @@ function _validateFilePath(filePath) {
 
 // ========== UPLOAD FILE ==========
 
-export async function uploadFile({ selector, filePath, forceNative = false, verifyPreview = false }) {
+// How many previews of ingested files the page shows: object-URL / data-URL images and videos,
+// background images, and SVG <image> elements. Google Business Profile draws its preview as
+// <svg role=img><image href="blob:…">, which went uncounted, so a real upload read as a ghost
+// pickup and was escalated to a native dialog that added a second copy. -1: the page was unreadable.
+const _PREVIEW_COUNT_JS = `function(){try{
+  var n=document.querySelectorAll('img[src^="blob:"], img[src^="data:image"], video[src^="blob:"]').length;
+  var all=document.querySelectorAll('div,span,a,figure');
+  for(var i=0;i<all.length;i++){var b=all[i].style&&all[i].style.backgroundImage||'';if(b.indexOf('blob:')>-1||b.indexOf('data:image')>-1)n++;}
+  var svg=document.querySelectorAll('image');
+  for(var j=0;j<svg.length;j++){var h=svg[j].getAttribute('href')||svg[j].getAttributeNS('http://www.w3.org/1999/xlink','href')||'';if(h.indexOf('blob:')===0||h.indexOf('data:image')===0)n++;}
+  return n;}catch(_){return -1;}}`;
+
+// `locate`: how index.js asks the extension where this session's tab is (see _locusWindows).
+export async function uploadFile({ selector, filePath, forceNative = false, verifyPreview = false, locate = null }) {
   _validateFilePath(filePath);
+  const elsewhere = _locusWindows(locate);
   // Read file in Node.js, send as base64 to Safari JS, create File + DataTransfer
   // NO file dialog, NO System Events, NO focus stealing
 
@@ -5101,7 +5138,8 @@ export async function uploadFile({ selector, filePath, forceNative = false, veri
   const imageFormats = new Set(['webp', 'heic', 'heif', 'tiff', 'tif']);
   if (imageFormats.has(ext)) {
     const accept = await runJS(
-      `(function(){var el=document.querySelector('${sel}');if(!el){var roots=window.mcpCollectRoots?window.mcpCollectRoots():[document];for(var i=0;i<roots.length;i++){el=roots[i].querySelector('${sel}');if(el)break;}}return el?(el.getAttribute('accept')||''):'';})()`
+      `(function(){var el=document.querySelector('${sel}');if(!el){var roots=window.mcpCollectRoots?window.mcpCollectRoots():[document];for(var i=0;i<roots.length;i++){el=roots[i].querySelector('${sel}');if(el)break;}}return el?(el.getAttribute('accept')||''):'';})()`,
+      { elsewhere }
     ).catch(() => '');
     const acceptStr = String(accept || '').toLowerCase();
     const accepted = !acceptStr ||
@@ -5173,17 +5211,7 @@ export async function uploadFile({ selector, filePath, forceNative = false, veri
 
       // Counts the visual proof that a site actually ingested the file: object-URL previews
       // it created for it. Ghost pickups (see Strategy 1) leave this at the pre-upload value.
-      function __mcpPreviewCount() {
-        try {
-          var n = document.querySelectorAll('img[src^="blob:"], img[src^="data:image"], video[src^="blob:"]').length;
-          var all = document.querySelectorAll('div,span,a,figure');
-          for (var i = 0; i < all.length; i++) {
-            var b = all[i].style && all[i].style.backgroundImage || '';
-            if (b.indexOf('blob:') > -1 || b.indexOf('data:image') > -1) n++;
-          }
-          return n;
-        } catch (_) { return -1; }
-      }
+      var __mcpPreviewCount = ${_PREVIEW_COUNT_JS};
 
       // Baseline BEFORE any dispatch — after the change event a site that works has already
       // painted its preview, so sampling then makes an honest pickup look identical to a ghost.
@@ -5223,7 +5251,7 @@ export async function uploadFile({ selector, filePath, forceNative = false, veri
       var hint = newImgs.length > 0 ? ' (detected ' + newImgs.length + ' blob/data images on page — upload likely succeeded)' : '';
       return 'Upload attempted: ${safeName} (' + Math.round(bytes.length / 1024) + ' KB) — drop event dispatched. el.files is empty (normal for custom upload handlers).' + hint + ' Verify with safari_snapshot.';
     })()`,
-    { timeout: 30000 }
+    { timeout: 30000, elsewhere }
   );
 
   // Strategy 3: synthetic injection (files=/drop) is silently rejected by isTrusted-gated
@@ -5240,9 +5268,7 @@ export async function uploadFile({ selector, filePath, forceNative = false, veri
   if (verifyPreview && !forceNative && /verified [1-9]\d* file/i.test(result)) {
     const before = Number((result.match(/\[previews=(-?\d+)\]/) || [])[1] ?? -1);
     const countPreviews = async () => Number(
-      await runJS(
-        `(function(){try{var n=document.querySelectorAll('img[src^="blob:"], img[src^="data:image"], video[src^="blob:"]').length;var all=document.querySelectorAll('div,span,a,figure');for(var i=0;i<all.length;i++){var b=all[i].style&&all[i].style.backgroundImage||'';if(b.indexOf('blob:')>-1||b.indexOf('data:image')>-1)n++;}return n;}catch(_){return -1;}})()`
-      ).catch(() => -1)
+      await runJS(`(${_PREVIEW_COUNT_JS})()`, { elsewhere }).catch(() => -1)
     );
     // Locked screen: every window is occluded, Safari throttles the page, and the site can take
     // 30–90 s to render the preview (GBP, 26.9.2026) — while the native-dialog escalation cannot
@@ -5368,7 +5394,8 @@ async function _clickInputAndDriveDialog(c, absPath) {
 
 // ========== PASTE IMAGE FROM FILE ==========
 
-export async function pasteImageFromFile({ filePath }) {
+// `locate`: as for uploadFile.
+export async function pasteImageFromFile({ filePath, locate = null }) {
   _validateFilePath(filePath);
   // Paste image via JS ClipboardEvent — NO clipboard touch, NO System Events, NO focus steal
   const { extname } = await import("node:path");
@@ -5413,7 +5440,7 @@ export async function pasteImageFromFile({ filePath }) {
 
       return 'Pasted image: ${fileName} (' + Math.round(bytes.length / 1024) + ' KB)';
     })()`,
-    { timeout: 30000 }
+    { timeout: 30000, elsewhere: _locusWindows(locate) }
   );
 
   return result;

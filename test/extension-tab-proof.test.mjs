@@ -407,6 +407,34 @@ test("a tab the extension opened in another window is not the front window's tab
   assert.deepEqual(browser.ran, [], "the fallback ran in the front window's tab 2");
 });
 
+test("runJSLarge and runJS find the extension's tab in the window the caller names, and only by its marker", async () => {
+  // A named profile with two windows: AppleScript's target window is the first, and the extension
+  // opened the session's tab in the second. safari_upload_file failed there with "Tab tracking
+  // lost during runJSLarge" (Google Business Profile, 2.10.26) until it asked the extension.
+  const front = [tab(USER_URL, { current: true }), tab(USER2_URL)];
+  const browser = safariApp(front, [tab(USER3_URL)]);
+  const { safari, server } = session(browser, { home: browser.windows[1] });
+  await server.safari_new_tab({ url: A_URL });
+  const mine = browser.windows[1][1];
+  await assert.rejects(safari.runJSLarge("document.title"), refused);
+  let asked = 0;
+  const elsewhere = async () => { asked++; return ["window id 2"]; };
+  assert.equal(await safari.runJSLarge("document.title", { elsewhere }), A_URL);
+  assert.equal(await safari.runJS("document.title", { elsewhere }), A_URL);
+  assert.deepEqual(browser.ran, [mine, mine]);
+  assert.equal(asked, 2, "each call looks in the named window only after the target window missed");
+  // A named window that does not hold the tab proves nothing.
+  await assert.rejects(safari.runJSLarge("document.title", { elsewhere: async () => ["window id 1"] }), refused);
+  assert.deepEqual(browser.ran, [mine, mine], "a script ran in a tab of the user's");
+});
+
+test("a tab proven in the target window never asks where else it might be", async () => {
+  const { browser, safari, mine } = await afterUserShift(A_URL);
+  const elsewhere = async () => assert.fail("asked for another window");
+  assert.equal(await safari.runJSLarge("document.title", { elsewhere }), A_URL);
+  assert.deepEqual(browser.ran, [mine]);
+});
+
 // ---------- 2. a URL proves nothing ----------
 
 for (const { name, mine, users } of [

@@ -3791,14 +3791,19 @@ server.tool(
   "safari_upload_file",
   "Upload a file to a <input type='file'> element via JavaScript DataTransfer — NO file dialog, NO UI interaction. IMPORTANT: Do NOT click the file input before calling this tool — just provide the selector and file path. If a file dialog is already open, this tool will close it first. NOTE: 'verified 0 files' may appear even on success if the site uses a custom upload handler — check visually with safari_snapshot. For an IMAGE going into a composer/editor that should show a thumbnail, pass verifyPreview:true — some sites (Google Business Profile) accept the file handle and flip their UI to 'attached' while ingesting nothing, and the post then publishes with no image.",
   {
+    receipt: z.string().optional().describe("Tab receipt from safari_new_tab — pins this call to that tab (survives reconnects/subagents)"),
     selector: z.string().describe("CSS selector of the file input"),
     filePath: z.string().describe("Absolute path to the file to upload"),
     verifyPreview: z.boolean().optional().describe("Require a visible preview (blob:/data: image) to appear; if none does, the synthetic pickup was a ghost and this escalates to a real OS file dialog. Use for images going into a composer."),
     forceNative: z.boolean().optional().describe("Skip synthetic injection and go straight to the real OS file dialog (isTrusted). Needs an unlocked screen and briefly focuses Safari. Use when the site is known to reject synthetic uploads."),
   },
   async (args) => {
-    _assertTabOwnership("upload_file");
-    const result = await safari.uploadFile(args);
+    // The receipt first: for a caller with no state of its own it is what names the tab, and the
+    // guard has to see it. The upload bypasses extensionOrFallback, so assert ownership here.
+    _assertTabOwnership("upload_file", _explicitReceipt(args));
+    // AppleScript carries the file; it finds the tab by its marker in the profile's first window,
+    // and the extension can say which of the profile's windows holds it (see _locusWindows).
+    const result = await safari.uploadFile({ ...args, locate: _tabLocusFromExtension });
     return textResult(result);
   }
 );
@@ -3809,11 +3814,13 @@ server.tool(
   "safari_paste_image",
   "Paste an image from a local file into the focused element via JS DataTransfer (no clipboard, no focus steal). Works on Medium, dev.to, HackerNoon, TOI, etc.",
   {
+    receipt: z.string().optional().describe("Tab receipt from safari_new_tab — pins this call to that tab (survives reconnects/subagents)"),
     filePath: z.string().describe("Absolute path to the image file (PNG, JPG, WebP)"),
   },
-  async ({ filePath }) => {
-    _assertTabOwnership("paste_image");
-    const result = await safari.pasteImageFromFile({ filePath });
+  async ({ filePath, receipt }) => {
+    // As safari_upload_file: the receipt before the guard, and the extension's locus for the scan.
+    _assertTabOwnership("paste_image", _explicitReceipt({ receipt }));
+    const result = await safari.pasteImageFromFile({ filePath, locate: _tabLocusFromExtension });
     return textResult(result);
   }
 );
