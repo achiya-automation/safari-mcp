@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.22.10] - 2026-10-04
+
+### Fixed
+- **On Node 24, a secondary instance no longer exits when its primary goes away; it takes the bridge port over as intended.** Node 24's bundled undici calls `socket.setTypeOfService()` on every HTTP/1.1 write, outside any catch. On macOS, a socket whose peer has just reset makes that call throw `EINVAL` from inside an I/O callback, where no try/catch around `fetch()` can reach it, so the process ended: a secondary's `/proxy-check` to a primary that had just exited killed the secondary instead of letting it take the port over (#140; the takeover test hit it twice on CI, Node 24 on the macOS runner). undici 8.8.0 ignores these errors (nodejs/undici#5547) and Node 24 never got that fix: measured on 2026-10-04, one `fetch()` calls `setTypeOfService` once on Node 24.21.0 and not at all on Node 26.10.0. The server now wraps `Socket.prototype.setTypeOfService` so that `EINVAL` alone is ignored, and a request to a peer that is gone fails the ordinary way, as a rejected `fetch()`. Type of service is a QoS hint, so skipping it changes nothing else.
+
 ## [2.22.9] - 2026-10-03
 
 ### Fixed

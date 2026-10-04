@@ -1,6 +1,6 @@
 {
   "name": "safari-mcp",
-  "version": "2.22.9",
+  "version": "2.22.10",
   "mcpName": "io.github.achiya-automation/safari-mcp",
   "description": "Safari browser automation for AI agents — native macOS, zero Chrome overhead. 98 tools via AppleScript + JavaScript.",
   "type": "module",
@@ -71,6 +71,7 @@
     "ownership-state.js",
     "image-size.js",
     "worker-ledger.js",
+    "node-compat.js",
     "mcp-helpers.js",
     "injected-validators.js",
     "injected-escape.js",

@@ -37,6 +37,12 @@ import {
   readProfileIdentities,
   describeProfileIdentities,
 } from "./worker-ledger.js";
+import { Socket } from "node:net";
+import { ignoreTypeOfServiceEinval } from "./node-compat.js";
+
+// Before the first fetch: a secondary's /proxy-check to a primary that just went away
+// must reject, not end the process (#140).
+ignoreTypeOfServiceEinval(Socket.prototype);
 
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 MB cap on POST body — prevents DoS
 
