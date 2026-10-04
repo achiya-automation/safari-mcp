@@ -71,6 +71,7 @@
     "ownership-state.js",
     "image-size.js",
     "worker-ledger.js",
+    "node-compat.js",
     "mcp-helpers.js",
     "injected-validators.js",
     "injected-escape.js",
