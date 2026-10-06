@@ -306,8 +306,10 @@ test("AppleScript never re-runs an evaluate the extension may have started", () 
     /extensionType === "evaluate" && err\?\.dispatched !== false && !\/evaluate did not start\/\.test\(err\.message\)/
   );
   // A result that merely mentions CSP is the script's own error once it ran; only the
-  // extension's own "nothing ran" marker may send an evaluate on to AppleScript.
-  assert.match(fallback, /const isCspError = hardCspBlock \|\| \(extensionType !== "evaluate" && /);
+  // extension's own "nothing ran" marker, as the reply's opening words, may send an
+  // evaluate on to AppleScript.
+  assert.match(fallback, /hardCspBlock = extensionType === "evaluate" && typeof result === 'string' && result\.startsWith\('Error: CSP blocked all strategies'\)/);
+  assert.match(fallback, /\} else if \(hardCspBlock\) \{/);
   assert.match(background, /CSP blocked all strategies - the script did not run/);
   // Only a command that never left the queue, or never had an extension to go to, is safe
   // to run elsewhere.

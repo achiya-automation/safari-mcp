@@ -1773,7 +1773,7 @@ const _nullMeansFailure = new Set([
   "read_page", "get_source", "snapshot", "get_element", "query_all",
   "scroll", "scroll_to",
   // NOTE: "evaluate" intentionally NOT here — null is a valid return value.
-  // CSP fallback is handled separately via isCspError check.
+  // Its CSP fallback is handled separately, by the ladder's terminal marker (hardCspBlock).
 ]);
 
 // Operations that don't need tab ownership (read-only or tab management)
@@ -2459,16 +2459,18 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
         // The ladder's own terminal marker. It was not in this list, so the fallback the
         // marker's text promises never actually ran and its text reached the caller as
         // the tool's value instead of as a failure (#106).
-        hardCspBlock = typeof result === 'string' && result.includes('CSP blocked all strategies');
-        // An evaluate reports "nothing ran" through that marker alone. Other CSP wording in
-        // its result is the script's own error: it ran, and AppleScript must not run it again.
-        const isCspError = hardCspBlock || (extensionType !== "evaluate" && typeof result === 'string' && (result.includes('unsafe-eval') || result.includes('trusted-types') || result.includes('Trusted Type') || result.includes('Content Security Policy')));
-        const isPermissionDenied = typeof result === 'string' && result.includes('__SCREENSHOT_PERMISSION_DENIED__');
+        // It is the whole reply of an evaluate, so it is matched as that and nowhere else. A
+        // result is page text as often as not: matched anywhere in it, CSP wording read a page
+        // that mentions Trusted Types as a blocked command, which a profile session then
+        // refused and any other session ran a second time through AppleScript. Every other
+        // command's failure arrives as a rejection, never as its result.
+        hardCspBlock = extensionType === "evaluate" && typeof result === 'string' && result.startsWith('Error: CSP blocked all strategies');
+        const isPermissionDenied = result === '__SCREENSHOT_PERMISSION_DENIED__';
         const isElementMiss = typeof result === 'string' && result.startsWith('Element not found');
         const isFailed = result === null || isElementMiss;
         if (isPermissionDenied) {
           console.error(`[Safari MCP] ${extensionType} permission denied (${Date.now() - t0}ms) — falling back to AppleScript`);
-        } else if (isCspError) {
+        } else if (hardCspBlock) {
           console.error(`[Safari MCP] ${extensionType} CSP blocked: ${result?.substring(0, 100)} (${Date.now() - t0}ms) — falling back to AppleScript`);
         } else if (isFailed && _nullMeansFailure.has(extensionType)) {
           if (_preferAppleScript && isElementMiss) {
@@ -2511,6 +2513,16 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
     }
     if (!usedExtension) {
       if (_preferAppleScript) {
+        // The extension answered here, so naming it unavailable sent callers after a bridge
+        // that worked (copilot.microsoft.com, 4-5.10.26: Trusted Types turn away its policy).
+        if (hardCspBlock) {
+          throw new Error(
+            "safari_evaluate: this page's Content-Security-Policy refused every way to run a script string " +
+            "(no eval, no inline script the extension can add), so the script did not run. A profile-scoped " +
+            "session never falls back to AppleScript. Tools that run no script string still work here: " +
+            "safari_read_page, safari_snapshot, safari_get_element, safari_click, safari_fill."
+          );
+        }
         throw new Error(`Safari profile extension unavailable for "${extensionType}"; refusing AppleScript fallback`);
       }
       const t0 = Date.now();
