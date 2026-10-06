@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A page that mentions CSP is read like any other page; it is no longer taken for a blocked command.** The server read any result containing "Content Security Policy", "unsafe-eval", "trusted-types" or "Trusted Type" as the extension saying CSP had blocked it, so reading a CSP guide, a security blog or a GitHub issue about Trusted Types failed in a named profile with `Safari profile extension unavailable for "read_page"; refusing AppleScript fallback`, and without one ran the command a second time through AppleScript: a click on a link titled "Content Security Policy" clicked it twice, since the click's result quotes the link text. The extension never reports a CSP block in a result: every other command's failure arrives as an error. Only `safari_evaluate`'s own marker counts now, matched as the whole reply rather than anywhere in it, and the screenshot permission marker likewise.
+- **In a named profile, an evaluate on a page whose CSP refuses every way to run a script string says so.** It failed with `Safari profile extension unavailable for "evaluate"`, which sent callers after an extension that was working: copilot.microsoft.com allows no eval, and its Trusted Types list leaves out the policies the extension creates, so the script cannot start there. The error now names the page's Content-Security-Policy and the tools that run no script string, such as `safari_read_page` and `safari_snapshot`, which still work on that page.
+
 ## [2.22.10] - 2026-10-04
 
 ### Fixed
