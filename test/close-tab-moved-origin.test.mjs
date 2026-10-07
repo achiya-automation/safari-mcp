@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * A receipt closes its tab after the page moved the tab to another origin.
+ * A receipt keeps naming its tab when Safari stops reporting the tab's origin.
  *
  * Found on 6.10.26 (geo-audit): a tab opened on claude.ai/new left that origin within four
  * seconds. safari_close_tab with its receipt was refused ("receipt is not valid for this
@@ -8,6 +8,10 @@
  * receipt for this tab URL"): getReceipt mints only for an http(s) origin or about:blank. The tab
  * stayed open with nothing able to close it. handleCommand let only get_tab_receipt follow a
  * receipt across origins; close_tab, which runs nothing in the page either, now does as well.
+ *
+ * Measured on 7.10.26: the same pair of refusals hit a fresh safari_new_tab() on its first
+ * command, navigate included. Safari leaves `url` off a blank tab, and _receiptOrigin read the
+ * missing URL as no origin, never as the about:blank its receipt was minted on.
  *
  * The extension's code is the real one: handleCommand's preflight, _resolveReceiptTab,
  * _issueTabReceipt, _closeTabForSession and the ownership helpers, over a fake Safari window.
@@ -43,6 +47,7 @@ const extensionParts = [
   between(background, "const _readOnlyCommands = new Set([", "\n]);") + "\n]);",
 ].join("\n");
 const preflight = between(background, "  // Receipt-based targeting depends on durable ownership state", "\n  switch (type) {");
+const getTabReceiptCase = between(background, '    case "get_tab_receipt": {', "\n\n    // Which WINDOW holds");
 
 function makeExtension() {
   const tabs = [{ id: 1, windowId: WINDOW, url: USER_URL, active: true }];
@@ -76,9 +81,13 @@ function makeExtension() {
       async handleCommand(type, payload, ran) {
         const sessionId = payload.sessionId || _DEFAULT_SESSION;
       ${preflight}
-        if (type === "close_tab") return _closeTabForSession(sessionId, targetTab, payload);
-        ran.push({ type, tabId });
-        return "ran";
+        switch (type) {
+      ${getTabReceiptCase}
+          case "close_tab": return _closeTabForSession(sessionId, targetTab, payload);
+          default:
+            ran.push({ type, tabId });
+            return "ran";
+        }
       },
     };`
   )(
@@ -138,4 +147,26 @@ test("a receipt this extension never issued still closes nothing", async () => {
     /no record of that receipt/
   );
   assert.equal(ext.tabs.length, 2, "both tabs stay open");
+});
+
+test("a blank tab Safari reports without a URL takes commands, a rotation and a close by its receipt", async () => {
+  const ext = makeExtension();
+  // safari_new_tab() mints on about:blank; Safari then leaves `url` off the tab.
+  const { id, receipt } = await ext.open("geo", "about:blank");
+  ext.live(id).url = undefined;
+
+  assert.equal(await ext.send("navigate", { receipt, sessionId: "geo" }), "ran");
+  assert.deepEqual(ext.ran, [{ type: "navigate", tabId: id }]);
+  const rotated = await ext.send("get_tab_receipt", { receipt, sessionId: "geo" });
+  assert.match(rotated.receipt, /^[A-Za-z0-9_-]{24,}$/);
+  assert.equal(await ext.send("close_tab", { receipt: rotated.receipt, sessionId: "geo" }), "Tab closed");
+  assert.equal(ext.live(id), undefined);
+});
+
+test("a receipt minted on a web origin still takes no page command once its tab shows no URL", async () => {
+  const ext = makeExtension();
+  const { id, receipt } = await ext.open("geo", "https://shop.example/cart");
+  ext.live(id).url = undefined;
+  await assert.rejects(ext.send("click", { receipt, sessionId: "geo" }), /not valid for this origin/);
+  assert.deepEqual(ext.ran, []);
 });
