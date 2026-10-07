@@ -914,7 +914,11 @@ async function handleCommand(type, payload) {
   const suppliedReceipt = (type === "new_tab" || type === "list_tabs")
     ? ""
     : _receiptTokenFromPayload(payload);
-  const allowReceiptOriginChange = type === "get_tab_receipt";
+  // getReceipt and close_tab use a receipt only to find its tab; neither runs anything in the
+  // page. close_tab was held to the receipt's origin, so a tab a redirect or login bounce had
+  // moved could be closed only after a getReceipt rotation, and a page with no http(s) origin
+  // never gets one: the tab stayed open with nothing able to close it (geo-audit, 6.10.26).
+  const allowReceiptOriginChange = type === "get_tab_receipt" || type === "close_tab";
   let receiptResolved = false;
   // new_tab CREATES its target, so a failure to resolve an existing one must not stop
   // it. Once a profile holds several windows, resolution legitimately fails with
