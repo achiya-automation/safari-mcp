@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.22.13] - 2026-10-07
+
+### Fixed
+- **A blank tab from `safari_new_tab()` takes commands by its receipt.** Safari leaves `url` off a blank tab, and the extension read the missing URL as no origin at all instead of the `about:blank` the receipt was minted on. Measured on 7.10.26 in a named profile: a fresh blank tab's receipt was refused on its first command, `safari_navigate` included ("receipt is not valid for this origin"), `getReceipt` could not rotate it ("Cannot issue a receipt for this tab URL"), and the tab could be neither used nor closed. A tab Safari shows no URL for now counts as blank; a receipt minted on a web origin still takes no page command there. Like 2.22.12, the change is in the Safari extension and takes effect once the extension app is rebuilt from this version.
+
 ## [2.22.12] - 2026-10-07
 
 ### Fixed

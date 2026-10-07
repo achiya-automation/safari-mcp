@@ -125,7 +125,10 @@ function _safeTabUrl(rawUrl) {
 
 function _receiptOrigin(rawUrl) {
   const raw = String(rawUrl || "");
-  if (raw === "about:blank") return raw;
+  // Safari leaves `url` off a blank tab (measured 7.10.26). Read as no origin at all, the
+  // about:blank receipt of a fresh safari_new_tab() was refused on its first command, and
+  // getReceipt could not rotate it: the tab could be neither used nor closed.
+  if (!raw || raw === "about:blank") return "about:blank";
   try {
     const parsed = new URL(raw);
     return /^https?:$/.test(parsed.protocol) ? parsed.origin : "";
