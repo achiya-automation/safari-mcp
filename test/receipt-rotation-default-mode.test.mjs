@@ -4,7 +4,7 @@
  * with or without SAFARI_PROFILE.
  *
  * Found by code reading on 29.9.26. The extension binds every receipt to the origin it was
- * minted on, and only get_tab_receipt may follow a tab across origins (handleCommand and
+ * minted on, and only get_tab_receipt and close_tab may follow a tab across origins (handleCommand and
  * _resolveReceiptTab in extension/background.js). When the page moves the tab by itself — a
  * clicked link, a JS or server redirect, a login bounce — the next call carrying the receipt is
  * refused, and extensionOrFallback appended: "Rotate it with safari_run_script

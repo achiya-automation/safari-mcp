@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.22.12] - 2026-10-07
+
+### Fixed
+- **`safari_close_tab` closes its receipt's tab after the page moved the tab to another origin.** The extension let only `getReceipt` follow a receipt across origins, so a close of a tab that a redirect or a login bounce had moved was refused with "receipt is not valid for this origin". The rotation that refusal suggests works only when the new page has an http(s) origin: a tab that landed on a page without one, or on a page whose URL Safari does not show the extension, could not be rotated, and nothing could close it (claude.ai/new, 6.10.26: two tabs left open in a named profile). A close runs nothing in the page, so it now locates its tab the way `getReceipt` does; every other command stays bound to the receipt's origin, and a receipt the extension never issued still closes nothing. The change is in the Safari extension, so it takes effect once the extension app is rebuilt from this version ([Installing the Extension](README.md#installing-the-extension)).
+
 ## [2.22.11] - 2026-10-06
 
 ### Fixed

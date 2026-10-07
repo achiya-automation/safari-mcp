@@ -766,7 +766,7 @@ test("getReceipt is locator-only rotation and never mutates or returns the live 
   assert.ok(!block.includes("url: liveTab.url"));
 
   const handler = extract(background, "async function handleCommand(", "\n// ========== HELPERS ==========");
-  assert.ok(handler.includes('const allowReceiptOriginChange = type === "get_tab_receipt"'));
+  assert.ok(handler.includes('const allowReceiptOriginChange = type === "get_tab_receipt" || type === "close_tab";'));
   assert.ok(handler.includes("allowOriginChange: allowReceiptOriginChange"));
 
   const batch = extract(index, "async function _runExtensionBatchAction(", "\n// Try the profile-verified extension first");
