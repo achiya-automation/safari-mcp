@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import { tmpdir, homedir } from "node:os";
 import { join, dirname, resolve as resolvePath } from "node:path";
 import { readFile, writeFile, unlink, appendFile, mkdir } from "node:fs/promises";
-import { readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { VIEWPORT_SCRIPT, SAFE_AREA_SCRIPT, PWA_SCRIPT, WEBKIT_COMPAT_SCRIPT, ALL_SHEETS_FN } from "./injected-validators.js";
@@ -1426,9 +1426,16 @@ export const SCREEN_LOCKED_MSG =
   "safari_type_text / safari_press_key, and safari_upload_file without forceNative.";
 
 export async function isScreenLocked() {
-  return execFileAsync("/bin/sh", ["-c",
-    "ioreg -n Root -d1 -r -a 2>/dev/null | grep -c CGSSessionScreenIsLocked || true"])
-    .then((r) => String(r.stdout).trim() !== "0").catch(() => false);
+  try {
+    const { stdout } = await execFileAsync("/usr/sbin/ioreg", ["-n", "Root", "-d1", "-r", "-a"], { timeout: 2000 });
+    const matches = [...String(stdout).matchAll(/<key>\s*(?:CGSSessionScreenIsLocked|IOConsoleLocked)\s*<\/key>\s*<(true|false)\s*\/>/g)];
+    if (matches.length) return matches.some(match => match[1] === "true");
+    // ioreg omits the key on an unlocked session. A present but unreadable value or
+    // a broken probe must fail toward blocked input, never toward CGEvent.
+    return /<key>\s*(?:CGSSessionScreenIsLocked|IOConsoleLocked)\s*<\/key>/.test(String(stdout));
+  } catch {
+    return true;
+  }
 }
 
 export async function assertScreenUnlocked(probe = isScreenLocked) {
@@ -6610,6 +6617,17 @@ export function macosCompatNote(productVersion) {
   return { version: raw, major, risky, line };
 }
 
+// A Homebrew upgrade deletes the node binary a long-running server still executes, and System
+// Settings cannot grant anything to a file that is gone. Seen on 9.10.26: node 26.9.0 was replaced
+// by 26.11.0 under a LaunchAgent daemon started two days earlier, and doctor went from 6/6 to 3/6
+// (Apple Events -1743, both helper permissions false). Only a restart onto the current node helps.
+export function staleNodeNote(execPath = process.execPath, exists = existsSync) {
+  if (exists(execPath)) return null;
+  return `⚠ This server still runs node from ${execPath}, which no longer exists: node was upgraded or removed while the server kept running. ` +
+    "macOS permission checks can fail for a binary that is gone, and System Settings cannot grant anything to it. " +
+    "Restart the server on the current node, then grant the permissions to the new binary if macOS asks.";
+}
+
 export async function doctor() {
   const checks = [];
   const add = (ok, label, detail, fix) => checks.push({ ok, label, detail, fix: ok ? null : fix });
@@ -6657,7 +6675,7 @@ export async function doctor() {
   // Homebrew node upgrade changes that path, so the grant has to follow the new binary.
   add(!!pf && pf.screenRecording === true, "Screen Recording (screenshots)",
     pf ? (pf.screenRecording ? "permitted" : "NOT permitted — screenshots taken through AppleScript and safari_save_pdf fail (extension screenshots don't need it)") : "unknown (helper not responding)",
-    `System Settings > Privacy & Security > Screen & System Audio Recording → enable ${process.ppid === 1 ? `node at ${process.execPath} (this server runs under launchd)` : "the terminal/IDE that launched this server"}.`);
+    `System Settings > Privacy & Security > Screen & System Audio Recording → enable ${process.ppid !== 1 ? "the terminal/IDE that launched this server" : staleNodeNote() ? "the node this server runs on after a restart (see the warning above)" : `node at ${process.execPath} (this server runs under launchd)`}.`);
 
   // 6. Helper codesign identity — a stale/ad-hoc id breaks the Accessibility grant on reinstall
   let idOk = false, idDetail = "";
@@ -6685,6 +6703,8 @@ export async function doctor() {
   const passed = checks.filter((c) => c.ok).length;
   const lines = [`Safari MCP doctor — ${passed}/${checks.length} checks passed`, ""];
   if (osLine) lines.push(osLine, "");
+  const nodeNote = staleNodeNote();
+  if (nodeNote) lines.push(nodeNote, "");
   // Not a pass/fail check — a state the user has to be able to see here rather than dig out
   // of the host's env, so "why did it touch my tab" has an answer in the same report (#92).
   lines.push(

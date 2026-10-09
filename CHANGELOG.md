@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.22.14] - 2026-10-09
+
+### Fixed
+- **The screen-lock gate reads `IOConsoleLocked` too, and a failed probe now blocks native input.** The gate in front of every CGEvent path counted only `CGSSessionScreenIsLocked` and treated a probe that failed as unlocked. On macOS 27.0.1 the Root registry entry carries `IOConsoleLocked`, `true` while the console is locked and `false` once it is unlocked (both read on 9.10.26), so the gate now treats either key set to `true` as locked, and an `ioreg` probe that fails or returns an unreadable value keeps native input off instead of letting it through.
+- **`safari_doctor` warns when the server is running on a node binary that no longer exists.** A Homebrew upgrade deletes the node that a long-running LaunchAgent daemon still executes, and System Settings cannot grant anything to a deleted file. On 9.10.26 a daemon started two days before node 26.9.0 was replaced by 26.11.0 went from 6/6 to 3/6 (Apple Events -1743, both helper permissions false) while doctor still said to enable the deleted path. Doctor now names the missing binary and says to restart the server on the current node first.
+
 ## [2.22.13] - 2026-10-07
 
 ### Fixed
