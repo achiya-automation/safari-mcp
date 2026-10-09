@@ -56,6 +56,25 @@ test("every raw CGEvent sender is gated before it talks to the helper", () => {
   }
 });
 
+test("screen-lock probe reads both lock keys and fails closed when the probe fails", async () => {
+  // Reads the function's own source, so the real ioreg never runs here.
+  const body = bodyOf("isScreenLocked").replace(/^function /, "async function ") + "\n}";
+  for (const [stdout, expected] of [
+    ["<key>CGSSessionScreenIsLocked</key><true/>", true],
+    ["<key>CGSSessionScreenIsLocked</key><false/>", false],
+    ["<key>IOConsoleLocked</key><true/>", true],
+    ["<key>IOConsoleLocked</key><false/>", false],
+    ["<key>CGSSessionScreenIsLocked</key><false/><key>IOConsoleLocked</key><true/>", true],
+    ["<plist><dict></dict></plist>", false],
+    ["<key>CGSSessionScreenIsLocked</key><string>unknown</string>", true],
+  ]) {
+    const probe = new Function("execFileAsync", `${body}\nreturn isScreenLocked;`)(async () => ({ stdout }));
+    assert.equal(await probe(), expected, stdout);
+  }
+  const failed = new Function("execFileAsync", `${body}\nreturn isScreenLocked;`)(async () => { throw new Error("ioreg unavailable"); });
+  assert.equal(await failed(), true);
+});
+
 test("the native file dialog is gated before it restyles the page's input", () => {
   const body = bodyOf("_nativeFileUpload");
   assert.ok(body.indexOf("await assertScreenUnlocked()") >= 0, "_nativeFileUpload must be gated");
