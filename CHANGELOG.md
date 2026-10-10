@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.22.15] - 2026-10-10
+
 ### Security
 - **A tool argument can no longer end the JavaScript string it is placed in and run as code in the page.** Sixteen places in `safari.js` that hold a tool argument escaped a single quote but not a backslash in front of it, so a value containing a backslash and then a quote (`\'`) closed the string literal and the rest of the value ran as page JavaScript. Seven of them belong to read-only tools that skip the tab-ownership check: `filter` in `safari_network_details` and `safari_extract_links`, `level` in `safari_console_filter`, `selector` in `safari_snapshot`, `safari_accessibility_snapshot` and `safari_extract_tables`, and `dbName` and `storeName` in `safari_get_indexed_db`. A client that allowed only read-only tools could therefore still run any script, in a tab it does not own. The others are `ref` in `safari_select_option` and the two react-select tools, the key in `safari_press_key`, the file name in `safari_upload_file` and `safari_paste_image`, and the first line of the text in `safari_replace_editor`. All of them now use the shared `escJsSingleQuote`, which escapes the backslash before the quote; the server's own tab-marker check escapes it too, and a test fails if a quote-only escape comes back. Reported privately on 2026-10-09.
 
