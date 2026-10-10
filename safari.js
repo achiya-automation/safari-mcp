@@ -998,7 +998,7 @@ function _windowById(id) {
 // Page JavaScript that answers "1" when the page carries exactly `marker`: in window.name, or in
 // window.__mcpTabMarker once a page has taken window.name over.
 function _markerCheckJS(marker) {
-  const safeMarker = String(marker).replace(/'/g, "\\'");
+  const safeMarker = String(marker).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
   return `(function(){try{return (window.name==='${safeMarker}'||window.__mcpTabMarker==='${safeMarker}')?'1':'0'}catch(e){return '0'}})()`;
 }
 
@@ -3242,7 +3242,7 @@ export async function selectOption({ selector, value, ref }) {
   const val = String(value).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
   let finder;
   if (ref) {
-    finder = `mcpFindRef('${String(ref).replace(/'/g, "\\'")}')`;
+    finder = `mcpFindRef('${escJsSingleQuote(ref)}')`;
   } else if (selector) {
     const sel = escJsSingleQuote(selector);
     finder = `(document.querySelector('${sel}')||mcpQuerySelectorDeep('${sel}'))`;
@@ -3264,7 +3264,7 @@ export async function reactSelectSet({ selector, ref, value }) {
   if (value === undefined || value === null) throw new Error("reactSelectSet requires 'value' (option label)");
   let finder;
   if (ref) {
-    const safeRef = String(ref).replace(/'/g, "\\'");
+    const safeRef = escJsSingleQuote(ref);
     finder = `mcpFindRef('${safeRef}')`;
   } else if (selector) {
     const sel = escJsSingleQuote(selector);
@@ -3281,7 +3281,7 @@ export async function reactSelectListOptions({ selector, ref }) {
   await ensureHelpers();
   let finder;
   if (ref) {
-    const safeRef = String(ref).replace(/'/g, "\\'");
+    const safeRef = escJsSingleQuote(ref);
     finder = `mcpFindRef('${safeRef}')`;
   } else if (selector) {
     const sel = escJsSingleQuote(selector);
@@ -3518,7 +3518,7 @@ export async function pressKey({ key, modifiers = [] }) {
 
   // Non-modifier keys: pure JavaScript (no System Events)
   const jsKey = jsKeyMap[k] || key;
-  const safeKey = jsKey.replace(/'/g, "\\'");
+  const safeKey = escJsSingleQuote(jsKey);
   // W3C `code` values: special keys are NOT "Key"-prefixed ("Enter", "ArrowUp", ...);
   // only letters are ("KeyA"), digits are "Digit1". Apps that route on event.code
   // (Notion, Monaco, Google Docs) ignore a bogus "KeyEnter".
@@ -3533,7 +3533,7 @@ export async function pressKey({ key, modifiers = [] }) {
     || (/^[a-z]$/i.test(jsKey) ? "Key" + jsKey.toUpperCase()
       : /^[0-9]$/.test(jsKey) ? "Digit" + jsKey
         : jsKey);
-  const safeCode = jsCode.replace(/'/g, "\\'");
+  const safeCode = escJsSingleQuote(jsCode);
   const shiftKey = hasShift;
   const altKey = modifiers.some((m) => m.toLowerCase() === "alt");
 
@@ -3694,7 +3694,7 @@ export async function replaceEditorContent({ text }) {
   // then call onChange(text) to sync React. Works for Airtable-style embeds
   // and is a no-op on plain Monaco (VS Code web, GitHub) where setValue
   // already covers the state.
-  const preflightFirstLine = text.split('\n')[0].slice(0, 20).replace(/'/g, "\\'");
+  const preflightFirstLine = escJsSingleQuote(text.split('\n')[0].slice(0, 20));
   const monacoPreflight = await runJS(
     `(function(){
       var m = (typeof monaco !== 'undefined') ? monaco : window.monaco;
@@ -5181,7 +5181,7 @@ export async function uploadFile({ selector, filePath, forceNative = false, veri
     xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   };
   const mime = mimeMap[ext] || "application/octet-stream";
-  const safeName = fileName.replace(/'/g, "\\'");
+  const safeName = escJsSingleQuote(fileName);
 
   // forceNative: skip synthetic injection entirely. Attempting it first would leave a stray
   // media item behind on sites that register the pickup in their UI without ingesting it
@@ -5413,7 +5413,7 @@ export async function pasteImageFromFile({ filePath, locate = null }) {
   // Read image as base64
   const fileData = await readFile(filePath);
   const base64 = fileData.toString("base64");
-  const fileName = filePath.split("/").pop().replace(/'/g, "\\'");
+  const fileName = escJsSingleQuote(filePath.split("/").pop());
 
   // Use runJSLarge — images are often >260KB as base64
   const result = await runJSLarge(
@@ -5665,7 +5665,7 @@ export function getNextSnapshotGen() { return _snapshotGen++; }
 export async function takeSnapshot({ selector, _gen } = {}) {
   // Use provided gen (from tool path) or allocate a new one (direct call)
   const gen = _gen != null ? _gen : _snapshotGen++;
-  const root = selector ? `document.querySelector('${selector.replace(/'/g, "\\'")}')` : "document.body";
+  const root = selector ? `document.querySelector('${escJsSingleQuote(selector)}')` : "document.body";
 
   const result = await runJS(
     `(function(){
@@ -5897,7 +5897,7 @@ export async function runScript({ steps, onStep, actions: overrides = {} }) {
 // ========== ACCESSIBILITY SNAPSHOT ==========
 
 export async function getAccessibilityTree({ selector, maxDepth = 5 }) {
-  const sel = selector ? `'${selector.replace(/'/g, "\\'")}'` : "null";
+  const sel = selector ? `'${escJsSingleQuote(selector)}'` : "null";
   return runJS(
     `(function(){
       function buildTree(el, depth) {
@@ -6242,7 +6242,7 @@ export async function clearNetworkCapture() {
 }
 
 export async function getNetworkDetails({ limit = 50, filter } = {}) {
-  const filterStr = filter ? `.filter(function(r){return r.url.includes('${filter.replace(/'/g, "\\'")}')})` : "";
+  const filterStr = filter ? `.filter(function(r){return r.url.includes('${escJsSingleQuote(filter)}')})` : "";
   return runJS(
     `JSON.stringify((window.__mcp_network||[])${filterStr}.slice(-${Number(limit)}))`
   );
@@ -6350,7 +6350,7 @@ export async function throttleNetwork({ profile, latency, downloadKbps, uploadKb
 // ========== CONSOLE FILTER ==========
 
 export async function getConsoleByLevel({ level }) {
-  const safeLevel = level.replace(/'/g, "\\'");
+  const safeLevel = escJsSingleQuote(level);
   return runJS(
     `JSON.stringify((window.__mcp_console||[]).filter(function(m){return m.level==='${safeLevel}'}))`
   );
@@ -6359,7 +6359,7 @@ export async function getConsoleByLevel({ level }) {
 // ========== DATA EXTRACTION ==========
 
 export async function extractTables({ selector, limit = 10 }) {
-  const sel = selector ? `'${selector.replace(/'/g, "\\'")}'` : "'table'";
+  const sel = selector ? `'${escJsSingleQuote(selector)}'` : "'table'";
   return runJS(
     `(function(){
       var tables = [...document.querySelectorAll(${sel})].slice(0, ${Number(limit)});
@@ -6424,7 +6424,7 @@ export async function extractImages({ limit = 50 }) {
 
 export async function extractLinks({ limit = 100, filter }) {
   const filterStr = filter
-    ? `.filter(function(a){return a.href.includes('${filter.replace(/'/g, "\\'")}')||a.textContent.includes('${filter.replace(/'/g, "\\'")}')})`
+    ? `.filter(function(a){return a.href.includes('${escJsSingleQuote(filter)}')||a.textContent.includes('${escJsSingleQuote(filter)}')})`
     : "";
   return runJS(
     `JSON.stringify([...document.querySelectorAll('a[href]')]${filterStr}.slice(0,${Number(limit)}).map(function(a){
@@ -6476,8 +6476,8 @@ export async function getComputedStyles({ selector, properties }) {
 // ========== INDEXEDDB ==========
 
 export async function getIndexedDB({ dbName, storeName, limit = 20 }) {
-  const safeDb = dbName.replace(/'/g, "\\'");
-  const safeStore = storeName.replace(/'/g, "\\'");
+  const safeDb = escJsSingleQuote(dbName);
+  const safeStore = escJsSingleQuote(storeName);
   // `do JavaScript` can't await a Promise — route async work through the Node-side poller.
   return _evaluateAsync(
     `(async function(){

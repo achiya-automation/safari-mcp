@@ -62,6 +62,19 @@ test("escAppleScriptString: strips CR/LF (injection guard) and escapes quotes + 
   assert.equal(unescapedQuotes, 0, "no unescaped double-quote may remain");
 });
 
+// A quote-only escape lets a value with `\` before a quote close the literal and run the
+// rest as page JS (safari_network_details `filter`, reported privately 2026-10-09; 16 more
+// call sites had the same recipe). Hand-rolled escapes must escape backslashes first.
+test("safari.js: no single-quote escape skips the backslash escape", () => {
+  const src = readFileSync(new URL("../safari.js", import.meta.url), "utf8");
+  const bad = [];
+  for (const m of src.matchAll(/\.replace\(\/'\/g, "\\\\'"\)/g)) {
+    const before = src.slice(Math.max(0, m.index - 40), m.index);
+    if (!/\.replace\(\/\\\\\/g, (["'])\\\\\\\\\1\)\s*$/.test(before)) bad.push(src.slice(0, m.index).split("\n").length);
+  }
+  assert.deepEqual(bad, [], `quote-only escape at safari.js line(s) ${bad.join(", ")}: use escJsSingleQuote`);
+});
+
 // ========== /proxy-command local-token gate ==========
 // The token is the only thing stopping an unrelated local process (a malicious npm
 // postinstall, say) from driving the browser through the bridge. It is compared on
