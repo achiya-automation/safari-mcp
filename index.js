@@ -642,6 +642,7 @@ const _safariSessionHint = createSafariSessionHintReader();
 // time it verifies, so it is reloaded then (see worker-upgrade.js). SAFARI_MCP_NO_AUTO_UPGRADE=1
 // turns this off.
 const _staleWorkerPolicy = createStaleWorkerPolicy();
+const _buildLoggedWorkerIds = new Set();
 let _staleReloadInFlight = false;
 async function _reloadStaleWorker(workerId) {
   if (process.env.SAFARI_MCP_NO_AUTO_UPGRADE === "1" || _staleReloadInFlight) return;
@@ -1197,6 +1198,12 @@ try {
       // skip the protocol gate by posting the second handshake step directly.
       const announcedBuild = String(connectUrl.searchParams.get("build") || "");
       const build = /^[A-Za-z0-9._-]{1,40}$/.test(announcedBuild) ? announcedBuild : "";
+      // One line per worker, so a context that announces no build can be told from one that does.
+      if (!_buildLoggedWorkerIds.has(workerId)) {
+        if (_buildLoggedWorkerIds.size >= 256) _buildLoggedWorkerIds.clear();
+        _buildLoggedWorkerIds.add(workerId);
+        console.error(`[Safari MCP] worker ${workerId.slice(0, 8)} connecting (extension build: ${build || "none announced"})`);
+      }
       _rememberConnectingHttpWorker(workerId, _reloadHandoffToken(req), build);
       ledgerNoteConnect(_workerLedger, workerId);
       _noteUnverifiedWorker(workerId);
