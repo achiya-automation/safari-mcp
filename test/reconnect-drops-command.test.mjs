@@ -54,6 +54,7 @@ test("a reconnect scheduled before a successful connect never runs after it", as
     "_discoverProfileWindow", "updateBadge", "_startHeartbeat", "_stopHeartbeat",
     "pollForCommands", "AbortSignal", "setTimeout", "clearTimeout",
     `const BRIDGE_PORTS = [9224];
+     const _EXTENSION_BUILD = "test-build";
      let HTTP_URL = "http://127.0.0.1:9224";
      let _enabled = true;
      let _bridgeWorkerSuperseded = false;

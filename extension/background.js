@@ -608,7 +608,7 @@ async function connect() {
       const connectHeaders = reloadHandoffToken
         ? { "X-Safari-MCP-Reload-Handoff": reloadHandoffToken }
         : {};
-      const res = await _bridgeFetch(`${HTTP_URL}/connect?verifier=existing-tab-v1&protocol=popup-opener-lease-v2`, {
+      const res = await _bridgeFetch(`${HTTP_URL}/connect?verifier=existing-tab-v1&protocol=popup-opener-lease-v2&build=${_EXTENSION_BUILD}`, {
         method: "POST",
         headers: connectHeaders,
         signal: AbortSignal.timeout(1500),
@@ -2693,7 +2693,7 @@ const MAX_SESSIONS = 50; // Hard cap on session cache size
 const _sessionOwnedTabs = new Map(); // sessionId → Set<tabId>
 // Mirror of the above in storage.local. storage.session is absent on Safari, so it is
 // the only place ownership actually survives a worker suspend.
-const _OWNED_TABS_LOCAL_KEY = "mcpOwnedTabsLocal";
+const _OWNED_TABS_LOCAL_KEY = "mcpOwnedTabsLocalV2";
 // Long enough to span a working session, short enough that tab ids from a previous
 // browser run have expired rather than being reused by unrelated tabs.
 const _OWNED_TABS_TTL_MS = 6 * 60 * 60 * 1000;
@@ -2704,8 +2704,15 @@ const _OWNED_TABS_TTL_MS = 6 * 60 * 60 * 1000;
 // "no tabs owned yet" compatibility path then silently allowed write commands
 // on ANY tab, including the user's.
 const _OWNED_TABS_KEY = "mcpSessionOwnedTabs";
-const _TAB_RECEIPTS_KEY = "mcpOwnedTabReceiptsV3";
-const _TAB_RECEIPTS_VERSION = 3;
+// V4/V2: earlier builds keep writing "mcpOwnedTabReceiptsV3"/"mcpOwnedTabsLocal" for as long as Safari
+// keeps one of their contexts alive after an app update, under an epoch of their own, over
+// whatever this build stored. Reading and writing other keys keeps that out of this build's
+// state (#143).
+const _TAB_RECEIPTS_KEY = "mcpOwnedTabReceiptsV4";
+const _TAB_RECEIPTS_VERSION = 4;
+// Announced on /connect. The daemon reloads a lease holder that announces none (worker-upgrade.js).
+// Must equal EXTENSION_BUILD in worker-upgrade.js.
+const _EXTENSION_BUILD = "isolated-envelopes-1";
 const _BROWSER_SESSION_EPOCH_KEY = "mcpBrowserSessionEpochV1";
 // The prefix of `_bridgeWorkerId` that the daemon log prints for this worker. Every
 // ownership envelope written to storage.local carries it, so the on-disk history shows

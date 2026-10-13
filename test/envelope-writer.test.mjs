@@ -46,9 +46,9 @@ function harness() {
     "use strict";
     const _bridgeWorkerId = ${JSON.stringify(WORKER_ID)};
     ${writerLine[0]}
-    const _TAB_RECEIPTS_VERSION = 3;
-    const _TAB_RECEIPTS_KEY = "mcpOwnedTabReceiptsV3";
-    const _OWNED_TABS_LOCAL_KEY = "mcpOwnedTabsLocal";
+    const _TAB_RECEIPTS_VERSION = 4;
+    const _TAB_RECEIPTS_KEY = "mcpOwnedTabReceiptsV4";
+    const _OWNED_TABS_LOCAL_KEY = "mcpOwnedTabsLocalV2";
     const _OWNED_TABS_KEY = "mcpSessionOwnedTabs";
     let _browserSessionEpoch = ${JSON.stringify(EPOCH)};
     let _browserEpochGeneration = 0;
@@ -75,12 +75,12 @@ test("both ownership envelopes name the worker that wrote them", async () => {
   const { persist, localWrites } = harness();
   await persist(true);
   assert.equal(localWrites.length, 1);
-  const receipts = localWrites[0].mcpOwnedTabReceiptsV3;
-  const owners = localWrites[0].mcpOwnedTabsLocal;
+  const receipts = localWrites[0].mcpOwnedTabReceiptsV4;
+  const owners = localWrites[0].mcpOwnedTabsLocalV2;
   assert.equal(receipts.writer, "0123abcd");
   assert.equal(owners.writer, "0123abcd");
   // The fields hydration does read are unchanged.
-  assert.equal(receipts.version, 3);
+  assert.equal(receipts.version, 4);
   assert.equal(receipts.browserEpoch, EPOCH);
   assert.equal(typeof receipts.at, "number");
   assert.deepEqual(receipts.records.map((record) => record.tabId), [7]);

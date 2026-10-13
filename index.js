@@ -29,6 +29,7 @@ import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { jpegSize } from "./image-size.js";
 import { createSafariSessionHintReader } from "./safari-session-hint.js";
+import { createStaleWorkerPolicy } from "./worker-upgrade.js";
 import {
   createLedger as createWorkerLedger,
   noteConnect as ledgerNoteConnect,
@@ -634,6 +635,26 @@ let _activeHttpWorkerId = "";
 // The identity of the running Safari process, sent on every authenticated bridge response so
 // the extension can name its browser session the same way from every worker instance (#143).
 const _safariSessionHint = createSafariSessionHintReader();
+
+// A context Safari kept from an older app announces no build. It becomes the lease holder each
+// time it verifies, so it is reloaded then (see worker-upgrade.js). SAFARI_MCP_NO_AUTO_UPGRADE=1
+// turns this off.
+const _staleWorkerPolicy = createStaleWorkerPolicy();
+function _reloadStaleWorker(workerId, build) {
+  if (process.env.SAFARI_MCP_NO_AUTO_UPGRADE === "1") return;
+  const verdict = _staleWorkerPolicy({
+    build,
+    active: workerId === _activeHttpWorkerId,
+    busy: _pendingRequests.size > 0,
+  });
+  if (!verdict.reload) return;
+  console.error(`[Safari MCP] worker ${workerId.slice(0, 8)} announced no extension build (a context Safari kept from an older app); reloading it`);
+  // Let it finish verifying and start polling, then check again that nobody queued a command.
+  setTimeout(() => {
+    if (workerId !== _activeHttpWorkerId || _pendingRequests.size > 0) return;
+    sendToExtension("reload_extension", {}, 30000).catch(() => {});
+  }, 1500);
+}
 const _connectingHttpWorkers = new Map();
 const _HTTP_WORKER_TTL_MS = 60 * 1000;
 const _HTTP_RELOAD_HANDOFF_TTL_MS = 30 * 1000;
@@ -657,12 +678,12 @@ function _reloadHandoffToken(req) {
   return typeof value === "string" && /^[A-Za-z0-9_-]{24,}$/.test(value) ? value : "";
 }
 
-function _rememberConnectingHttpWorker(workerId, reloadHandoffToken = "") {
+function _rememberConnectingHttpWorker(workerId, reloadHandoffToken = "", build = "") {
   const now = Date.now();
   for (const [id, record] of _connectingHttpWorkers) {
     if (now - record.connectedAt > _HTTP_WORKER_TTL_MS) _connectingHttpWorkers.delete(id);
   }
-  _connectingHttpWorkers.set(workerId, { connectedAt: now, reloadHandoffToken });
+  _connectingHttpWorkers.set(workerId, { connectedAt: now, reloadHandoffToken, build });
 }
 
 function _connectingHttpWorker(workerId) {
@@ -1157,7 +1178,9 @@ try {
       // Only an accepted code generation may proceed to /verify-profile and
       // /extension-verified. Remembering rejected workers would let a stale process
       // skip the protocol gate by posting the second handshake step directly.
-      _rememberConnectingHttpWorker(workerId, _reloadHandoffToken(req));
+      const announcedBuild = String(connectUrl.searchParams.get("build") || "");
+      const build = /^[A-Za-z0-9._-]{1,40}$/.test(announcedBuild) ? announcedBuild : "";
+      _rememberConnectingHttpWorker(workerId, _reloadHandoffToken(req), build);
       ledgerNoteConnect(_workerLedger, workerId);
       _noteUnverifiedWorker(workerId);
       // When SAFARI_PROFILE is set, don't mark as connected until profile is verified.
@@ -1183,6 +1206,7 @@ try {
           console.error("[Safari MCP] Extension connected via HTTP polling");
         }
         _scheduleKeepaliveTab();
+        _reloadStaleWorker(workerId, build);
       }
       if (!process.env.SAFARI_PROFILE) _extensionLastPollTime = Date.now();
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -1234,6 +1258,7 @@ try {
         return;
       }
       const workerChanged = workerId !== _activeHttpWorkerId;
+      const verifiedBuild = connectingWorker.build || "";
       _activeHttpWorkerId = workerId;
       _connectingHttpWorkers.delete(workerId);
       if (workerChanged) {
@@ -1251,6 +1276,7 @@ try {
       _scheduleKeepaliveTab();
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "verified" }));
+      _reloadStaleWorker(workerId, verifiedBuild);
       return;
     }
 
