@@ -1,12 +1,18 @@
 /**
- * Retiring extension contexts that still run an older build (#143).
+ * Contexts that still run an older build (#143).
  *
- * Replacing the extension app does not stop the contexts Safari had already started: they stay
- * alive, each with its own in-memory receipts, and each becomes the daemon's lease holder again
- * every time it verifies. A lease that moves between an old context and a new one loses the
- * receipts the other minted. Every worker that holds the lease passes through verification, so
- * the daemon reloads it there, once, when it did not announce a build: the reload restarts that
- * context from the app now on disk, and the replacement announces the build.
+ * Replacing the extension app does not stop the contexts Safari had already started, and Safari
+ * keeps the context of every app generation it ever loaded (13.10.26: its process had the
+ * resources of a dozen builds mapped, among them deleted ones). Each wakes every minute, verifies
+ * and becomes the daemon's lease holder, each with its own in-memory receipts, so a lease that
+ * moves between an old context and a new one loses the receipts the other minted.
+ *
+ * Reloading an old context does not remove it: it restarts the same old generation, so the stream
+ * of old contexts never ends (45 reloads in 90 minutes). What the daemon controls is who leads.
+ * A worker that announced no build never takes the lease while a current one has verified within
+ * `LEASE_BUILD_PREFERENCE_MS`, and a current one takes it from an old holder at once. Reloading
+ * is the fallback for when no current context is around at all: the reload restarts the context
+ * from the app now on disk, and the replacement announces the build.
  *
  * A worker that announces any build is never reloaded here, so a newer extension talking to an
  * older daemon is left alone. The rate limit bounds the damage if a reload ever fails to change
@@ -15,6 +21,24 @@
 
 /** Sent by the extension on `/connect` (`&build=`). Absent on every older build. */
 export const EXTENSION_BUILD = "isolated-envelopes-1";
+
+/** How long after a current context verified the daemon keeps older ones away from the lease. */
+export const LEASE_BUILD_PREFERENCE_MS = 15 * 60_000;
+
+/**
+ * Whether the builds alone settle who may lead. The caller still applies its other rules (a
+ * command in flight, a reload handoff) before acting on "take".
+ *   deny      an older context while a current one is around: it never leads
+ *   take      a current context against a holder from an older app: replace it, even while it polls
+ *   ordinary  the usual rule decides (the holder has been quiet for a while)
+ * @param {{ candidateBuild: string, holderBuild: string, hasHolder: boolean, currentSeenRecently: boolean }} s
+ * @returns {"deny" | "take" | "ordinary"}
+ */
+export function leaseBuildVerdict({ candidateBuild, holderBuild, hasHolder, currentSeenRecently }) {
+  if (!candidateBuild && currentSeenRecently) return "deny";
+  if (candidateBuild && hasHolder && !holderBuild) return "take";
+  return "ordinary";
+}
 
 /**
  * `check` decides without recording anything; `commit` records an attempt once the reload is
