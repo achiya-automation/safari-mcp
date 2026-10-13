@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A receipt from `safari_new_tab` survives the extension worker being replaced (#143).** The extension named the browser session with a value kept in `storage.session`, and Safari gives every worker instance its own `storage.session`. So the epoch rotated with each worker succession, instances alive together held different ones, and the first tab removal afterwards made every instance rewrite the shared receipt envelope under its own epoch and drop what the others had stored. On 13.10.26 a receipt stopped resolving about a minute after it worked while Safari's process kept running, and four envelopes written in the same millisecond carried four different epochs. Three changes:
+  - **The daemon names the browser session.** Every authenticated bridge response now carries `X-Safari-MCP-Browser-Epoch`, the identity of the running Safari process (`<pid>:<start time>`, read from the process table at most once a second). The extension derives its epoch from it and keeps the last one in `storage.local`, so every worker instance agrees on the epoch and only a Safari restart changes it. A daemon that sends no hint leaves `storage.session` as the authority, as before.
+  - **Only the worker that holds the daemon's lease writes the shared envelopes.** A superseded, retiring, disabled or disconnected instance still receives tab events and still holds the maps from when it last hydrated; it no longer writes them over the live worker's receipts. A command's own durable write is refused only once its worker has been superseded.
+  - **A receipt this instance has never seen is looked up in the shared envelope again before it is refused**, in case another instance minted it after this one hydrated. A string that is not shaped like a receipt still causes no storage read.
+  New: `safari-session-hint.js`, `test/safari-session-hint.test.mjs`, `test/stable-browser-epoch.test.mjs`. The two existing harnesses that run the changed functions directly (`browser-epoch-rotation`, `envelope-writer`) gained the new dependencies. The extension part takes effect once the extension app is rebuilt; the daemon part once the daemon restarts.
+
 ## [2.22.16] - 2026-10-13
 
 ### Added

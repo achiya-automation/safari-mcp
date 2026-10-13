@@ -56,6 +56,7 @@ function harness() {
     const _sessionOwnedTabs = new Map([["session-a", new Set([7])]]);
     const _receiptByToken = new Map([[${JSON.stringify(TOKEN)}, { token: ${JSON.stringify(TOKEN)}, tabId: 7 }]]);
     async function _ensureBrowserSessionEpoch() { return _browserSessionEpoch; }
+    function _mayPersistOwnership() { return true; } // this worker holds the lease (see stable-browser-epoch.test.mjs)
     ${fnSource("_withBrowserEpochStorageLock")}
     ${fnSource("_persistOwnedTabs")}
     return _persistOwnedTabs;

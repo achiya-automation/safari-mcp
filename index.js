@@ -28,6 +28,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { jpegSize } from "./image-size.js";
+import { createSafariSessionHintReader } from "./safari-session-hint.js";
 import {
   createLedger as createWorkerLedger,
   noteConnect as ledgerNoteConnect,
@@ -630,6 +631,9 @@ function _isAllowedWebSocketOrigin(origin) {
 let _extensionWs = null;
 let _extensionConnected = false;
 let _activeHttpWorkerId = "";
+// The identity of the running Safari process, sent on every authenticated bridge response so
+// the extension can name its browser session the same way from every worker instance (#143).
+const _safariSessionHint = createSafariSessionHintReader();
 const _connectingHttpWorkers = new Map();
 const _HTTP_WORKER_TTL_MS = 60 * 1000;
 const _HTTP_RELOAD_HANDOFF_TTL_MS = 30 * 1000;
@@ -1033,6 +1037,13 @@ try {
       res.writeHead(401);
       res.end("Unauthorized");
       return;
+    }
+    if (extensionBridgeEndpoint) {
+      const sessionHint = _safariSessionHint();
+      if (sessionHint) {
+        res.setHeader("X-Safari-MCP-Browser-Epoch", sessionHint);
+        res.setHeader("Access-Control-Expose-Headers", "X-Safari-MCP-Browser-Epoch");
+      }
     }
 
     // GET /poll — extension asks for next command (long-poll, up to 5s)
