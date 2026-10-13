@@ -55,6 +55,8 @@ function harness({ initial = EPOCH_A, minted = [] } = {}) {
     let _browserEpochStorageTail = Promise.resolve();
     const _browserSessionStorageAvailable = true;
     const _BROWSER_SESSION_EPOCH_KEY = ${JSON.stringify(KEY)};
+    let _serverBrowserEpoch = ""; // no daemon-named session: storage.session stays the authority
+    async function _restoreServerEpoch() {}
     ${fnSource("_withBrowserEpochStorageLock")}
     ${fnSource("_adoptBrowserSessionEpoch")}
     ${fnSource("_ensureBrowserSessionEpoch")}

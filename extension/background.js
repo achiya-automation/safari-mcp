@@ -62,7 +62,14 @@ async function _bridgeFetch(url, init = {}) {
   const headers = new Headers(init.headers || {});
   headers.set("X-Safari-MCP-Token", await _bridgeAuthToken());
   headers.set("X-Safari-MCP-Worker", _bridgeWorkerId);
-  return fetch(url, { ...init, headers });
+  const response = await fetch(url, { ...init, headers });
+  // The daemon names the browser session on every authenticated response (#143). Adopt it
+  // before the caller acts on the body, so a command never resolves a receipt under an
+  // epoch that this response has already replaced.
+  try {
+    await _noteBrowserEpochHint(response.headers.get("X-Safari-MCP-Browser-Epoch"));
+  } catch {} // a failure here must never take the bridge down; the old epoch stays in force
+  return response;
 }
 const _CONTENT_WAKE_TOKEN_STORAGE_KEY = "mcpContentWakeTokenV1";
 const _CONTENT_WAKE_LABEL = "safari-mcp-content-wakeup-v1";
@@ -2785,7 +2792,78 @@ function _adoptBrowserSessionEpoch(epoch) {
   return epoch;
 }
 
+// ---- The daemon names the browser session (#143) ----
+// Safari gives every worker instance its own `storage.session`, so an epoch minted there
+// rotated with each worker succession and differed between instances alive together. The
+// next tab removal then rewrote the shared receipt envelope under another epoch and dropped
+// every receipt the previous one held. The daemon knows which Safari process is running and
+// sends its identity ("<pid>:<start time>") on every authenticated response: the same for
+// every instance, changing only when Safari itself restarts, which is exactly when tab ids
+// stop meaning anything. The epoch is derived from it; `storage.session` stays the fallback
+// for a daemon that sends none.
+const _SERVER_EPOCH_KEY = "mcpServerBrowserEpochV1";
+// A stored copy older than this is not trusted by a cold worker: Safari has probably been
+// relaunched since, and the daemon has not yet said so.
+const _SERVER_EPOCH_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const _SERVER_EPOCH_REFRESH_MS = 60 * 60 * 1000;
+let _serverBrowserEpoch = "";
+let _serverEpochStoredAt = 0;
+let _serverEpochRestorePromise = null;
+
+async function _deriveServerEpoch(hint) {
+  const bytes = new TextEncoder().encode(`safari-mcp-browser-session-v1:${hint}`);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("").slice(0, 36);
+}
+
+async function _storeServerEpoch(epoch) {
+  try {
+    await browser.storage.local.set({ [_SERVER_EPOCH_KEY]: { epoch, at: Date.now() } });
+    _serverEpochStoredAt = Date.now();
+  } catch {} // best effort: the next response names it again
+}
+
+// A cold worker starts with the identity the previous worker last stored, so that a tab
+// event delivered before its first bridge response is not read under a made-up epoch. The
+// first response replaces it if Safari has restarted since.
+function _restoreServerEpoch() {
+  if (_serverBrowserEpoch) return Promise.resolve();
+  if (!_serverEpochRestorePromise) {
+    _serverEpochRestorePromise = (async () => {
+      try {
+        const stored = (await browser.storage.local.get(_SERVER_EPOCH_KEY))?.[_SERVER_EPOCH_KEY];
+        if (!_serverBrowserEpoch && stored && /^[a-f0-9]{36}$/.test(String(stored.epoch || "")) &&
+          typeof stored.at === "number" && (Date.now() - stored.at) < _SERVER_EPOCH_MAX_AGE_MS) {
+          _serverBrowserEpoch = stored.epoch;
+          _serverEpochStoredAt = stored.at;
+        }
+      } catch {}
+    })();
+  }
+  return _serverEpochRestorePromise;
+}
+
+async function _noteBrowserEpochHint(hint) {
+  const text = String(hint || "");
+  if (!/^\d{1,8}:[ -~]{8,40}$/.test(text)) return;
+  const epoch = await _deriveServerEpoch(text);
+  if (epoch === _serverBrowserEpoch) {
+    if (Date.now() - _serverEpochStoredAt > _SERVER_EPOCH_REFRESH_MS) await _storeServerEpoch(epoch);
+    return;
+  }
+  _serverBrowserEpoch = epoch;
+  await _storeServerEpoch(epoch);
+  if (_browserSessionEpoch !== epoch) {
+    // Bumps the generation, so work stamped with the previous epoch aborts instead of
+    // writing, and forces the next hydration to read storage under the new one.
+    _adoptBrowserSessionEpoch(epoch);
+    _ownedTabsHydrated = false;
+  }
+}
+
 async function _ensureBrowserSessionEpoch() {
+  await _restoreServerEpoch();
+  if (_serverBrowserEpoch) return _adoptBrowserSessionEpoch(_serverBrowserEpoch);
   if (!_browserSessionStorageAvailable) {
     throw new Error("Browser session storage is unavailable; refusing durable tab authority");
   }
@@ -2974,7 +3052,23 @@ async function _hydrateOwnedTabs() {
     if (_ownedTabsHydrationPromise === hydration) _ownedTabsHydrationPromise = null;
   }
 }
+// Only the worker that holds the daemon's lease writes the shared envelopes. A superseded or
+// disconnected instance still gets tab events and still holds the maps from when it last
+// hydrated; letting it write replaced the live worker's receipts with its stale view (#143).
+// A command running here (a durable write) is the lease holder by construction, unless it
+// has been superseded.
+function _mayPersistOwnership(requireDurableReceipt) {
+  if (requireDurableReceipt) return !_bridgeWorkerSuperseded;
+  return isConnected && _enabled && !_bridgeWorkerSuperseded && !_bridgeWorkerRetiring;
+}
+
 async function _persistOwnedTabs(requireDurableReceipt = false) {
+  if (!_mayPersistOwnership(requireDurableReceipt)) {
+    if (requireDurableReceipt) {
+      throw new Error("Could not persist tab receipt: this worker no longer holds the bridge lease");
+    }
+    return [];
+  }
   const browserEpoch = await _ensureBrowserSessionEpoch();
   const generation = _browserEpochGeneration;
   const owners = {};
@@ -3151,6 +3245,16 @@ async function _refreshAllReceiptIdentities() {
 async function _resolveReceiptTab(token, { allowOriginChange = false } = {}) {
   return _withReceiptMutationLock(async () => {
     const normalized = String(token || "");
+    if (!_receiptByToken.has(normalized) && /^[A-Za-z0-9_-]{24,}$/.test(normalized)) {
+      // Another worker instance may have minted it after this one hydrated: read the
+      // shared envelope again before refusing (#143). Every mutation persists before it
+      // returns, so nothing in memory is lost by rebuilding the maps from storage.
+      await (async () => {
+        if (_ownedTabsHydrationPromise) await _ownedTabsHydrationPromise.catch(() => {});
+        _ownedTabsHydrated = false;
+        await _hydrateOwnedTabs();
+      })().catch(() => {});
+    }
     const record = _receiptByToken.get(normalized);
     if (!/^[A-Za-z0-9_-]{24,}$/.test(normalized) || !_isValidReceiptRecord(normalized, record)) {
       throw new Error("Tab safety: this extension has no record of that receipt. It was never issued by this extension instance, or it ended when its tab closed, when getReceipt replaced it, or when Safari or the extension restarted. Open the tab again with safari_new_tab.");
