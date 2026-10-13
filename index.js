@@ -650,9 +650,18 @@ function _reloadStaleWorker(workerId, build) {
   if (!verdict.reload) return;
   console.error(`[Safari MCP] worker ${workerId.slice(0, 8)} announced no extension build (a context Safari kept from an older app); reloading it`);
   // Let it finish verifying and start polling, then check again that nobody queued a command.
-  setTimeout(() => {
+  // The reload needs the same handoff as safari_reload_extension (see /proxy-command): it is
+  // what lets the replacement worker take the lease from this one.
+  setTimeout(async () => {
     if (workerId !== _activeHttpWorkerId || _pendingRequests.size > 0) return;
-    sendToExtension("reload_extension", {}, 30000).catch(() => {});
+    let handoff = null;
+    try {
+      handoff = _prepareReloadHttpWorkerHandoff();
+      await sendToExtension("reload_extension", { reloadHandoff: handoff.token }, 30000);
+    } catch (error) {
+      if (handoff) _cancelReloadHttpWorkerHandoff(handoff);
+      console.error(`[Safari MCP] reloading worker ${workerId.slice(0, 8)} failed: ${error.message}`);
+    }
   }, 1500);
 }
 const _connectingHttpWorkers = new Map();
