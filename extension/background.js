@@ -2700,6 +2700,11 @@ const _OWNED_TABS_KEY = "mcpSessionOwnedTabs";
 const _TAB_RECEIPTS_KEY = "mcpOwnedTabReceiptsV3";
 const _TAB_RECEIPTS_VERSION = 3;
 const _BROWSER_SESSION_EPOCH_KEY = "mcpBrowserSessionEpochV1";
+// The prefix of `_bridgeWorkerId` that the daemon log prints for this worker. Every
+// ownership envelope written to storage.local carries it, so the on-disk history shows
+// which worker instance wrote each one and under which epoch (#143). Diagnostic only:
+// hydration never reads it.
+const _ENVELOPE_WRITER = _bridgeWorkerId.slice(0, 8);
 // Receipts are bearer capabilities stored entirely out of band. They are never added
 // to a live page URL: doing so corrupts signed queries and application hash routers.
 const _receiptByToken = new Map(); // token → { tabId, windowId, receiptOrigin, identityDigest, issuedAt }
@@ -2977,6 +2982,7 @@ async function _persistOwnedTabs(requireDurableReceipt = false) {
   const receiptEnvelope = {
     version: _TAB_RECEIPTS_VERSION,
     browserEpoch,
+    writer: _ENVELOPE_WRITER,
     at: Date.now(),
     records: [..._receiptByToken.values()].map((record) => ({ ...record })),
   };
@@ -2995,7 +3001,7 @@ async function _persistOwnedTabs(requireDurableReceipt = false) {
     try {
       localWrite = Promise.resolve(browser.storage.local.set({
         [_TAB_RECEIPTS_KEY]: receiptEnvelope,
-        [_OWNED_TABS_LOCAL_KEY]: { browserEpoch, at: Date.now(), tabs: owners },
+        [_OWNED_TABS_LOCAL_KEY]: { browserEpoch, writer: _ENVELOPE_WRITER, at: Date.now(), tabs: owners },
       }));
     } catch (error) {
       localWrite = Promise.reject(error);
