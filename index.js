@@ -632,6 +632,8 @@ function _isAllowedWebSocketOrigin(origin) {
 let _extensionWs = null;
 let _extensionConnected = false;
 let _activeHttpWorkerId = "";
+// The build the lease holder announced on /connect ("" for a context from an older app).
+let _activeHttpWorkerBuild = "";
 // The identity of the running Safari process, sent on every authenticated bridge response so
 // the extension can name its browser session the same way from every worker instance (#143).
 const _safariSessionHint = createSafariSessionHintReader();
@@ -640,34 +642,34 @@ const _safariSessionHint = createSafariSessionHintReader();
 // time it verifies, so it is reloaded then (see worker-upgrade.js). SAFARI_MCP_NO_AUTO_UPGRADE=1
 // turns this off.
 const _staleWorkerPolicy = createStaleWorkerPolicy();
-function _reloadStaleWorker(workerId, build, attempt = 0) {
-  if (process.env.SAFARI_MCP_NO_AUTO_UPGRADE === "1" || build) return;
-  // Decided after a short wait, so the worker has finished verifying and is polling. A command
-  // in flight (or a reload a moment ago) only delays it: this worker stays the lease holder
-  // until another one verifies, so look again every few seconds for about a minute.
-  setTimeout(async () => {
-    const verdict = _staleWorkerPolicy.check({
-      build,
-      active: workerId === _activeHttpWorkerId,
-      busy: _pendingRequests.size > 0,
-    });
-    if (!verdict.reload) {
-      if (verdict.retry && attempt < 20) _reloadStaleWorker(workerId, build, attempt + 1);
-      return;
-    }
-    _staleWorkerPolicy.commit();
-    console.error(`[Safari MCP] worker ${workerId.slice(0, 8)} announced no extension build (a context Safari kept from an older app); reloading it`);
-    // The reload needs the same handoff as safari_reload_extension (see /proxy-command): it is
-    // what lets the replacement worker take the lease from this one.
-    let handoff = null;
-    try {
-      handoff = _prepareReloadHttpWorkerHandoff();
-      await sendToExtension("reload_extension", { reloadHandoff: handoff.token }, 30000);
-    } catch (error) {
-      if (handoff) _cancelReloadHttpWorkerHandoff(handoff);
-      console.error(`[Safari MCP] reloading worker ${workerId.slice(0, 8)} failed: ${error.message}`);
-    }
-  }, attempt === 0 ? 1500 : 3000);
+let _staleReloadInFlight = false;
+async function _reloadStaleWorker(workerId) {
+  if (process.env.SAFARI_MCP_NO_AUTO_UPGRADE === "1" || _staleReloadInFlight) return;
+  if (workerId !== _activeHttpWorkerId || _activeHttpWorkerBuild) return;
+  // Asked on every poll of the lease holder until it has been reloaded: a command in flight or a
+  // reload a moment ago only delays it, so a context that verified at a busy moment cannot stay
+  // the lease holder for good.
+  const verdict = _staleWorkerPolicy.check({
+    build: _activeHttpWorkerBuild,
+    active: true,
+    busy: _pendingRequests.size > 0,
+  });
+  if (!verdict.reload) return;
+  _staleReloadInFlight = true;
+  _staleWorkerPolicy.commit();
+  console.error(`[Safari MCP] worker ${workerId.slice(0, 8)} announced no extension build (a context Safari kept from an older app); reloading it`);
+  // The reload needs the same handoff as safari_reload_extension (see /proxy-command): it is
+  // what lets the replacement worker take the lease from this one.
+  let handoff = null;
+  try {
+    handoff = _prepareReloadHttpWorkerHandoff();
+    await sendToExtension("reload_extension", { reloadHandoff: handoff.token }, 30000);
+  } catch (error) {
+    if (handoff) _cancelReloadHttpWorkerHandoff(handoff);
+    console.error(`[Safari MCP] reloading worker ${workerId.slice(0, 8)} failed: ${error.message}`);
+  } finally {
+    _staleReloadInFlight = false;
+  }
 }
 const _connectingHttpWorkers = new Map();
 const _HTTP_WORKER_TTL_MS = 60 * 1000;
@@ -1094,6 +1096,7 @@ try {
         return;
       }
       _extensionLastPollTime = Date.now(); // Keep connection alive — critical for stale detection
+      _reloadStaleWorker(pollingWorkerId);
       if (!_extensionConnected) {
         _extensionConnected = true;
         console.error("[Safari MCP] Extension reconnected via poll");
@@ -1209,6 +1212,7 @@ try {
         }
         const workerChanged = workerId !== _activeHttpWorkerId;
         _activeHttpWorkerId = workerId;
+        _activeHttpWorkerBuild = build;
         _connectingHttpWorkers.delete(workerId);
         if (workerChanged) {
           _adoptReloadHandoff(workerId);
@@ -1220,7 +1224,6 @@ try {
           console.error("[Safari MCP] Extension connected via HTTP polling");
         }
         _scheduleKeepaliveTab();
-        _reloadStaleWorker(workerId, build);
       }
       if (!process.env.SAFARI_PROFILE) _extensionLastPollTime = Date.now();
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -1272,8 +1275,8 @@ try {
         return;
       }
       const workerChanged = workerId !== _activeHttpWorkerId;
-      const verifiedBuild = connectingWorker.build || "";
       _activeHttpWorkerId = workerId;
+      _activeHttpWorkerBuild = connectingWorker.build || "";
       _connectingHttpWorkers.delete(workerId);
       if (workerChanged) {
         _adoptReloadHandoff(workerId);
@@ -1290,7 +1293,6 @@ try {
       _scheduleKeepaliveTab();
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "verified" }));
-      _reloadStaleWorker(workerId, verifiedBuild);
       return;
     }
 
