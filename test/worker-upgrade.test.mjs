@@ -76,14 +76,17 @@ test("the daemon remembers the announced build and checks it when the worker tak
   assert.match(index, /const verifiedBuild = connectingWorker\.build \|\| "";\s*_activeHttpWorkerId = workerId;/, "read before the connecting record is deleted");
 });
 
-test("the reload goes through the same command as safari_reload_extension, and looks again before it runs", () => {
+test("the reload prepares the same handoff safari_reload_extension does, and looks again before it runs", () => {
   const start = index.indexOf("function _reloadStaleWorker(");
   const body = stripComments(index.slice(start, index.indexOf("\n}\n", start)));
   assert.match(body, /SAFARI_MCP_NO_AUTO_UPGRADE === "1"\) return;/, "it can be switched off");
   assert.match(body, /busy: _pendingRequests\.size > 0/);
   const timer = body.slice(body.indexOf("setTimeout("));
   assert.match(timer, /workerId !== _activeHttpWorkerId \|\| _pendingRequests\.size > 0\) return;/, "nobody queued a command while it waited");
-  assert.match(timer, /sendToExtension\("reload_extension", \{\}, 30000\)/);
+  assert.match(timer, /handoff = _prepareReloadHttpWorkerHandoff\(\);/, "without a handoff the extension refuses to reload");
+  assert.match(timer, /sendToExtension\("reload_extension", \{ reloadHandoff: handoff\.token \}, 30000\)/);
+  assert.match(timer, /if \(handoff\) _cancelReloadHttpWorkerHandoff\(handoff\);/, "a failed reload gives the handoff back");
+  assert.match(timer, /console\.error\(`\[Safari MCP\] reloading worker/, "a failure is logged, not swallowed");
 });
 
 test("this build's envelopes are stored under keys that no older build reads or writes", () => {
