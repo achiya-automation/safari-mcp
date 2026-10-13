@@ -26,37 +26,41 @@ const stripComments = (s) => s.split("\n").filter((l) => !/^\s*(\/\/|\*|\/\*)/.t
 const idle = { build: "", active: true, busy: false };
 
 test("a lease holder that announced no build is reloaded", () => {
-  const decide = createStaleWorkerPolicy();
-  assert.deepEqual(decide(idle), { reload: true, reason: "no build announced" });
+  const policy = createStaleWorkerPolicy();
+  assert.deepEqual(policy.check(idle), { reload: true, retry: false, reason: "no build announced" });
 });
 
 test("a worker that announced any build is left alone, so a newer extension survives an older daemon", () => {
-  const decide = createStaleWorkerPolicy();
-  assert.equal(decide({ ...idle, build: EXTENSION_BUILD }).reload, false);
-  assert.equal(decide({ ...idle, build: "some-future-build" }).reload, false);
+  const policy = createStaleWorkerPolicy();
+  assert.equal(policy.check({ ...idle, build: EXTENSION_BUILD }).reload, false);
+  assert.equal(policy.check({ ...idle, build: "some-future-build" }).reload, false);
+  assert.equal(policy.check({ ...idle, build: EXTENSION_BUILD }).retry, false, "nothing to wait for");
 });
 
-test("only the lease holder is reloaded, and never while a command is in flight", () => {
-  const decide = createStaleWorkerPolicy();
-  assert.match(decide({ ...idle, active: false }).reason, /not the lease holder/);
-  assert.match(decide({ ...idle, busy: true }).reason, /command is in flight/);
-  assert.equal(decide(idle).reload, true, "the skipped looks did not use up an attempt");
+test("only the lease holder is reloaded; a command in flight delays it instead of cancelling it", () => {
+  const policy = createStaleWorkerPolicy();
+  assert.deepEqual(policy.check({ ...idle, active: false }), { reload: false, retry: false, reason: "not the lease holder" });
+  assert.deepEqual(policy.check({ ...idle, busy: true }), { reload: false, retry: true, reason: "a command is in flight" });
+  assert.equal(policy.check(idle).reload, true, "looking does not use up an attempt");
 });
 
 test("reloads are spaced, and bounded per window, in case a reload ever leaves the code unchanged", () => {
   let t = 1_000_000;
-  const decide = createStaleWorkerPolicy({ now: () => t, minGapMs: 20_000, windowMs: 600_000, maxPerWindow: 3 });
-  assert.equal(decide(idle).reload, true);
+  const policy = createStaleWorkerPolicy({ now: () => t, minGapMs: 20_000, windowMs: 600_000, maxPerWindow: 3 });
+  assert.equal(policy.check(idle).reload, true);
+  policy.commit();
   t += 19_999;
-  assert.match(decide(idle).reason, /a moment ago/);
+  assert.deepEqual(policy.check(idle), { reload: false, retry: true, reason: "reloaded one a moment ago" });
   t += 1;
-  assert.equal(decide(idle).reload, true);
+  assert.equal(policy.check(idle).reload, true);
+  policy.commit();
   t += 20_000;
-  assert.equal(decide(idle).reload, true);
+  assert.equal(policy.check(idle).reload, true);
+  policy.commit();
   t += 20_000;
-  assert.match(decide(idle).reason, /limit reached/, "three in the window, then no more");
+  assert.deepEqual(policy.check(idle), { reload: false, retry: false, reason: "reload limit reached" }, "three in the window, then no more");
   t += 600_000;
-  assert.equal(decide(idle).reload, true, "the window moved on");
+  assert.equal(policy.check(idle).reload, true, "the window moved on");
 });
 
 test("the extension and the daemon agree on the build name", () => {
@@ -76,13 +80,14 @@ test("the daemon remembers the announced build and checks it when the worker tak
   assert.match(index, /const verifiedBuild = connectingWorker\.build \|\| "";\s*_activeHttpWorkerId = workerId;/, "read before the connecting record is deleted");
 });
 
-test("the reload prepares the same handoff safari_reload_extension does, and looks again before it runs", () => {
+test("the daemon decides inside the timer, keeps looking while the worker stays the lease holder, and prepares the same handoff the tool does", () => {
   const start = index.indexOf("function _reloadStaleWorker(");
   const body = stripComments(index.slice(start, index.indexOf("\n}\n", start)));
-  assert.match(body, /SAFARI_MCP_NO_AUTO_UPGRADE === "1"\) return;/, "it can be switched off");
-  assert.match(body, /busy: _pendingRequests\.size > 0/);
+  assert.match(body, /SAFARI_MCP_NO_AUTO_UPGRADE === "1" \|\| build\) return;/, "it can be switched off, and a worker with a build is never looked at");
   const timer = body.slice(body.indexOf("setTimeout("));
-  assert.match(timer, /workerId !== _activeHttpWorkerId \|\| _pendingRequests\.size > 0\) return;/, "nobody queued a command while it waited");
+  assert.match(timer, /_staleWorkerPolicy\.check\(\{[\s\S]*?busy: _pendingRequests\.size > 0,/, "decided when the timer fires, with the state of that moment");
+  assert.match(timer, /if \(verdict\.retry && attempt < 20\) _reloadStaleWorker\(workerId, build, attempt \+ 1\);/, "a command in flight delays the reload, it does not cancel it");
+  assert.ok(timer.indexOf("_staleWorkerPolicy.commit();") > timer.indexOf("if (!verdict.reload)"), "an attempt is recorded only when a reload is really going out");
   assert.match(timer, /handoff = _prepareReloadHttpWorkerHandoff\(\);/, "without a handoff the extension refuses to reload");
   assert.match(timer, /sendToExtension\("reload_extension", \{ reloadHandoff: handoff\.token \}, 30000\)/);
   assert.match(timer, /if \(handoff\) _cancelReloadHttpWorkerHandoff\(handoff\);/, "a failed reload gives the handoff back");
