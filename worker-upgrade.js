@@ -26,16 +26,33 @@ export const EXTENSION_BUILD = "isolated-envelopes-1";
 export const LEASE_BUILD_PREFERENCE_MS = 15 * 60_000;
 
 /**
- * Whether the builds alone settle who may lead. The caller still applies its other rules (a
- * command in flight, a reload handoff) before acting on "take".
- *   deny      an older context while a current one is around: it never leads
+ * How long the context that leads (the home context) may stay silent before another current
+ * context may lead. Its instances wake on a one-minute alarm, so this is a little over one cycle.
+ */
+export const HOME_CONTEXT_ALIVE_MS = 100_000;
+
+/**
+ * Whether the builds and contexts alone settle who may lead. The caller still applies its other
+ * rules (a command in flight, a reload handoff) before acting on "take".
+ *   deny      an older context while a current one is around, or a current context while another
+ *             current one (the home context, by extension origin) is alive: it never leads
  *   take      a current context against a holder from an older app: replace it, even while it polls
  *   ordinary  the usual rule decides (the holder has been quiet for a while)
- * @param {{ candidateBuild: string, holderBuild: string, hasHolder: boolean, currentSeenRecently: boolean }} s
+ *
+ * Several current contexts can be alive at once as well, and each has tab ids of its own: a receipt
+ * resolves only in the context that minted it, and a write from another context erased it from the
+ * shared envelope (13.10.26). Their requests carry different extension origins, so the first current
+ * context to lead stays the one that leads while it is alive.
+ * @param {{ candidateBuild: string, holderBuild: string, hasHolder: boolean, currentSeenRecently: boolean,
+ *   candidateOrigin?: string, homeOrigin?: string, homeAlive?: boolean }} s
  * @returns {"deny" | "take" | "ordinary"}
  */
-export function leaseBuildVerdict({ candidateBuild, holderBuild, hasHolder, currentSeenRecently }) {
+export function leaseBuildVerdict({
+  candidateBuild, holderBuild, hasHolder, currentSeenRecently,
+  candidateOrigin = "", homeOrigin = "", homeAlive = false,
+}) {
   if (!candidateBuild && currentSeenRecently) return "deny";
+  if (candidateBuild && homeAlive && homeOrigin && candidateOrigin !== homeOrigin) return "deny";
   if (candidateBuild && hasHolder && !holderBuild) return "take";
   return "ordinary";
 }

@@ -17,7 +17,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { readFileSync } from "node:fs";
-import { createStaleWorkerPolicy, EXTENSION_BUILD, leaseBuildVerdict, LEASE_BUILD_PREFERENCE_MS } from "../worker-upgrade.js";
+import { createStaleWorkerPolicy, EXTENSION_BUILD, leaseBuildVerdict, LEASE_BUILD_PREFERENCE_MS, HOME_CONTEXT_ALIVE_MS } from "../worker-upgrade.js";
 
 const background = readFileSync(new URL("../extension/background.js", import.meta.url), "utf8");
 const index = readFileSync(new URL("../index.js", import.meta.url), "utf8");
@@ -96,6 +96,19 @@ test("builds alone settle who may lead: older never while a current one is aroun
   assert.ok(LEASE_BUILD_PREFERENCE_MS >= 5 * 60_000, "long enough to outlast a context parked between its alarms");
 });
 
+test("another current context waits while the home context is alive, and follows the usual rule once it is not", () => {
+  const v = (o) => leaseBuildVerdict({ candidateBuild: EXTENSION_BUILD, holderBuild: EXTENSION_BUILD, hasHolder: true, currentSeenRecently: true, ...o });
+  assert.equal(v({ candidateOrigin: "b", homeOrigin: "a", homeAlive: true }), "deny", "a different context never leads while the home one is alive");
+  assert.equal(v({ candidateOrigin: "a", homeOrigin: "a", homeAlive: true }), "ordinary", "an instance of the home context follows the usual rule");
+  assert.equal(v({ candidateOrigin: "b", homeOrigin: "a", homeAlive: false }), "ordinary", "the home context has gone quiet: another may lead");
+  assert.equal(v({ candidateOrigin: "b", homeOrigin: "", homeAlive: true }), "ordinary", "no home context yet");
+  assert.equal(leaseBuildVerdict({ candidateBuild: EXTENSION_BUILD, holderBuild: "", hasHolder: true, currentSeenRecently: true, candidateOrigin: "b", homeOrigin: "a", homeAlive: true }), "deny",
+    "not even against an older holder: the home context's next instance will take it from there");
+  assert.equal(leaseBuildVerdict({ candidateBuild: "", holderBuild: "", hasHolder: true, currentSeenRecently: false, candidateOrigin: "b", homeOrigin: "a", homeAlive: true }), "ordinary",
+    "origins only separate current contexts from each other");
+  assert.ok(HOME_CONTEXT_ALIVE_MS > 60_000 && HOME_CONTEXT_ALIVE_MS < 5 * 60_000, "a little over one alarm cycle");
+});
+
 // The lease rule itself, run from the daemon's source with its other rules (a command in flight, a
 // reload handoff, the freshness window) in place.
 function leaseHarness() {
@@ -108,11 +121,14 @@ function leaseHarness() {
     let _activeHttpWorkerId = "";
     let _activeHttpWorkerBuild = "";
     let _currentBuildSeen = false;
+    let _homeOrigin = "";
+    let _homeAlive = false;
     let _extensionConnected = true;
     let _extensionLastPollTime = baseNow;
     let _extensionLastHeartbeat = 0;
     let _reloadHttpWorkerHandoff = null;
     const _currentBuildWorkerSeenRecently = () => _currentBuildSeen;
+    const _homeContextAlive = () => _homeAlive;
     const _pendingRequests = new Map();
     const _HTTP_RELOAD_HANDOFF_TTL_MS = 30_000;
     const _HTTP_WORKER_SUCCESSOR_GRACE_MS = 20_000;
@@ -120,7 +136,8 @@ function leaseHarness() {
     return {
       hold: (id, build) => { _activeHttpWorkerId = id; _activeHttpWorkerBuild = build; },
       currentSeen: (seen) => { _currentBuildSeen = seen; },
-      mayReplace: (id, build, now = baseNow) => _mayReplaceActiveHttpWorker(id, "", now, build),
+      home: (origin, alive) => { _homeOrigin = origin; _homeAlive = alive; },
+      mayReplace: (id, build, origin = "", now = baseNow) => _mayReplaceActiveHttpWorker(id, "", now, build, origin),
       fresh: () => { _extensionLastPollTime = baseNow; },
       quietFor: (ms) => { _extensionLastPollTime = baseNow - ms; },
       dispatchedTo: (id) => _pendingRequests.set("click", { dispatchedWorkerId: id }),
@@ -180,15 +197,40 @@ test("two current contexts follow the usual rule, and the holder itself is alway
   assert.equal(old.mayReplace("old-1", ""), true, "re-verifying never evicts the holder itself");
 });
 
-test("both places that grant the lease note a current context first, pass the build, and log the change", () => {
+test("only the home context's instances lead while it is alive; the others wait, and may lead once it is silent", () => {
+  const lease = leaseHarness();
+  lease.currentSeen(true);
+  lease.hold("home-1", NEW);
+  lease.home("a", true);
+  lease.quietFor(60_000);
+  assert.equal(lease.mayReplace("other-1", NEW, "b"), false, "a parked holder is not given away to another context");
+  assert.equal(lease.mayReplace("home-2", NEW, "a"), true, "a later instance of the home context takes over from the parked one");
+  lease.home("a", false);
+  assert.equal(lease.mayReplace("other-1", NEW, "b"), true, "the home context went silent");
+  const old = leaseHarness();
+  old.currentSeen(true);
+  old.home("a", true);
+  old.hold("old-1", "");
+  old.fresh();
+  assert.equal(old.mayReplace("other-1", NEW, "b"), false, "the home context's next instance replaces the older holder, not this one");
+  assert.equal(old.mayReplace("home-1", NEW, "a"), true);
+});
+
+test("both places that grant the lease note a current context first, pass the build and origin, pin the home context and log the change", () => {
   const verified = index.slice(index.lastIndexOf('req.url === "/extension-verified"'));
   const noted = verified.indexOf("_noteCurrentBuildWorker(connectingWorker.build);");
-  const decided = verified.indexOf("_mayReplaceActiveHttpWorker(workerId, connectingWorker.reloadHandoffToken, Date.now(), connectingWorker.build || \"\")");
-  assert.ok(noted > 0 && decided > noted, "a current context that is turned away still proves one is around");
-  assert.match(verified, /if \(workerChanged\) _logLeaseChange\(_activeHttpWorkerId, workerId, connectingWorker\.build, connectingWorker\.origin\);\s*_activeHttpWorkerId = workerId;/, "logged while the old holder is still known");
+  const homeNoted = verified.indexOf("_noteHomeContext(connectingWorker.build, connectingWorker.origin);");
+  const decided = verified.indexOf("_mayReplaceActiveHttpWorker(workerId, connectingWorker.reloadHandoffToken, Date.now(), connectingWorker.build || \"\", connectingWorker.origin || \"\")");
+  assert.ok(noted > 0 && homeNoted > noted && decided > homeNoted, "a current context that is turned away still proves it is alive");
+  assert.match(verified, /if \(connectingWorker\.build\) _logContextRefused\(workerId, connectingWorker\.origin\);/);
+  assert.match(verified, /if \(workerChanged\) _logLeaseChange\(_activeHttpWorkerId, workerId, connectingWorker\.build, connectingWorker\.origin\);\s*_pinHomeContext\(connectingWorker\.build, connectingWorker\.origin\);\s*_activeHttpWorkerId = workerId;/, "logged and pinned while the old holder is still known");
   const connect = index.slice(index.indexOf("// When SAFARI_PROFILE is set, don't mark as connected"), index.indexOf("// POST /heartbeat"));
-  assert.ok(connect.indexOf("_noteCurrentBuildWorker(build);") < connect.indexOf("_mayReplaceActiveHttpWorker(workerId, reloadHandoffToken, Date.now(), build)"));
-  assert.match(connect, /if \(workerChanged\) _logLeaseChange\(_activeHttpWorkerId, workerId, build, originId\);\s*_activeHttpWorkerId = workerId;/);
+  assert.ok(connect.indexOf("_noteCurrentBuildWorker(build);") < connect.indexOf("_noteHomeContext(build, originId);"));
+  assert.ok(connect.indexOf("_noteHomeContext(build, originId);") < connect.indexOf("_mayReplaceActiveHttpWorker(workerId, reloadHandoffToken, Date.now(), build, originId)"));
+  assert.match(connect, /if \(workerChanged\) _logLeaseChange\(_activeHttpWorkerId, workerId, build, originId\);\s*_pinHomeContext\(build, originId\);\s*_activeHttpWorkerId = workerId;/);
+  const pollAt = index.lastIndexOf('req.url === "/poll"');
+  const poll = index.slice(pollAt, index.indexOf('req.url === "/result"', pollAt));
+  assert.match(poll, /_extensionLastPollTime = Date\.now\(\);[^\n]*\n\s*_noteHomeContext\(_activeHttpWorkerBuild, _activeHttpWorkerOrigin\);/, "a polling holder keeps its context alive");
 });
 
 test("reloading is only the fallback: it is skipped while a current context is around", () => {

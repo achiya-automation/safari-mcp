@@ -35,7 +35,7 @@ test("only the profile-verified Safari worker can consume or answer commands", (
   assert.match(server, /_activeHttpWorkerId = workerId/);
   assert.match(server, /_connectingHttpWorker\(workerId\)/);
   assert.match(server, /pollingWorkerId !== _activeHttpWorkerId/);
-  assert.match(server, /_mayReplaceActiveHttpWorker\(workerId, connectingWorker\.reloadHandoffToken, Date\.now\(\), connectingWorker\.build \|\| ""\)/);
+  assert.match(server, /_mayReplaceActiveHttpWorker\(workerId, connectingWorker\.reloadHandoffToken, Date\.now\(\), connectingWorker\.build \|\| "", connectingWorker\.origin \|\| ""\)/);
   assert.match(server, /status: "worker_lease_held"/);
   assert.match(worker, /const _bridgeWorkerId/);
   assert.match(worker, /_bridgeWorkerSuperseded = true/);

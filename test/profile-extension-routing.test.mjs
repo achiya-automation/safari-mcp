@@ -90,7 +90,7 @@ test("the healthy-worker lease also protects an unscoped bridge", () => {
     index.indexOf('// POST /heartbeat')
   );
   const unscoped = connectRoute.slice(connectRoute.indexOf("if (!process.env.SAFARI_PROFILE)"));
-  assert.match(unscoped, /_mayReplaceActiveHttpWorker\(workerId, reloadHandoffToken, Date\.now\(\), build\)/);
+  assert.match(unscoped, /_mayReplaceActiveHttpWorker\(workerId, reloadHandoffToken, Date\.now\(\), build, originId\)/);
   assert.match(unscoped, /status: "worker_lease_held"/);
   assert.match(unscoped, /if \(workerChanged\) \{[\s\S]*_extensionConnectionGeneration \+= 1/);
 });
@@ -109,6 +109,8 @@ test("a healthy HTTP worker keeps its lease unless reload grants an exact one-sh
     let _reloadHttpWorkerHandoff = null;
     let _activeHttpWorkerBuild = "";
     const _currentBuildWorkerSeenRecently = () => false;
+    const _homeOrigin = "";
+    const _homeContextAlive = () => false;
     const _pendingRequests = new Map();
     const _HTTP_RELOAD_HANDOFF_TTL_MS = 30_000;
     const _HTTP_WORKER_SUCCESSOR_GRACE_MS = 20_000;
@@ -222,6 +224,8 @@ test("a reload the parked worker never received moves to its successor", () => {
     let _reloadHttpWorkerHandoff = null;
     let _activeHttpWorkerBuild = "";
     const _currentBuildWorkerSeenRecently = () => false;
+    const _homeOrigin = "";
+    const _homeContextAlive = () => false;
     const _pendingRequests = new Map();
     const _HTTP_RELOAD_HANDOFF_TTL_MS = 30_000;
     const _HTTP_WORKER_SUCCESSOR_GRACE_MS = 20_000;

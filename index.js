@@ -29,7 +29,7 @@ import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { jpegSize } from "./image-size.js";
 import { createSafariSessionHintReader } from "./safari-session-hint.js";
-import { createStaleWorkerPolicy, leaseBuildVerdict, LEASE_BUILD_PREFERENCE_MS } from "./worker-upgrade.js";
+import { createStaleWorkerPolicy, leaseBuildVerdict, LEASE_BUILD_PREFERENCE_MS, HOME_CONTEXT_ALIVE_MS } from "./worker-upgrade.js";
 import {
   createLedger as createWorkerLedger,
   noteConnect as ledgerNoteConnect,
@@ -652,6 +652,31 @@ function _noteCurrentBuildWorker(build) {
 function _currentBuildWorkerSeenRecently(now = Date.now()) {
   return _currentBuildWorkerSeenAt > 0 && now - _currentBuildWorkerSeenAt <= LEASE_BUILD_PREFERENCE_MS;
 }
+// Current contexts can be several as well, each with tab ids of its own: a receipt resolves only in
+// the context that minted it (see worker-upgrade.js). The first current context to lead is the home
+// context, and no instance of another origin leads while the home context is alive.
+let _homeOrigin = "";
+let _homeOriginSeenAt = 0;
+function _homeContextAlive(now = Date.now()) {
+  return !!_homeOrigin && now - _homeOriginSeenAt <= HOME_CONTEXT_ALIVE_MS;
+}
+function _noteHomeContext(build, origin) {
+  if (build && origin && origin === _homeOrigin) _homeOriginSeenAt = Date.now();
+}
+function _pinHomeContext(build, origin) {
+  if (!build || !origin || origin === "none") return;
+  if (origin !== _homeOrigin) console.error(`[Safari MCP] home context: ${_homeOrigin || "none"} -> ${origin}`);
+  _homeOrigin = origin;
+  _homeOriginSeenAt = Date.now();
+}
+const _contextRefusedLoggedAt = new Map();
+function _logContextRefused(workerId, origin) {
+  const now = Date.now();
+  if (now - (_contextRefusedLoggedAt.get(origin) || 0) < 5 * 60_000) return;
+  if (_contextRefusedLoggedAt.size >= 64) _contextRefusedLoggedAt.clear();
+  _contextRefusedLoggedAt.set(origin, now);
+  console.error(`[Safari MCP] lease: worker ${workerId.slice(0, 8)} of context ${origin} waits, context ${_homeOrigin} leads`);
+}
 function _extensionOriginId(origin) {
   return typeof origin === "string" && origin ? createHash("sha256").update(origin).digest("hex").slice(0, 6) : "none";
 }
@@ -798,13 +823,16 @@ function _activeHttpWorkerHasDispatchedRequest() {
   );
 }
 
-function _mayReplaceActiveHttpWorker(workerId, presentedToken, now = Date.now(), build = "") {
+function _mayReplaceActiveHttpWorker(workerId, presentedToken, now = Date.now(), build = "", origin = "") {
   if (workerId === _activeHttpWorkerId) return true;
   const preference = leaseBuildVerdict({
     candidateBuild: build,
     holderBuild: _activeHttpWorkerBuild,
     hasHolder: !!_activeHttpWorkerId,
     currentSeenRecently: _currentBuildWorkerSeenRecently(now),
+    candidateOrigin: origin,
+    homeOrigin: _homeOrigin,
+    homeAlive: _homeContextAlive(now),
   });
   if (preference === "deny") return false;
   if (!_activeHttpWorkerId) return true;
@@ -1127,6 +1155,7 @@ try {
         return;
       }
       _extensionLastPollTime = Date.now(); // Keep connection alive — critical for stale detection
+      _noteHomeContext(_activeHttpWorkerBuild, _activeHttpWorkerOrigin);
       _reloadStaleWorker(pollingWorkerId);
       if (!_extensionConnected) {
         _extensionConnected = true;
@@ -1237,7 +1266,9 @@ try {
       if (!process.env.SAFARI_PROFILE) {
         const reloadHandoffToken = _reloadHandoffToken(req);
         _noteCurrentBuildWorker(build);
-        if (!_mayReplaceActiveHttpWorker(workerId, reloadHandoffToken, Date.now(), build)) {
+        _noteHomeContext(build, originId);
+        if (!_mayReplaceActiveHttpWorker(workerId, reloadHandoffToken, Date.now(), build, originId)) {
+          if (build) _logContextRefused(workerId, originId);
           _connectingHttpWorkers.delete(workerId);
           res.writeHead(423, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ status: "worker_lease_held" }));
@@ -1245,6 +1276,7 @@ try {
         }
         const workerChanged = workerId !== _activeHttpWorkerId;
         if (workerChanged) _logLeaseChange(_activeHttpWorkerId, workerId, build, originId);
+        _pinHomeContext(build, originId);
         _activeHttpWorkerId = workerId;
         _activeHttpWorkerBuild = build;
         _activeHttpWorkerOrigin = originId;
@@ -1304,7 +1336,9 @@ try {
         return;
       }
       _noteCurrentBuildWorker(connectingWorker.build);
-      if (!_mayReplaceActiveHttpWorker(workerId, connectingWorker.reloadHandoffToken, Date.now(), connectingWorker.build || "")) {
+      _noteHomeContext(connectingWorker.build, connectingWorker.origin);
+      if (!_mayReplaceActiveHttpWorker(workerId, connectingWorker.reloadHandoffToken, Date.now(), connectingWorker.build || "", connectingWorker.origin || "")) {
+        if (connectingWorker.build) _logContextRefused(workerId, connectingWorker.origin);
         _connectingHttpWorkers.delete(workerId);
         res.writeHead(423, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "worker_lease_held" }));
@@ -1312,6 +1346,7 @@ try {
       }
       const workerChanged = workerId !== _activeHttpWorkerId;
       if (workerChanged) _logLeaseChange(_activeHttpWorkerId, workerId, connectingWorker.build, connectingWorker.origin);
+      _pinHomeContext(connectingWorker.build, connectingWorker.origin);
       _activeHttpWorkerId = workerId;
       _activeHttpWorkerBuild = connectingWorker.build || "";
       _activeHttpWorkerOrigin = connectingWorker.origin || "";
