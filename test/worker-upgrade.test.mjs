@@ -80,6 +80,12 @@ test("the daemon remembers the build the lease holder announced, from the record
   assert.match(index, /_activeHttpWorkerId = workerId;\s*_activeHttpWorkerBuild = build;/, "also where a worker is activated without a profile");
 });
 
+test("each worker's announced build is logged once, so old and new contexts can be told apart in the daemon log", () => {
+  assert.match(index, /if \(!_buildLoggedWorkerIds\.has\(workerId\)\) \{/);
+  assert.match(index, /extension build: \$\{build \|\| "none announced"\}/);
+  assert.match(index, /_buildLoggedWorkerIds\.size >= 256\) _buildLoggedWorkerIds\.clear\(\)/, "the set is bounded");
+});
+
 test("the daemon asks on every poll of the lease holder until it has been reloaded", () => {
   const pollAt = index.lastIndexOf('req.url === "/poll"'); // the handler; the first hit is the auth list
   const poll = index.slice(pollAt, index.indexOf('req.url === "/result"', pollAt));
