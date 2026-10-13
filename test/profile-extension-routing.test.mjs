@@ -694,6 +694,7 @@ test("OFF→ON during connect starts one fresh generation after prior command ex
     "_discoverProfileWindow", "updateBadge", "_startHeartbeat", "_stopHeartbeat",
     "scheduleReconnect", "pollForCommands", "AbortSignal",
     `const BRIDGE_PORTS = [9224];
+     const _EXTENSION_BUILD = "test-build";
      let HTTP_URL = "http://127.0.0.1:9224";
      let _enabled = true;
      let _bridgeWorkerSuperseded = false;
@@ -1014,9 +1015,9 @@ test("opaque receipts resolve by token, digest, and original origin and fail clo
   assert.equal(ambiguous.replacements, 0, "ambiguous receipts must not rebind ownership");
 });
 
-test("V3 receipts persist with a browser epoch and survive worker suspension safely", () => {
-  assert.match(background, /const _TAB_RECEIPTS_KEY = "mcpOwnedTabReceiptsV3"/);
-  assert.match(background, /const _TAB_RECEIPTS_VERSION = 3/);
+test("V4 receipts persist with a browser epoch and survive worker suspension safely", () => {
+  assert.match(background, /const _TAB_RECEIPTS_KEY = "mcpOwnedTabReceiptsV4"/);
+  assert.match(background, /const _TAB_RECEIPTS_VERSION = 4/);
   assert.match(background, /const _BROWSER_SESSION_EPOCH_KEY = "mcpBrowserSessionEpochV1"/);
   const hydrate = background.slice(
     background.indexOf("async function _hydrateOwnedTabs("),
