@@ -27,20 +27,19 @@ const idle = { build: "", active: true, busy: false };
 
 test("a lease holder that announced no build is reloaded", () => {
   const policy = createStaleWorkerPolicy();
-  assert.deepEqual(policy.check(idle), { reload: true, retry: false, reason: "no build announced" });
+  assert.deepEqual(policy.check(idle), { reload: true, reason: "no build announced" });
 });
 
 test("a worker that announced any build is left alone, so a newer extension survives an older daemon", () => {
   const policy = createStaleWorkerPolicy();
   assert.equal(policy.check({ ...idle, build: EXTENSION_BUILD }).reload, false);
   assert.equal(policy.check({ ...idle, build: "some-future-build" }).reload, false);
-  assert.equal(policy.check({ ...idle, build: EXTENSION_BUILD }).retry, false, "nothing to wait for");
 });
 
-test("only the lease holder is reloaded; a command in flight delays it instead of cancelling it", () => {
+test("only the lease holder is reloaded; a command in flight only delays it", () => {
   const policy = createStaleWorkerPolicy();
-  assert.deepEqual(policy.check({ ...idle, active: false }), { reload: false, retry: false, reason: "not the lease holder" });
-  assert.deepEqual(policy.check({ ...idle, busy: true }), { reload: false, retry: true, reason: "a command is in flight" });
+  assert.deepEqual(policy.check({ ...idle, active: false }), { reload: false, reason: "not the lease holder" });
+  assert.deepEqual(policy.check({ ...idle, busy: true }), { reload: false, reason: "a command is in flight" });
   assert.equal(policy.check(idle).reload, true, "looking does not use up an attempt");
 });
 
@@ -50,7 +49,7 @@ test("reloads are spaced, and bounded per window, in case a reload ever leaves t
   assert.equal(policy.check(idle).reload, true);
   policy.commit();
   t += 19_999;
-  assert.deepEqual(policy.check(idle), { reload: false, retry: true, reason: "reloaded one a moment ago" });
+  assert.deepEqual(policy.check(idle), { reload: false, reason: "reloaded one a moment ago" });
   t += 1;
   assert.equal(policy.check(idle).reload, true);
   policy.commit();
@@ -58,7 +57,7 @@ test("reloads are spaced, and bounded per window, in case a reload ever leaves t
   assert.equal(policy.check(idle).reload, true);
   policy.commit();
   t += 20_000;
-  assert.deepEqual(policy.check(idle), { reload: false, retry: false, reason: "reload limit reached" }, "three in the window, then no more");
+  assert.deepEqual(policy.check(idle), { reload: false, reason: "reload limit reached" }, "three in the window, then no more");
   t += 600_000;
   assert.equal(policy.check(idle).reload, true, "the window moved on");
 });
@@ -69,29 +68,39 @@ test("the extension and the daemon agree on the build name", () => {
   assert.match(background, /connect\?verifier=existing-tab-v1&protocol=popup-opener-lease-v2&build=\$\{_EXTENSION_BUILD\}/);
 });
 
-test("the daemon remembers the announced build and checks it when the worker takes the lease", () => {
+test("the daemon remembers the build the lease holder announced, from the record it made at /connect", () => {
   assert.match(index, /const announcedBuild = String\(connectUrl\.searchParams\.get\("build"\) \|\| ""\);/);
   assert.match(index, /\/\^\[A-Za-z0-9\._-\]\{1,40\}\$\/\.test\(announcedBuild\)/, "the value is validated before it is stored");
   assert.match(index, /_connectingHttpWorkers\.set\(workerId, \{ connectedAt: now, reloadHandoffToken, build \}\)/);
-  const verified = index.slice(index.indexOf('req.url === "/extension-verified"'));
-  const responded = verified.indexOf('res.end(JSON.stringify({ status: "verified" }));');
-  const reloaded = verified.indexOf("_reloadStaleWorker(workerId, verifiedBuild);");
-  assert.ok(responded > 0 && reloaded > responded, "the reload is decided after the worker has its answer");
-  assert.match(index, /const verifiedBuild = connectingWorker\.build \|\| "";\s*_activeHttpWorkerId = workerId;/, "read before the connecting record is deleted");
+  const verified = index.slice(index.lastIndexOf('req.url === "/extension-verified"')); // the handler; the first hit is the auth list
+  const activated = verified.indexOf("_activeHttpWorkerId = workerId;");
+  const remembered = verified.indexOf("_activeHttpWorkerBuild = connectingWorker.build || \"\";");
+  assert.ok(activated > 0 && remembered > activated, "remembered as the worker becomes the lease holder");
+  assert.ok(remembered < verified.indexOf("_connectingHttpWorkers.delete(workerId);", activated), "read before the connecting record is deleted");
+  assert.match(index, /_activeHttpWorkerId = workerId;\s*_activeHttpWorkerBuild = build;/, "also where a worker is activated without a profile");
 });
 
-test("the daemon decides inside the timer, keeps looking while the worker stays the lease holder, and prepares the same handoff the tool does", () => {
-  const start = index.indexOf("function _reloadStaleWorker(");
+test("the daemon asks on every poll of the lease holder until it has been reloaded", () => {
+  const pollAt = index.lastIndexOf('req.url === "/poll"'); // the handler; the first hit is the auth list
+  const poll = index.slice(pollAt, index.indexOf('req.url === "/result"', pollAt));
+  const asked = poll.indexOf("_reloadStaleWorker(pollingWorkerId);");
+  assert.ok(asked > 0, "the poll handler asks");
+  assert.ok(poll.indexOf("_requireActiveHttpWorker(req, res)") < asked, "only the worker that holds the lease is asked about");
+  assert.ok(asked < poll.indexOf("_dequeueHttpCommand(pollingWorkerId)"), "before the dequeue, so the reload goes out in this very poll");
+});
+
+test("the reload prepares the same handoff safari_reload_extension does, and never runs twice at once", () => {
+  const start = index.indexOf("async function _reloadStaleWorker(");
   const body = stripComments(index.slice(start, index.indexOf("\n}\n", start)));
-  assert.match(body, /SAFARI_MCP_NO_AUTO_UPGRADE === "1" \|\| build\) return;/, "it can be switched off, and a worker with a build is never looked at");
-  const timer = body.slice(body.indexOf("setTimeout("));
-  assert.match(timer, /_staleWorkerPolicy\.check\(\{[\s\S]*?busy: _pendingRequests\.size > 0,/, "decided when the timer fires, with the state of that moment");
-  assert.match(timer, /if \(verdict\.retry && attempt < 20\) _reloadStaleWorker\(workerId, build, attempt \+ 1\);/, "a command in flight delays the reload, it does not cancel it");
-  assert.ok(timer.indexOf("_staleWorkerPolicy.commit();") > timer.indexOf("if (!verdict.reload)"), "an attempt is recorded only when a reload is really going out");
-  assert.match(timer, /handoff = _prepareReloadHttpWorkerHandoff\(\);/, "without a handoff the extension refuses to reload");
-  assert.match(timer, /sendToExtension\("reload_extension", \{ reloadHandoff: handoff\.token \}, 30000\)/);
-  assert.match(timer, /if \(handoff\) _cancelReloadHttpWorkerHandoff\(handoff\);/, "a failed reload gives the handoff back");
-  assert.match(timer, /console\.error\(`\[Safari MCP\] reloading worker/, "a failure is logged, not swallowed");
+  assert.match(body, /SAFARI_MCP_NO_AUTO_UPGRADE === "1" \|\| _staleReloadInFlight\) return;/, "it can be switched off, and does not overlap itself");
+  assert.match(body, /workerId !== _activeHttpWorkerId \|\| _activeHttpWorkerBuild\) return;/, "a worker with a build, or one that lost the lease, is left alone");
+  assert.match(body, /busy: _pendingRequests\.size > 0,/);
+  assert.ok(body.indexOf("_staleWorkerPolicy.commit();") > body.indexOf("if (!verdict.reload) return;"), "an attempt is recorded only when a reload is really going out");
+  assert.match(body, /handoff = _prepareReloadHttpWorkerHandoff\(\);/, "without a handoff the extension refuses to reload");
+  assert.match(body, /sendToExtension\("reload_extension", \{ reloadHandoff: handoff\.token \}, 30000\)/);
+  assert.match(body, /if \(handoff\) _cancelReloadHttpWorkerHandoff\(handoff\);/, "a failed reload gives the handoff back");
+  assert.match(body, /console\.error\(`\[Safari MCP\] reloading worker/, "a failure is logged, not swallowed");
+  assert.match(body, /\} finally \{\s*_staleReloadInFlight = false;/);
 });
 
 test("this build's envelopes are stored under keys that no older build reads or writes", () => {
