@@ -17,7 +17,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { readFileSync } from "node:fs";
-import { createStaleWorkerPolicy, EXTENSION_BUILD } from "../worker-upgrade.js";
+import { createStaleWorkerPolicy, EXTENSION_BUILD, leaseBuildVerdict, LEASE_BUILD_PREFERENCE_MS } from "../worker-upgrade.js";
 
 const background = readFileSync(new URL("../extension/background.js", import.meta.url), "utf8");
 const index = readFileSync(new URL("../index.js", import.meta.url), "utf8");
@@ -80,10 +80,122 @@ test("the daemon remembers the build the lease holder announced, from the record
   assert.match(index, /_activeHttpWorkerId = workerId;\s*_activeHttpWorkerBuild = build;/, "also where a worker is activated without a profile");
 });
 
-test("each worker's announced build is logged once, so old and new contexts can be told apart in the daemon log", () => {
-  assert.match(index, /if \(!_buildLoggedWorkerIds\.has\(workerId\)\) \{/);
-  assert.match(index, /extension build: \$\{build \|\| "none announced"\}/);
-  assert.match(index, /_buildLoggedWorkerIds\.size >= 256\) _buildLoggedWorkerIds\.clear\(\)/, "the set is bounded");
+test("builds alone settle who may lead: older never while a current one is around, current always over older", () => {
+  const v = (candidateBuild, holderBuild, hasHolder, currentSeenRecently) =>
+    leaseBuildVerdict({ candidateBuild, holderBuild, hasHolder, currentSeenRecently });
+  const B = EXTENSION_BUILD;
+  assert.equal(v("", "", false, true), "deny", "even with nobody holding the lease");
+  assert.equal(v("", B, true, true), "deny");
+  assert.equal(v("", "", true, true), "deny");
+  assert.equal(v("", "", false, false), "ordinary", "no current context around: the usual rule");
+  assert.equal(v("", "", true, false), "ordinary");
+  assert.equal(v(B, "", true, true), "take", "a current context replaces an older holder");
+  assert.equal(v(B, "", true, false), "take");
+  assert.equal(v(B, B, true, true), "ordinary", "two current contexts follow the usual rule");
+  assert.equal(v(B, "", false, true), "ordinary", "nobody holds it: nothing to take");
+  assert.ok(LEASE_BUILD_PREFERENCE_MS >= 5 * 60_000, "long enough to outlast a context parked between its alarms");
+});
+
+// The lease rule itself, run from the daemon's source with its other rules (a command in flight, a
+// reload handoff, the freshness window) in place.
+function leaseHarness() {
+  const helperSource = index.slice(
+    index.indexOf("function _prepareReloadHttpWorkerHandoff("),
+    index.indexOf("function _requireActiveHttpWorker("),
+  );
+  return Function("randomBytes", "leaseBuildVerdict", `
+    const baseNow = Date.now();
+    let _activeHttpWorkerId = "";
+    let _activeHttpWorkerBuild = "";
+    let _currentBuildSeen = false;
+    let _extensionConnected = true;
+    let _extensionLastPollTime = baseNow;
+    let _extensionLastHeartbeat = 0;
+    let _reloadHttpWorkerHandoff = null;
+    const _currentBuildWorkerSeenRecently = () => _currentBuildSeen;
+    const _pendingRequests = new Map();
+    const _HTTP_RELOAD_HANDOFF_TTL_MS = 30_000;
+    const _HTTP_WORKER_SUCCESSOR_GRACE_MS = 20_000;
+    ${helperSource}
+    return {
+      hold: (id, build) => { _activeHttpWorkerId = id; _activeHttpWorkerBuild = build; },
+      currentSeen: (seen) => { _currentBuildSeen = seen; },
+      mayReplace: (id, build, now = baseNow) => _mayReplaceActiveHttpWorker(id, "", now, build),
+      fresh: () => { _extensionLastPollTime = baseNow; },
+      quietFor: (ms) => { _extensionLastPollTime = baseNow - ms; },
+      dispatchedTo: (id) => _pendingRequests.set("click", { dispatchedWorkerId: id }),
+      pendingHandoff: () => { _reloadHttpWorkerHandoff = { armed: true, expiresAt: baseNow + 30_000, fromWorkerId: _activeHttpWorkerId, token: "handoff_token_abcdefghijklmnop" }; },
+    };
+  `)(() => ({ toString: () => "handoff_token_abcdefghijklmnop" }), leaseBuildVerdict);
+}
+const NEW = EXTENSION_BUILD;
+
+test("an older context never takes the lease while a current one is around, fresh holder or not", () => {
+  const lease = leaseHarness();
+  assert.equal(lease.mayReplace("old-1", ""), true, "sanity: with nobody holding it and no current context around it passes");
+  lease.currentSeen(true);
+  lease.hold("new-1", NEW);
+  lease.quietFor(60_000);
+  assert.equal(lease.mayReplace("old-1", ""), false, "not even from a holder that has been quiet for a minute");
+  lease.hold("", "");
+  assert.equal(lease.mayReplace("old-1", ""), false, "not even when nobody holds it");
+});
+
+test("with no current context around, the usual rule decides for an older one", () => {
+  const lease = leaseHarness();
+  lease.hold("old-1", "");
+  lease.fresh();
+  assert.equal(lease.mayReplace("old-2", ""), false, "a polling holder keeps it");
+  lease.quietFor(21_000);
+  assert.equal(lease.mayReplace("old-2", ""), true, "a quiet one loses it");
+});
+
+test("a current context takes the lease from an older holder at once, unless the holder is mid-command or a handoff is pending", () => {
+  const lease = leaseHarness();
+  lease.currentSeen(true);
+  lease.hold("old-1", "");
+  lease.fresh();
+  assert.equal(lease.mayReplace("new-1", NEW), true, "the older holder is still polling and still loses it");
+  lease.dispatchedTo("old-1");
+  assert.equal(lease.mayReplace("new-1", NEW), false, "a mutation already delivered to the holder is never cut off");
+  const pending = leaseHarness();
+  pending.hold("old-1", "");
+  pending.fresh();
+  pending.pendingHandoff();
+  assert.equal(pending.mayReplace("new-1", NEW), false, "only the reload's own successor may use the handoff");
+});
+
+test("two current contexts follow the usual rule, and the holder itself is always let through", () => {
+  const lease = leaseHarness();
+  lease.currentSeen(true);
+  lease.hold("new-1", NEW);
+  lease.fresh();
+  assert.equal(lease.mayReplace("new-2", NEW), false);
+  assert.equal(lease.mayReplace("new-1", NEW), true);
+  lease.quietFor(21_000);
+  assert.equal(lease.mayReplace("new-2", NEW), true);
+  const old = leaseHarness();
+  old.currentSeen(true);
+  old.hold("old-1", "");
+  assert.equal(old.mayReplace("old-1", ""), true, "re-verifying never evicts the holder itself");
+});
+
+test("both places that grant the lease note a current context first, pass the build, and log the change", () => {
+  const verified = index.slice(index.lastIndexOf('req.url === "/extension-verified"'));
+  const noted = verified.indexOf("_noteCurrentBuildWorker(connectingWorker.build);");
+  const decided = verified.indexOf("_mayReplaceActiveHttpWorker(workerId, connectingWorker.reloadHandoffToken, Date.now(), connectingWorker.build || \"\")");
+  assert.ok(noted > 0 && decided > noted, "a current context that is turned away still proves one is around");
+  assert.match(verified, /if \(workerChanged\) _logLeaseChange\(_activeHttpWorkerId, workerId, connectingWorker\.build\);\s*_activeHttpWorkerId = workerId;/, "logged while the old holder is still known");
+  const connect = index.slice(index.indexOf("// When SAFARI_PROFILE is set, don't mark as connected"), index.indexOf("// POST /heartbeat"));
+  assert.ok(connect.indexOf("_noteCurrentBuildWorker(build);") < connect.indexOf("_mayReplaceActiveHttpWorker(workerId, reloadHandoffToken, Date.now(), build)"));
+  assert.match(connect, /if \(workerChanged\) _logLeaseChange\(_activeHttpWorkerId, workerId, build\);\s*_activeHttpWorkerId = workerId;/);
+});
+
+test("reloading is only the fallback: it is skipped while a current context is around", () => {
+  const start = index.indexOf("async function _reloadStaleWorker(");
+  const body = stripComments(index.slice(start, index.indexOf("\n}\n", start)));
+  assert.ok(body.indexOf("_currentBuildWorkerSeenRecently()") > body.indexOf("_activeHttpWorkerBuild) return;"));
+  assert.ok(body.indexOf("_currentBuildWorkerSeenRecently()") < body.indexOf("_staleWorkerPolicy.check("), "before the rate limit is consulted, so nothing is used up");
 });
 
 test("the daemon asks on every poll of the lease holder until it has been reloaded", () => {

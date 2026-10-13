@@ -29,7 +29,7 @@ import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { jpegSize } from "./image-size.js";
 import { createSafariSessionHintReader } from "./safari-session-hint.js";
-import { createStaleWorkerPolicy } from "./worker-upgrade.js";
+import { createStaleWorkerPolicy, leaseBuildVerdict, LEASE_BUILD_PREFERENCE_MS } from "./worker-upgrade.js";
 import {
   createLedger as createWorkerLedger,
   noteConnect as ledgerNoteConnect,
@@ -638,15 +638,32 @@ let _activeHttpWorkerBuild = "";
 // the extension can name its browser session the same way from every worker instance (#143).
 const _safariSessionHint = createSafariSessionHintReader();
 
-// A context Safari kept from an older app announces no build. It becomes the lease holder each
-// time it verifies, so it is reloaded then (see worker-upgrade.js). SAFARI_MCP_NO_AUTO_UPGRADE=1
-// turns this off.
+// Safari keeps the extension context of every app generation it ever loaded alive (measured
+// 13.10.26: its process had resources of a dozen builds mapped, the deleted ones included), and
+// each wakes every minute and verifies. The ones from before the isolated envelopes announce no
+// build, so while a current one has verified recently they may not take the lease, and a current
+// one takes it from them at once (see worker-upgrade.js).
+let _currentBuildWorkerSeenAt = 0;
+function _noteCurrentBuildWorker(build) {
+  if (build) _currentBuildWorkerSeenAt = Date.now();
+}
+function _currentBuildWorkerSeenRecently(now = Date.now()) {
+  return _currentBuildWorkerSeenAt > 0 && now - _currentBuildWorkerSeenAt <= LEASE_BUILD_PREFERENCE_MS;
+}
+function _logLeaseChange(fromWorkerId, toWorkerId, toBuild) {
+  const from = fromWorkerId ? `${fromWorkerId.slice(0, 8)} (${_activeHttpWorkerBuild || "no build"})` : "nobody";
+  console.error(`[Safari MCP] lease: ${from} -> ${toWorkerId.slice(0, 8)} (${toBuild || "no build"})`);
+}
+
+// When no current context is around, a lease holder that announced no build is reloaded
+// instead, once (see worker-upgrade.js). SAFARI_MCP_NO_AUTO_UPGRADE=1 turns this off.
 const _staleWorkerPolicy = createStaleWorkerPolicy();
-const _buildLoggedWorkerIds = new Set();
 let _staleReloadInFlight = false;
 async function _reloadStaleWorker(workerId) {
   if (process.env.SAFARI_MCP_NO_AUTO_UPGRADE === "1" || _staleReloadInFlight) return;
   if (workerId !== _activeHttpWorkerId || _activeHttpWorkerBuild) return;
+  // A current context is about to replace this one, and reloading restarts the same old one.
+  if (_currentBuildWorkerSeenRecently()) return;
   // Asked on every poll of the lease holder until it has been reloaded: a command in flight or a
   // reload a moment ago only delays it, so a context that verified at a busy moment cannot stay
   // the lease holder for good.
@@ -776,8 +793,16 @@ function _activeHttpWorkerHasDispatchedRequest() {
   );
 }
 
-function _mayReplaceActiveHttpWorker(workerId, presentedToken, now = Date.now()) {
-  if (!_activeHttpWorkerId || workerId === _activeHttpWorkerId) return true;
+function _mayReplaceActiveHttpWorker(workerId, presentedToken, now = Date.now(), build = "") {
+  if (workerId === _activeHttpWorkerId) return true;
+  const preference = leaseBuildVerdict({
+    candidateBuild: build,
+    holderBuild: _activeHttpWorkerBuild,
+    hasHolder: !!_activeHttpWorkerId,
+    currentSeenRecently: _currentBuildWorkerSeenRecently(now),
+  });
+  if (preference === "deny") return false;
+  if (!_activeHttpWorkerId) return true;
   // No successor capability may bypass a mutation already delivered to the
   // active worker. A reload result removes its pending fence before arming the
   // exact handoff, so the intended reload path remains available.
@@ -801,7 +826,7 @@ function _mayReplaceActiveHttpWorker(workerId, presentedToken, now = Date.now())
     // to the ordinary healthy-worker lease instead of leaving a permanent blockade.
     if (_reloadHttpWorkerHandoff === handoff) _reloadHttpWorkerHandoff = null;
   }
-  return !_activeHttpWorkerIsFresh(now);
+  return preference === "take" || !_activeHttpWorkerIsFresh(now);
 }
 
 function _requireActiveHttpWorker(req, res) {
@@ -1198,12 +1223,6 @@ try {
       // skip the protocol gate by posting the second handshake step directly.
       const announcedBuild = String(connectUrl.searchParams.get("build") || "");
       const build = /^[A-Za-z0-9._-]{1,40}$/.test(announcedBuild) ? announcedBuild : "";
-      // One line per worker, so a context that announces no build can be told from one that does.
-      if (!_buildLoggedWorkerIds.has(workerId)) {
-        if (_buildLoggedWorkerIds.size >= 256) _buildLoggedWorkerIds.clear();
-        _buildLoggedWorkerIds.add(workerId);
-        console.error(`[Safari MCP] worker ${workerId.slice(0, 8)} connecting (extension build: ${build || "none announced"})`);
-      }
       _rememberConnectingHttpWorker(workerId, _reloadHandoffToken(req), build);
       ledgerNoteConnect(_workerLedger, workerId);
       _noteUnverifiedWorker(workerId);
@@ -1211,13 +1230,15 @@ try {
       // A personal-profile extension connecting first would incorrectly set the flag.
       if (!process.env.SAFARI_PROFILE) {
         const reloadHandoffToken = _reloadHandoffToken(req);
-        if (!_mayReplaceActiveHttpWorker(workerId, reloadHandoffToken)) {
+        _noteCurrentBuildWorker(build);
+        if (!_mayReplaceActiveHttpWorker(workerId, reloadHandoffToken, Date.now(), build)) {
           _connectingHttpWorkers.delete(workerId);
           res.writeHead(423, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ status: "worker_lease_held" }));
           return;
         }
         const workerChanged = workerId !== _activeHttpWorkerId;
+        if (workerChanged) _logLeaseChange(_activeHttpWorkerId, workerId, build);
         _activeHttpWorkerId = workerId;
         _activeHttpWorkerBuild = build;
         _connectingHttpWorkers.delete(workerId);
@@ -1275,13 +1296,15 @@ try {
         res.end("Unverified worker");
         return;
       }
-      if (!_mayReplaceActiveHttpWorker(workerId, connectingWorker.reloadHandoffToken)) {
+      _noteCurrentBuildWorker(connectingWorker.build);
+      if (!_mayReplaceActiveHttpWorker(workerId, connectingWorker.reloadHandoffToken, Date.now(), connectingWorker.build || "")) {
         _connectingHttpWorkers.delete(workerId);
         res.writeHead(423, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "worker_lease_held" }));
         return;
       }
       const workerChanged = workerId !== _activeHttpWorkerId;
+      if (workerChanged) _logLeaseChange(_activeHttpWorkerId, workerId, connectingWorker.build);
       _activeHttpWorkerId = workerId;
       _activeHttpWorkerBuild = connectingWorker.build || "";
       _connectingHttpWorkers.delete(workerId);

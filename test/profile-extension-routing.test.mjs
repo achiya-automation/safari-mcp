@@ -9,6 +9,7 @@
 import assert from "node:assert";
 import { test } from "node:test";
 import { readFileSync } from "node:fs";
+import { leaseBuildVerdict } from "../worker-upgrade.js";
 
 const index = readFileSync(new URL("../index.js", import.meta.url), "utf8");
 const background = readFileSync(new URL("../extension/background.js", import.meta.url), "utf8");
@@ -89,7 +90,7 @@ test("the healthy-worker lease also protects an unscoped bridge", () => {
     index.indexOf('// POST /heartbeat')
   );
   const unscoped = connectRoute.slice(connectRoute.indexOf("if (!process.env.SAFARI_PROFILE)"));
-  assert.match(unscoped, /_mayReplaceActiveHttpWorker\(workerId, reloadHandoffToken\)/);
+  assert.match(unscoped, /_mayReplaceActiveHttpWorker\(workerId, reloadHandoffToken, Date\.now\(\), build\)/);
   assert.match(unscoped, /status: "worker_lease_held"/);
   assert.match(unscoped, /if \(workerChanged\) \{[\s\S]*_extensionConnectionGeneration \+= 1/);
 });
@@ -99,13 +100,15 @@ test("a healthy HTTP worker keeps its lease unless reload grants an exact one-sh
     index.indexOf("function _prepareReloadHttpWorkerHandoff("),
     index.indexOf("function _requireActiveHttpWorker(")
   );
-  const harness = Function("randomBytes", `
+  const harness = Function("randomBytes", "leaseBuildVerdict", `
     const baseNow = Date.now();
     let _activeHttpWorkerId = "worker-a";
     let _extensionConnected = true;
     let _extensionLastPollTime = baseNow;
     let _extensionLastHeartbeat = 0;
     let _reloadHttpWorkerHandoff = null;
+    let _activeHttpWorkerBuild = "";
+    const _currentBuildWorkerSeenRecently = () => false;
     const _pendingRequests = new Map();
     const _HTTP_RELOAD_HANDOFF_TTL_MS = 30_000;
     const _HTTP_WORKER_SUCCESSOR_GRACE_MS = 20_000;
@@ -123,7 +126,7 @@ test("a healthy HTTP worker keeps its lease unless reload grants an exact one-sh
       trackDispatched: () => _pendingRequests.set("click", { dispatchedWorkerId: "worker-a" }),
       untrack: () => _pendingRequests.clear(),
     };
-  `)(() => ({ toString: () => "handoff_token_abcdefghijklmnop" }));
+  `)(() => ({ toString: () => "handoff_token_abcdefghijklmnop" }), leaseBuildVerdict);
 
   assert.equal(harness.mayReplace("worker-b", "", harness.now + 1), false);
   const handoff = harness.prepare();
@@ -210,13 +213,15 @@ test("a reload the parked worker never received moves to its successor", () => {
     index.indexOf("function _prepareReloadHttpWorkerHandoff("),
     index.indexOf("function _requireActiveHttpWorker(")
   );
-  const harness = Function("randomBytes", `
+  const harness = Function("randomBytes", "leaseBuildVerdict", `
     const baseNow = Date.now();
     let _activeHttpWorkerId = "worker-a";
     let _extensionConnected = true;
     let _extensionLastPollTime = baseNow;
     let _extensionLastHeartbeat = 0;
     let _reloadHttpWorkerHandoff = null;
+    let _activeHttpWorkerBuild = "";
+    const _currentBuildWorkerSeenRecently = () => false;
     const _pendingRequests = new Map();
     const _HTTP_RELOAD_HANDOFF_TTL_MS = 30_000;
     const _HTTP_WORKER_SUCCESSOR_GRACE_MS = 20_000;
@@ -234,7 +239,7 @@ test("a reload the parked worker never received moves to its successor", () => {
       answer: () => { _pendingRequests.delete("reload"); },
       now: baseNow,
     };
-  `)(() => ({ toString: () => "handoff_token_abcdefghijklmnop" }));
+  `)(() => ({ toString: () => "handoff_token_abcdefghijklmnop" }), leaseBuildVerdict);
 
   const handoff = harness.prepare();
   harness.queue(handoff);
