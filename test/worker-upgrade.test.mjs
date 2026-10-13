@@ -71,7 +71,7 @@ test("the extension and the daemon agree on the build name", () => {
 test("the daemon remembers the build the lease holder announced, from the record it made at /connect", () => {
   assert.match(index, /const announcedBuild = String\(connectUrl\.searchParams\.get\("build"\) \|\| ""\);/);
   assert.match(index, /\/\^\[A-Za-z0-9\._-\]\{1,40\}\$\/\.test\(announcedBuild\)/, "the value is validated before it is stored");
-  assert.match(index, /_connectingHttpWorkers\.set\(workerId, \{ connectedAt: now, reloadHandoffToken, build \}\)/);
+  assert.match(index, /_connectingHttpWorkers\.set\(workerId, \{ connectedAt: now, reloadHandoffToken, build, origin \}\)/);
   const verified = index.slice(index.lastIndexOf('req.url === "/extension-verified"')); // the handler; the first hit is the auth list
   const activated = verified.indexOf("_activeHttpWorkerId = workerId;");
   const remembered = verified.indexOf("_activeHttpWorkerBuild = connectingWorker.build || \"\";");
@@ -185,10 +185,10 @@ test("both places that grant the lease note a current context first, pass the bu
   const noted = verified.indexOf("_noteCurrentBuildWorker(connectingWorker.build);");
   const decided = verified.indexOf("_mayReplaceActiveHttpWorker(workerId, connectingWorker.reloadHandoffToken, Date.now(), connectingWorker.build || \"\")");
   assert.ok(noted > 0 && decided > noted, "a current context that is turned away still proves one is around");
-  assert.match(verified, /if \(workerChanged\) _logLeaseChange\(_activeHttpWorkerId, workerId, connectingWorker\.build\);\s*_activeHttpWorkerId = workerId;/, "logged while the old holder is still known");
+  assert.match(verified, /if \(workerChanged\) _logLeaseChange\(_activeHttpWorkerId, workerId, connectingWorker\.build, connectingWorker\.origin\);\s*_activeHttpWorkerId = workerId;/, "logged while the old holder is still known");
   const connect = index.slice(index.indexOf("// When SAFARI_PROFILE is set, don't mark as connected"), index.indexOf("// POST /heartbeat"));
   assert.ok(connect.indexOf("_noteCurrentBuildWorker(build);") < connect.indexOf("_mayReplaceActiveHttpWorker(workerId, reloadHandoffToken, Date.now(), build)"));
-  assert.match(connect, /if \(workerChanged\) _logLeaseChange\(_activeHttpWorkerId, workerId, build\);\s*_activeHttpWorkerId = workerId;/);
+  assert.match(connect, /if \(workerChanged\) _logLeaseChange\(_activeHttpWorkerId, workerId, build, originId\);\s*_activeHttpWorkerId = workerId;/);
 });
 
 test("reloading is only the fallback: it is skipped while a current context is around", () => {

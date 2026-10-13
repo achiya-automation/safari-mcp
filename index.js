@@ -21,7 +21,7 @@ import {
 } from "./ownership-state.js";
 import { WebSocketServer } from "ws";
 import { createServer } from "node:http";
-import { randomUUID, randomBytes, timingSafeEqual, createHmac } from "node:crypto";
+import { randomUUID, randomBytes, timingSafeEqual, createHmac, createHash } from "node:crypto";
 import { execFile, execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -634,6 +634,8 @@ let _extensionConnected = false;
 let _activeHttpWorkerId = "";
 // The build the lease holder announced on /connect ("" for a context from an older app).
 let _activeHttpWorkerBuild = "";
+// Which extension origin the lease holder's requests came from (a short hash), for the log.
+let _activeHttpWorkerOrigin = "";
 // The identity of the running Safari process, sent on every authenticated bridge response so
 // the extension can name its browser session the same way from every worker instance (#143).
 const _safariSessionHint = createSafariSessionHintReader();
@@ -650,9 +652,12 @@ function _noteCurrentBuildWorker(build) {
 function _currentBuildWorkerSeenRecently(now = Date.now()) {
   return _currentBuildWorkerSeenAt > 0 && now - _currentBuildWorkerSeenAt <= LEASE_BUILD_PREFERENCE_MS;
 }
-function _logLeaseChange(fromWorkerId, toWorkerId, toBuild) {
-  const from = fromWorkerId ? `${fromWorkerId.slice(0, 8)} (${_activeHttpWorkerBuild || "no build"})` : "nobody";
-  console.error(`[Safari MCP] lease: ${from} -> ${toWorkerId.slice(0, 8)} (${toBuild || "no build"})`);
+function _extensionOriginId(origin) {
+  return typeof origin === "string" && origin ? createHash("sha256").update(origin).digest("hex").slice(0, 6) : "none";
+}
+function _logLeaseChange(fromWorkerId, toWorkerId, toBuild, toOrigin) {
+  const from = fromWorkerId ? `${fromWorkerId.slice(0, 8)} (${_activeHttpWorkerBuild || "no build"}, origin ${_activeHttpWorkerOrigin || "?"})` : "nobody";
+  console.error(`[Safari MCP] lease: ${from} -> ${toWorkerId.slice(0, 8)} (${toBuild || "no build"}, origin ${toOrigin || "?"})`);
 }
 
 // When no current context is around, a lease holder that announced no build is reloaded
@@ -712,12 +717,12 @@ function _reloadHandoffToken(req) {
   return typeof value === "string" && /^[A-Za-z0-9_-]{24,}$/.test(value) ? value : "";
 }
 
-function _rememberConnectingHttpWorker(workerId, reloadHandoffToken = "", build = "") {
+function _rememberConnectingHttpWorker(workerId, reloadHandoffToken = "", build = "", origin = "") {
   const now = Date.now();
   for (const [id, record] of _connectingHttpWorkers) {
     if (now - record.connectedAt > _HTTP_WORKER_TTL_MS) _connectingHttpWorkers.delete(id);
   }
-  _connectingHttpWorkers.set(workerId, { connectedAt: now, reloadHandoffToken, build });
+  _connectingHttpWorkers.set(workerId, { connectedAt: now, reloadHandoffToken, build, origin });
 }
 
 function _connectingHttpWorker(workerId) {
@@ -1223,7 +1228,8 @@ try {
       // skip the protocol gate by posting the second handshake step directly.
       const announcedBuild = String(connectUrl.searchParams.get("build") || "");
       const build = /^[A-Za-z0-9._-]{1,40}$/.test(announcedBuild) ? announcedBuild : "";
-      _rememberConnectingHttpWorker(workerId, _reloadHandoffToken(req), build);
+      const originId = _extensionOriginId(req.headers.origin);
+      _rememberConnectingHttpWorker(workerId, _reloadHandoffToken(req), build, originId);
       ledgerNoteConnect(_workerLedger, workerId);
       _noteUnverifiedWorker(workerId);
       // When SAFARI_PROFILE is set, don't mark as connected until profile is verified.
@@ -1238,9 +1244,10 @@ try {
           return;
         }
         const workerChanged = workerId !== _activeHttpWorkerId;
-        if (workerChanged) _logLeaseChange(_activeHttpWorkerId, workerId, build);
+        if (workerChanged) _logLeaseChange(_activeHttpWorkerId, workerId, build, originId);
         _activeHttpWorkerId = workerId;
         _activeHttpWorkerBuild = build;
+        _activeHttpWorkerOrigin = originId;
         _connectingHttpWorkers.delete(workerId);
         if (workerChanged) {
           _adoptReloadHandoff(workerId);
@@ -1304,9 +1311,10 @@ try {
         return;
       }
       const workerChanged = workerId !== _activeHttpWorkerId;
-      if (workerChanged) _logLeaseChange(_activeHttpWorkerId, workerId, connectingWorker.build);
+      if (workerChanged) _logLeaseChange(_activeHttpWorkerId, workerId, connectingWorker.build, connectingWorker.origin);
       _activeHttpWorkerId = workerId;
       _activeHttpWorkerBuild = connectingWorker.build || "";
+      _activeHttpWorkerOrigin = connectingWorker.origin || "";
       _connectingHttpWorkers.delete(workerId);
       if (workerChanged) {
         _adoptReloadHandoff(workerId);
