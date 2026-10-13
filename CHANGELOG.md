@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.22.16] - 2026-10-13
+
 ### Added
 - **Every ownership envelope the extension writes names the worker that wrote it.** `mcpOwnedTabReceiptsV3` and `mcpOwnedTabsLocal` in `storage.local` now carry `writer`, the first eight hex characters of the worker id that the server log prints (`worker 88d445b4`). On 13.10.26 a receipt from `safari_new_tab` stopped resolving about a minute after it worked, while Safari kept running, and the profile's storage history held four browser-session epochs in five minutes, four envelopes of them written in the same millisecond. That reads as several live worker instances in one profile, each with its own `storage.session`, but an envelope could not say who wrote it. With `writer`, a read-only look at `LocalStorage.db` and its WAL shows it directly and lines up with the server log (#143). Hydration never reads the field. It takes effect once the extension app is rebuilt.
 
