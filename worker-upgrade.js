@@ -17,8 +17,11 @@
 export const EXTENSION_BUILD = "isolated-envelopes-1";
 
 /**
+ * `check` decides without recording anything; `commit` records an attempt once the reload is
+ * really about to be sent. `retry` says the answer may change soon: a command in flight or a
+ * reload a moment ago only delays the reload while the worker stays the lease holder.
  * @param {{ now?: () => number, minGapMs?: number, windowMs?: number, maxPerWindow?: number }} [options]
- * @returns {(worker: { build: string, active: boolean, busy: boolean }) => { reload: boolean, reason: string }}
+ * @returns {{ check: (worker: { build: string, active: boolean, busy: boolean }) => { reload: boolean, retry: boolean, reason: string }, commit: () => void }}
  */
 export function createStaleWorkerPolicy({
   now = Date.now,
@@ -28,15 +31,22 @@ export function createStaleWorkerPolicy({
 } = {}) {
   /** @type {number[]} */
   const attempts = [];
-  return function decide({ build, active, busy }) {
-    if (build) return { reload: false, reason: "announced a build" };
-    if (!active) return { reload: false, reason: "not the lease holder" };
-    if (busy) return { reload: false, reason: "a command is in flight" };
-    const t = now();
-    while (attempts.length && t - attempts[0] > windowMs) attempts.shift();
-    if (attempts.length && t - attempts[attempts.length - 1] < minGapMs) return { reload: false, reason: "reloaded one a moment ago" };
-    if (attempts.length >= maxPerWindow) return { reload: false, reason: "reload limit reached" };
-    attempts.push(t);
-    return { reload: true, reason: "no build announced" };
+  const prune = (t) => { while (attempts.length && t - attempts[0] > windowMs) attempts.shift(); };
+  return {
+    check({ build, active, busy }) {
+      if (build) return { reload: false, retry: false, reason: "announced a build" };
+      if (!active) return { reload: false, retry: false, reason: "not the lease holder" };
+      const t = now();
+      prune(t);
+      if (attempts.length >= maxPerWindow) return { reload: false, retry: false, reason: "reload limit reached" };
+      if (busy) return { reload: false, retry: true, reason: "a command is in flight" };
+      if (attempts.length && t - attempts[attempts.length - 1] < minGapMs) return { reload: false, retry: true, reason: "reloaded one a moment ago" };
+      return { reload: true, retry: false, reason: "no build announced" };
+    },
+    commit() {
+      const t = now();
+      prune(t);
+      attempts.push(t);
+    },
   };
 }

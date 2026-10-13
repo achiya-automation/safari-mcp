@@ -640,20 +640,25 @@ const _safariSessionHint = createSafariSessionHintReader();
 // time it verifies, so it is reloaded then (see worker-upgrade.js). SAFARI_MCP_NO_AUTO_UPGRADE=1
 // turns this off.
 const _staleWorkerPolicy = createStaleWorkerPolicy();
-function _reloadStaleWorker(workerId, build) {
-  if (process.env.SAFARI_MCP_NO_AUTO_UPGRADE === "1") return;
-  const verdict = _staleWorkerPolicy({
-    build,
-    active: workerId === _activeHttpWorkerId,
-    busy: _pendingRequests.size > 0,
-  });
-  if (!verdict.reload) return;
-  console.error(`[Safari MCP] worker ${workerId.slice(0, 8)} announced no extension build (a context Safari kept from an older app); reloading it`);
-  // Let it finish verifying and start polling, then check again that nobody queued a command.
-  // The reload needs the same handoff as safari_reload_extension (see /proxy-command): it is
-  // what lets the replacement worker take the lease from this one.
+function _reloadStaleWorker(workerId, build, attempt = 0) {
+  if (process.env.SAFARI_MCP_NO_AUTO_UPGRADE === "1" || build) return;
+  // Decided after a short wait, so the worker has finished verifying and is polling. A command
+  // in flight (or a reload a moment ago) only delays it: this worker stays the lease holder
+  // until another one verifies, so look again every few seconds for about a minute.
   setTimeout(async () => {
-    if (workerId !== _activeHttpWorkerId || _pendingRequests.size > 0) return;
+    const verdict = _staleWorkerPolicy.check({
+      build,
+      active: workerId === _activeHttpWorkerId,
+      busy: _pendingRequests.size > 0,
+    });
+    if (!verdict.reload) {
+      if (verdict.retry && attempt < 20) _reloadStaleWorker(workerId, build, attempt + 1);
+      return;
+    }
+    _staleWorkerPolicy.commit();
+    console.error(`[Safari MCP] worker ${workerId.slice(0, 8)} announced no extension build (a context Safari kept from an older app); reloading it`);
+    // The reload needs the same handoff as safari_reload_extension (see /proxy-command): it is
+    // what lets the replacement worker take the lease from this one.
     let handoff = null;
     try {
       handoff = _prepareReloadHttpWorkerHandoff();
@@ -662,7 +667,7 @@ function _reloadStaleWorker(workerId, build) {
       if (handoff) _cancelReloadHttpWorkerHandoff(handoff);
       console.error(`[Safari MCP] reloading worker ${workerId.slice(0, 8)} failed: ${error.message}`);
     }
-  }, 1500);
+  }, attempt === 0 ? 1500 : 3000);
 }
 const _connectingHttpWorkers = new Map();
 const _HTTP_WORKER_TTL_MS = 60 * 1000;
