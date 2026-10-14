@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.22.17] - 2026-10-14
+
+### Changed
+- **`@modelcontextprotocol/sdk` 1.31.0 → 1.32.1** (#165). Lockfile only; the declared range is unchanged.
+
 ### Fixed
 - **Contexts Safari kept from an older app no longer break receipts, and the daemon retires them (#143).** Replacing the extension app does not stop the contexts Safari had already started. Each keeps its own in-memory receipts, writes its own envelope under an epoch of its own, and becomes the daemon's lease holder again every time it verifies, so a lease moving between an old context and a new one lost the receipts the other had minted. Measured on 13.10.26 after the epoch change above shipped: an old context's envelope replaced the new one's twice in ten minutes, and a receipt minted by the new build was refused one command later when an old context held the lease.
   - **The build stores its state under keys no older build touches** (`mcpOwnedTabReceiptsV4`, `mcpOwnedTabsLocalV2`; earlier builds use `...V3` and `mcpOwnedTabsLocal`), so an old context that is still alive cannot replace what this build stored.
