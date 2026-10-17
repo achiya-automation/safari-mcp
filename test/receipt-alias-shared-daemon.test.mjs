@@ -639,3 +639,30 @@ for (const { name, url, rotates } of [
     }
   });
 }
+
+// ---------- 4. the client that navigated ----------
+
+// Served by the extension, safari_navigate and safari_navigate_and_read left safari.js holding the
+// URL the tab had left, and released that URL from the session's ownership. Without SAFARI_PROFILE
+// every later write of the same client was then judged by a URL it no longer owned, and refused
+// ("current tab (<the URL it left>) was not opened by this MCP session"), with the rotated receipt,
+// the receipt it started with, or none. A same-origin navigation hid it: an owned URL that differs
+// only in its query still matches.
+for (const tool of ["safari_navigate", "safari_navigate_and_read"]) {
+  for (const mode of MODES) {
+    test(`${mode.name}: after ${tool} to another origin, the client that navigated keeps working in the tab`, async () => {
+      const { server, extension, safari } = setup(mode);
+      const { receipt } = json(await server.safari_new_tab({ url: SHOP }));
+      const shop = extension.tabs.at(-1);
+
+      const fresh = json(await server[tool]({ url: LOGIN, receipt })).receipt;
+      assert.match(fresh ?? "", RECEIPT, "the navigation handed back no receipt");
+
+      for (const args of [{ receipt: fresh }, { receipt }, {}]) {
+        assert.equal(await outcome(() => server.safari_click({ selector: "#go", ...args })), CLICKED, JSON.stringify(args));
+        assert.deepEqual(extension.ran.at(-1), { type: "click", tabId: shop.id, url: LOGIN });
+      }
+      assert.deepEqual(safari.appleScript, [], "AppleScript touched a tab");
+    });
+  }
+}

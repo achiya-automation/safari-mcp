@@ -2115,6 +2115,22 @@ function _sanitizeTabResult(value) {
   };
 }
 
+// The page a navigation landed on becomes the session's current page. safari.navigate() records it
+// for the AppleScript path, but a navigation the extension served left safari.js holding the URL the
+// tab had left, and the tool then released that URL from ownership: without SAFARI_PROFILE every
+// later write of the client was judged by a URL it no longer owned, and refused. Skipped when a call
+// alongside has made another tab the session's current one: the landed page is not that tab's.
+function _recordLandedPage(result, usedReceipt, requestedUrl) {
+  if (_receiptToken(usedReceipt) !== _getActiveReceipt()) return;
+  let page = result;
+  if (typeof page === "string") {
+    try { page = JSON.parse(page); } catch { page = null; }
+  }
+  const landed = (page && typeof page === "object" && page.url) || requestedUrl;
+  safari.setActiveTabURL(landed);
+  _addOwnedURL(landed);
+}
+
 // A receipt is bound to the origin it was minted on, so a cross-origin navigation the
 // caller itself asked for used to strand every following call ("not valid for this
 // origin", ~80×/week). The caller chose the destination, so rotating here is safe —
@@ -2756,6 +2772,7 @@ server.tool(
     );
     // Tab kept its identity, just changed URL — drop the stale old URL from ownership.
     if (oldUrl && oldUrl !== url && oldUrl !== 'about:blank') _removeOwnedURL(oldUrl);
+    _recordLandedPage(result, usedReceipt, url);
     return textResult(await _rotateReceiptAfterNavigate(result, usedReceipt, oldUrl));
   }
 );
@@ -2859,6 +2876,7 @@ server.tool(
       }
     );
     if (oldUrl && oldUrl !== url && oldUrl !== 'about:blank') _removeOwnedURL(oldUrl);
+    _recordLandedPage(result, usedReceipt, url);
     return textResult(await _rotateReceiptAfterNavigate(result, usedReceipt, oldUrl));
   }
 );
