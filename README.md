@@ -752,8 +752,10 @@ xcodebuild -project "xcode/Safari MCP/Safari MCP.xcodeproj" \
 APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData/Safari_MCP-*/Build/Products/Release -name "Safari MCP.app" -maxdepth 2 | head -1)
 
 # 4. Re-sign safari-helper with the Apple Events entitlement
-# (helps macOS surface the TCC Automation prompt reliably)
-codesign --sign - --force --entitlements safari-helper.entitlements safari-helper
+# (helps macOS surface the TCC Automation prompt reliably).
+# Keep the stable identifier: macOS keys the Accessibility grant to it.
+codesign --sign - --force --identifier com.achiya-automation.safari-mcp \
+  --entitlements safari-helper.entitlements safari-helper
 
 # 5. Open the app (needed once so Safari registers the extension)
 open "$APP_PATH"
