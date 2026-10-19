@@ -179,13 +179,16 @@ function makeExtension() {
         const receipt = await ext._issueTabReceipt(tab);
         return { tabIndex: tabs.indexOf(tab) + 1, url: tab.url, receipt };
       }
-      case "navigate":
-        live(target.id).url = payload.url;
-        setSessionTab(sessionId, target.id, payload.url);
-        ran.push({ type, tabId: target.id, url: payload.url });
+      case "navigate": {
+        // A site that redirects decides where the tab lands.
+        const landed = hooks.redirectTo || payload.url;
+        live(target.id).url = landed;
+        setSessionTab(sessionId, target.id, landed);
+        ran.push({ type, tabId: target.id, url: landed });
         await hooks.loading; // the page is still loading until the test says otherwise
         hooks.afterNavigate?.();
-        return { title: "", url: payload.url };
+        return { title: "", url: landed };
+      }
       case "navigate_and_read":
         live(target.id).url = payload.url;
         setSessionTab(sessionId, target.id, payload.url);
@@ -639,3 +642,46 @@ for (const { name, url, rotates } of [
     }
   });
 }
+
+// ---------- 4. the client that navigated ----------
+
+// Served by the extension, safari_navigate and safari_navigate_and_read left safari.js holding the
+// URL the tab had left, and released that URL from the session's ownership. Without SAFARI_PROFILE
+// every later write of the same client was then refused ("current tab (<the URL it left>) was not
+// opened by this MCP session"), with the rotated receipt, the one it started with, or none (#172).
+// A same-origin navigation hid it: an owned URL that differs only in its query still matches.
+for (const tool of ["safari_navigate", "safari_navigate_and_read"]) {
+  for (const mode of MODES) {
+    test(`${mode.name}: after ${tool} to another origin, the client that navigated keeps working in the tab`, async () => {
+      const { server, extension, safari } = setup(mode);
+      const { receipt } = json(await server.safari_new_tab({ url: SHOP }));
+      const shop = extension.tabs.at(-1);
+
+      const fresh = json(await server[tool]({ url: LOGIN, receipt })).receipt;
+      assert.match(fresh ?? "", RECEIPT, "the navigation handed back no receipt");
+
+      for (const args of [{ receipt: fresh }, { receipt }, {}]) {
+        assert.equal(await outcome(() => server.safari_click({ selector: "#go", ...args })), CLICKED, JSON.stringify(args));
+        assert.deepEqual(extension.ran.at(-1), { type: "click", tabId: shop.id, url: LOGIN });
+      }
+      assert.deepEqual(safari.appleScript, [], "AppleScript touched a tab");
+    });
+  }
+}
+
+// The session's current page is pinned to the URL it asked for, not to where a redirect took the
+// tab: the site would otherwise choose what the machine-wide ownership file vouches for.
+test("without SAFARI_PROFILE: a redirect after safari_navigate keeps the client working and claims nothing the site chose", async () => {
+  const { server, extension, safari } = setup(MODES[0]);
+  const { receipt } = json(await server.safari_new_tab({ url: SHOP }));
+  const shop = extension.tabs.at(-1);
+  const landing = "https://redirected.example/landing";
+  extension.hooks.redirectTo = landing;
+
+  json(await server.safari_navigate({ url: LOGIN, receipt }));
+  assert.equal(safari.getActiveTabURL(), LOGIN);
+  assert.equal(own._isURLOwned(landing), false, "the redirect target was claimed");
+
+  assert.equal(await outcome(() => server.safari_click({ selector: "#go" })), CLICKED);
+  assert.deepEqual(extension.ran.at(-1), { type: "click", tabId: shop.id, url: landing });
+});

@@ -2115,6 +2115,18 @@ function _sanitizeTabResult(value) {
   };
 }
 
+// After a navigation, the session's current page is the URL it asked for. safari.navigate() records
+// one for the AppleScript path, but a navigation the extension served left safari.js holding the URL
+// the tab had left, which the tool then released: without SAFARI_PROFILE every later write of that
+// client was judged by a URL it no longer owned, and refused (#172). The requested URL, not the one
+// the page reports: extensionOrFallback has already claimed it, while a redirect target is the
+// site's choice (see run_script's newTab). Skipped when a call alongside has made another tab the
+// session's current one: the navigated page is not that tab's.
+function _pinNavigatedUrl(url, usedReceipt) {
+  if ((usedReceipt || "") !== (_getActiveReceipt() || "")) return;
+  safari.setActiveTabURL(url);
+}
+
 // A receipt is bound to the origin it was minted on, so a cross-origin navigation the
 // caller itself asked for used to strand every following call ("not valid for this
 // origin", ~80×/week). The caller chose the destination, so rotating here is safe —
@@ -2756,6 +2768,7 @@ server.tool(
     );
     // Tab kept its identity, just changed URL — drop the stale old URL from ownership.
     if (oldUrl && oldUrl !== url && oldUrl !== 'about:blank') _removeOwnedURL(oldUrl);
+    _pinNavigatedUrl(url, usedReceipt);
     return textResult(await _rotateReceiptAfterNavigate(result, usedReceipt, oldUrl));
   }
 );
@@ -2859,6 +2872,7 @@ server.tool(
       }
     );
     if (oldUrl && oldUrl !== url && oldUrl !== 'about:blank') _removeOwnedURL(oldUrl);
+    _pinNavigatedUrl(url, usedReceipt);
     return textResult(await _rotateReceiptAfterNavigate(result, usedReceipt, oldUrl));
   }
 );
