@@ -110,6 +110,13 @@ if (window.__mcpVersion !== 6) {
   window.mcpResolveTarget = function(el) {
     var base = window.mcpPickActionable(el) || el;
     if (!base) return null;
+    // A form control or its label stays the target: a consent checkbox's label wraps a policy
+    // link, and the point that resolves it (the label's centre, or the wrapping label for a hidden
+    // Material input) lands on that link, so the click followed the link instead of toggling.
+    var isControl = base.matches && base.matches('input:not([type="hidden"]),select,textarea,label');
+    var keepControl = function(picked) {
+      return isControl && picked !== base && (picked.contains(base) || (picked.matches && picked.matches('a[href],button,input,select,textarea')));
+    };
     try { base.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
     var r = base.getBoundingClientRect();
     var dx = Math.min(12, Math.max(4, r.width / 4));
@@ -126,11 +133,14 @@ if (window.__mcpVersion !== 6) {
       if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) continue;
       var hit = window.mcpElementFromPoint(x, y);
       if (!hit) continue;
-      if (base === hit || base.contains(hit) || hit.contains(base)) return window.mcpPickActionable(hit) || hit;
+      if (base === hit || base.contains(hit) || hit.contains(base)) {
+        var picked = window.mcpPickActionable(hit) || hit;
+        return keepControl(picked) ? base : picked;
+      }
       // Overlay pattern: transparent button/link overlays a text label (e.g. dropdown items).
       // If the hit is an interactive element sharing a nearby common ancestor, prefer it.
       var hitAction = window.mcpPickActionable(hit);
-      if (hitAction && hitAction !== base && hitAction.matches && hitAction.matches('button,a[href],[role="button"],[role="option"],[role="menuitem"]')) {
+      if (hitAction && hitAction !== base && !keepControl(hitAction) && hitAction.matches && hitAction.matches('button,a[href],[role="button"],[role="option"],[role="menuitem"]')) {
         var p = base.parentElement;
         for (var k = 0; k < 4 && p; k++) {
           if (p.contains(hitAction)) return hitAction;
@@ -156,6 +166,9 @@ if (window.__mcpVersion !== 6) {
     // navigation. Firing from the leaf reproduces the real bubble path exactly.
     var from = window.mcpElementFromPoint(x, y);
     if (!from || !(target === from || target.contains(from))) from = target;
+    // A leaf inside a link nested in the target (a label's policy link) would follow that link.
+    var fromLink = from.closest ? from.closest('a[href]') : null;
+    if (fromLink && fromLink !== target && target.contains(fromLink)) from = target;
     var s = { bubbles: true, cancelable: true, composed: true, view: window, clientX: x, clientY: y, button: 0, detail: 1 };
     var p = { ...s, pointerId: 1, pointerType: 'mouse', isPrimary: true, width: 1, height: 1, pressure: 0.5 };
     from.dispatchEvent(new PointerEvent('pointerover', { ...p, buttons: 0 }));
@@ -173,8 +186,12 @@ if (window.__mcpVersion !== 6) {
     // .click() on an anchor (or a node inside one) triggers the browser's own navigation
     // with target === the anchor, which is the exact shape the gate rejects. For anchors,
     // let the dispatched event below carry the default action instead.
+    // A checkbox, radio or their label toggles on the dispatched click below as well, so .click()
+    // first toggled it twice: safari_click left every checkbox unchecked.
+    var toggles = (target.tagName === 'INPUT' && (target.type === 'checkbox' || target.type === 'radio')) ||
+      (target.tagName === 'LABEL' && !!target.control);
     try {
-      if (!href && typeof from.click === 'function') from.click();
+      if (!href && !toggles && typeof from.click === 'function') from.click();
     } catch (e) {}
     var clickEv = new MouseEvent('click', { ...s, buttons: 0 });
     var notPrevented = from.dispatchEvent(clickEv);
