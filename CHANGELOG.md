@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.22.18] - 2026-10-19
+
 ### Fixed
 - **A client that navigates its tab to another origin keeps working in it, without `SAFARI_PROFILE` (#172).** When the extension served `safari_navigate` or `safari_navigate_and_read`, safari.js kept the URL the tab had left as the session's current page, and the tool then released that URL from the session's ownership. Every later write of the same client (click, fill, evaluate) was refused with "current tab (<the URL it left>) was not opened by this MCP session", whichever receipt it passed. A same-origin navigation hid it, because an owned URL that differs only in its query still matches. Both tools now pin the session's current page to the URL they were asked for, which the navigation has already claimed, as `safari_new_tab` does. Where a redirect took the tab is not claimed: that is the site's choice, not the caller's. Nothing is pinned when a call alongside has made another tab the session's current one. Named-profile mode was not affected. Reported, with a live reproduction, by @jkrygel.
 
