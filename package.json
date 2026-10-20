@@ -88,7 +88,8 @@
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
-    "ws": "^8.19.0"
+    "ws": "^8.19.0",
+    "zod": "^3.25 || ^4.0"
   },
   "overrides": {
     "hono": "^4.12.21",
