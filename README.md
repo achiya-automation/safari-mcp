@@ -375,7 +375,7 @@ What the flag deliberately does *not* do:
 
 ## Environment variables
 
-Agent tabs open in a window of their own, created in the background and shared by every session, never among your tabs. Safari has no tab-group API for extensions, so a window stands in for a tab group. Its first tab stays blank so the window survives the agent closing its last tab. `safari_new_tab` with `private: true` opens the tab in a separate private window instead, with no cookies or logins, for logged-out testing. That needs the extension's **Allow in Private Browsing** (Safari → Settings → Extensions); without it the call is refused rather than opened logged in.
+Agent tabs open in a window of their own, created in the background at 1440×900 and shared by every session, never among your tabs. Safari has no tab-group API for extensions, so a window stands in for a tab group. Its first tab stays blank so the window survives the agent closing its last tab. `safari_new_tab` with `private: true` opens the tab in a separate private window instead, with no cookies or logins, for logged-out testing. That needs the extension's **Allow in Private Browsing** (Safari → Settings → Extensions); without it the call is refused rather than opened logged in.
 
 | Variable | Default | What it does |
 |----------|---------|--------------|

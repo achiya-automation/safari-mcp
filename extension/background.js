@@ -203,7 +203,8 @@ async function _agentWindow(incognito = false) {
     ? await browser.windows.get(_agentWindowIds[incognito]).catch(() => null)
     : null;
   if (existing && !!existing.incognito === incognito) return existing;
-  const created = await browser.windows.create({ url: "about:blank", focused: false, incognito });
+  // 1440x900: one size for every session's screenshots and layouts, whatever the user's windows.
+  const created = await browser.windows.create({ url: "about:blank", focused: false, incognito, width: 1440, height: 900 });
   if (!created || !!created.incognito !== incognito) {
     // Safari returns no window, or a normal one, when the extension may not run in Private Browsing.
     if (created) await browser.windows.remove(created.id).catch(() => {});
