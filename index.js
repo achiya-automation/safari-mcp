@@ -1947,7 +1947,7 @@ const _RUNSCRIPT_OWNERSHIP_EXEMPT = new Set([
 
 // Origin of a URL, or "" when it has none (about:blank, "missing value", junk).
 // An empty result must never compare equal to another empty result at a call site.
-const _SCREENSHOT_MAX_WIDTH = parseInt(process.env.SAFARI_MCP_SCREENSHOT_MAX_WIDTH || "0", 10) || 0;
+const _SCREENSHOT_MAX_WIDTH = parseInt(process.env.SAFARI_MCP_SCREENSHOT_MAX_WIDTH ?? "1280", 10) || 0;
 // Retina captures come back at 2× the viewport (3024px wide on a 15" MacBook → ~1,900 tokens
 // per image even after the API's own 1568px cap). Resampling with the system's sips keeps the
 // tool dependency-free; the original is returned untouched on any failure.
@@ -3263,7 +3263,7 @@ server.tool(
   {
     receipt: z.string().optional().describe("Tab receipt from safari_new_tab — pins this call to that tab (survives reconnects/subagents)"),
     fullPage: z.boolean().optional().describe("Capture full page (not just viewport)"),
-    maxWidth: z.coerce.number().optional().describe("Downscale to this pixel width before returning (default: env SAFARI_MCP_SCREENSHOT_MAX_WIDTH, else none). Retina captures are 2× the viewport; 1280 keeps text readable at a third fewer tokens, 800 is plenty for layout checks. 0 = never scale."),
+    maxWidth: z.coerce.number().optional().describe("Downscale to this pixel width before returning (default: env SAFARI_MCP_SCREENSHOT_MAX_WIDTH, else 1280). Retina captures are 2× the viewport; 1280 keeps text readable at about a sixth of the bytes, 800 is plenty for layout checks. 0 = never scale."),
   },
   async ({ fullPage, receipt, maxWidth }) => {
     let base64;
