@@ -375,6 +375,8 @@ What the flag deliberately does *not* do:
 
 ## Environment variables
 
+Agent tabs open in a window of their own, created in the background and shared by every session, never among your tabs. Safari has no tab-group API for extensions, so a window stands in for a tab group. Its first tab stays blank so the window survives the agent closing its last tab.
+
 | Variable | Default | What it does |
 |----------|---------|--------------|
 | `SAFARI_MCP_HTTP` | off | Run one shared HTTP daemon instead of a process per client (see above). |
