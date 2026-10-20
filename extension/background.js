@@ -191,28 +191,44 @@ async function _waitForNavigatedTab(tabId, timeoutMs = 12000) {
 // group class in AppleScript), so a window is the closest substitute for a separate tab group.
 // Its first tab stays as a blank parking tab: closing the agent's last real tab would otherwise
 // close the window, and reopening it later can bring Safari to the front.
-let _agentWindowId = null;
-async function _agentWindow() {
-  if (!_agentWindowId) {
-    _agentWindowId = (await browser.storage.local.get("mcpAgentWindowId").catch(() => ({}))).mcpAgentWindowId || null;
+// A private agent window (safari_new_tab private:true) is kept apart the same way: it has no
+// cookies or logins, so a session's logged-out tabs never land in a logged-in window or back.
+const _agentWindowIds = { false: null, true: null };
+async function _agentWindow(incognito = false) {
+  const key = incognito ? "mcpPrivateAgentWindowId" : "mcpAgentWindowId";
+  if (!_agentWindowIds[incognito]) {
+    _agentWindowIds[incognito] = (await browser.storage.local.get(key).catch(() => ({})))[key] || null;
   }
-  const existing = _agentWindowId ? await browser.windows.get(_agentWindowId).catch(() => null) : null;
-  if (existing) return existing;
-  const created = await browser.windows.create({ url: "about:blank", focused: false });
-  _agentWindowId = created.id;
-  browser.storage.local.set({ mcpAgentWindowId: _agentWindowId }).catch(() => {});
+  const existing = _agentWindowIds[incognito]
+    ? await browser.windows.get(_agentWindowIds[incognito]).catch(() => null)
+    : null;
+  if (existing && !!existing.incognito === incognito) return existing;
+  const created = await browser.windows.create({ url: "about:blank", focused: false, incognito });
+  if (!created || !!created.incognito !== incognito) {
+    // Safari returns no window, or a normal one, when the extension may not run in Private Browsing.
+    if (created) await browser.windows.remove(created.id).catch(() => {});
+    throw new Error(
+      "Safari did not open a private window. Enable Safari > Settings > Extensions > Safari MCP Bridge > " +
+      "Allow in Private Browsing, then retry."
+    );
+  }
+  _agentWindowIds[incognito] = created.id;
+  browser.storage.local.set({ [key]: created.id }).catch(() => {});
   return created;
 }
 
 async function _newTabForSession(sessionId, payload) {
   const sid = sessionId || _DEFAULT_SESSION;
+  const incognito = payload.private === true;
   const hadSessionWindow = _sessionWindowIds.has(sid);
   // A session's own window (one it opened a tab in) is kept; with none, never the shared
   // default, which is the user's focused window until the agent window takes its place.
-  let profileWindow = hadSessionWindow
+  // A private tab always goes to the private agent window, which no session adopts.
+  let profileWindow = hadSessionWindow && !incognito
     ? await browser.windows.get(_sessionWindowIds.get(sid)).catch(() => null)
     : null;
-  if (!profileWindow) profileWindow = await _agentWindow();
+  if (profileWindow?.incognito) profileWindow = null;
+  if (!profileWindow) profileWindow = await _agentWindow(incognito);
 
   const newTab = await browser.tabs.create({
     url: "about:blank",
@@ -223,11 +239,13 @@ async function _newTabForSession(sessionId, payload) {
   const openedWindowId = newTab.windowId || profileWindow.id;
   // A session that already owns a window must not move the shared default for every
   // other session merely because it opened another tab in its own window.
-  if (!_profileWindowId || !hadSessionWindow) {
-    _profileWindowId = openedWindowId;
-    browser.storage.local.set({ mcpProfileWindowId: _profileWindowId }).catch(() => {});
+  if (!incognito) {
+    if (!_profileWindowId || !hadSessionWindow) {
+      _profileWindowId = openedWindowId;
+      browser.storage.local.set({ mcpProfileWindowId: _profileWindowId }).catch(() => {});
+    }
+    _adoptWindowForSession(sessionId, openedWindowId);
   }
-  _adoptWindowForSession(sessionId, openedWindowId);
 
   const rawNavigationUrl = String(payload.url || "");
   const trackUrl = rawNavigationUrl || newTab.url || "about:blank";
