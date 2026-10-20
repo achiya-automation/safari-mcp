@@ -2750,6 +2750,45 @@ const _pkgVersion = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.me
 // stdio mode calls this exactly once, identical to the historical inline server. Tool bodies are
 // unchanged; they close over the module-global safari state, which stays shared across sessions
 // (correct: one physical Safari window). See docs/http-transport-design.md.
+// safari_snapshot diff mode. A snapshot is cut into lines at line breaks and before block
+// tags, and lines are compared without their refs (_normalizeRefs). Added lines keep their
+// new refs; removed ones are shown without refs, which are dead.
+const _lastSnapshots = new Map();
+function _rememberSnapshot(key, text) {
+  _lastSnapshots.delete(key);
+  _lastSnapshots.set(key, text);
+  if (_lastSnapshots.size > 50) _lastSnapshots.delete(_lastSnapshots.keys().next().value);
+}
+function _snapshotLines(text) {
+  return String(text)
+    .split(/\n|(?=<(?:li|p|h[1-6]|form|section|article|nav|header|footer|main|aside|dialog|ul|ol|button|label|tr)\b)/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+// Refs are numbered in page order, so one inserted element renumbers every ref after it:
+// lines compare without them. ref="3_12" (extension) and ref=3_12 (AppleScript).
+const _normalizeRefs = (line) => line.replace(/ ?\bref=("[^"]*"|\S+)/g, "").trim();
+function _snapshotDiff(previous, current) {
+  const before = new Map();
+  for (const line of _snapshotLines(previous)) {
+    const k = _normalizeRefs(line);
+    before.set(k, (before.get(k) || 0) + 1);
+  }
+  const added = [];
+  for (const line of _snapshotLines(current)) {
+    const k = _normalizeRefs(line);
+    const n = before.get(k) || 0;
+    if (n) before.set(k, n - 1);
+    else added.push(`+ ${line}`);
+  }
+  const removed = [];
+  for (const [k, n] of before) for (let i = 0; i < n; i++) removed.push(`- ${k}`);
+  if (!added.length && !removed.length) return "No changes since the previous snapshot.";
+  const shown = removed.slice(0, 50);
+  if (removed.length > shown.length) shown.push(`- … ${removed.length - shown.length} more removed lines`);
+  return `Changes since the previous snapshot (${added.length} added, ${removed.length} removed):\n${[...added, ...shown].join("\n")}`;
+}
+
 function buildServer() {
 const server = new McpServer({
   name: "safari-mcp",
@@ -2855,14 +2894,24 @@ server.tool(
 server.tool(
   "safari_snapshot",
   "PREFERRED way to see page state. Returns accessibility tree with ref IDs for every interactive element. Use refs with click/fill/type instead of CSS selectors. Workflow: snapshot → see refs → click({ref:'0_5'}). PREFER THIS over safari_screenshot (cheaper, structured text vs heavy image) and over safari_read_page (includes interactive refs). Use safari_screenshot only when you need to see visual layout/styling.",
-  { selector: z.string().optional().describe("CSS selector for subtree (default: full page)"), receipt: z.string().optional().describe("Tab receipt from safari_new_tab — pins this call to that tab (survives reconnects/subagents)"), },
+  {
+    selector: z.string().optional().describe("CSS selector for subtree (default: full page)"),
+    receipt: z.string().optional().describe("Tab receipt from safari_new_tab — pins this call to that tab (survives reconnects/subagents)"),
+    diff: z.boolean().optional().describe("Return only the lines that changed since this tab's previous snapshot (+ added, - removed); far smaller after a click or a fill"),
+  },
   async (args) => {
     const gen = safari.getNextSnapshotGen();
+    const key = `${_receiptSessionKey()}|${_receiptToken(args.receipt) || _getActiveReceipt() || ""}|${args.selector || ""}`;
     const result = await extensionOrFallback(
       "snapshot", { selector: args.selector, gen, ..._explicitReceipt(args) },
       () => safari.takeSnapshot({ ...args, _gen: gen })
     );
-    return textResult(result);
+    if (typeof result !== "string") return textResult(result);
+    const previous = _lastSnapshots.get(key);
+    _rememberSnapshot(key, result);
+    if (!args.diff) return textResult(result);
+    if (previous === undefined) return textResult(`(No earlier snapshot of this tab to compare with: full snapshot.)\n${result}`);
+    return textResult(_snapshotDiff(previous, result));
   }
 );
 

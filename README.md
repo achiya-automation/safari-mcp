@@ -373,6 +373,8 @@ What the flag deliberately does *not* do:
 
 ---
 
+After a click or a fill, `safari_snapshot` with `diff: true` returns only the lines that changed since that tab's previous snapshot (`+` added, with fresh refs; `-` removed), usually a small fraction of a full snapshot.
+
 ## Environment variables
 
 | Variable | Default | What it does |
