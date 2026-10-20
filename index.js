@@ -3380,8 +3380,11 @@ server.tool(
 server.tool(
   "safari_new_tab",
   "Open a new background tab (never steals focus), optionally with a URL. Returns {tabIndex, safeUrl, receipt}. KEEP THE RECEIPT and pass it as `receipt` to every later call on this tab — it survives MCP reconnects, daemon restarts, parallel sessions and subagents, and makes safari_list_tabs / safari_switch_tab unnecessary.",
-  { url: z.string().optional().describe("URL to open (empty for blank tab)") },
-  async ({ url }) => {
+  {
+    url: z.string().optional().describe("URL to open (empty for blank tab)"),
+    private: z.boolean().optional().describe("Open in a private window: no cookies or logins, for logged-out testing"),
+  },
+  async ({ url, private: isPrivate }) => {
     // Safari may suspend the profile worker between calls. Give it one full wake
     // cycle; once connected, the extension creates a background profile window
     // itself when the previous last window was closed.
@@ -3394,8 +3397,18 @@ server.tool(
     const requestedUrl = String(url || "");
     let viaAppleScript = false;
     const rawResult = await extensionOrFallback(
-      "new_tab", { url: requestedUrl },
-      () => { viaAppleScript = true; return _openTabViaAppleScript(requestedUrl); }
+      "new_tab", { url: requestedUrl, ...(isPrivate ? { private: true } : {}) },
+      () => {
+        // AppleScript cannot open a private window; a logged-in tab in its place could act as the user.
+        if (isPrivate) {
+          throw new Error(
+            "No private tab opened: only the Safari extension can open one, and it could not. Turn on " +
+            "Safari > Settings > Extensions > Safari MCP Bridge > Allow in Private Browsing, and check safari_doctor."
+          );
+        }
+        viaAppleScript = true;
+        return _openTabViaAppleScript(requestedUrl);
+      }
     );
     // AppleScript fallback returns a JSON string; extension returns an object — normalize
     let result = rawResult;
