@@ -142,3 +142,35 @@ test("http mode: a DNS-rebinding request gets 403 before any session exists", as
     await handle.close();
   }
 });
+
+test("http mode: a session's end runs onSessionClosed, on DELETE and when reaped idle", async () => {
+  const closed = [];
+  const handle = await startTransport(
+    makeStubServer,
+    { SAFARI_MCP_HTTP: "1", SAFARI_MCP_HTTP_PORT: "9323", SAFARI_MCP_SESSION_IDLE_MIN: "0.005" }, // 300ms
+    { onSessionClosed: (id) => closed.push(id) }
+  );
+  try {
+    // DELETE: the client ends its session.
+    const client = new Client({ name: "t", version: "0" });
+    const transport = new StreamableHTTPClientTransport(new URL("http://127.0.0.1:9323/mcp"));
+    await client.connect(transport);
+    const deleted = transport.sessionId;
+    await transport.terminateSession();
+    assert.deepEqual(closed, [deleted]);
+    await client.close();
+
+    // Idle: a client that vanished without a DELETE is reaped, and only once it is idle.
+    const idle = new StreamableHTTPClientTransport(new URL("http://127.0.0.1:9323/mcp"));
+    const idleClient = new Client({ name: "t", version: "0" });
+    await idleClient.connect(idle);
+    await idleClient.callTool({ name: "ping", arguments: {} });
+    assert.equal(closed.length, 1, "an active session is not reaped");
+    const deadline = Date.now() + 3000;
+    while (closed.length < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+    assert.deepEqual(closed, [deleted, idle.sessionId]);
+    await idleClient.close().catch(() => {});
+  } finally {
+    await handle.close();
+  }
+});
