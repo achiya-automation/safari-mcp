@@ -849,12 +849,19 @@ async function executeAndReply(msg, bridgeUrl = HTTP_URL) {
   if (!msg || !msg.id || !msg.type) return;
 
   let response;
+  const isClose = msg.type === "close_tab";
+  if (isClose) _closeCommandsInFlight++;
   try {
     const result = await handleCommand(msg.type, msg.payload || {});
     response = { type: "response", id: msg.id, result, error: null };
   } catch (err) {
     response = { type: "response", id: msg.id, result: null, error: err.message || String(err) };
+  } finally {
+    // Safari can deliver onRemoved just after tabs.remove() resolves.
+    if (isClose) setTimeout(() => { _closeCommandsInFlight--; }, 1000);
   }
+  const events = msg.payload?.sessionId ? _drainTabEvents(msg.payload.sessionId) : null;
+  if (events) response.events = events;
 
   try {
     const resultAck = await _bridgeFetch(`${bridgeUrl}/result`, {
@@ -3421,11 +3428,35 @@ browser.tabs.onActivated.addListener(({ tabId, windowId }) => {
   // the cross-session interference. Sessions track their own tabs explicitly.
 });
 
+// A session hears about its tabs that the page or the user closed on the reply to its next
+// command (executeAndReply), instead of from a stale-receipt error later.
+const _sessionTabEvents = new Map(); // sessionId -> [{ kind: "closed", receipt }]
+// While an MCP close_tab runs, a closed tab is that command's doing, not news to report.
+// shortcut: a user close in that same moment goes unreported too; tag closes by tab id if that matters.
+let _closeCommandsInFlight = 0;
+function _queueTabEvent(sessionId, event) {
+  const list = _sessionTabEvents.get(sessionId) || [];
+  if (list.length < 20) list.push(event);
+  _sessionTabEvents.set(sessionId, list);
+}
+function _drainTabEvents(sessionId) {
+  const sid = sessionId || _DEFAULT_SESSION;
+  const items = _sessionTabEvents.get(sid);
+  if (!items?.length) return null;
+  _sessionTabEvents.delete(sid);
+  return { sessionId: sid, items };
+}
+
 browser.tabs.onRemoved.addListener((tabId) => {
   _withReceiptMutationLock(async () => {
     // A cold worker can receive tab events before its durable maps are hydrated. Never
     // persist an empty in-memory state over valid receipts/ownership from the last worker.
     await _hydrateOwnedTabs();
+    if (!_closeCommandsInFlight) {
+      for (const [sid, ownedSet] of _sessionOwnedTabs) {
+        if (ownedSet.has(tabId)) _queueTabEvent(sid, { kind: "closed", receipt: _tokenByTabId.get(tabId) || "" });
+      }
+    }
     // Clean up any session that was tracking this tab
     for (const [sid, cache] of _sessionTabCache) {
       if (cache.tabId === tabId) {

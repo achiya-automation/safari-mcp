@@ -254,6 +254,22 @@ async function _evictOldestTab(sessionId) {
   return null;
 }
 
+// Close every tab an HTTP session opened once the session ends (its DELETE, or transport.js
+// reaping it idle). Without this a finished Claude session's tabs stayed open until the daemon
+// restarted, up to MAX_TABS per session, and piled up across sessions. A failed close keeps
+// the tab tracked, so the shutdown cleanup and the memory sweep still see it.
+async function _closeSessionTabs(sessionId) {
+  let closed = 0;
+  for (const [key, info] of _sessionTabs(`${SESSION_ID}:${sessionId}`)) {
+    const outcome = await _oneCloseAtATime(() => _closeTrackedTab(info));
+    if (outcome === "failed") continue;
+    _untrackTab(key);
+    if (outcome === "closed") closed++;
+  }
+  if (closed) console.error(`[Safari MCP] Session ${sessionId.slice(0, 8)} ended — closed its ${closed} tab(s)`);
+  _tabEventsBySession.delete(`${SESSION_ID}:${sessionId}`);
+}
+
 // What safari_new_tab tells the caller about the tab the cap closed. The receipt is how the
 // caller knows which of its tabs is gone; the position it had is meaningless by now.
 function _evictionReport(info) {
@@ -1209,6 +1225,7 @@ try {
         try {
           const msg = JSON.parse(body);
           accepted = _handleExtensionResponse(msg, respondingWorkerId);
+          if (accepted) _queueTabEvents(msg.events);
         } catch {}
         res.writeHead(accepted ? 200 : 409);
         res.end(accepted ? "ok" : "Result was not accepted");
@@ -2735,12 +2752,86 @@ const _pkgVersion = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.me
 // stdio mode calls this exactly once, identical to the historical inline server. Tool bodies are
 // unchanged; they close over the module-global safari state, which stays shared across sessions
 // (correct: one physical Safari window). See docs/http-transport-design.md.
+// Tabs of a session's that the page or the user closed, as the extension reports them with a
+// reply (extension/background.js _drainTabEvents), held per session until that session's next
+// tool result carries them (_withTabEvents).
+const _tabEventsBySession = new Map();
+function _queueTabEvents(events) {
+  const sid = typeof events?.sessionId === "string" ? events.sessionId : "";
+  if (!sid || !Array.isArray(events.items) || !events.items.length) return;
+  const list = _tabEventsBySession.get(sid) || [];
+  _tabEventsBySession.set(sid, list.concat(events.items).slice(-20));
+}
+
+// Append this session's tab events to a tool result: each closed tab is forgotten, and its
+// receipt named so the caller stops using it.
+function _withTabEvents(result) {
+  const mySession = `${SESSION_ID}:${currentSessionId()}`;
+  const items = _tabEventsBySession.get(mySession);
+  if (!items?.length || !result || !Array.isArray(result.content)) return result;
+  _tabEventsBySession.delete(mySession);
+  const closed = [];
+  for (const item of items) {
+    const receipt = _receiptToken(item.receipt);
+    if (item.kind !== "closed") continue;
+    if (receipt) _untrackClosedTab({ receipt });
+    closed.push(receipt ? `your tab with receipt ${receipt} was closed by the page or the user` : "one of your tabs was closed by the page or the user");
+  }
+  if (!closed.length) return result;
+  return { ...result, content: [...result.content, { type: "text", text: `Tab events: ${closed.join("; ")}.` }] };
+}
+
+// safari_snapshot diff mode. A snapshot is cut into lines at line breaks and before block
+// tags, and lines are compared without their refs (_normalizeRefs). Added lines keep their
+// new refs; removed ones are shown without refs, which are dead.
+const _lastSnapshots = new Map();
+function _rememberSnapshot(key, text) {
+  _lastSnapshots.delete(key);
+  _lastSnapshots.set(key, text);
+  if (_lastSnapshots.size > 50) _lastSnapshots.delete(_lastSnapshots.keys().next().value);
+}
+function _snapshotLines(text) {
+  return String(text)
+    .split(/\n|(?=<(?:li|p|h[1-6]|form|section|article|nav|header|footer|main|aside|dialog|ul|ol|button|label|tr)\b)/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+// Refs are numbered in page order, so one inserted element renumbers every ref after it:
+// lines compare without them. ref="3_12" (extension) and ref=3_12 (AppleScript).
+const _normalizeRefs = (line) => line.replace(/ ?\bref=("[^"]*"|\S+)/g, "").trim();
+function _snapshotDiff(previous, current) {
+  const before = new Map();
+  for (const line of _snapshotLines(previous)) {
+    const k = _normalizeRefs(line);
+    before.set(k, (before.get(k) || 0) + 1);
+  }
+  const added = [];
+  for (const line of _snapshotLines(current)) {
+    const k = _normalizeRefs(line);
+    const n = before.get(k) || 0;
+    if (n) before.set(k, n - 1);
+    else added.push(`+ ${line}`);
+  }
+  const removed = [];
+  for (const [k, n] of before) for (let i = 0; i < n; i++) removed.push(`- ${k}`);
+  if (!added.length && !removed.length) return "No changes since the previous snapshot.";
+  const shown = removed.slice(0, 50);
+  if (removed.length > shown.length) shown.push(`- … ${removed.length - shown.length} more removed lines`);
+  return `Changes since the previous snapshot (${added.length} added, ${removed.length} removed):\n${[...added, ...shown].join("\n")}`;
+}
+
 function buildServer() {
 const server = new McpServer({
   name: "safari-mcp",
   version: _pkgVersion,
   description: "Safari browser automation - lightweight, keeps logins",
 });
+// Every tool's result carries the session's tab events (_withTabEvents).
+const _registerTool = server.tool.bind(server);
+server.tool = (...args) => {
+  const handler = args.pop();
+  return _registerTool(...args, async (...callArgs) => _withTabEvents(await handler(...callArgs)));
+};
 
 // ========== NAVIGATION ==========
 
@@ -2840,14 +2931,24 @@ server.tool(
 server.tool(
   "safari_snapshot",
   "PREFERRED way to see page state. Returns accessibility tree with ref IDs for every interactive element. Use refs with click/fill/type instead of CSS selectors. Workflow: snapshot → see refs → click({ref:'0_5'}). PREFER THIS over safari_screenshot (cheaper, structured text vs heavy image) and over safari_read_page (includes interactive refs). Use safari_screenshot only when you need to see visual layout/styling.",
-  { selector: z.string().optional().describe("CSS selector for subtree (default: full page)"), receipt: z.string().optional().describe("Tab receipt from safari_new_tab — pins this call to that tab (survives reconnects/subagents)"), },
+  {
+    selector: z.string().optional().describe("CSS selector for subtree (default: full page)"),
+    receipt: z.string().optional().describe("Tab receipt from safari_new_tab — pins this call to that tab (survives reconnects/subagents)"),
+    diff: z.boolean().optional().describe("Return only the lines that changed since this tab's previous snapshot (+ added, - removed); far smaller after a click or a fill"),
+  },
   async (args) => {
     const gen = safari.getNextSnapshotGen();
+    const key = `${_receiptSessionKey()}|${_receiptToken(args.receipt) || _getActiveReceipt() || ""}|${args.selector || ""}`;
     const result = await extensionOrFallback(
       "snapshot", { selector: args.selector, gen, ..._explicitReceipt(args) },
       () => safari.takeSnapshot({ ...args, _gen: gen })
     );
-    return textResult(result);
+    if (typeof result !== "string") return textResult(result);
+    const previous = _lastSnapshots.get(key);
+    _rememberSnapshot(key, result);
+    if (!args.diff) return textResult(result);
+    if (previous === undefined) return textResult(`(No earlier snapshot of this tab to compare with: full snapshot.)\n${result}`);
+    return textResult(_snapshotDiff(previous, result));
   }
 );
 
@@ -4815,7 +4916,7 @@ if (!process.env.SAFARI_PROFILE) _startMemoryMonitor();
 
 // Transport is chosen at runtime: default stdio (unchanged), or a shared HTTP instance when
 // SAFARI_MCP_HTTP=1 (many Claude sessions → one process). buildServer is the per-session factory.
-const transportHandle = await startTransport(buildServer, process.env);
+const transportHandle = await startTransport(buildServer, process.env, { onSessionClosed: _closeSessionTabs });
 
 if (transportHandle.kind === "stdio") {
   // A client can disappear without delivering a signal. Treat its pipe closing as the stdio
