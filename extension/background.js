@@ -2168,7 +2168,11 @@ async function handleCommand(type, payload) {
             attrs += ` value="${esc(String(el.value).substring(0, 50))}"`;
           }
           if (el.type && el.tagName === "INPUT") attrs += ` type="${esc(el.type)}"`;
-          if (el.href && el.tagName === "A") attrs += ` href="${esc(el.href.substring(0, 100))}"`;
+          if (el.href && el.tagName === "A") {
+            // Same-origin links as a path: the origin repeated on every link was a large share of a snapshot.
+            const href = el.href.startsWith(location.origin + "/") ? el.href.slice(location.origin.length) : el.href;
+            attrs += ` href="${esc(href.substring(0, 100))}"`;
+          }
           if (el.disabled) attrs += " disabled";
           const ph = el.getAttribute("placeholder");
           if (ph) attrs += ` placeholder="${esc(ph)}"`;
@@ -2205,6 +2209,13 @@ async function handleCommand(type, payload) {
           }
 
           if (!children.trim() && !interactive) return "";
+
+          // A layout wrapper with nothing of its own to say is only its content: on table and
+          // div layouts the <tr><td><span> tags outweighed the text. Block wrappers keep a line
+          // break and inline ones a space, so neighbouring texts do not run together.
+          if (!interactive && !attrs && ["div", "span", "table", "tbody", "thead", "tr", "td", "th"].includes(tag)) {
+            return children.trim() + (["span", "td", "th"].includes(tag) ? " " : "\n");
+          }
 
           return `<${tag}${attrs}>${children}</${tag}>`;
         }
