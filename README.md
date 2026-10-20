@@ -379,6 +379,7 @@ What the flag deliberately does *not* do:
 |----------|---------|--------------|
 | `SAFARI_MCP_HTTP` | off | Run one shared HTTP daemon instead of a process per client (see above). |
 | `SAFARI_MCP_HTTP_PORT` | `9225` | Port for that daemon. |
+| `SAFARI_MCP_SESSION_IDLE_MIN` | `30` | In HTTP mode, end a session idle this many minutes and close the tabs it opened (they also close on the session's DELETE). `0` = never. |
 | `SAFARI_PROFILE` | unset | Bind sessions to a named Safari profile. Unset = your ordinary windows. |
 | `SAFARI_MCP_ALLOW_USER_TABS` | off | Let `safari_switch_tab` adopt a tab **you** already had open, instead of refusing it (see below). |
 | `MCP_MAX_TABS` | `6` | Tabs one session may keep open. Opening one more closes that session's oldest tab, and `safari_new_tab` names it in `evictedTab` (its receipt). |
