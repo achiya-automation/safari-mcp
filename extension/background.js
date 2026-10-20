@@ -186,49 +186,77 @@ async function _waitForNavigatedTab(tabId, timeoutMs = 12000) {
   return null;
 }
 
+// Agent tabs live in one window of their own, opened unfocused behind the user's windows, so
+// they never land among the user's tabs. Safari has no tabGroups API for extensions (nor a tab
+// group class in AppleScript), so a window is the closest substitute for a separate tab group.
+// Its first tab stays as a blank parking tab: closing the agent's last real tab would otherwise
+// close the window, and reopening it later can bring Safari to the front.
+// A private agent window (safari_new_tab private:true) is kept apart the same way: it has no
+// cookies or logins, so a session's logged-out tabs never land in a logged-in window or back.
+// A stored window id alone is not proof the window is still ours: the user can close it and
+// ids are not promised unique across restarts. The agent window is recognised by its parking
+// tab as well: the tab id recorded when the window was made, still in it, still blank. Its
+// position is no proof: Safari puts the user's pinned tabs first in every window.
+const _agentWindows = { false: null, true: null }; // { windowId, parkingTabId }
+async function _agentWindow(incognito = false) {
+  const key = incognito ? "mcpPrivateAgentWindow" : "mcpAgentWindow";
+  if (!_agentWindows[incognito]) {
+    _agentWindows[incognito] = (await browser.storage.local.get(key).catch(() => ({})))[key] || null;
+  }
+  const known = _agentWindows[incognito];
+  const existing = known ? await browser.windows.get(known.windowId).catch(() => null) : null;
+  if (existing && !!existing.incognito === incognito) {
+    const parking = known.parkingTabId != null ? await browser.tabs.get(known.parkingTabId).catch(() => null) : null;
+    if (parking?.windowId === existing.id && (!parking.url || parking.url === "about:blank")) return existing;
+  }
+  // 1440x900: one size for every session's screenshots and layouts, whatever the user's windows.
+  const created = await browser.windows.create({ url: "about:blank", focused: false, incognito, width: 1440, height: 900 });
+  if (!created || !!created.incognito !== incognito) {
+    // Safari returns no window, or a normal one, when the extension may not run in Private Browsing.
+    if (created) await browser.windows.remove(created.id).catch(() => {});
+    throw new Error(
+      "Safari did not open a private window. Enable Safari > Settings > Extensions > Safari MCP Bridge > " +
+      "Allow in Private Browsing, then retry."
+    );
+  }
+  // The window's own blank tab, not one of the user's pinned tabs Safari placed before it
+  // (Safari does not report them as pinned, so they are told apart by their pages).
+  const createdTabs = created.tabs?.length ? created.tabs : await browser.tabs.query({ windowId: created.id });
+  const parking = createdTabs.find((tab) => !tab.url || tab.url === "about:blank") || createdTabs[createdTabs.length - 1];
+  _agentWindows[incognito] = { windowId: created.id, parkingTabId: parking?.id };
+  browser.storage.local.set({ [key]: _agentWindows[incognito] }).catch(() => {});
+  return created;
+}
+
 async function _newTabForSession(sessionId, payload) {
   const sid = sessionId || _DEFAULT_SESSION;
+  const incognito = payload.private === true;
   const hadSessionWindow = _sessionWindowIds.has(sid);
-  const preferredWindowId = _windowForSession(sessionId);
-  let profileWindow = preferredWindowId
-    ? await browser.windows.get(preferredWindowId).catch(() => null)
+  // A session's own window (one it opened a tab in) is kept; with none, never the shared
+  // default, which is the user's focused window until the agent window takes its place.
+  // A private tab always goes to the private agent window, which no session adopts.
+  let profileWindow = hadSessionWindow && !incognito
+    ? await browser.windows.get(_sessionWindowIds.get(sid)).catch(() => null)
     : null;
+  if (profileWindow?.incognito) profileWindow = null;
+  if (!profileWindow) profileWindow = await _agentWindow(incognito);
 
-  if (!profileWindow) {
-    const existingWindows = await browser.windows.getAll();
-    profileWindow = existingWindows[0] || null;
-  }
-
-  let newTab;
-  if (!profileWindow) {
-    // The extension worker is scoped to this Safari profile, so a WebExtension
-    // window created here belongs to the verified profile. `focused: false`
-    // keeps the recovery entirely in the background and avoids UI scripting.
-    profileWindow = await browser.windows.create({ url: "about:blank", focused: false });
-    const bootstrapTabs = profileWindow.tabs?.length
-      ? profileWindow.tabs
-      : await browser.tabs.query({ windowId: profileWindow.id });
-    newTab = bootstrapTabs[0] || await browser.tabs.create({
-      url: "about:blank",
-      active: false,
-      windowId: profileWindow.id,
-    });
-  } else {
-    newTab = await browser.tabs.create({
-      url: "about:blank",
-      active: false,
-      windowId: profileWindow.id,
-    });
-  }
+  const newTab = await browser.tabs.create({
+    url: "about:blank",
+    active: false,
+    windowId: profileWindow.id,
+  });
 
   const openedWindowId = newTab.windowId || profileWindow.id;
   // A session that already owns a window must not move the shared default for every
   // other session merely because it opened another tab in its own window.
-  if (!_profileWindowId || !hadSessionWindow) {
-    _profileWindowId = openedWindowId;
-    browser.storage.local.set({ mcpProfileWindowId: _profileWindowId }).catch(() => {});
+  if (!incognito) {
+    if (!_profileWindowId || !hadSessionWindow) {
+      _profileWindowId = openedWindowId;
+      browser.storage.local.set({ mcpProfileWindowId: _profileWindowId }).catch(() => {});
+    }
+    _adoptWindowForSession(sessionId, openedWindowId);
   }
-  _adoptWindowForSession(sessionId, openedWindowId);
 
   const rawNavigationUrl = String(payload.url || "");
   const trackUrl = rawNavigationUrl || newTab.url || "about:blank";
