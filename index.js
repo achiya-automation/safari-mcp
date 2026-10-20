@@ -267,6 +267,7 @@ async function _closeSessionTabs(sessionId) {
     if (outcome === "closed") closed++;
   }
   if (closed) console.error(`[Safari MCP] Session ${sessionId.slice(0, 8)} ended — closed its ${closed} tab(s)`);
+  _tabEventsBySession.delete(`${SESSION_ID}:${sessionId}`);
 }
 
 // What safari_new_tab tells the caller about the tab the cap closed. The receipt is how the
@@ -1224,6 +1225,7 @@ try {
         try {
           const msg = JSON.parse(body);
           accepted = _handleExtensionResponse(msg, respondingWorkerId);
+          if (accepted) _queueTabEvents(msg.events);
         } catch {}
         res.writeHead(accepted ? 200 : 409);
         res.end(accepted ? "ok" : "Result was not accepted");
@@ -2750,6 +2752,35 @@ const _pkgVersion = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.me
 // stdio mode calls this exactly once, identical to the historical inline server. Tool bodies are
 // unchanged; they close over the module-global safari state, which stays shared across sessions
 // (correct: one physical Safari window). See docs/http-transport-design.md.
+// Tabs of a session's that the page or the user closed, as the extension reports them with a
+// reply (extension/background.js _drainTabEvents), held per session until that session's next
+// tool result carries them (_withTabEvents).
+const _tabEventsBySession = new Map();
+function _queueTabEvents(events) {
+  const sid = typeof events?.sessionId === "string" ? events.sessionId : "";
+  if (!sid || !Array.isArray(events.items) || !events.items.length) return;
+  const list = _tabEventsBySession.get(sid) || [];
+  _tabEventsBySession.set(sid, list.concat(events.items).slice(-20));
+}
+
+// Append this session's tab events to a tool result: each closed tab is forgotten, and its
+// receipt named so the caller stops using it.
+function _withTabEvents(result) {
+  const mySession = `${SESSION_ID}:${currentSessionId()}`;
+  const items = _tabEventsBySession.get(mySession);
+  if (!items?.length || !result || !Array.isArray(result.content)) return result;
+  _tabEventsBySession.delete(mySession);
+  const closed = [];
+  for (const item of items) {
+    const receipt = _receiptToken(item.receipt);
+    if (item.kind !== "closed") continue;
+    if (receipt) _untrackClosedTab({ receipt });
+    closed.push(receipt ? `your tab with receipt ${receipt} was closed by the page or the user` : "one of your tabs was closed by the page or the user");
+  }
+  if (!closed.length) return result;
+  return { ...result, content: [...result.content, { type: "text", text: `Tab events: ${closed.join("; ")}.` }] };
+}
+
 // safari_snapshot diff mode. A snapshot is cut into lines at line breaks and before block
 // tags, and lines are compared without their refs (_normalizeRefs). Added lines keep their
 // new refs; removed ones are shown without refs, which are dead.
@@ -2795,6 +2826,12 @@ const server = new McpServer({
   version: _pkgVersion,
   description: "Safari browser automation - lightweight, keeps logins",
 });
+// Every tool's result carries the session's tab events (_withTabEvents).
+const _registerTool = server.tool.bind(server);
+server.tool = (...args) => {
+  const handler = args.pop();
+  return _registerTool(...args, async (...callArgs) => _withTabEvents(await handler(...callArgs)));
+};
 
 // ========== NAVIGATION ==========
 
