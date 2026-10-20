@@ -193,16 +193,22 @@ async function _waitForNavigatedTab(tabId, timeoutMs = 12000) {
 // close the window, and reopening it later can bring Safari to the front.
 // A private agent window (safari_new_tab private:true) is kept apart the same way: it has no
 // cookies or logins, so a session's logged-out tabs never land in a logged-in window or back.
-const _agentWindowIds = { false: null, true: null };
+// A stored window id alone is not proof the window is still ours: the user can close it and
+// ids are not promised unique across restarts. The agent window is recognised by its parking
+// tab as well: the tab id recorded when the window was made, still in it, still blank. Its
+// position is no proof: Safari puts the user's pinned tabs first in every window.
+const _agentWindows = { false: null, true: null }; // { windowId, parkingTabId }
 async function _agentWindow(incognito = false) {
-  const key = incognito ? "mcpPrivateAgentWindowId" : "mcpAgentWindowId";
-  if (!_agentWindowIds[incognito]) {
-    _agentWindowIds[incognito] = (await browser.storage.local.get(key).catch(() => ({})))[key] || null;
+  const key = incognito ? "mcpPrivateAgentWindow" : "mcpAgentWindow";
+  if (!_agentWindows[incognito]) {
+    _agentWindows[incognito] = (await browser.storage.local.get(key).catch(() => ({})))[key] || null;
   }
-  const existing = _agentWindowIds[incognito]
-    ? await browser.windows.get(_agentWindowIds[incognito]).catch(() => null)
-    : null;
-  if (existing && !!existing.incognito === incognito) return existing;
+  const known = _agentWindows[incognito];
+  const existing = known ? await browser.windows.get(known.windowId).catch(() => null) : null;
+  if (existing && !!existing.incognito === incognito) {
+    const parking = known.parkingTabId != null ? await browser.tabs.get(known.parkingTabId).catch(() => null) : null;
+    if (parking?.windowId === existing.id && (!parking.url || parking.url === "about:blank")) return existing;
+  }
   // 1440x900: one size for every session's screenshots and layouts, whatever the user's windows.
   const created = await browser.windows.create({ url: "about:blank", focused: false, incognito, width: 1440, height: 900 });
   if (!created || !!created.incognito !== incognito) {
@@ -213,8 +219,12 @@ async function _agentWindow(incognito = false) {
       "Allow in Private Browsing, then retry."
     );
   }
-  _agentWindowIds[incognito] = created.id;
-  browser.storage.local.set({ [key]: created.id }).catch(() => {});
+  // The window's own blank tab, not one of the user's pinned tabs Safari placed before it
+  // (Safari does not report them as pinned, so they are told apart by their pages).
+  const createdTabs = created.tabs?.length ? created.tabs : await browser.tabs.query({ windowId: created.id });
+  const parking = createdTabs.find((tab) => !tab.url || tab.url === "about:blank") || createdTabs[createdTabs.length - 1];
+  _agentWindows[incognito] = { windowId: created.id, parkingTabId: parking?.id };
+  browser.storage.local.set({ [key]: _agentWindows[incognito] }).catch(() => {});
   return created;
 }
 

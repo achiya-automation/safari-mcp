@@ -7,6 +7,8 @@ const background = readFileSync(new URL("../extension/background.js", import.met
 // _agentWindow + _newTabForSession, run against a fake browser with one user window (id 1).
 function harness({ privateAllowed = true, privateReturnsNull = false } = {}) {
   const windows = new Map([[1, { id: 1, focused: true }]]);
+  // Tabs by window, in order. The user's window shows one of their pages first.
+  const tabsByWindow = new Map([[1, [{ id: 100, url: "https://mail.example.com/" }]]]);
   const created = [];
   const stored = {};
   let nextWindow = 50;
@@ -23,16 +25,33 @@ function harness({ privateAllowed = true, privateReturnsNull = false } = {}) {
         // Safari opens a normal window when the extension may not run in Private Browsing.
         if (options.incognito && privateReturnsNull) return null; // what Safari 26 did live
         const incognito = options.incognito === true && privateAllowed;
-        const win = { id: nextWindow++, focused: options.focused !== false, incognito, tabs: [{ id: nextTab++ }] };
+        // Safari puts the user's pinned tabs first in every new window.
+        // Safari does not report them as pinned.
+        const pinned = [{ id: 900, url: "https://chat.example.com/" }, { id: 901, url: "https://app.example.com/" }];
+        const win = { id: nextWindow++, focused: options.focused !== false, incognito, tabs: [...pinned, { id: nextTab++, url: "about:blank" }] };
         windows.set(win.id, win);
+        tabsByWindow.set(win.id, [...win.tabs]);
         created.push({ window: win.id, options });
         return win;
       },
     },
     tabs: {
-      create: async (options) => ({ id: nextTab++, index: 1, windowId: options.windowId, url: options.url, title: "" }),
+      create: async (options) => {
+        const list = tabsByWindow.get(options.windowId);
+        const tab = { id: nextTab++, url: options.url };
+        list.push(tab);
+        return { ...tab, index: list.length - 1, windowId: options.windowId, title: "" };
+      },
       update: async (id, patch) => ({ id, ...patch }),
-      query: async () => [],
+      get: async (id) => {
+        for (const [windowId, list] of tabsByWindow) {
+          const tab = list.find((candidate) => candidate.id === id);
+          if (tab) return { ...tab, windowId };
+        }
+        throw new Error("no tab " + id);
+      },
+      query: async ({ windowId, index }) =>
+        (tabsByWindow.get(windowId) || []).map((tab, i) => ({ ...tab, index: i, windowId })).filter((tab) => index === undefined || tab.index === index),
     },
     storage: {
       local: {
@@ -42,7 +61,7 @@ function harness({ privateAllowed = true, privateReturnsNull = false } = {}) {
     },
   };
   const source = background.slice(
-    background.indexOf("const _agentWindowIds = "),
+    background.indexOf("const _agentWindows = "),
     background.indexOf("async function _closeTabForSession(")
   );
   const sessionWindows = new Map();
@@ -58,7 +77,7 @@ function harness({ privateAllowed = true, privateReturnsNull = false } = {}) {
     () => {}, async () => {}, async () => "Receipt_abcdefghijklmnopqrstuvwx",
     async () => null, (url) => new URL(url).origin, (url) => url,
   );
-  return { api, windows, created, stored, sessionWindows };
+  return { api, windows, created, stored, sessionWindows, tabsByWindow };
 }
 
 test("a session with no window opens its tab in an unfocused agent window, never the user's", async () => {
@@ -68,10 +87,11 @@ test("a session with no window opens its tab in an unfocused agent window, never
   assert.equal(created[0].options.focused, false, "the agent window must not take focus");
   const agentId = created[0].window;
   assert.notEqual(agentId, 1);
-  assert.equal(stored.mcpAgentWindowId, agentId);
+  assert.equal(stored.mcpAgentWindow.windowId, agentId);
+  assert.equal(typeof stored.mcpAgentWindow.parkingTabId, "number", "the parking tab is recorded with the window");
   assert.equal(sessionWindows.get("session-a"), agentId);
   assert.equal(api.shared(), agentId, "the shared default moves off the user's window");
-  assert.equal(first.tabIndex, 2);
+  assert.equal(first.tabIndex, 4, "after the two pinned tabs and the parking tab");
 
   // A second session reuses the same agent window.
   await api.open("session-b", {});
@@ -98,7 +118,7 @@ test("a private tab opens in its own private agent window, which no session adop
   assert.equal(created.length, 2);
   assert.equal(created[1].options.incognito, true);
   assert.equal(created[1].options.focused, false);
-  assert.equal(stored.mcpPrivateAgentWindowId, created[1].window);
+  assert.equal(stored.mcpPrivateAgentWindow.windowId, created[1].window);
   assert.equal(sessionWindows.get("session-a"), agentId, "the session keeps its logged-in window");
   assert.equal(api.shared(), agentId, "the shared default never moves to the private window");
 
@@ -128,4 +148,24 @@ test("safari_new_tab never falls back to AppleScript for a private tab", () => {
 test("a private tab is refused when Safari returns no window at all", async () => {
   const { api } = harness({ privateReturnsNull: true });
   await assert.rejects(api.open("session-a", { private: true }), /Allow in Private Browsing/);
+});
+
+test("a stored window id that now names the user's window (ids reused after a restart) is not trusted", async () => {
+  const { api, created, stored, sessionWindows } = harness();
+  stored.mcpAgentWindow = { windowId: 1, parkingTabId: 501 }; // from before the restart
+  await api.open("session-a", {});
+  assert.equal(created.length, 1, "a new agent window is made");
+  assert.notEqual(sessionWindows.get("session-a"), 1, "the tab never lands in the user's window");
+});
+
+test("the agent window is reused despite pinned tabs before its parking tab, and only while that tab is blank", async () => {
+  const { api, created, tabsByWindow, stored } = harness();
+  await api.open("session-a", {});
+  const agent = created[0].window;
+  assert.ok(![900, 901].includes(stored.mcpAgentWindow.parkingTabId), "a pinned tab is never taken for the parking tab");
+  await api.open("session-c", {});
+  assert.equal(created.length, 1, "pinned tabs first do not make the window look foreign");
+  tabsByWindow.get(agent).find((tab) => tab.id === stored.mcpAgentWindow.parkingTabId).url = "https://news.example.com/"; // the user browsed in the parking tab
+  await api.open("session-b", {});
+  assert.equal(created.length, 2);
 });
