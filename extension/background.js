@@ -186,40 +186,39 @@ async function _waitForNavigatedTab(tabId, timeoutMs = 12000) {
   return null;
 }
 
+// Agent tabs live in one window of their own, opened unfocused behind the user's windows, so
+// they never land among the user's tabs. Safari has no tabGroups API for extensions (nor a tab
+// group class in AppleScript), so a window is the closest substitute for a separate tab group.
+// Its first tab stays as a blank parking tab: closing the agent's last real tab would otherwise
+// close the window, and reopening it later can bring Safari to the front.
+let _agentWindowId = null;
+async function _agentWindow() {
+  if (!_agentWindowId) {
+    _agentWindowId = (await browser.storage.local.get("mcpAgentWindowId").catch(() => ({}))).mcpAgentWindowId || null;
+  }
+  const existing = _agentWindowId ? await browser.windows.get(_agentWindowId).catch(() => null) : null;
+  if (existing) return existing;
+  const created = await browser.windows.create({ url: "about:blank", focused: false });
+  _agentWindowId = created.id;
+  browser.storage.local.set({ mcpAgentWindowId: _agentWindowId }).catch(() => {});
+  return created;
+}
+
 async function _newTabForSession(sessionId, payload) {
   const sid = sessionId || _DEFAULT_SESSION;
   const hadSessionWindow = _sessionWindowIds.has(sid);
-  const preferredWindowId = _windowForSession(sessionId);
-  let profileWindow = preferredWindowId
-    ? await browser.windows.get(preferredWindowId).catch(() => null)
+  // A session's own window (one it opened a tab in) is kept; with none, never the shared
+  // default, which is the user's focused window until the agent window takes its place.
+  let profileWindow = hadSessionWindow
+    ? await browser.windows.get(_sessionWindowIds.get(sid)).catch(() => null)
     : null;
+  if (!profileWindow) profileWindow = await _agentWindow();
 
-  if (!profileWindow) {
-    const existingWindows = await browser.windows.getAll();
-    profileWindow = existingWindows[0] || null;
-  }
-
-  let newTab;
-  if (!profileWindow) {
-    // The extension worker is scoped to this Safari profile, so a WebExtension
-    // window created here belongs to the verified profile. `focused: false`
-    // keeps the recovery entirely in the background and avoids UI scripting.
-    profileWindow = await browser.windows.create({ url: "about:blank", focused: false });
-    const bootstrapTabs = profileWindow.tabs?.length
-      ? profileWindow.tabs
-      : await browser.tabs.query({ windowId: profileWindow.id });
-    newTab = bootstrapTabs[0] || await browser.tabs.create({
-      url: "about:blank",
-      active: false,
-      windowId: profileWindow.id,
-    });
-  } else {
-    newTab = await browser.tabs.create({
-      url: "about:blank",
-      active: false,
-      windowId: profileWindow.id,
-    });
-  }
+  const newTab = await browser.tabs.create({
+    url: "about:blank",
+    active: false,
+    windowId: profileWindow.id,
+  });
 
   const openedWindowId = newTab.windowId || profileWindow.id;
   // A session that already owns a window must not move the shared default for every

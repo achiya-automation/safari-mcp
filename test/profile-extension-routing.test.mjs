@@ -816,8 +816,14 @@ test("new_tab recreates a closed verified-profile window through WebExtension AP
     background.indexOf("async function _newTabForSession("),
     background.indexOf("async function _closeTabForSession(")
   );
-  assert.match(newTabCase, /browser\.windows\.getAll\(\)/);
-  assert.match(newTabCase, /browser\.windows\.create\(\{ url: "about:blank", focused: false \}\)/);
+  // A session with no window of its own goes to the agent window, never the user's first window.
+  assert.doesNotMatch(newTabCase, /browser\.windows\.getAll\(\)/);
+  assert.match(newTabCase, /await _agentWindow\(\)/);
+  const agentWindow = background.slice(
+    background.indexOf("async function _agentWindow("),
+    background.indexOf("async function _newTabForSession(")
+  );
+  assert.match(agentWindow, /browser\.windows\.create\(\{ url: "about:blank", focused: false \}\)/);
   assert.doesNotMatch(index, /SAFARI_PROFILE_WINDOW_OPENER|PROFILE_WINDOW_OPENER/);
   assert.match(index, /_waitForVerifiedProfileExtension\(30000\)/);
   assert.match(index, /refusing AppleScript fallback/);
