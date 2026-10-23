@@ -807,7 +807,7 @@ export async function saveFrontmostApp() {
   const app = await _helperGetFrontApp();
   return app?.bundleId || null;
 }
-export async function restoreFocusIfStolen(savedBundleId) {
+export async function restoreFocusIfStolen(savedBundleId, opStartMs = Date.now() - 2500) {
   // Show-intent agents (SAFARI_MCP_RAISE_ON_NAVIGATE=1) WANT Safari to keep
   // the foreground after their actions — restoring would undo the very raise
   // they asked for. The background-operation posture is unchanged by default.
@@ -816,17 +816,15 @@ export async function restoreFocusIfStolen(savedBundleId) {
   let current = await _helperGetFrontApp();
   if (current?.bundleId !== "com.apple.Safari") return;
 
-  // GUARD FIRST — check the user BEFORE any activate. If they interacted within
-  // the last couple seconds, Safari is frontmost because THEY are working in it
-  // (or just switched to it while a background instance's op was mid-flight), and
-  // restoring the previous app rips Safari out from under them — the "VS Code
-  // keeps jumping in front every few seconds" bug. The OLD code ran this guard
-  // only AFTER the first activate below, so that activate already stole focus
-  // before the guard could veto. With ~5 safari-mcp instances sharing one Safari
-  // window, every background op fired this steal. Bias HARD toward not stealing:
-  // a stale Safari-frontmost (user clicks back once) beats repeatedly yanking
-  // focus away from an active user.
-  if (await _userIsActive()) { _traceRestore(savedBundleId, "skip-user-active"); return; }
+  // GUARD FIRST — check the user BEFORE any activate. If they switched into Safari
+  // while the op was in flight, restoring the previous app rips Safari out from
+  // under them — the "VS Code keeps jumping in front every few seconds" bug.
+  // The OLD guard vetoed on ANY input in the last 2.5s, so a user typing in another
+  // app was read as "working in Safari" and the steal was left in place: Safari
+  // stayed in front and swallowed their keystrokes (most skip-user-active lines in
+  // restore-trace.log, 23.10.26). Typing can't switch apps; only a click or a
+  // modifier chord (Cmd+Tab, Spotlight) can. So veto only on those since the op began.
+  if (await _userSwitchedAppsSince(opStartMs)) { _traceRestore(savedBundleId, "skip-user-switched"); return; }
 
   _traceRestore(savedBundleId, "restore");
   // Bring previous app back. Await so the caller doesn't hand control back to
@@ -852,7 +850,7 @@ export async function restoreFocusIfStolen(savedBundleId) {
     // interacting, they own the foreground — leave it. Otherwise one more activate
     // attempt, then give up and leave Safari frontmost (the user clicks back —
     // vastly better than Safari vanishing).
-    if (await _userIsActive()) { _traceRestore(savedBundleId, "skip-user-active-late"); return; }
+    if (await _userSwitchedAppsSince(opStartMs)) { _traceRestore(savedBundleId, "skip-user-switched-late"); return; }
     await _helperActivateApp(savedBundleId).catch(() => {});
   }
 }
@@ -875,6 +873,25 @@ async function _userIdleSeconds() {
 // Safari out from under a user who just brought it to the front themselves.
 async function _userIsActive() {
   return (await _userIdleSeconds()) < 2.5;
+}
+
+// True when, since opStartMs, the user did something that can switch apps: a mouse
+// button (click on a window or the Dock) or a modifier key (Cmd+Tab, Spotlight).
+// Plain typing doesn't count. CGEventSourceSecondsSinceLastEventType via JXA
+// (~50ms, only reached when Safari is already frontmost after an op). Event types:
+// 1 leftMouseDown, 3 rightMouseDown, 25 otherMouseDown, 12 flagsChanged.
+// On failure falls back to the old any-input guard.
+// ponytail: a trackpad space-swipe into Safari isn't a click — it reads as "ours" and gets restored once.
+async function _userSwitchedAppsSince(opStartMs) {
+  const windowSec = (Date.now() - opStartMs) / 1000 + 0.25;
+  try {
+    const { stdout } = await execFileAsync("/usr/bin/osascript", ["-l", "JavaScript", "-e",
+      'ObjC.import("CoreGraphics");var f=$.CGEventSourceSecondsSinceLastEventType;Math.min(f(1,1),f(1,3),f(1,25),f(1,12))'],
+      { timeout: 1500 });
+    const ago = parseFloat(stdout);
+    if (!Number.isFinite(ago)) return _userIsActive();
+    return ago < windowSec;
+  } catch { return _userIsActive(); }
 }
 
 // Lightweight trace of every restore decision — confirms WHICH instance (pid)
@@ -1255,6 +1272,7 @@ async function osascript(script, { timeout = 10000 } = {}) {
   // Save frontmost app via daemon BEFORE subprocess (~0.1ms)
   // Skip if an outer caller (extensionOrFallback) already handles focus
   const shouldGuardFocus = !_focusGuardActive;
+  const opStart = Date.now();
   const frontApp = shouldGuardFocus ? await _helperGetFrontApp() : null;
   try {
     const { stdout } = await execFileAsync("osascript", ["-e", script], {
@@ -1277,7 +1295,7 @@ async function osascript(script, { timeout = 10000 } = {}) {
   } finally {
     // Awaited restore — caller must not return to user-space while Safari is still frontmost.
     if (shouldGuardFocus && frontApp?.bundleId && frontApp.bundleId !== 'com.apple.Safari') {
-      await restoreFocusIfStolen(frontApp.bundleId).catch(() => {});
+      await restoreFocusIfStolen(frontApp.bundleId, opStart).catch(() => {});
     }
   }
 }
@@ -1293,6 +1311,7 @@ async function osascriptFast(script, { timeout = 10000, noFocusGuard = false } =
   // already handles focus, or if the caller knows the script is read-only and
   // not worth the round-trip overhead (e.g. background polling every 3s).
   const shouldGuardFocus = !_focusGuardActive && !noFocusGuard;
+  const opStart = Date.now();
   const frontApp = shouldGuardFocus ? await _helperGetFrontApp() : null;
 
   try {
@@ -1318,7 +1337,7 @@ async function osascriptFast(script, { timeout = 10000, noFocusGuard = false } =
     return await osascript(script, { timeout });
   } finally {
     if (shouldGuardFocus && frontApp?.bundleId && frontApp.bundleId !== "com.apple.Safari") {
-      await restoreFocusIfStolen(frontApp.bundleId).catch(() => {});
+      await restoreFocusIfStolen(frontApp.bundleId, opStart).catch(() => {});
     }
   }
 }
@@ -1953,6 +1972,7 @@ async function runJSLarge(js, { tabIndex, timeout = 30000, elsewhere = null } = 
   // Save frontmost app via daemon before subprocess execution
   // Skip if outer caller already handles focus
   const shouldGuard = !_focusGuardActive;
+  const opStart = Date.now();
   const frontApp = shouldGuard ? await _helperGetFrontApp() : null;
   try {
     const { stdout } = await execFileAsync("osascript", [tmpFile], {
@@ -1972,7 +1992,7 @@ async function runJSLarge(js, { tabIndex, timeout = 30000, elsewhere = null } = 
     unlink(tmpFile).catch(() => {});
     // Awaited restore — caller must not return to user-space while Safari is still frontmost.
     if (shouldGuard && frontApp?.bundleId && frontApp.bundleId !== 'com.apple.Safari') {
-      await restoreFocusIfStolen(frontApp.bundleId).catch(() => {});
+      await restoreFocusIfStolen(frontApp.bundleId, opStart).catch(() => {});
     }
   }
 }
@@ -3976,6 +3996,7 @@ async function _screenshotFronted({ fullPage }) {
 
     // On macOS Tahoe, screencapture -l may briefly steal focus.
     // Save frontmost app via daemon so we can hide Safari if it stole focus.
+    const shotStart = Date.now();
     let previousBundleId = null;
     if (windowId) {
       const fa = await _helperGetFrontApp();
@@ -4024,7 +4045,7 @@ async function _screenshotFronted({ fullPage }) {
         // Re-activate previous app if screencapture stole focus (common on macOS Tahoe).
         // Centralized restore handles settle delay + hide fallback if activate is blocked.
         if (previousBundleId && previousBundleId !== "com.apple.Safari") {
-          await restoreFocusIfStolen(previousBundleId).catch(() => {});
+          await restoreFocusIfStolen(previousBundleId, shotStart).catch(() => {});
         }
         // Compress: convert PNG to JPEG (50% quality) + resize to max 1200px width
         // Cuts ~600KB PNG → ~60KB JPEG — critical for staying under 20MB context limit
