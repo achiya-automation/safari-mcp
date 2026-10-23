@@ -2553,6 +2553,7 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
   // Safari AppleScript/extension can steal focus (bring Safari window to front).
   // Save the frontmost app before the operation and restore it after if Safari stole focus.
   // Set focusGuard flag so inner osascript/runJSLarge calls skip their own focus logic.
+  const opStart = Date.now();
   const savedApp = _preferAppleScript ? null : await safari.saveFrontmostApp();
   safari.setFocusGuard(true);
 
@@ -2690,7 +2691,7 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
     // then yanks Safari out from under them (the "VS Code jumps in front while I work
     // in Safari" bug), and the HID-idle guard can't catch it because a user who is
     // reading (not typing) looks idle. So skip restore entirely for extension ops.
-    if (!usedExtension && savedApp) await safari.restoreFocusIfStolen(savedApp);
+    if (!usedExtension && savedApp) await safari.restoreFocusIfStolen(savedApp, opStart);
   }
 
   return result;
@@ -2977,7 +2978,7 @@ server.tool(
 
 server.tool(
   "safari_native_click",
-  "OS-level mouse click via macOS CGEvent — produces isTrusted: true events that pass WAF/bot detection (G2, Cloudflare, etc.). Use when regular safari_click fails with 405/403 errors or form submissions are blocked. Trade-off: physically moves the mouse cursor and requires Safari window to be visible. Use ref (from snapshot), selector, text, or x/y. When using ref, always take a FRESH safari_snapshot first.",
+  "Real click performed by WebKit through the macOS accessibility tree — mousedown/mouseup/click arrive with isTrusted: true, so WAF/bot-gated and isTrusted-checking handlers accept it (G2, Cloudflare, Google editors). Runs in the background: Safari is never activated, no window is raised and the mouse does not move. Use when regular safari_click has no effect or is rejected. Use ref (from snapshot), selector, text, or x/y. When using ref, always take a FRESH safari_snapshot first. Needs an unlocked screen.",
   {
     ref: z.string().optional().describe("Ref ID from safari_snapshot (e.g. '0_5')"),
     selector: z.string().optional().describe("CSS selector"),
@@ -3057,7 +3058,7 @@ server.tool(
 
 server.tool(
   "safari_native_type",
-  "Insert text into ANY editor via OS-level clipboard paste (CGEvent Cmd+V targeted to Safari window). Unlike safari_fill which manipulates DOM directly (breaking React/ProseMirror state), this goes through the real paste pipeline — ProseMirror/Slate/Draft.js process the paste event natively and update their internal model. After native_type, pressing Enter (via safari_native_keyboard) will actually submit the form because the framework state matches the DOM. Saves and restores the user's clipboard. No focus stealing. Use for Discord, Slack, and any editor where safari_fill works visually but the content isn't 'really there' when you try to submit.",
+  "Insert text as real input, in the background (Safari is never activated). Inputs and textareas get it through the macOS accessibility tree (isTrusted beforeinput/input, any language, clipboard untouched); rich editors (contenteditable) get a real paste (Cmd+V to the Safari window). Unlike safari_fill which manipulates DOM directly (breaking React/ProseMirror state), this goes through the real paste pipeline — ProseMirror/Slate/Draft.js process the paste event natively and update their internal model. After native_type, pressing Enter (via safari_native_keyboard) will actually submit the form because the framework state matches the DOM. Saves and restores the user's clipboard. No focus stealing. Use for Discord, Slack, and any editor where safari_fill works visually but the content isn't 'really there' when you try to submit.",
   {
     value: z.string().describe("Text to insert via clipboard paste"),
     selector: z.string().optional().describe("CSS selector of the editor element to focus first"),

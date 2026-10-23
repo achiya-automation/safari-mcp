@@ -239,10 +239,15 @@ function _releaseClipboardLock() {
   _clipboardLocked = false;
 }
 
+// pbcopy/pbpaste pick the text encoding from the locale, and under launchd there is none:
+// they fall back to MacRoman, so Hebrew (any non-ASCII) went in and out as mojibake —
+// both the text the tool pasted and the user's own clipboard it put back.
+const PB_ENV = { ...process.env, LANG: "en_US.UTF-8", LC_ALL: "en_US.UTF-8" };
+
 // Save current clipboard and return it for later restore
 async function _saveClipboard() {
   try {
-    const { stdout } = await execFileAsync("pbpaste", []);
+    const { stdout } = await execFileAsync("pbpaste", [], { env: PB_ENV });
     return stdout;
   } catch { return null; }
 }
@@ -252,7 +257,7 @@ async function _saveClipboard() {
 // uncaughtException and kill the whole server.
 function _pbcopy(text) {
   return new Promise((resolve, reject) => {
-    const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
+    const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"], env: PB_ENV });
     proc.stdin.on("error", reject);
     proc.on("error", reject);
     proc.on("close", resolve);
@@ -807,7 +812,7 @@ export async function saveFrontmostApp() {
   const app = await _helperGetFrontApp();
   return app?.bundleId || null;
 }
-export async function restoreFocusIfStolen(savedBundleId) {
+export async function restoreFocusIfStolen(savedBundleId, opStartMs = Date.now() - 2500) {
   // Show-intent agents (SAFARI_MCP_RAISE_ON_NAVIGATE=1) WANT Safari to keep
   // the foreground after their actions — restoring would undo the very raise
   // they asked for. The background-operation posture is unchanged by default.
@@ -816,17 +821,15 @@ export async function restoreFocusIfStolen(savedBundleId) {
   let current = await _helperGetFrontApp();
   if (current?.bundleId !== "com.apple.Safari") return;
 
-  // GUARD FIRST — check the user BEFORE any activate. If they interacted within
-  // the last couple seconds, Safari is frontmost because THEY are working in it
-  // (or just switched to it while a background instance's op was mid-flight), and
-  // restoring the previous app rips Safari out from under them — the "VS Code
-  // keeps jumping in front every few seconds" bug. The OLD code ran this guard
-  // only AFTER the first activate below, so that activate already stole focus
-  // before the guard could veto. With ~5 safari-mcp instances sharing one Safari
-  // window, every background op fired this steal. Bias HARD toward not stealing:
-  // a stale Safari-frontmost (user clicks back once) beats repeatedly yanking
-  // focus away from an active user.
-  if (await _userIsActive()) { _traceRestore(savedBundleId, "skip-user-active"); return; }
+  // GUARD FIRST — check the user BEFORE any activate. If they switched into Safari
+  // while the op was in flight, restoring the previous app rips Safari out from
+  // under them — the "VS Code keeps jumping in front every few seconds" bug.
+  // The OLD guard vetoed on ANY input in the last 2.5s, so a user typing in another
+  // app was read as "working in Safari" and the steal was left in place: Safari
+  // stayed in front and swallowed their keystrokes (most skip-user-active lines in
+  // restore-trace.log, 23.10.26). Typing can't switch apps; only a click or a
+  // modifier chord (Cmd+Tab, Spotlight) can. So veto only on those since the op began.
+  if (await _userSwitchedAppsSince(opStartMs)) { _traceRestore(savedBundleId, "skip-user-switched"); return; }
 
   _traceRestore(savedBundleId, "restore");
   // Bring previous app back. Await so the caller doesn't hand control back to
@@ -852,7 +855,7 @@ export async function restoreFocusIfStolen(savedBundleId) {
     // interacting, they own the foreground — leave it. Otherwise one more activate
     // attempt, then give up and leave Safari frontmost (the user clicks back —
     // vastly better than Safari vanishing).
-    if (await _userIsActive()) { _traceRestore(savedBundleId, "skip-user-active-late"); return; }
+    if (await _userSwitchedAppsSince(opStartMs)) { _traceRestore(savedBundleId, "skip-user-switched-late"); return; }
     await _helperActivateApp(savedBundleId).catch(() => {});
   }
 }
@@ -875,6 +878,25 @@ async function _userIdleSeconds() {
 // Safari out from under a user who just brought it to the front themselves.
 async function _userIsActive() {
   return (await _userIdleSeconds()) < 2.5;
+}
+
+// True when, since opStartMs, the user did something that can switch apps: a mouse
+// button (click on a window or the Dock) or a modifier key (Cmd+Tab, Spotlight).
+// Plain typing doesn't count. CGEventSourceSecondsSinceLastEventType via JXA
+// (~50ms, only reached when Safari is already frontmost after an op). Event types:
+// 1 leftMouseDown, 3 rightMouseDown, 25 otherMouseDown, 12 flagsChanged.
+// On failure falls back to the old any-input guard.
+// ponytail: a trackpad space-swipe into Safari isn't a click — it reads as "ours" and gets restored once.
+async function _userSwitchedAppsSince(opStartMs) {
+  const windowSec = (Date.now() - opStartMs) / 1000 + 0.25;
+  try {
+    const { stdout } = await execFileAsync("/usr/bin/osascript", ["-l", "JavaScript", "-e",
+      'ObjC.import("CoreGraphics");var f=$.CGEventSourceSecondsSinceLastEventType;Math.min(f(1,1),f(1,3),f(1,25),f(1,12))'],
+      { timeout: 1500 });
+    const ago = parseFloat(stdout);
+    if (!Number.isFinite(ago)) return _userIsActive();
+    return ago < windowSec;
+  } catch { return _userIsActive(); }
 }
 
 // Lightweight trace of every restore decision — confirms WHICH instance (pid)
@@ -1255,6 +1277,7 @@ async function osascript(script, { timeout = 10000 } = {}) {
   // Save frontmost app via daemon BEFORE subprocess (~0.1ms)
   // Skip if an outer caller (extensionOrFallback) already handles focus
   const shouldGuardFocus = !_focusGuardActive;
+  const opStart = Date.now();
   const frontApp = shouldGuardFocus ? await _helperGetFrontApp() : null;
   try {
     const { stdout } = await execFileAsync("osascript", ["-e", script], {
@@ -1277,7 +1300,7 @@ async function osascript(script, { timeout = 10000 } = {}) {
   } finally {
     // Awaited restore — caller must not return to user-space while Safari is still frontmost.
     if (shouldGuardFocus && frontApp?.bundleId && frontApp.bundleId !== 'com.apple.Safari') {
-      await restoreFocusIfStolen(frontApp.bundleId).catch(() => {});
+      await restoreFocusIfStolen(frontApp.bundleId, opStart).catch(() => {});
     }
   }
 }
@@ -1293,6 +1316,7 @@ async function osascriptFast(script, { timeout = 10000, noFocusGuard = false } =
   // already handles focus, or if the caller knows the script is read-only and
   // not worth the round-trip overhead (e.g. background polling every 3s).
   const shouldGuardFocus = !_focusGuardActive && !noFocusGuard;
+  const opStart = Date.now();
   const frontApp = shouldGuardFocus ? await _helperGetFrontApp() : null;
 
   try {
@@ -1318,7 +1342,7 @@ async function osascriptFast(script, { timeout = 10000, noFocusGuard = false } =
     return await osascript(script, { timeout });
   } finally {
     if (shouldGuardFocus && frontApp?.bundleId && frontApp.bundleId !== "com.apple.Safari") {
-      await restoreFocusIfStolen(frontApp.bundleId).catch(() => {});
+      await restoreFocusIfStolen(frontApp.bundleId, opStart).catch(() => {});
     }
   }
 }
@@ -1549,7 +1573,18 @@ async function _helperNativeHover(x, y, windowId = 0, dwellMs = 500, restoreMous
 // Sends a CGEvent keyboard command to the Swift helper daemon.
 // No focus stealing — sends key events directly to the target window via PID.
 function _helperNativeKeyboard(keyCode, flags = [], windowId = 0, timeout = 5000) {
-  return _withTargetTabFronted(() => _helperNativeKeyboardRaw(keyCode, flags, windowId, timeout));
+  return _withTargetTabFronted(async () => {
+    // A key event posted to Safari's process goes to Safari's FRONT window, whatever
+    // window id it names. When that is someone else's window (the user browsing in
+    // another Safari window), the keystroke would type into their page — refuse.
+    if (windowId) {
+      const front = Number(await osascriptFast(`tell application "Safari" to return (id of front window) as text`, { noFocusGuard: true }).catch(() => NaN));
+      if (Number.isFinite(front) && front !== Number(windowId)) {
+        throw new Error(`another Safari window (id ${front}) is in front, so the keystroke would land there instead of this session's window (id ${windowId}) — not sent. Use safari_press_key / safari_type_text, or retry later.`);
+      }
+    }
+    return _helperNativeKeyboardRaw(keyCode, flags, windowId, timeout);
+  });
 }
 
 async function _helperNativeKeyboardRaw(keyCode, flags = [], windowId = 0, timeout = 5000) {
@@ -1595,6 +1630,76 @@ async function _helperNativeKeyboardRaw(keyCode, flags = [], windowId = 0, timeo
       reject(e);
     }
   }));
+}
+
+// Acts on a web element through Safari's accessibility tree (see axDomAct in
+// safari-helper.swift): press → isTrusted mousedown/mouseup/click, value → isTrusted
+// beforeinput/input. Never activates Safari, raises a window or moves the cursor.
+// The element must carry DOM id `domId` and sit in its window's selected tab.
+async function _helperAxDom(domId, action, value, timeout = 12000) {
+  await assertScreenUnlocked();
+  return _withHelperLock(() => new Promise((resolve, reject) => {
+    if (!_helperProc) startHelper();
+    if (!_helperProc || !_helperProc.stdin || !_helperProc.stdin.writable) {
+      reject(new Error("safari-helper not available for accessibility input"));
+      return;
+    }
+    let resolved = false;
+    const timer = setTimeout(() => {
+      if (resolved) return;
+      resolved = true;
+      _replaceHelperCb(cb, () => {});
+      reject(new Error("accessibility input timeout"));
+    }, timeout);
+    function cb(line) {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed.error) reject(new Error(parsed.error));
+        else resolve(parsed.result ?? "");
+      } catch {
+        resolve(line);
+      }
+    }
+    _helperQueue.push(cb);
+    const cmd = { axDom: { id: domId, action } };
+    if (value !== undefined) cmd.axDom.value = value;
+    try {
+      _helperProc.stdin.write(_helperLine(cmd, cb));
+    } catch (e) {
+      _dropHelperCb(cb);
+      clearTimeout(timer);
+      resolved = true;
+      reject(e);
+    }
+  }));
+}
+
+// JS that finds an element, and stamps it with a DOM id the helper can find in the AX
+// tree (WebKit exposes ids as AXDOMIdentifier). A unique existing id is reused; otherwise
+// a temporary one goes on, and _axUnstampJs puts the original back.
+function _axStampJs(findExpr, scroll = true) {
+  return `(function(){
+    var el = ${findExpr};
+    if (!el || el.nodeType !== 1) return JSON.stringify({error: 'not found'});
+    ${scroll ? "el.scrollIntoView({block:'center', behavior:'instant'});" : ""}
+    var id = el.id, tmp = false;
+    if (!id || document.querySelectorAll('#' + CSS.escape(id)).length !== 1) {
+      el.setAttribute('data-mcpax-prev-id', el.id || '');
+      id = 'mcpax-' + Math.random().toString(36).slice(2, 10);
+      el.id = id; tmp = true;
+    }
+    return JSON.stringify({id: id, tmp: tmp, tag: el.tagName,
+      text: (el.innerText || el.textContent || el.value || '').trim().substring(0, 50)});
+  })()`;
+}
+
+function _axUnstampJs(id) {
+  return `(function(){var el=document.getElementById('${id}');if(!el)return;` +
+    `var p=el.getAttribute('data-mcpax-prev-id');el.removeAttribute('data-mcpax-prev-id');` +
+    `if(p)el.id=p;else el.removeAttribute('id');})()`;
 }
 
 // ========== NATIVE FOCUS OPERATIONS VIA DAEMON ==========
@@ -1953,6 +2058,7 @@ async function runJSLarge(js, { tabIndex, timeout = 30000, elsewhere = null } = 
   // Save frontmost app via daemon before subprocess execution
   // Skip if outer caller already handles focus
   const shouldGuard = !_focusGuardActive;
+  const opStart = Date.now();
   const frontApp = shouldGuard ? await _helperGetFrontApp() : null;
   try {
     const { stdout } = await execFileAsync("osascript", [tmpFile], {
@@ -1972,7 +2078,7 @@ async function runJSLarge(js, { tabIndex, timeout = 30000, elsewhere = null } = 
     unlink(tmpFile).catch(() => {});
     // Awaited restore — caller must not return to user-space while Safari is still frontmost.
     if (shouldGuard && frontApp?.bundleId && frontApp.bundleId !== 'com.apple.Safari') {
-      await restoreFocusIfStolen(frontApp.bundleId).catch(() => {});
+      await restoreFocusIfStolen(frontApp.bundleId, opStart).catch(() => {});
     }
   }
 }
@@ -2518,10 +2624,13 @@ export async function rightClick({ selector, x, y }) {
   throw new Error("rightClick requires selector or x/y coordinates");
 }
 
-// ========== NATIVE CLICK (OS-level CGEvent — produces isTrusted: true) ==========
-// Unlike JS clicks (dispatchEvent/element.click), CGEvent clicks are real OS input.
-// Sites with WAF protection (G2, Cloudflare, etc.) that check isTrusted will accept these.
-// Trade-off: this moves the physical mouse cursor and requires Safari to be visible.
+// ========== NATIVE CLICK (accessibility press — produces isTrusted: true) ==========
+// Unlike JS clicks (dispatchEvent/element.click), this is a click WebKit itself performs:
+// mousedown/mouseup/click arrive with isTrusted:true, so isTrusted-gated handlers (WAFs,
+// Google's editors, G2, Cloudflare) accept it. It goes through the accessibility tree,
+// not the mouse: Safari is never activated, no window is raised and the cursor stays put.
+// (The CGEvent click it replaces only landed when Safari was frontmost, so it activated
+// Safari and moved the cursor — stealing the user's focus on every call.)
 
 export async function nativeClick(args) {
   // Helpers are only needed to LOCATE an element (ref/selector/text). With explicit
@@ -2638,162 +2747,60 @@ async function _withPinnedTabFronted(pinned, fn) {
     await osascriptFast(`tell application "Safari" to tell ${winRef} to set current tab to tab ${tabIndex}`);
     await new Promise((r) => setTimeout(r, NATIVE_TAB_SETTLE_MS));
   }
-  // On macOS 26 a window-targeted CGEvent silently no-ops when the target window is
-  // NOT the frontmost Safari window (issue #29 — verified live: the math was right,
-  // the event was delivered, the checkbox never toggled; a front-window click landed).
-  // Raise the pinned window within Safari for the duration of the click. This does not
-  // steal app focus — Safari's window order changes, the active app does not.
-  let prevFrontWinId = null;
-  try {
-    prevFrontWinId = Number(await osascriptFast(`tell application "Safari" to return (id of front window) as text`));
-  } catch (_e) { /* leave as-is */ }
-  const mustRaise = Number.isFinite(prevFrontWinId) && prevFrontWinId !== pinned.winId;
-  if (mustRaise) {
-    await osascriptFast(`tell application "Safari" to tell ${winRef} to set index to 1`);
-    await new Promise((r) => setTimeout(r, NATIVE_TAB_SETTLE_MS));
-  }
-  // A CGEvent goes to the FRONTMOST APPLICATION, not to the window id we aim at.
-  // Measured 23.8.26: WhatsApp was frontmost, so every "successful" native click was
-  // delivered to WhatsApp — the page never saw it. Raising Safari's own window (above)
-  // does not change which app is frontmost; Safari itself has to be activated.
-  // This is the one moment the tool legitimately needs the foreground, and the saved
-  // app is handed back in the finally below.
-  const savedApp = await saveFrontmostApp().catch(() => null);
-  const mustActivate = savedApp !== "com.apple.Safari";
-  if (mustActivate) {
-    await _helperActivateApp("com.apple.Safari").catch(() => {});
-    await new Promise((r) => setTimeout(r, 150)); // activate() is async at the OS level
-  }
-  // With Safari genuinely frontmost and the right window raised, use the GLOBAL event
-  // tap instead of postToPid. Verified 23.8.26 on macOS 26: a window-targeted
-  // postToPid click reports success and never reaches the page — proven on a plain
-  // <a> in example.com with a click listener armed, which never fired. The global tap
-  // moves the cursor, clicks, and restores it — the same path a person's click takes,
-  // and the only one that actually lands. This is why the pin has to raise Safari.
-  _pinnedForceGlobalTap = true;
-  // _nativeClickImpl reads geometry via _getSafariWindowGeometry(), which resolves the
-  // profile window by name. Override the resolution for the duration of this call so
-  // geometry, toolbar math, and the CGEvent all target the pinned window.
+  // No window raise and no Safari activation: the accessibility press reaches the selected
+  // tab of a background window. (The CGEvent click needed both, which stole the user's
+  // focus on every pinned click.) _getSafariWindowGeometry still resolves the pinned
+  // window for the callers that measure geometry (hover, keyboard).
   const prevOverride = _pinnedWindowOverride;
   _pinnedWindowOverride = pinned;
   try {
     return await fn();
   } finally {
     _pinnedWindowOverride = prevOverride;
-    _pinnedForceGlobalTap = false;
     if (mustSwitch) {
       try { await osascriptFast(`tell application "Safari" to tell ${winRef} to set current tab to tab ${prev}`); }
       catch (_e) { /* restore is best-effort */ }
     }
-    // Hand the previous front window back — the user (or another session) had it up.
-    if (mustRaise && Number.isFinite(prevFrontWinId)) {
-      try { await osascriptFast(`tell application "Safari" to tell window id ${prevFrontWinId} to set index to 1`); }
-      catch (_e) { /* restore is best-effort */ }
-    }
-    // And give the foreground back to whatever app had it. restoreFocusIfStolen keeps
-    // its own guard: if the user has been interacting, it leaves Safari alone rather
-    // than yanking the window out from under them.
-    if (mustActivate && savedApp) {
-      try { await restoreFocusIfStolen(savedApp); } catch (_e) { /* best-effort */ }
-    }
   }
 }
 let _pinnedWindowOverride = null;
-// Set only inside a pinned click, where Safari has been raised to the front. Tells the
-// click layer to use the global event tap (windowId 0) instead of postToPid.
-let _pinnedForceGlobalTap = false;
 
 async function _nativeClickImpl({ selector, text, x, y, ref, doubleClick = false }) {
-
-  // Step 1: Get element's viewport coordinates via JavaScript
-  let viewportCoords;
-  if (ref || selector || text) {
-    let jsExpr;
-    if (ref) {
-      jsExpr = `(function(){
-        var el = mcpFindRef('${ref}');
-        if (!el) return JSON.stringify({error: 'Element not found: ref=${ref}'});
-        el.scrollIntoView({block:'center', behavior:'instant'});
-        var rect = el.getBoundingClientRect();
-        return JSON.stringify({
-          x: Math.round(rect.left + rect.width / 2),
-          y: Math.round(rect.top + rect.height / 2),
-          tag: el.tagName,
-          text: (el.innerText || el.textContent || '').trim().substring(0, 50)
-        });
-      })()`;
-    } else if (selector) {
-      const sel = escJsSingleQuote(selector);
-      jsExpr = `(function(){
-        var el = document.querySelector('${sel}');
-        if (!el) return JSON.stringify({error: 'Element not found: ${sel}'});
-        el.scrollIntoView({block:'center', behavior:'instant'});
-        var rect = el.getBoundingClientRect();
-        return JSON.stringify({
-          x: Math.round(rect.left + rect.width / 2),
-          y: Math.round(rect.top + rect.height / 2),
-          tag: el.tagName,
-          text: (el.innerText || el.textContent || '').trim().substring(0, 50)
-        });
-      })()`;
-    } else {
-      const safeText = escJsSingleQuote(text);
-      jsExpr = `(function(){
-        var el = mcpFindText('${safeText}', true) || mcpFindText('${safeText}', false);
-        if (!el) return JSON.stringify({error: 'Element not found with text: ${safeText}'});
-        el.scrollIntoView({block:'center', behavior:'instant'});
-        var rect = el.getBoundingClientRect();
-        return JSON.stringify({
-          x: Math.round(rect.left + rect.width / 2),
-          y: Math.round(rect.top + rect.height / 2),
-          tag: el.tagName,
-          text: (el.innerText || el.textContent || '').trim().substring(0, 50)
-        });
-      })()`;
-    }
-
-    const result = await runJS(jsExpr);
-    try {
-      viewportCoords = JSON.parse(result);
-    } catch {
-      throw new Error("Failed to get element coordinates: " + result);
-    }
-    if (viewportCoords.error) {
-      throw new Error(viewportCoords.error);
-    }
+  let findExpr, what;
+  if (ref) {
+    findExpr = `mcpFindRef('${escJsSingleQuote(ref)}')`; what = `ref=${ref}`;
+  } else if (selector) {
+    findExpr = `document.querySelector('${escJsSingleQuote(selector)}')`; what = selector;
+  } else if (text) {
+    const t = escJsSingleQuote(text);
+    findExpr = `(mcpFindText('${t}', true) || mcpFindText('${t}', false))`; what = `text "${text}"`;
   } else if (x !== undefined && y !== undefined) {
-    // Direct viewport coordinates provided
-    viewportCoords = { x: Number(x), y: Number(y), tag: 'point', text: '' };
+    findExpr = `document.elementFromPoint(${Number(x)}, ${Number(y)})`; what = `point (${x},${y})`;
   } else {
     throw new Error("nativeClick requires selector, text, ref, or x/y coordinates");
   }
+  // A point is already in view — scrolling would move the element out from under it.
+  const raw = await runJS(_axStampJs(findExpr, x === undefined || !!(ref || selector || text)));
+  let target;
+  try { target = JSON.parse(raw); } catch { throw new Error("Failed to locate element: " + raw); }
+  if (target.error) throw new Error(`Element not found: ${what}`);
 
-  // Step 2: Get Safari window position and toolbar geometry
-  const geo = await _getSafariWindowGeometry();
-
-  // Step 3: Calculate absolute screen coordinates
-  // screenX = windowLeft + viewportX
-  // screenY = windowTop + toolbarHeight + viewportY
-  const screenX = geo.windowX + viewportCoords.x;
-  const screenY = geo.windowY + geo.toolbarHeight + viewportCoords.y;
-
-  // Sanity check: ensure coordinates are within the window bounds
-  if (screenX < geo.windowX || screenX > geo.windowRight ||
-      screenY < geo.windowY || screenY > geo.windowBottom) {
-    console.error(`[Safari MCP] nativeClick: coords (${screenX},${screenY}) outside window bounds (${geo.windowX},${geo.windowY})-(${geo.windowRight},${geo.windowBottom}). Proceeding anyway.`);
+  let how;
+  try {
+    how = await _helperAxDom(target.id, "press");
+    if (doubleClick) {
+      // AX has no double press: two trusted clicks, then the dblclick event itself
+      // (synthetic — WebKit offers no trusted way to produce one without the mouse).
+      await _helperAxDom(target.id, "press");
+      await runJS(`(function(){var el=document.getElementById('${target.id}');` +
+        `if(el)el.dispatchEvent(new MouseEvent('dblclick',{bubbles:true,cancelable:true,detail:2}));})()`);
+    }
+  } finally {
+    if (target.tmp) await runJS(_axUnstampJs(target.id)).catch(() => {});
   }
-
-  // Step 4: Perform the native click via CGEvent (targeted to specific window — no mouse move, no focus steal)
-  // MUST have windowId — legacy path (windowId=0) moves mouse and may steal focus
-  if (!geo.windowId) throw new Error("Cannot native-click without Safari window ID — would move mouse and steal focus");
-  // windowId 0 selects the global tap. Only a pinned click may ask for it: that path
-  // has already raised Safari and its own window, so moving the cursor is expected and
-  // the focus is handed back afterwards.
-  await _helperNativeClick(screenX, screenY, doubleClick, _pinnedForceGlobalTap ? 0 : geo.windowId);
-
   const clickType = doubleClick ? 'Native double-clicked' : 'Native clicked';
-  const label = viewportCoords.tag + (viewportCoords.text ? ` "${viewportCoords.text}"` : '');
-  return `${clickType}: ${label} at screen (${screenX},${screenY})`;
+  const label = target.tag + (target.text ? ` "${target.text}"` : '');
+  return `${clickType}: ${label} (${how}; Safari stayed in the background)`;
 }
 
 // ========== NATIVE HOVER (OS-level CGEvent mouse move — triggers real :hover and mouseenter) ==========
@@ -3395,13 +3402,39 @@ export async function nativeType(args) {
 }
 
 async function _nativeTypeImpl({ value, selector, ref }) {
-  // Focus the target element if selector/ref provided
-  if (ref || selector) {
-    const sel = ref ? refSelector(ref) : escJsSingleQuote(selector);
-    await runJS(`(function(){ var el=document.querySelector('${sel}'); if(el){el.focus();el.click();} return el?'focused':'not found'; })()`);
-    await new Promise(r => setTimeout(r, 50));
+  const sel = ref ? refSelector(ref) : selector;
+  const findExpr = sel ? `document.querySelector('${escJsSingleQuote(sel)}')` : "document.activeElement";
+  // An <input>/<textarea> takes the text through the accessibility tree: the value is
+  // spliced in at the caret here, and WebKit applies it with isTrusted beforeinput/input
+  // — any script, no clipboard, no keystrokes. Rich editors (contenteditable) and
+  // cross-origin iframes would lose their own model that way, so they keep the paste.
+  const probe = await runJS(`(function(){
+    var el = ${findExpr};
+    if (!el) return JSON.stringify({kind: 'missing'});
+    var tag = el.tagName;
+    if ((tag === 'INPUT' || tag === 'TEXTAREA') && !el.readOnly && !el.disabled) {
+      var v = el.value, s = v.length, e = v.length;
+      try { if (el.selectionStart != null) { s = el.selectionStart; e = el.selectionEnd; } } catch (_) {}
+      return JSON.stringify({kind: 'value', next: v.slice(0, s) + ${JSON.stringify(value)} + v.slice(e), caret: s + ${value.length}});
+    }
+    el.focus();
+    return JSON.stringify({kind: 'paste'});
+  })()`);
+  let p;
+  try { p = JSON.parse(probe); } catch { p = { kind: "paste" }; }
+  if (p.kind === "missing") throw new Error(`Element not found: ${sel}`);
+  if (p.kind !== "value") return await _nativeTypeViaClipboard(value);
+
+  const target = JSON.parse(await runJS(_axStampJs(findExpr, false)));
+  if (target.error) throw new Error(`Element not found: ${sel || "focused element"}`);
+  try {
+    await _helperAxDom(target.id, "value", p.next);
+    await runJS(`(function(){var el=document.getElementById('${target.id}');` +
+      `try{el.setSelectionRange(${p.caret},${p.caret})}catch(_){}})()`).catch(() => {});
+  } finally {
+    if (target.tmp) await runJS(_axUnstampJs(target.id)).catch(() => {});
   }
-  return await _nativeTypeViaClipboard(value);
+  return `Typed ${value.length} chars into ${target.tag} (accessibility input, isTrusted; Safari stayed in the background)`;
 }
 
 export async function nativeKeyboard(args) {
@@ -3794,10 +3827,9 @@ export async function replaceEditorContent({ text }) {
 
   // Airtable-style embed where React fiber sync failed (wrapper.onChange was
   // a no-op, or the site guards writes by permission/readOnly). Fall back to
-  // native clipboard paste via CGEvent: forces readOnly=false first, activates
-  // Safari, focuses the textarea, and sends Cmd+A/Cmd+V targeted to the window.
+  // native clipboard paste via CGEvent: forces readOnly=false first, focuses the
+  // textarea, and sends Cmd+A/Cmd+V to the Safari window (Safari stays in the background).
   if (mpParsed && mpParsed.kind === 'monaco' && mpParsed.hasTextarea) {
-    const savedFrontApp = await saveFrontmostApp();
     try {
       // Step 1: Install editor capture hook (if not already) + try to find visible editable editor
       await runJS(
@@ -3816,33 +3848,29 @@ export async function replaceEditorContent({ text }) {
           return 'hook-installed';
         })()`
       );
-      // Step 2: Activate Safari to frontmost — required for CGEvent keyboard to reach web content
-      await _helperActivateApp("com.apple.Safari");
-      await new Promise(r => setTimeout(r, 300));
-      // Step 3: Focus Monaco's input textarea
+      // Step 2: Focus Monaco's input textarea. Safari is NOT activated: the keystrokes
+      // below go to Safari's process (postToPid), which reaches a background window —
+      // activating Safari here took the user's focus on every Monaco replace.
       await runJS(`(function(){var t=document.querySelector('.monaco-editor textarea.inputarea');if(t){t.focus();return 'focused';}return 'no-textarea';})()`);
       await new Promise(r => setTimeout(r, 100));
-      // Step 4: Cmd+A + Cmd+V via GLOBAL CGEvent (cghidEventTap) — reaches web content
-      // reliably since Safari is frontmost
-      await _helperNativeKeyboard(0, ["cmd"], 0); // Cmd+A global
+      const { windowId: winId } = await _getSafariWindowGeometry();
+      if (!winId) throw new Error("no Safari window id for background keystrokes");
+      // Step 3: Cmd+A, then the text through the clipboard + Cmd+V, to the Safari window
+      await _helperNativeKeyboard(0, ["cmd"], winId);
       await new Promise(r => setTimeout(r, 100));
-      // Write clipboard + paste via global CGEvent (not windowed)
       await _acquireClipboardLock();
       try {
         const savedClip = await _saveClipboard();
         await _pbcopy(text);
-        await _helperNativeKeyboard(9, ["cmd"], 0); // Cmd+V global
+        await _helperNativeKeyboard(9, ["cmd"], winId);
         await new Promise(r => setTimeout(r, 200));
         await _restoreClipboard(savedClip);
       } finally {
         _releaseClipboardLock();
       }
       await new Promise(r => setTimeout(r, 300));
-      // Restore original front app
-      if (savedFrontApp) await restoreFocusIfStolen(savedFrontApp);
       return 'Monaco(native-paste): replaced ' + text.split('\n').length + ' lines';
     } catch(e) {
-      if (savedFrontApp) await restoreFocusIfStolen(savedFrontApp).catch(() => {});
       // Fall through to remaining editor-type checks
     }
   }
@@ -3976,6 +4004,7 @@ async function _screenshotFronted({ fullPage }) {
 
     // On macOS Tahoe, screencapture -l may briefly steal focus.
     // Save frontmost app via daemon so we can hide Safari if it stole focus.
+    const shotStart = Date.now();
     let previousBundleId = null;
     if (windowId) {
       const fa = await _helperGetFrontApp();
@@ -4024,7 +4053,7 @@ async function _screenshotFronted({ fullPage }) {
         // Re-activate previous app if screencapture stole focus (common on macOS Tahoe).
         // Centralized restore handles settle delay + hide fallback if activate is blocked.
         if (previousBundleId && previousBundleId !== "com.apple.Safari") {
-          await restoreFocusIfStolen(previousBundleId).catch(() => {});
+          await restoreFocusIfStolen(previousBundleId, shotStart).catch(() => {});
         }
         // Compress: convert PNG to JPEG (50% quality) + resize to max 1200px width
         // Cuts ~600KB PNG → ~60KB JPEG — critical for staying under 20MB context limit
@@ -5322,6 +5351,13 @@ export async function uploadFile({ selector, filePath, forceNative = false, veri
 async function _nativeFileUpload(sel, absPath, safeName) {
   // Gate first: step 1 restyles the input into an invisible full-size overlay.
   await assertScreenUnlocked();
+  // The OS file dialog only opens for a frontmost Safari and is driven with real
+  // keystrokes, so this path would pull Safari in front of whatever the user is doing.
+  // Run it only when Safari is already in front; never take the focus to get there.
+  const front = await saveFrontmostApp().catch(() => null);
+  if (front !== "com.apple.Safari") {
+    throw new Error("the native file dialog needs Safari in front, and taking the focus from the user is not allowed — skipped. Retry when Safari is the active app, or upload through the page's own drop zone.");
+  }
   // 1. Make the input clickable (hidden inputs have no hit-box) and read its viewport centre.
   const coordsJson = await runJS(
     `(function(){var el=document.querySelector('${sel}');if(!el){var all=document.querySelectorAll('*');for(var i=0;i<all.length;i++){var sr=all[i].shadowRoot;if(sr){el=sr.querySelector('${sel}');if(el)break;}}}if(!el)return JSON.stringify({error:'Element not found: ${sel}'});el.setAttribute('data-mcp-oldstyle',el.getAttribute('style')||'');el.style.cssText='position:fixed !important;top:42% !important;left:38% !important;width:320px !important;height:120px !important;opacity:0.02 !important;z-index:2147483647 !important;display:block !important;visibility:visible !important;pointer-events:auto !important';var r=el.getBoundingClientRect();return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)});})()`
@@ -6067,7 +6103,7 @@ export async function clipboardRead() {
   // Acquire lock to avoid reading during a write/restore cycle
   await _acquireClipboardLock(3000); // Short timeout — reads are fast
   try {
-    const text = await execFileAsync("pbpaste", []);
+    const text = await execFileAsync("pbpaste", [], { env: PB_ENV });
     return text.stdout;
   } catch {
     return "(clipboard empty or contains non-text data)";
@@ -6121,7 +6157,7 @@ export function flushClipboardRestore() {
   const content = _pendingClipboardRestore;
   _pendingClipboardRestore = undefined;
   try {
-    spawnSync("pbcopy", [], { input: content });
+    spawnSync("pbcopy", [], { input: content, env: PB_ENV });
   } catch { /* best effort — we're exiting anyway */ }
   _releaseClipboardLock();
 }
