@@ -440,6 +440,9 @@ test("native input never takes the user's focus", () => {
   assert.ok(/_helperAxDom\(target\.id, "value"/.test(type), "inputs take typed text through the accessibility tree");
   const monaco = between("mpParsed.hasTextarea", "Monaco(native-paste)");
   assert.ok(!/_helperActivateApp|, 0\);/.test(monaco), "the Monaco paste must not activate Safari or use the global tap");
+  const keys = between("function _helperNativeKeyboard(", "async function _helperNativeKeyboardRaw(");
+  assert.ok(/id of front window/.test(keys) && /throw new Error/.test(keys),
+    "a keystroke goes to Safari's front window, so it is refused when that is not ours");
   const helper = readFileSync(new URL("../safari-helper.swift", import.meta.url), "utf8");
   assert.ok(!/frontTabByUrl|realClickAtPoint|axPressInWindow/.test(helper), "the helper's focus-taking click paths stay deleted");
 });

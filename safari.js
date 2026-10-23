@@ -1573,7 +1573,18 @@ async function _helperNativeHover(x, y, windowId = 0, dwellMs = 500, restoreMous
 // Sends a CGEvent keyboard command to the Swift helper daemon.
 // No focus stealing — sends key events directly to the target window via PID.
 function _helperNativeKeyboard(keyCode, flags = [], windowId = 0, timeout = 5000) {
-  return _withTargetTabFronted(() => _helperNativeKeyboardRaw(keyCode, flags, windowId, timeout));
+  return _withTargetTabFronted(async () => {
+    // A key event posted to Safari's process goes to Safari's FRONT window, whatever
+    // window id it names. When that is someone else's window (the user browsing in
+    // another Safari window), the keystroke would type into their page — refuse.
+    if (windowId) {
+      const front = Number(await osascriptFast(`tell application "Safari" to return (id of front window) as text`, { noFocusGuard: true }).catch(() => NaN));
+      if (Number.isFinite(front) && front !== Number(windowId)) {
+        throw new Error(`another Safari window (id ${front}) is in front, so the keystroke would land there instead of this session's window (id ${windowId}) — not sent. Use safari_press_key / safari_type_text, or retry later.`);
+      }
+    }
+    return _helperNativeKeyboardRaw(keyCode, flags, windowId, timeout);
+  });
 }
 
 async function _helperNativeKeyboardRaw(keyCode, flags = [], windowId = 0, timeout = 5000) {
