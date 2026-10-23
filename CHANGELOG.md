@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Safari no longer stays in front after an operation steals focus while the user is typing in another app.** On macOS Tahoe some AppleScript commands implicitly activate Safari, and the focus guard gives the foreground back to the app the user was in. It skipped that restore whenever there was any keyboard or mouse input in the last 2.5 seconds, reading it as "the user switched into Safari". A user typing in another app always has recent input, so Safari kept the foreground and took their keystrokes. Typing cannot switch apps; the guard now skips the restore only when a mouse button or a modifier key (Cmd+Tab, Spotlight) was pressed after the operation began.
+
 ## [2.22.18] - 2026-10-19
 
 ### Fixed
