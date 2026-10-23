@@ -424,26 +424,32 @@ test("native_click with explicit coordinates does not require injection", () => 
   );
 });
 
-test("a pinned native click uses the global tap, not postToPid", () => {
-  // Measured 23.8.26 on macOS 26: a window-targeted postToPid click reports success and
-  // never reaches the page. Proven on a plain <a> in example.com with a click listener
-  // armed — it never fired. Only the global tap (windowId 0, which moves the cursor and
-  // restores it) actually lands, and it needs Safari genuinely frontmost. That is what
-  // the pin buys: it raises Safari and its window, clicks for real, then hands both back.
+test("native input never takes the user's focus", () => {
+  // The CGEvent click only landed with Safari frontmost, so every pinned native click
+  // activated Safari, raised its window and moved the cursor — stealing the user's focus
+  // (23.10.26). Input now goes through the accessibility tree (axDomAct in the helper),
+  // which reaches a background window: none of that may come back.
   const safari = readFileSync(new URL("../safari.js", import.meta.url), "utf8");
-  assert.ok(safari.includes("_pinnedForceGlobalTap"), "pinned clicks must select the tap explicitly");
-  assert.ok(
-    /_helperNativeClick\([^)]*_pinnedForceGlobalTap \? 0 : geo\.windowId\)/s.test(safari),
-    "windowId 0 (global tap) only when pinned; otherwise keep the targeted path"
-  );
-  const pinned = safari.slice(
-    safari.indexOf("async function _withPinnedTabFronted"),
-    safari.indexOf("let _pinnedWindowOverride")
-  );
-  assert.ok(pinned.includes('_helperActivateApp("com.apple.Safari")'), "must bring Safari to the front");
-  assert.ok(pinned.includes("restoreFocusIfStolen"), "and give the foreground back afterwards");
-  assert.ok(
-    pinned.indexOf("_pinnedForceGlobalTap = false") > pinned.indexOf("finally"),
-    "the flag must be cleared in finally, or it leaks into unpinned clicks"
-  );
+  const between = (a, b) => safari.slice(safari.indexOf(a), safari.indexOf(b, safari.indexOf(a)));
+  const pinned = between("async function _withPinnedTabFronted", "let _pinnedWindowOverride");
+  assert.ok(!/_helperActivateApp|set index to 1|restoreFocusIfStolen/.test(pinned), "a pinned click must not raise or activate Safari");
+  const click = between("async function _nativeClickImpl(", "// ========== NATIVE HOVER");
+  assert.ok(/_helperAxDom\(target\.id, "press"\)/.test(click), "the click is an accessibility press");
+  assert.ok(!/_helperNativeClick\(/.test(click), "and never a CGEvent click");
+  const type = between("async function _nativeTypeImpl(", "export async function nativeKeyboard(");
+  assert.ok(/_helperAxDom\(target\.id, "value"/.test(type), "inputs take typed text through the accessibility tree");
+  const monaco = between("mpParsed.hasTextarea", "Monaco(native-paste)");
+  assert.ok(!/_helperActivateApp|, 0\);/.test(monaco), "the Monaco paste must not activate Safari or use the global tap");
+  const helper = readFileSync(new URL("../safari-helper.swift", import.meta.url), "utf8");
+  assert.ok(!/frontTabByUrl|realClickAtPoint|axPressInWindow/.test(helper), "the helper's focus-taking click paths stay deleted");
+});
+
+test("the clipboard tools run in UTF-8", () => {
+  // Under launchd there is no locale, and pbcopy/pbpaste fall back to MacRoman: Hebrew
+  // came out as mojibake, in the pasted text and in the user's restored clipboard.
+  const safari = readFileSync(new URL("../safari.js", import.meta.url), "utf8");
+  assert.ok(/const PB_ENV = \{[^}]*LANG: "en_US\.UTF-8"/.test(safari));
+  for (const m of safari.matchAll(/(spawn|spawnSync|execFileAsync)\("pb(copy|paste)"[^\n]*/g)) {
+    assert.ok(m[0].includes("PB_ENV"), `${m[0]} must pass env: PB_ENV`);
+  }
 });
