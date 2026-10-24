@@ -2530,6 +2530,25 @@ function _assertTabOwnership(opType, extensionPayload = {}) {
   }
 }
 
+// Safari suspends the extension's worker now and then, and the bridge sees it gone for a few
+// seconds (in proxy mode, until the next 10 s primary check). A safari_new_tab in that gap went
+// to AppleScript: the tab came back with no receipt, and once the extension was back it refused
+// that tab as "not opened by this MCP session" (seen 24.10.26). A session the extension served a
+// moment ago waits for it first; one that never had it, or lost it long ago, falls back at once.
+const EXTENSION_BLIP_WINDOW_MS = 120000;
+const EXTENSION_BLIP_WAIT_MS = 10500;
+let _extensionLastUsedAt = 0;
+async function _waitForExtensionBlip(timeoutMs = EXTENSION_BLIP_WAIT_MS) {
+  if (_extensionConnected) return true;
+  if (!_extensionLastUsedAt || Date.now() - _extensionLastUsedAt > EXTENSION_BLIP_WINDOW_MS) return false;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 250));
+    if (_extensionConnected) return true;
+  }
+  return false;
+}
+
 // Try the profile-verified extension first. Named profiles are extension-only:
 // crossing to AppleScript would lose the extension's profile and tab-id proof.
 async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) {
@@ -2548,6 +2567,8 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
   if (_preferAppleScript && (!_extensionConnected || !_profileExtensionVerified)) {
     await _waitForVerifiedProfileExtension(30000);
   }
+  // A tab opened through AppleScript has no receipt, so a new_tab rides out a short drop-out.
+  if (!_preferAppleScript && extensionType === "new_tab" && !_extensionConnected) await _waitForExtensionBlip();
 
   // ========== FOCUS PRESERVATION ==========
   // Safari AppleScript/extension can steal focus (bring Safari window to front).
@@ -2649,6 +2670,7 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
         console.error(`[Safari MCP] ${extensionType} extension failed: ${err.message} — falling back to AppleScript`);
       }
     }
+    if (usedExtension) _extensionLastUsedAt = Date.now();
     if (!usedExtension) {
       if (_preferAppleScript) {
         // The extension answered here, so naming it unavailable sent callers after a bridge
@@ -3402,7 +3424,19 @@ server.tool(
     if (typeof rawResult === 'string') {
       try { result = JSON.parse(rawResult); } catch {}
     }
-    const safeResult = _sanitizeTabResult(result);
+    let safeResult = _sanitizeTabResult(result);
+    // A tab AppleScript opened has no receipt, and nothing in the result said so: the caller only
+    // learned it from the next refusal.
+    if (viaAppleScript && safeResult && typeof safeResult === "object") {
+      safeResult = {
+        ...safeResult,
+        receipt: null,
+        via: "applescript",
+        note: "The Safari extension was not connected, so AppleScript opened this tab: it has no receipt, " +
+          "and once the extension is back it will not accept this tab by index. Keep working in it without " +
+          "a receipt, or open a new tab with safari_new_tab when safari_doctor shows the extension connected.",
+      };
+    }
     // Sync safari.js tracking when extension handled new_tab. The raw navigation URL
     // remains internal and is never copied into the MCP response.
     if (safeResult?.tabIndex) {
