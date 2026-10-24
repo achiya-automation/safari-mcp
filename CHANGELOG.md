@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A profile's extension finds its own daemon when the bridge it remembered now belongs to another profile.** The extension tries the bridge it connected to last before scanning the ports. When daemons come back on different ports, that bridge can be another profile's daemon, which answers `/connect` with 423 while its own worker holds the lease. The extension stopped at that 423 and retried the same bridge every 3 seconds, so the profile never reconnected until its stored bridge was cleared by hand. A 423 now moves on to the next port, and the short lease retry runs only when no bridge accepts the worker.
+
 ## [2.22.18] - 2026-10-19
 
 ### Fixed
