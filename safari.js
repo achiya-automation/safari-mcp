@@ -1017,6 +1017,23 @@ function _windowById(id) {
   return Number.isInteger(n) && n > 0 ? `window id ${n}` : null;
 }
 
+// Every window of the named profile (`window id N`), for a marker scan that missed in the target
+// window — the first of them. The extension opens the session's tab in any of the profile's
+// windows, and AppleScript-only paths (helper injection, native input) had no locus to ask, so
+// they refused a tab four windows had made invisible to them. Without a profile: none.
+async function _otherProfileWindows() {
+  if (!SAFARI_PROFILE) return [];
+  const p = SAFARI_PROFILE.replace(/"/g, '\\"');
+  const raw = await osascriptFast(`tell application "Safari"
+  set out to ""
+  repeat with w in every window
+    if name of w starts with "${p} —" then set out to out & (id of w as text) & ","
+  end repeat
+  return out
+end tell`).catch(() => "");
+  return String(raw || "").split(",").map(_windowById).filter(Boolean);
+}
+
 // Page JavaScript that answers "1" when the page carries exactly `marker`: in window.name, or in
 // window.__mcpTabMarker once a page has taken window.name over.
 function _markerCheckJS(marker) {
@@ -1156,6 +1173,7 @@ async function resolveActiveTab() {
 // only once the target window has no tab carrying the marker. A named profile can hold several
 // windows and the target window is only the first of them, while the extension opens or picks
 // the session's tab in any of them. The marker proves the tab in whichever window it is found.
+// Without one, the profile's other windows are scanned (_otherProfileWindows).
 async function _resolveSessionTab({ elsewhere = null } = {}) {
   const s = _st();
   if (s.hasOwnedTab) {
@@ -1182,8 +1200,8 @@ async function _resolveSessionTab({ elsewhere = null } = {}) {
       // makes of s.activeTabMarker while the scan runs.
       const marker = s.activeTabMarker;
       let found = await _scanForMarker(marker, s.activeTabIndex);
-      if (found && !found.idx && elsewhere) {
-        for (const win of await elsewhere()) {
+      if (found && !found.idx) {
+        for (const win of await (elsewhere || _otherProfileWindows)()) {
           const there = win !== found.win && await _scanForMarker(marker, s.activeTabIndex, win);
           if (there?.idx) { found = there; break; }
         }
@@ -1636,7 +1654,20 @@ async function _helperNativeKeyboardRaw(keyCode, flags = [], windowId = 0, timeo
 // safari-helper.swift): press → isTrusted mousedown/mouseup/click, value → isTrusted
 // beforeinput/input. Never activates Safari, raises a window or moves the cursor.
 // The element must carry DOM id `domId` and sit in its window's selected tab.
+// A tab just selected in a background window reaches the accessibility tree a beat later
+// (measured: not there after the 120ms tab settle, there after ~1s), so a miss is retried.
 async function _helperAxDom(domId, action, value, timeout = 12000) {
+  for (const wait of [250, 500, 1000, 0]) {
+    try {
+      return await _helperAxDomOnce(domId, action, value, timeout);
+    } catch (e) {
+      if (!wait || !/^ax-dom-not-found/.test(e.message)) throw e;
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
+}
+
+async function _helperAxDomOnce(domId, action, value, timeout) {
   await assertScreenUnlocked();
   return _withHelperLock(() => new Promise((resolve, reject) => {
     if (!_helperProc) startHelper();
@@ -1818,13 +1849,14 @@ async function _withTargetTabFronted(fn) {
 
   // Only a tab this session can prove is its own gets the event. Without that proof the event
   // would land in whatever tab is selected — the user's.
-  const idx = _st().hasOwnedTab ? await resolveActiveTab() : _st().activeTabIndex;
+  const { idx, win } = _st().hasOwnedTab ? await _resolveSessionTab() : { idx: _st().activeTabIndex, win: null };
   if (!idx && _st().hasOwnedTab) {
     throw new Error("Tab tracking lost — refusing to act in the selected tab (native input, screenshot): it is the user's. Call safari_new_tab to reopen.");
   }
   if (!idx) return await fn(); // no owned tab — nothing to front
 
-  const winRef = getTargetWindowRef();
+  // The window the marker was found in: one of the profile's windows, not always the first.
+  const winRef = win || getTargetWindowRef();
   let prev;
   try {
     prev = Number(
@@ -1847,9 +1879,13 @@ async function _withTargetTabFronted(fn) {
   }
 
   _tabFrontedDepth++;
+  // Geometry and the keyboard's front-window check measure that same window.
+  const prevOverride = _pinnedWindowOverride;
+  if (win) _pinnedWindowOverride = { winRef, winId: Number(/\d+/.exec(winRef)[0]), tabIndex: idx };
   try {
     return await fn();
   } finally {
+    _pinnedWindowOverride = prevOverride;
     _tabFrontedDepth--;
     // Always hand the user's tab back — even if the event threw.
     if (mustSwitch) {

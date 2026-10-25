@@ -2980,6 +2980,7 @@ server.tool(
   "safari_native_click",
   "Real click performed by WebKit through the macOS accessibility tree — mousedown/mouseup/click arrive with isTrusted: true, so WAF/bot-gated and isTrusted-checking handlers accept it (G2, Cloudflare, Google editors). Runs in the background: Safari is never activated, no window is raised and the mouse does not move. Use when regular safari_click has no effect or is rejected. Use ref (from snapshot), selector, text, or x/y. When using ref, always take a FRESH safari_snapshot first. Needs an unlocked screen.",
   {
+    receipt: z.string().optional().describe("Tab receipt from safari_new_tab — pins this call to that tab (survives reconnects/subagents)"),
     ref: z.string().optional().describe("Ref ID from safari_snapshot (e.g. '0_5')"),
     selector: z.string().optional().describe("CSS selector"),
     text: z.string().optional().describe("Visible text to find and click"),
@@ -2991,7 +2992,7 @@ server.tool(
     // Native click always uses AppleScript path (no extension) — it needs OS-level access.
     // Bypasses extensionOrFallback, so assert tab-ownership explicitly — an OS-level click
     // on the user's front window would otherwise slip past the safety guard.
-    _assertTabOwnership("native_click");
+    _assertTabOwnership("native_click", _explicitReceipt(args));
     // A profile can hold SEVERAL windows (measured: four "אוטומציות" at once), and the
     // AppleScript side picks the first by name — so coordinates were computed against
     // one window and the event delivered to another, a silent no-op. The extension is
@@ -3027,6 +3028,7 @@ server.tool(
   "safari_native_hover",
   "OS-level mouse hover via macOS CGEvent — moves the real cursor to an element to trigger native :hover / mouseenter handlers. Use for obfuscated UIs where JS-dispatched mouseenter isn't enough, like Discord server sidebars (tooltips only appear on real hover) or portal-rendered tooltips. After hover, call safari_wait_for or safari_evaluate to read the tooltip. Dwells for dwellMs to let tooltips render, then restores the original cursor position by default. Requires Safari window to be visible.",
   {
+    receipt: z.string().optional().describe("Tab receipt from safari_new_tab — pins this call to that tab (survives reconnects/subagents)"),
     ref: z.string().optional().describe("Ref ID from safari_snapshot"),
     selector: z.string().optional().describe("CSS selector"),
     text: z.string().optional().describe("Visible text to find and hover"),
@@ -3036,7 +3038,7 @@ server.tool(
     restoreMouse: z.boolean().optional().default(true).describe("Restore cursor to original position after dwell"),
   },
   async (args) => {
-    _assertTabOwnership("native_hover");
+    _assertTabOwnership("native_hover", _explicitReceipt(args));
     const result = await safari.nativeHover(args);
     return textResult(result);
   }
@@ -3046,11 +3048,12 @@ server.tool(
   "safari_native_keyboard",
   "OS-level keyboard event via macOS CGEvent — sends a real keypress (with optional modifiers) to the Safari window WITHOUT activating Safari or stealing focus. Use when safari_press_key's JS path doesn't reach React trust-gated handlers (Discord ProseMirror Enter, Slack send, virtualized editors). Keys: enter, return, tab, escape, space, delete, backspace, up/down/left/right, home, end, pageup, pagedown, f1-f6, a-z, 0-9 and common punctuation. Modifiers: cmd, shift, alt, ctrl. Produces isTrusted:true events. Never activates Safari — runs entirely in the background.",
   {
+    receipt: z.string().optional().describe("Tab receipt from safari_new_tab — pins this call to that tab (survives reconnects/subagents)"),
     key: z.string().describe("Key name: enter, escape, tab, space, arrow keys, letters, digits, etc."),
     modifiers: z.array(z.string()).optional().default([]).describe("Modifier keys: cmd, shift, alt, ctrl"),
   },
   async (args) => {
-    _assertTabOwnership("native_keyboard");
+    _assertTabOwnership("native_keyboard", _explicitReceipt(args));
     const result = await safari.nativeKeyboard(args);
     return textResult(result);
   }
@@ -3060,12 +3063,13 @@ server.tool(
   "safari_native_type",
   "Insert text as real input, in the background (Safari is never activated). Inputs and textareas get it through the macOS accessibility tree (isTrusted beforeinput/input, any language, clipboard untouched); rich editors (contenteditable) get a real paste (Cmd+V to the Safari window). Unlike safari_fill which manipulates DOM directly (breaking React/ProseMirror state), this goes through the real paste pipeline — ProseMirror/Slate/Draft.js process the paste event natively and update their internal model. After native_type, pressing Enter (via safari_native_keyboard) will actually submit the form because the framework state matches the DOM. Saves and restores the user's clipboard. No focus stealing. Use for Discord, Slack, and any editor where safari_fill works visually but the content isn't 'really there' when you try to submit.",
   {
+    receipt: z.string().optional().describe("Tab receipt from safari_new_tab — pins this call to that tab (survives reconnects/subagents)"),
     value: z.string().describe("Text to insert via clipboard paste"),
     selector: z.string().optional().describe("CSS selector of the editor element to focus first"),
     ref: z.string().optional().describe("Ref ID from safari_snapshot to focus first"),
   },
   async (args) => {
-    _assertTabOwnership("native_type");
+    _assertTabOwnership("native_type", _explicitReceipt(args));
     const result = await safari.nativeType(args);
     return textResult(result);
   }

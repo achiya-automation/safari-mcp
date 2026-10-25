@@ -447,6 +447,23 @@ test("native input never takes the user's focus", () => {
   assert.ok(!/frontTabByUrl|realClickAtPoint|axPressInWindow/.test(helper), "the helper's focus-taking click paths stay deleted");
 });
 
+test("native input finds the session's tab in any window of the profile", () => {
+  // A profile held four windows and the extension opened the tab in the last one; the
+  // AppleScript side scanned only the first, so helper injection and native input refused
+  // a tab that was the session's own (24.10.26). The native tools also took no receipt.
+  const safari = readFileSync(new URL("../safari.js", import.meta.url), "utf8");
+  const between = (a, b) => safari.slice(safari.indexOf(a), safari.indexOf(b, safari.indexOf(a)));
+  const resolve = between("async function _resolveSessionTab(", "// The index a session that never owned");
+  assert.ok(/\(elsewhere \|\| _otherProfileWindows\)\(\)/.test(resolve), "a missed scan falls back to the profile's other windows");
+  const fronted = between("async function _withTargetTabFronted(", "// Atomic tab-identity guard");
+  assert.ok(/const winRef = win \|\| getTargetWindowRef\(\)/.test(fronted), "the tab is selected in the window it was found in");
+  assert.ok(/_pinnedWindowOverride = \{ winRef/.test(fronted), "and geometry/keyboard measure that window");
+  const index = readFileSync(new URL("../index.js", import.meta.url), "utf8");
+  for (const op of ["native_click", "native_hover", "native_keyboard", "native_type"]) {
+    assert.ok(index.includes(`_assertTabOwnership("${op}", _explicitReceipt(args));`), `${op} takes a receipt`);
+  }
+});
+
 test("the clipboard tools run in UTF-8", () => {
   // Under launchd there is no locale, and pbcopy/pbpaste fall back to MacRoman: Hebrew
   // came out as mojibake, in the pasted text and in the user's restored clipboard.
