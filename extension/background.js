@@ -2107,6 +2107,10 @@ async function handleCommand(type, payload) {
           if (!el || el.nodeType !== 1) return false;
           const cs = window.getComputedStyle(el);
           if (cs.display === "none" || cs.visibility === "hidden" || cs.opacity === "0") return false;
+          // display:contents has no box of its own (a 0x0 rect), and walk() stops at an
+          // invisible node, so a whole app mounted in such a root came back empty (#187).
+          // Its children decide.
+          if (cs.display === "contents") return true;
           const r = el.getBoundingClientRect();
           return r.width > 0 && r.height > 0;
         }
