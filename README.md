@@ -312,6 +312,8 @@ The recommended pattern for AI agents using Safari MCP:
 
 > **Tip:** Start with `safari_snapshot` to get element refs, then use refs for precise targeting. This is faster and more reliable than CSS selectors.
 
+After a click or a fill, pass `diff: true` to `safari_snapshot` to get only the lines that changed since that tab's previous snapshot (`+` added, with fresh refs; `-` removed). It is usually a small fraction of a full snapshot; the first call for a tab returns the full snapshot.
+
 ---
 
 ## Running several agents at once
