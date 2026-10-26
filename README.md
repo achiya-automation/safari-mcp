@@ -386,6 +386,9 @@ What the flag deliberately does *not* do:
 | `SAFARI_MCP_SCREENSHOT_MAX_WIDTH` | unset | Downscale every `safari_screenshot` to this pixel width (Retina captures are 2× the viewport). Per-call `maxWidth` overrides it. |
 | `SAFARI_MCP_KEEPALIVE_TAB` | off | Keep one daemon-served page open in the profile window so Safari never parks the extension worker between commands. |
 | `SAFARI_MCP_OPEN_WINDOW_CMD` | unset | Command run with the profile name when the profile window is absent (e.g. after a reboot). Must open the window without focusing Safari. |
+| `SAFARI_MCP_AGENT_WINDOW` | off | Open agent tabs in one background window of their own (1440×900, shared by every session) instead of among your tabs (see below). |
+
+With `SAFARI_MCP_AGENT_WINDOW=1`, `safari_new_tab` opens agent tabs in a window of their own, created in the background at 1440×900 and shared by every session, never among your tabs. Safari has no tab-group API for extensions, so a window stands in for a tab group. Its first tab stays blank so the window survives the agent closing its last tab. Unset, nothing changes.
 
 `SAFARI_MCP_RAISE_ON_NAVIGATE=1` is for agents whose whole point is *showing* you a page — a voice assistant answering "open YouTube", a demo driver. Everything else should leave it off: by default Safari MCP works in the background and hands focus back to whatever app you were using, so an agent can drive a page while you keep typing somewhere else.
 

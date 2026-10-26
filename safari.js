@@ -1151,7 +1151,24 @@ async function resolveActiveTab() {
 // only once the target window has no tab carrying the marker. A named profile can hold several
 // windows and the target window is only the first of them, while the extension opens or picks
 // the session's tab in any of them. The marker proves the tab in whichever window it is found.
+// With SAFARI_MCP_AGENT_WINDOW=1 and no named profile, the extension opens agent tabs in a
+// background window of their own, never the front one, so a marker missing from the front
+// window is looked for in Safari's other windows. The marker is exact: finding it anywhere
+// proves the tab.
+async function _otherWindows() {
+  // Joined here: a list coerced to text runs its items together ("1094510958").
+  const ids = await osascriptFast(`tell application "Safari"
+  set out to ""
+  repeat with w in every window
+    set out to out & (id of w as text) & ","
+  end repeat
+  return out
+end tell`).catch(() => "");
+  return String(ids).split(",").map(_windowById).filter(Boolean);
+}
+
 async function _resolveSessionTab({ elsewhere = null } = {}) {
+  if (!elsewhere && !SAFARI_PROFILE && process.env.SAFARI_MCP_AGENT_WINDOW === "1") elsewhere = _otherWindows;
   const s = _st();
   if (s.hasOwnedTab) {
     let marked = false;

@@ -3417,7 +3417,8 @@ server.tool(
     const requestedUrl = String(url || "");
     let viaAppleScript = false;
     const rawResult = await extensionOrFallback(
-      "new_tab", { url: requestedUrl },
+      // Opt-in agent window: the extension cannot read this process's env, so the payload carries it.
+      "new_tab", { url: requestedUrl, ...(process.env.SAFARI_MCP_AGENT_WINDOW === "1" ? { agentWindow: true } : {}) },
       () => { viaAppleScript = true; return _openTabViaAppleScript(requestedUrl); }
     );
     // AppleScript fallback returns a JSON string; extension returns an object — normalize
