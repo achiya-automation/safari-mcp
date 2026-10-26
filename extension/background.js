@@ -488,6 +488,21 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
     return false;
   }
+  // command-content.js asks whether its own tab is one the bridge owns, to keep that page
+  // rendering while hidden (content.js). Answers only about the sender's top frame, with
+  // a boolean: no tab id, receipt or session leaves the worker.
+  if (msg?.action === "mcpTabOwnedV1") {
+    if (Object.keys(msg).length !== 1) return false;
+    const tabId = sender?.tab?.id;
+    if (!Number.isInteger(tabId) || sender.frameId > 0) return false; // Safari may omit frameId; the asker checks it is the top frame
+    // A returned Promise, not sendResponse + `return true`: Safari dropped the async
+    // sendResponse here and the page got undefined.
+    // _sessionOwnedTabs, not the receipts: a new tab is owned before it navigates, but its
+    // receipt is minted after, so the page's first load would ask too early.
+    return _hydrateOwnedTabs().catch(() => {}).then(() => ({
+      owned: _tokenByTabId.has(tabId) || [..._sessionOwnedTabs.values()].some((ids) => ids.has(tabId)),
+    }));
+  }
   if (msg.action === "setEnabled") {
     _enabled = msg.enabled;
     if (!_enabled) {

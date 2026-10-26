@@ -5322,6 +5322,20 @@ export async function uploadFile({ selector, filePath, forceNative = false, veri
       finalResult = `${ghostPickup ? "NO PREVIEW — the page never showed the file. " : ""}${result} | Native file-dialog ${forceNative ? '(forced)' : '(ghost-pickup escalation)'} failed: ${nativeErr.message}`;
     }
   } else if (/verified 0 file|Upload attempted|el\.files is empty/i.test(result)) {
+    // Some composers (Google Business Profile, 26.10.2026) read the file and clear the input at
+    // once, so "verified 0" can be a success. With verifyPreview, a preview that appears settles
+    // it; on a locked screen that is the only check left, as the native dialog cannot open.
+    const before = Number((result.match(/\[previews=(-?\d+)\]/) || [])[1] ?? -1);
+    if (verifyPreview && before >= 0) {
+      const locked = await isScreenLocked();
+      const deadline = Date.now() + (locked ? 90000 : 3000);
+      let after = -1;
+      do {
+        await new Promise((r) => setTimeout(r, 2000));
+        after = Number(await runJS(`(${_PREVIEW_COUNT_JS})()`, { elsewhere }).catch(() => -1));
+      } while (Date.now() < deadline && !(after > before));
+      if (after > before) return `${result} | preview appeared (${before}→${after}): the page read the file and cleared the input`;
+    }
     try {
       finalResult = await _nativeFileUpload(sel, resolvedPath, safeName);
     } catch (nativeErr) {
