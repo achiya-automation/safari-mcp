@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.22.19] - 2026-10-26
+
 ### Security
 - **`body-parser` 2.3.0 → 2.4.0 and `zod` 4.4.3 → 4.6.7, both through `@modelcontextprotocol/sdk`**, close two high advisories that failed CI's production audit: a denial of service from trailing bytes after a compressed request body in HTTP mode (GHSA-27r3-jxmh-p828), and memory exhaustion while validating oversized constrained collections (GHSA-mrhx-c7xc-m3w5). The same update takes `fast-uri` 3.1.8 → 3.1.9 (four moderate advisories, via `ajv`), `ip-address` 10.7.2 → 10.7.4 (GHSA-rxp7-6hxx-x8q5, via `express-rate-limit`) and `qs` 6.16.0 → 6.16.1. Lockfile only; the declared ranges are unchanged.
 
