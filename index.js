@@ -254,6 +254,23 @@ async function _evictOldestTab(sessionId) {
   return null;
 }
 
+// Close every tab an HTTP session opened once the session ends (its DELETE, or the opt-in idle
+// reaper in transport.js). Without this a finished session's tabs stayed open until the daemon
+// restarted, up to MAX_TABS per session, and piled up across sessions. A failed close keeps the
+// tab tracked, so the shutdown cleanup and the memory sweep still see it.
+async function _closeSessionTabs(sessionId) {
+  const key = `${SESSION_ID}:${sessionId}`;
+  _activeReceipts.delete(key);
+  let closed = 0;
+  for (const [tabKey, info] of _sessionTabs(key)) {
+    const outcome = await _oneCloseAtATime(() => _closeTrackedTab(info));
+    if (outcome === "failed") continue;
+    _untrackTab(tabKey);
+    if (outcome === "closed") closed++;
+  }
+  if (closed) console.error(`[Safari MCP] Session ${sessionId.slice(0, 8)} ended — closed its ${closed} tab(s)`);
+}
+
 // What safari_new_tab tells the caller about the tab the cap closed. The receipt is how the
 // caller knows which of its tabs is gone; the position it had is meaningless by now.
 function _evictionReport(info) {
@@ -4849,7 +4866,7 @@ if (!process.env.SAFARI_PROFILE) _startMemoryMonitor();
 
 // Transport is chosen at runtime: default stdio (unchanged), or a shared HTTP instance when
 // SAFARI_MCP_HTTP=1 (many Claude sessions → one process). buildServer is the per-session factory.
-const transportHandle = await startTransport(buildServer, process.env);
+const transportHandle = await startTransport(buildServer, process.env, { onSessionClosed: _closeSessionTabs });
 
 if (transportHandle.kind === "stdio") {
   // A client can disappear without delivering a signal. Treat its pipe closing as the stdio

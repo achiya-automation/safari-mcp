@@ -31,7 +31,13 @@ export function planTransport(env = {}) {
 // state lives at module scope and is shared across sessions (correct — one physical Safari window),
 // so per-session servers still drive the same Safari. stdio calls the factory exactly once, so its
 // path is behaviourally identical to the historical inline `new McpServer(); connect(stdio)`.
-export async function startTransport(createMcpServer, env = process.env) {
+//
+// `onSessionClosed(sessionId)` runs when an HTTP session ends: on its DELETE, and, only when
+// SAFARI_MCP_SESSION_IDLE_MIN is a positive number of minutes, once the session has been idle
+// that long. Unset or 0 never reaps, so a session that is merely quiet is never ended for it.
+/** @param {{ onSessionClosed?: (sessionId: string) => unknown }} [hooks] */
+export async function startTransport(createMcpServer, env = process.env, hooks = {}) {
+  const { onSessionClosed } = hooks;
   const plan = planTransport(env);
 
   if (plan.kind === "stdio") {
@@ -45,6 +51,17 @@ export async function startTransport(createMcpServer, env = process.env) {
   // module-global (correct: one physical Safari window), so sessions share Safari but each gets its
   // own protocol channel for request/response routing.
   const transports = new Map();
+  const lastSeen = new Map();
+  const idleMs = parseFloat(env.SAFARI_MCP_SESSION_IDLE_MIN) * 60000;
+  const reaper = idleMs > 0
+    ? setInterval(() => {
+        const cutoff = Date.now() - idleMs;
+        for (const [id, seen] of lastSeen) {
+          if (seen < cutoff) transports.get(id)?.close().catch(() => {});
+        }
+      }, Math.min(60000, idleMs / 2))
+    : null;
+  reaper?.unref(); // never keep the process alive for the reaper
 
   const httpServer = createServer(async (req, res) => {
     try {
@@ -72,10 +89,16 @@ export async function startTransport(createMcpServer, env = process.env) {
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (id) => {
             transports.set(id, transport);
+            lastSeen.set(id, Date.now());
           },
         });
         transport.onclose = () => {
-          if (transport.sessionId) { transports.delete(transport.sessionId); _dropSession(transport.sessionId); }
+          const id = transport.sessionId;
+          if (!id || !transports.has(id)) return; // a second close of the same session
+          transports.delete(id);
+          lastSeen.delete(id);
+          _dropSession(id);
+          Promise.resolve(onSessionClosed?.(id)).catch(() => {});
         };
         const server = createMcpServer(); // fresh server per session (McpServer is single-connection)
         await server.connect(transport);
@@ -102,6 +125,7 @@ export async function startTransport(createMcpServer, env = process.env) {
         return;
       }
 
+      if (sid) lastSeen.set(sid, Date.now());
       await sessionCtx.run({ sessionId: sid ?? "_init" }, () => transport.handleRequest(req, res, body));
     } catch {
       if (!res.headersSent) {
@@ -120,6 +144,7 @@ export async function startTransport(createMcpServer, env = process.env) {
     kind: "http",
     port: plan.port,
     async close() {
+      if (reaper) clearInterval(reaper);
       for (const t of transports.values()) await t.close().catch(() => {});
       await new Promise((r) => httpServer.close(r));
     },

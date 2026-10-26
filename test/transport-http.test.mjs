@@ -142,3 +142,71 @@ test("http mode: a DNS-rebinding request gets 403 before any session exists", as
     await handle.close();
   }
 });
+
+const HTTP = (port, extra = {}) => ({ SAFARI_MCP_HTTP: "1", SAFARI_MCP_HTTP_PORT: String(port), ...extra });
+
+test("http mode: DELETE ends the session and reports its id to onSessionClosed, once", async () => {
+  const closed = [];
+  const handle = await startTransport(makeStubServer, HTTP(9323), { onSessionClosed: (id) => closed.push(id) });
+  try {
+    const client = new Client({ name: "t", version: "0" });
+    const transport = new StreamableHTTPClientTransport(new URL("http://127.0.0.1:9323/mcp"));
+    await client.connect(transport);
+    const id = transport.sessionId;
+    await transport.terminateSession();
+    assert.deepEqual(closed, [id]);
+    await client.close().catch(() => {});
+    assert.deepEqual(closed, [id], "closing again does not report the session twice");
+  } finally {
+    await handle.close();
+  }
+});
+
+// The reaper is the only setInterval startTransport makes, so a spy on it tells "no reaper" apart
+// from "a reaper that has not fired yet" without waiting.
+for (const [label, env] of [["unset", {}], ["0", { SAFARI_MCP_SESSION_IDLE_MIN: "0" }], ["non-numeric", { SAFARI_MCP_SESSION_IDLE_MIN: "off" }]]) {
+  test(`http mode: SAFARI_MCP_SESSION_IDLE_MIN ${label} starts no idle reaper (off by default)`, async () => {
+    const realSetInterval = globalThis.setInterval;
+    let intervals = 0;
+    globalThis.setInterval = /** @type {any} */ ((fn, ms) => { intervals++; return realSetInterval(fn, ms); });
+    let handle;
+    try {
+      handle = await startTransport(makeStubServer, HTTP(9324, env), { onSessionClosed: () => {} });
+    } finally {
+      globalThis.setInterval = realSetInterval;
+    }
+    try {
+      assert.equal(intervals, 0);
+    } finally {
+      await handle.close();
+    }
+  });
+}
+
+test("http mode: a positive SAFARI_MCP_SESSION_IDLE_MIN reaps only the idle session", async () => {
+  const closed = [];
+  // 0.005 min = 300ms idle, checked every 150ms
+  const handle = await startTransport(makeStubServer, HTTP(9325, { SAFARI_MCP_SESSION_IDLE_MIN: "0.005" }), {
+    onSessionClosed: (id) => closed.push(id),
+  });
+  try {
+    const mk = async () => {
+      const client = new Client({ name: "t", version: "0" });
+      const transport = new StreamableHTTPClientTransport(new URL("http://127.0.0.1:9325/mcp"));
+      await client.connect(transport);
+      return { client, transport };
+    };
+    const idle = await mk();
+    const busy = await mk();
+    const until = Date.now() + 900; // three idle windows: keep one session active throughout
+    while (Date.now() < until) {
+      await busy.client.callTool({ name: "ping", arguments: {} });
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.deepEqual(closed, [idle.transport.sessionId], "only the idle session is reaped");
+    await busy.client.close().catch(() => {});
+    await idle.client.close().catch(() => {});
+  } finally {
+    await handle.close();
+  }
+});
