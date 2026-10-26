@@ -1168,6 +1168,16 @@ try {
       } else {
         // Long-poll: wait up to 5 seconds for a command; _wakeHttpPolls() runs check().
         const check = () => {
+          // Dropped with no successor (the stale timer after the Mac slept, a wedged-worker
+          // drop): the worker must reconnect, same as the gate above. A 423 here tells it a
+          // replacement verified, so it went dormant for good while its own profile's pages
+          // kept it alive (26.10.26: a profile lost its extension overnight).
+          if (!_activeHttpWorkerId) {
+            done();
+            res.writeHead(409);
+            res.end("Worker reconnect required");
+            return;
+          }
           if (pollingWorkerId !== _activeHttpWorkerId) {
             done();
             res.writeHead(423);

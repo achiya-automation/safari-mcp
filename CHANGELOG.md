@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+
+- **A profile no longer loses its extension for good after the Mac sleeps.** On waking, the daemon's stale timer saw a poll older than the timeout, dropped the profile's worker with no successor, and woke the worker's own open `/poll`. That poll's check compared the worker against an empty lease holder and answered `423 Worker superseded`, which tells a worker that a replacement verified, so it went dormant until Safari reloads it. In a profile with open pages the content-script keepalive pings that worker every few seconds, so Safari never recycled it: on 2026-10-26 the automation profile answered every tool call with `Safari profile extension unavailable` from 00:03 until the extension was reloaded, its heartbeat frozen at the last tick before sleep, while `safari_doctor` showed only other profiles' workers. An open poll whose worker was dropped with no successor now answers `409 Worker reconnect required`, as the `/poll` gate already does, and the worker reconnects. `test/poll-wake.test.mjs` checks the order. Manifest 2.10.27 — rebuilding the extension app makes Safari reload the extension, which also releases a worker already stuck this way.
+
 - **Safari no longer stays in front after an operation steals focus while the user is typing in another app.** On macOS Tahoe some AppleScript commands implicitly activate Safari, and the focus guard gives the foreground back to the app the user was in. It skipped that restore whenever there was any keyboard or mouse input in the last 2.5 seconds, reading it as "the user switched into Safari". A user typing in another app always has recent input, so Safari kept the foreground and took their keystrokes. Typing cannot switch apps; the guard now skips the restore only when a mouse button or a modifier key (Cmd+Tab, Spotlight) was pressed after the operation began.
 
 ## [2.22.18] - 2026-10-19

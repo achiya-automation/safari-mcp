@@ -33,6 +33,15 @@ test("switching or dropping the active worker wakes the open polls", () => {
   }
 });
 
+test("an open poll of a worker dropped with no successor answers 409, not 423", () => {
+  const start = index.indexOf("const check = () => {", index.indexOf("// GET /poll"));
+  const check = index.slice(start, index.indexOf("const timer = setTimeout", start));
+  const noHolder = check.indexOf("if (!_activeHttpWorkerId)");
+  const superseded = check.indexOf("res.writeHead(423)");
+  assert.ok(noHolder > 0 && superseded > noHolder, "the no-holder case must be decided before the 423");
+  assert.match(check.slice(noHolder, superseded), /res\.writeHead\(409\)/);
+});
+
 test("profile navigate refuses URLs the extension cannot issue a receipt for", () => {
   const start = index.indexOf('"safari_navigate",');
   const nav = index.slice(start, index.indexOf("_addOwnedURL(url);", start));
