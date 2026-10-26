@@ -597,6 +597,11 @@ async function connect() {
     ...BRIDGE_PORTS.map((port) => `http://127.0.0.1:${port}`),
   ].filter((url, index, all) => url && all.indexOf(url) === index);
 
+  // A daemon answers 423 while another healthy worker holds its lease. That holder may be
+  // another profile's worker on a port this worker remembered from an earlier run, so a
+  // 423 is remembered and the scan goes on; the short lease retry runs only when no
+  // candidate takes this worker.
+  let leaseHeld = false;
   for (const candidate of candidates) {
     try {
       HTTP_URL = candidate;
@@ -615,12 +620,8 @@ async function connect() {
       });
       if (_restartInvalidatedConnect(pollGeneration)) return;
       if (res.status === 423) {
-        isConnected = false;
-        updateBadge("");
-        _stopHeartbeat();
-        scheduleReconnect(3000);
-        _connecting = false;
-        return;
+        leaseHeld = true;
+        continue;
       }
       if (!res.ok) continue;
 
@@ -681,7 +682,13 @@ async function connect() {
   if (_restartInvalidatedConnect(pollGeneration)) return;
   isConnected = false;
   updateBadge("");
-  scheduleReconnect();
+  if (leaseHeld) {
+    // This worker may be the valid successor once the lease holder exits.
+    _stopHeartbeat();
+    scheduleReconnect(3000);
+  } else {
+    scheduleReconnect();
+  }
   _connecting = false;
 }
 

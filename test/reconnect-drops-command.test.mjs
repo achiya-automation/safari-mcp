@@ -103,6 +103,78 @@ test("a reconnect scheduled before a successful connect never runs after it", as
   assert.deepEqual(polls, [1], "the healthy poll loop must stay the only generation");
 });
 
+// Seen live 24.10.26: the bridge a worker remembered was now another profile's daemon, whose
+// lease that profile's worker held. Every attempt stopped at its 423 and retried it, and the
+// worker never reached its own daemon on the next port.
+function connectHarness(answers) {
+  const delays = [];
+  const stored = [];
+  const harness = Function(
+    "_bridgeFetch", "browser", "_storedReloadHandoffToken", "_verifyProfileMatch",
+    "_discoverProfileWindow", "updateBadge", "_startHeartbeat", "_stopHeartbeat",
+    "pollForCommands", "AbortSignal", "setTimeout", "clearTimeout",
+    `const BRIDGE_PORTS = [9224, 9228];
+     const _EXTENSION_BUILD = "test-build";
+     let HTTP_URL = "http://127.0.0.1:9224";
+     let _enabled = true;
+     let _bridgeWorkerSuperseded = false;
+     let _bridgeWorkerRetiring = false;
+     let pollAbort = null;
+     let _pollLoopGeneration = 0;
+     let isConnected = false;
+     let _targetProfile = null;
+     let _reconnectDelay = 3000;
+     let _reconnectTimer = null;
+     const _RECONNECT_MAX = 60000;
+     const _BRIDGE_RELOAD_HANDOFF_KEY = "reload";
+     let _commandExecutionTail = Promise.resolve();
+     ${sourceBetween("let _connecting = false", "async function pollForCommands(")}
+     return { connect, state: () => ({ isConnected }) };`
+  )(
+    async (url) => {
+      const port = Number(String(url).match(/:(\d+)\//)[1]);
+      const status = String(url).includes("/connect") ? answers[port] : 200;
+      return { ok: status === 200, status, json: async () => ({ profile: "אוטומציות" }) };
+    },
+    {
+      storage: {
+        local: {
+          get: async () => ({ mcpBridgeUrl: "http://127.0.0.1:9224" }),
+          remove: async () => {},
+          set: async (value) => { stored.push(value.mcpBridgeUrl); },
+        },
+      },
+      alarms: { create: () => {} },
+    },
+    async () => "",
+    async () => true,
+    async () => {},
+    () => {},
+    () => {},
+    () => {},
+    () => {},
+    AbortSignal,
+    (fire, delay) => { delays.push(delay); return delays.length; },
+    () => {}
+  );
+  return { harness, delays, stored };
+}
+
+test("a 423 from a remembered bridge does not stop the scan for this profile's daemon", async () => {
+  const { harness, delays, stored } = connectHarness({ 9224: 423, 9228: 200 });
+  await harness.connect();
+  assert.equal(harness.state().isConnected, true, "the worker must reach its own daemon on the next port");
+  assert.deepEqual(stored, ["http://127.0.0.1:9228"], "the bridge that took the worker replaces the remembered one");
+  assert.deepEqual(delays, [], "a connected worker schedules no retry");
+});
+
+test("a lease held on every bridge still retries soon instead of backing off", async () => {
+  const { harness, delays } = connectHarness({ 9224: 423, 9228: 423 });
+  await harness.connect();
+  assert.equal(harness.state().isConnected, false);
+  assert.deepEqual(delays, [3000], "a possible successor retries on the short lease interval");
+});
+
 test("the minute alarm leaves a connect that is already in flight alone", () => {
   const alarmSource = sourceBetween('browser.alarms.create("keepalive"', "// ========== STARTUP");
   const run = (connecting) => {

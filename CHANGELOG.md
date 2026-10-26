@@ -7,8 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **`body-parser` 2.3.0 → 2.4.0 and `zod` 4.4.3 → 4.6.7, both through `@modelcontextprotocol/sdk`**, close two high advisories that failed CI's production audit: a denial of service from trailing bytes after a compressed request body in HTTP mode (GHSA-27r3-jxmh-p828), and memory exhaustion while validating oversized constrained collections (GHSA-mrhx-c7xc-m3w5). The same update takes `fast-uri` 3.1.8 → 3.1.9 (four moderate advisories, via `ajv`), `ip-address` 10.7.2 → 10.7.4 (GHSA-rxp7-6hxx-x8q5, via `express-rate-limit`) and `qs` 6.16.0 → 6.16.1. Lockfile only; the declared ranges are unchanged.
+
 ### Fixed
 - **Safari no longer stays in front after an operation steals focus while the user is typing in another app.** On macOS Tahoe some AppleScript commands implicitly activate Safari, and the focus guard gives the foreground back to the app the user was in. It skipped that restore whenever there was any keyboard or mouse input in the last 2.5 seconds, reading it as "the user switched into Safari". A user typing in another app always has recent input, so Safari kept the foreground and took their keystrokes. Typing cannot switch apps; the guard now skips the restore only when a mouse button or a modifier key (Cmd+Tab, Spotlight) was pressed after the operation began.
+- **A profile's extension finds its own daemon when the bridge it remembered now belongs to another profile.** The extension tries the bridge it connected to last before scanning the ports. When daemons come back on different ports, that bridge can be another profile's daemon, which answers `/connect` with 423 while its own worker holds the lease. The extension stopped at that 423 and retried the same bridge every 3 seconds, so the profile never reconnected until its stored bridge was cleared by hand. A 423 now moves on to the next port, and the short lease retry runs only when no bridge accepts the worker.
 
 ## [2.22.18] - 2026-10-19
 
