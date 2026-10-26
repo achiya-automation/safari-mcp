@@ -275,6 +275,36 @@ function _untrackClosedTab({ receipt = "", marker = "" }) {
   }
 }
 
+// Opt-in (SAFARI_MCP_TAB_EVENTS=1): tell a session which of its tabs the page or the user
+// closed. The extension sends them with a reply (extension/background.js _drainTabEvents);
+// they wait here until that session's next tool result carries them (_withTabEvents).
+const TAB_EVENTS_ENABLED = process.env.SAFARI_MCP_TAB_EVENTS === "1";
+const _tabEventsBySession = new Map();
+function _queueTabEvents(events) {
+  const sid = typeof events?.sessionId === "string" ? events.sessionId : "";
+  if (!sid || !Array.isArray(events.items) || !events.items.length) return;
+  const list = _tabEventsBySession.get(sid) || [];
+  _tabEventsBySession.set(sid, list.concat(events.items).slice(-20));
+}
+
+// Append this session's tab events to a tool result: each closed tab is forgotten, and its
+// receipt named so the caller stops using it.
+function _withTabEvents(result) {
+  const mySession = `${SESSION_ID}:${currentSessionId()}`;
+  const items = _tabEventsBySession.get(mySession);
+  if (!items?.length || !result || !Array.isArray(result.content)) return result;
+  _tabEventsBySession.delete(mySession);
+  const closed = [];
+  for (const item of items) {
+    if (item.kind !== "closed") continue;
+    const receipt = _receiptToken(item.receipt);
+    if (receipt) _untrackClosedTab({ receipt });
+    closed.push(receipt ? `your tab with receipt ${receipt} was closed by the page or the user` : "one of your tabs was closed by the page or the user");
+  }
+  if (!closed.length) return result;
+  return { ...result, content: [...result.content, { type: "text", text: `Tab events: ${closed.join("; ")}.` }] };
+}
+
 // One tab close at a time in this process. closeTabByMarker() checks a tab's marker and closes the
 // tab in one script, but as two AppleEvents, and a close sent in between renumbered the window: the
 // index the check found then named the next tab, the user's included. Two tab-cap evictions at once
@@ -1219,6 +1249,7 @@ try {
         try {
           const msg = JSON.parse(body);
           accepted = _handleExtensionResponse(msg, respondingWorkerId);
+          if (accepted && TAB_EVENTS_ENABLED) _queueTabEvents(msg.events);
         } catch {}
         res.writeHead(accepted ? 200 : 409);
         res.end(accepted ? "ok" : "Result was not accepted");
@@ -2764,6 +2795,14 @@ const server = new McpServer({
   version: _pkgVersion,
   description: "Safari browser automation - lightweight, keeps logins",
 });
+if (TAB_EVENTS_ENABLED) {
+  // Every tool's result carries the session's tab events (_withTabEvents).
+  const registerTool = server.tool.bind(server);
+  server.tool = (...args) => {
+    const handler = args.pop();
+    return registerTool(...args, async (...callArgs) => _withTabEvents(await handler(...callArgs)));
+  };
+}
 
 // ========== NAVIGATION ==========
 
