@@ -122,3 +122,35 @@ test("CLICK: an unclaimed anchor still navigates (the fix must not break plain l
     "an unclaimed anchor must still navigate — the guard must not swallow ordinary links"
   );
 });
+
+// A checkbox whose label wraps a link (a consent line with a policy link): the label's
+// centre is the link, so resolving the checkbox through the probe points must not land there.
+const CONSENT_LABEL =
+  `<label id="consent"><input type="checkbox" id="agree"> I accept the ` +
+  `<a href="/terms" data-leaf>terms</a></label>`;
+
+test("CLICK: a checkbox inside a label that wraps a link is checked, and the link is not followed", () => {
+  const { window, navAttempts } = domWithHelpers(CONSENT_LABEL);
+  const box = window.document.getElementById("agree");
+  assert.equal(window.mcpResolveTarget(box), box, "the checkbox stays the target");
+  window.mcpClick(box);
+  assert.deepEqual(navAttempts, [], "the link in the label must not be followed");
+  assert.equal(box.checked, true);
+});
+
+test("CLICK: clicking that label checks its checkbox without following the link", () => {
+  const { window, navAttempts } = domWithHelpers(CONSENT_LABEL);
+  window.mcpClick(window.document.getElementById("consent"));
+  assert.deepEqual(navAttempts, []);
+  assert.equal(window.document.getElementById("agree").checked, true);
+});
+
+test("CLICK: a bare checkbox toggles once and its click handler runs once", () => {
+  const { window } = domWithHelpers(`<input type="checkbox" id="box" data-leaf>`);
+  const box = window.document.getElementById("box");
+  let clicks = 0;
+  box.addEventListener("click", () => clicks++);
+  window.mcpClick(box);
+  assert.equal(box.checked, true, "two toggles would leave it unchecked");
+  assert.equal(clicks, 1);
+});

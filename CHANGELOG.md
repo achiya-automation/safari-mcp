@@ -7,8 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.22.19] - 2026-10-26
+
+### Security
+- **`body-parser` 2.3.0 → 2.4.0 and `zod` 4.4.3 → 4.6.7, both through `@modelcontextprotocol/sdk`**, close two high advisories that failed CI's production audit: a denial of service from trailing bytes after a compressed request body in HTTP mode (GHSA-27r3-jxmh-p828), and memory exhaustion while validating oversized constrained collections (GHSA-mrhx-c7xc-m3w5). The same update takes `fast-uri` 3.1.8 → 3.1.9 (four moderate advisories, via `ajv`), `ip-address` 10.7.2 → 10.7.5 (GHSA-rxp7-6hxx-x8q5, via `express-rate-limit`) and `qs` 6.16.0 → 6.16.1. Lockfile only; the declared ranges are unchanged.
+- **`undici` 7.30.0 → 7.30.1** (dev, through `jsdom`): a denial of service from an unhandled error on excessive content encodings (GHSA-xjj6-f33q-929c). Lockfile only. Together with the entry above this covers Dependabot #192–#196.
+
 ### Fixed
+- **`safari_snapshot` no longer comes back empty when the page sits inside a `display: contents` wrapper (#187).** Such an element has no box of its own, so its rect is 0×0, and the extension's snapshot walk stopped at any node it judged invisible, children included. A page whose app root used `display: contents` returned an empty snapshot while `safari_read_page`, `safari_query_all` and clicks all worked. The walk now looks through those wrappers to their children; `display: none` still hides a subtree. Reported, with a minimal reproduction and the exact line, by @fakepooh.
+- **`safari_click` checks a checkbox instead of leaving it unchanged, and no longer follows a link inside its label, on the AppleScript path.** The page helpers called `.click()` and then dispatched a click, and a checkbox, a radio or a label bound to one toggles on each, so the box ended where it started. When the box's label wrapped a link (a consent line with a policy link), the probe points could also land on that link and follow it. A form control now stays the click target, and a toggle gets one click. The extension path already dispatched a single click. Idea and test cases from PR #176 by @kad-xyz. The page helpers move to version 7, so pages that still hold the old ones pick up the fix.
+- **`safari_new_tab` waits briefly for the extension after a short drop-out instead of opening a tab without a receipt.** Safari suspends the extension's worker now and then. A new tab requested in that gap went to AppleScript, came back with no receipt, and the extension refused that tab once it was back. When the extension served the daemon in the last two minutes, `safari_new_tab` now waits up to about 10 seconds for it before falling back, and a tab AppleScript does open says so in its result (`receipt: null`, `via: "applescript"`, with a note). Idea and diagnosis from PR #190 by @kad-xyz.
 - **Safari no longer stays in front after an operation steals focus while the user is typing in another app.** On macOS Tahoe some AppleScript commands implicitly activate Safari, and the focus guard gives the foreground back to the app the user was in. It skipped that restore whenever there was any keyboard or mouse input in the last 2.5 seconds, reading it as "the user switched into Safari". A user typing in another app always has recent input, so Safari kept the foreground and took their keystrokes. Typing cannot switch apps; the guard now skips the restore only when a mouse button or a modifier key (Cmd+Tab, Spotlight) was pressed after the operation began.
+- **A profile's extension finds its own daemon when the bridge it remembered now belongs to another profile.** The extension tries the bridge it connected to last before scanning the ports. When daemons come back on different ports, that bridge can be another profile's daemon, which answers `/connect` with 423 while its own worker holds the lease. The extension stopped at that 423 and retried the same bridge every 3 seconds, so the profile never reconnected until its stored bridge was cleared by hand. A 423 now moves on to the next port, and the short lease retry runs only when no bridge accepts the worker.
+
+### Changed
+- **`zod` is declared as a dependency** (`^3.25 || ^4.0`, the range `@modelcontextprotocol/sdk` uses). `index.js` imports it directly but relied on npm hoisting the SDK's copy, which a strict installer such as pnpm does not do. Idea from PR #177 by @fahadjibransheikh.
+- **`eslint` 10.12.0 → 10.13.0** (#175). Dev dependency only.
 
 ## [2.22.18] - 2026-10-19
 

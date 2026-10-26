@@ -597,6 +597,11 @@ async function connect() {
     ...BRIDGE_PORTS.map((port) => `http://127.0.0.1:${port}`),
   ].filter((url, index, all) => url && all.indexOf(url) === index);
 
+  // A daemon answers 423 while another healthy worker holds its lease. That holder may be
+  // another profile's worker on a port this worker remembered from an earlier run, so a
+  // 423 is remembered and the scan goes on; the short lease retry runs only when no
+  // candidate takes this worker.
+  let leaseHeld = false;
   for (const candidate of candidates) {
     try {
       HTTP_URL = candidate;
@@ -615,12 +620,8 @@ async function connect() {
       });
       if (_restartInvalidatedConnect(pollGeneration)) return;
       if (res.status === 423) {
-        isConnected = false;
-        updateBadge("");
-        _stopHeartbeat();
-        scheduleReconnect(3000);
-        _connecting = false;
-        return;
+        leaseHeld = true;
+        continue;
       }
       if (!res.ok) continue;
 
@@ -681,7 +682,13 @@ async function connect() {
   if (_restartInvalidatedConnect(pollGeneration)) return;
   isConnected = false;
   updateBadge("");
-  scheduleReconnect();
+  if (leaseHeld) {
+    // This worker may be the valid successor once the lease holder exits.
+    _stopHeartbeat();
+    scheduleReconnect(3000);
+  } else {
+    scheduleReconnect();
+  }
   _connecting = false;
 }
 
@@ -2100,6 +2107,10 @@ async function handleCommand(type, payload) {
           if (!el || el.nodeType !== 1) return false;
           const cs = window.getComputedStyle(el);
           if (cs.display === "none" || cs.visibility === "hidden" || cs.opacity === "0") return false;
+          // display:contents has no box of its own (a 0x0 rect), and walk() stops at an
+          // invisible node, so a whole app mounted in such a root came back empty (#187).
+          // Its children decide.
+          if (cs.display === "contents") return true;
           const r = el.getBoundingClientRect();
           return r.width > 0 && r.height > 0;
         }

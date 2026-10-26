@@ -3,8 +3,8 @@
 // It is also used by the extension's execInTab for the AppleScript fallback path.
 // IMPORTANT: Keep compatible with all browsers — no ES6+ modules, use var where possible.
 
-if (window.__mcpVersion !== 6) {
-  window.__mcpVersion = 6;
+if (window.__mcpVersion !== 7) {
+  window.__mcpVersion = 7;
   window.__mcpRefs = window.__mcpRefs || {};
   window.__mcpCachedRoots = null;
   window.__mcpRootsDirty = true;
@@ -110,6 +110,14 @@ if (window.__mcpVersion !== 6) {
   window.mcpResolveTarget = function(el) {
     var base = window.mcpPickActionable(el) || el;
     if (!base) return null;
+    // A form control stays the target. A consent checkbox's label often wraps a policy link,
+    // and the probe points below can land on that link (or on the label around a hidden
+    // input), so the click would follow the link instead of toggling the box.
+    var baseIsControl = !!(base.matches && base.matches('input:not([type="hidden"]),select,textarea,label'));
+    var stealsControl = function(cand) {
+      if (!baseIsControl || cand === base) return false;
+      return cand.contains(base) || !!(cand.matches && cand.matches('a[href],button,input,select,textarea'));
+    };
     try { base.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
     var r = base.getBoundingClientRect();
     var dx = Math.min(12, Math.max(4, r.width / 4));
@@ -126,11 +134,14 @@ if (window.__mcpVersion !== 6) {
       if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) continue;
       var hit = window.mcpElementFromPoint(x, y);
       if (!hit) continue;
-      if (base === hit || base.contains(hit) || hit.contains(base)) return window.mcpPickActionable(hit) || hit;
+      if (base === hit || base.contains(hit) || hit.contains(base)) {
+        var picked = window.mcpPickActionable(hit) || hit;
+        return stealsControl(picked) ? base : picked;
+      }
       // Overlay pattern: transparent button/link overlays a text label (e.g. dropdown items).
       // If the hit is an interactive element sharing a nearby common ancestor, prefer it.
       var hitAction = window.mcpPickActionable(hit);
-      if (hitAction && hitAction !== base && hitAction.matches && hitAction.matches('button,a[href],[role="button"],[role="option"],[role="menuitem"]')) {
+      if (hitAction && hitAction !== base && !stealsControl(hitAction) && hitAction.matches && hitAction.matches('button,a[href],[role="button"],[role="option"],[role="menuitem"]')) {
         var p = base.parentElement;
         for (var k = 0; k < 4 && p; k++) {
           if (p.contains(hitAction)) return hitAction;
@@ -156,6 +167,10 @@ if (window.__mcpVersion !== 6) {
     // navigation. Firing from the leaf reproduces the real bubble path exactly.
     var from = window.mcpElementFromPoint(x, y);
     if (!from || !(target === from || target.contains(from))) from = target;
+    // A leaf inside a link nested in the target (the policy link in a checkbox's label)
+    // would carry the click into that link.
+    var leafLink = from.closest ? from.closest('a[href]') : null;
+    if (leafLink && leafLink !== target && target.contains(leafLink)) from = target;
     var s = { bubbles: true, cancelable: true, composed: true, view: window, clientX: x, clientY: y, button: 0, detail: 1 };
     var p = { ...s, pointerId: 1, pointerType: 'mouse', isPrimary: true, width: 1, height: 1, pressure: 0.5 };
     from.dispatchEvent(new PointerEvent('pointerover', { ...p, buttons: 0 }));
@@ -173,8 +188,13 @@ if (window.__mcpVersion !== 6) {
     // .click() on an anchor (or a node inside one) triggers the browser's own navigation
     // with target === the anchor, which is the exact shape the gate rejects. For anchors,
     // let the dispatched event below carry the default action instead.
+    // A checkbox, a radio or a label bound to one toggles on the dispatched click below too,
+    // so .click() first toggled it twice and left it as it was. The extension path already
+    // dispatches a single click.
+    var toggles = (target.tagName === 'INPUT' && (target.type === 'checkbox' || target.type === 'radio')) ||
+      (target.tagName === 'LABEL' && !!target.control);
     try {
-      if (!href && typeof from.click === 'function') from.click();
+      if (!href && !toggles && typeof from.click === 'function') from.click();
     } catch (e) {}
     var clickEv = new MouseEvent('click', { ...s, buttons: 0 });
     var notPrevented = from.dispatchEvent(clickEv);

@@ -2548,6 +2548,17 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
   if (_preferAppleScript && (!_extensionConnected || !_profileExtensionVerified)) {
     await _waitForVerifiedProfileExtension(30000);
   }
+  // Without a named profile a new tab gets a shorter grace. Safari suspends the worker now
+  // and then, and an AppleScript tab opened in that gap has no receipt, which the extension
+  // refuses once it is back. So when the extension served this daemon in the last two minutes,
+  // wait up to ~10 s (one proxy primary check) for it; a daemon that never had it, or lost it
+  // long ago, falls back at once. The timestamp lives on this function so the guard stays
+  // self-contained. Idea and diagnosis from PR #190 by @kad-xyz.
+  if (!_preferAppleScript && extensionType === "new_tab" && !_extensionConnected &&
+      Date.now() - (extensionOrFallback.servedAt || 0) < 120000) {
+    const deadline = Date.now() + 10500;
+    while (!_extensionConnected && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 250));
+  }
 
   // ========== FOCUS PRESERVATION ==========
   // Safari AppleScript/extension can steal focus (bring Safari window to front).
@@ -2650,6 +2661,7 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
         console.error(`[Safari MCP] ${extensionType} extension failed: ${err.message} — falling back to AppleScript`);
       }
     }
+    if (usedExtension) extensionOrFallback.servedAt = Date.now();
     if (!usedExtension) {
       if (_preferAppleScript) {
         // The extension answered here, so naming it unavailable sent callers after a bridge
@@ -3424,9 +3436,20 @@ server.tool(
     if (!viaAppleScript) safari.setActiveTabFromExtension(safeResult?.tabIndex, requestedUrl);
     // The eviction used to be stderr-only, so a session learned about its closed tab from
     // the next "receipt … stale" error. Say it in the response instead.
-    const out = evicted && safeResult && typeof safeResult === "object"
+    let out = evicted && safeResult && typeof safeResult === "object"
       ? { ...safeResult, ..._evictionReport(evicted) }
       : safeResult;
+    // Nothing in an AppleScript tab's result said it had no receipt; the caller learned it
+    // from the next refusal.
+    if (viaAppleScript && out && typeof out === "object" && !out.receipt) {
+      out = {
+        ...out,
+        receipt: null,
+        via: "applescript",
+        note: "The Safari extension was not connected, so AppleScript opened this tab without a receipt. " +
+          "Keep working in it without one, or open a new tab once safari_doctor shows the extension connected.",
+      };
+    }
     return { content: [{ type: "text", text: typeof out === 'string' ? out : JSON.stringify(out) }] };
   }
 );
