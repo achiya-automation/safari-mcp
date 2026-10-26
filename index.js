@@ -2754,6 +2754,22 @@ safari.setExtensionTabMarker(async (marker) => {
 
 // Read version from package.json to avoid hardcoded mismatch
 const _pkgVersion = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'package.json'), 'utf8')).version;
+// SAFARI_MCP_TOOLS: "core" (the everyday tools below) or a comma list of tool names.
+// Unset or "all" registers everything, as before. A client that loads every tool
+// definition up front pays about 14k tokens for the full set; "core" is roughly 40% of that.
+const _CORE_TOOLS = `
+  new_tab close_tab list_tabs switch_tab wait_for_new_tab navigate navigate_and_read go_back
+  reload snapshot read_page screenshot get_element extract_links click click_and_wait
+  fill fill_form type_text press_key select_option scroll hover upload_file
+  handle_dialog wait_for evaluate run_script get_console network doctor
+`.trim().split(/\s+/).map((name) => `safari_${name}`); // bare names: tests find handlers by their quoted names
+function _enabledTools(spec) {
+  const names = String(spec || "").split(",").map((name) => name.trim()).filter(Boolean);
+  if (!names.length || names.includes("all")) return null;
+  return new Set(names.flatMap((name) => name === "core" ? _CORE_TOOLS : [name]));
+}
+const _ENABLED_TOOLS = _enabledTools(process.env.SAFARI_MCP_TOOLS);
+
 // Factory so each MCP session (in HTTP mode) gets its own McpServer — McpServer is single-connection.
 // stdio mode calls this exactly once, identical to the historical inline server. Tool bodies are
 // unchanged; they close over the module-global safari state, which stays shared across sessions
@@ -2764,6 +2780,10 @@ const server = new McpServer({
   version: _pkgVersion,
   description: "Safari browser automation - lightweight, keeps logins",
 });
+if (_ENABLED_TOOLS) {
+  const _registerTool = server.tool.bind(server);
+  server.tool = (...args) => (_ENABLED_TOOLS.has(args[0]) ? _registerTool(...args) : undefined);
+}
 
 // ========== NAVIGATION ==========
 
