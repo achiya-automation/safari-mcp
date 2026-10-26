@@ -2553,6 +2553,7 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
   // Safari AppleScript/extension can steal focus (bring Safari window to front).
   // Save the frontmost app before the operation and restore it after if Safari stole focus.
   // Set focusGuard flag so inner osascript/runJSLarge calls skip their own focus logic.
+  const opStart = Date.now();
   const savedApp = _preferAppleScript ? null : await safari.saveFrontmostApp();
   safari.setFocusGuard(true);
 
@@ -2690,7 +2691,7 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
     // then yanks Safari out from under them (the "VS Code jumps in front while I work
     // in Safari" bug), and the HID-idle guard can't catch it because a user who is
     // reading (not typing) looks idle. So skip restore entirely for extension ops.
-    if (!usedExtension && savedApp) await safari.restoreFocusIfStolen(savedApp);
+    if (!usedExtension && savedApp) await safari.restoreFocusIfStolen(savedApp, opStart);
   }
 
   return result;
