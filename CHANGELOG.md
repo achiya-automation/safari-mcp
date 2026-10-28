@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.23.0] - 2026-10-28
+
 ### Added
 - **`safari_snapshot({ diff: true })` returns only what changed since that tab's previous snapshot.** After a click or a fill an agent usually needs the few lines that changed, not the whole page again. Lines compare without their refs, which every snapshot renumbers in page order, so an element inserted near the top changes one line instead of all the lines after it. `+` lines are new and carry fresh refs; `-` lines are gone and are shown without their dead refs, at most 50 of them. The first call for a tab returns the full snapshot. Every snapshot is remembered (the newest 50 tabs per process), so a plain snapshot is a base for the next diff. Idea and tests from PR #201 by @fahadjibransheikh. `test/snapshot-diff.test.mjs`.
 - **`SAFARI_MCP_TOOLS=core` registers only the everyday tools** (tabs, navigation, snapshot, reading, clicks, forms, evaluate, console, network, doctor), or a comma list of tool names, `core` allowed among them. For clients that load every tool definition up front. Unset or `all` registers every tool, as before. Idea from PR #204 by @fahadjibransheikh. `tests/smoke.test.js`.
