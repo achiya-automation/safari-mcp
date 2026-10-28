@@ -112,11 +112,11 @@ const safariExports = [...safariParts.matchAll(/^export (?:async )?function (\w+
 function loadSafari(window) {
   return new Function(
     "currentSessionId", "randomUUID", "osascript", "osascriptFast", "getTargetWindowRef",
-    "refreshTargetWindow", "console",
+    "refreshTargetWindow", "console", "SAFARI_PROFILE",
     `${safariParts.replace(/^export /gm, "")}\nreturn { _st, resolveActiveTab, ${safariExports.join(", ")} };`
   )(
     () => "s1", () => "sess0001-0000-4000-8000-000000000000", window.run, window.run,
-    () => "front window", async () => {}, { error() {} }
+    () => "front window", async () => {}, { error() {} }, null
   );
 }
 
@@ -267,3 +267,42 @@ for (const path of PATHS.filter((p) => p.name !== "run_script getReceipt")) {
     assert.equal(await safari.resolveActiveTab(), 2);
   });
 }
+
+// With SAFARI_MCP_AGENT_WINDOW=1 and no named profile the extension opens agent tabs in a background
+// window of their own. The session's marker is then on a tab of that window, not the front one, and
+// AppleScript must find it there (by the exact marker) instead of refusing the tab as lost.
+function otherWindowFixture() {
+  const front = [{ url: USER_URL }];
+  const agent = [{ url: "about:blank" }, { url: B_URL }];
+  let listed = 0;
+  const run = async (script) => {
+    if (/repeat with w in every window/.test(script)) { listed++; return "1,2,"; }
+    if (isMarkerScan(script)) {
+      const inAgent = /set w to window id 2\b/.test(script);
+      return answerMarkerScan(script, { windowId: inAgent ? 2 : 1, tabs: inAgent ? agent : front, pageOf: (t) => ({ name: t.marker || "" }) });
+    }
+    throw new Error(`unexpected AppleScript:\n${script}`);
+  };
+  const safari = loadSafari({ run });
+  safari.setActiveTabFromExtension(3, B_URL);
+  safari.setExtensionTabMarker(async (marker) => { agent[1].marker = marker; return true; });
+  return { safari, front, listed: () => listed };
+}
+
+test("agent window on: a session tab in another window than the front one is found there by its marker", async () => {
+  process.env.SAFARI_MCP_AGENT_WINDOW = "1";
+  try {
+    const { safari, front } = otherWindowFixture();
+    assert.equal(await safari.resolveActiveTab(), 2, "tab 2 of the agent window");
+    assert.equal(front[0].marker, undefined, "the user's front tab is never marked or taken");
+  } finally {
+    delete process.env.SAFARI_MCP_AGENT_WINDOW;
+  }
+});
+
+test("agent window off (default): other windows are never listed and the tab is not taken", async () => {
+  delete process.env.SAFARI_MCP_AGENT_WINDOW;
+  const { safari, listed } = otherWindowFixture();
+  assert.equal(await safari.resolveActiveTab(), null);
+  assert.equal(listed(), 0, "the window-listing script never runs");
+});
