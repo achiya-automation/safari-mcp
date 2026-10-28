@@ -70,6 +70,7 @@
     "ownership-match.js",
     "ownership-state.js",
     "image-size.js",
+    "snapshot-diff.js",
     "worker-ledger.js",
     "safari-session-hint.js",
     "worker-upgrade.js",

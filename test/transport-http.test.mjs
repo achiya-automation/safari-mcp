@@ -142,3 +142,72 @@ test("http mode: a DNS-rebinding request gets 403 before any session exists", as
     await handle.close();
   }
 });
+
+// A session that ends closes its tabs (idea from PR #202 by @fahadjibransheikh): transport.js
+// reports the end once through onSessionClosed, and only a positive SAFARI_MCP_SESSION_IDLE_MIN
+// ends a quiet session.
+const httpEnv = (port, extra = {}) => ({ SAFARI_MCP_HTTP: "1", SAFARI_MCP_HTTP_PORT: String(port), ...extra });
+
+test("http mode: a DELETE reports the session to onSessionClosed exactly once", async () => {
+  const ended = [];
+  const handle = await startTransport(makeStubServer, httpEnv(9323), { onSessionClosed: (id) => ended.push(id) });
+  try {
+    const client = new Client({ name: "test-client", version: "0.0.0" });
+    const transport = new StreamableHTTPClientTransport(new URL("http://127.0.0.1:9323/mcp"));
+    await client.connect(transport);
+    const id = transport.sessionId;
+    await transport.terminateSession();
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(ended, [id]);
+    await client.close().catch(() => {});
+    await handle.close();
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(ended, [id], "a session that already ended is not reported again");
+  } finally {
+    await handle.close().catch(() => {});
+  }
+});
+
+test("http mode: no idle reaper unless SAFARI_MCP_SESSION_IDLE_MIN is positive", async () => {
+  for (const value of [undefined, "0", "off", "-5"]) {
+    const realSetInterval = globalThis.setInterval;
+    let intervals = 0;
+    globalThis.setInterval = /** @type {any} */ ((fn, ms) => { intervals++; return realSetInterval(fn, ms); });
+    let handle;
+    try {
+      handle = await startTransport(makeStubServer, httpEnv(9324, value === undefined ? {} : { SAFARI_MCP_SESSION_IDLE_MIN: value }));
+    } finally {
+      globalThis.setInterval = realSetInterval;
+    }
+    await handle.close();
+    assert.equal(intervals, 0, `SAFARI_MCP_SESSION_IDLE_MIN=${value} started a reaper`);
+  }
+});
+
+test("http mode: a positive SAFARI_MCP_SESSION_IDLE_MIN ends only the idle session", async () => {
+  const ended = [];
+  // 0.005 min = 300 ms idle, checked every 150 ms.
+  const handle = await startTransport(makeStubServer, httpEnv(9325, { SAFARI_MCP_SESSION_IDLE_MIN: "0.005" }), {
+    onSessionClosed: (id) => ended.push(id),
+  });
+  try {
+    const open = async () => {
+      const client = new Client({ name: "test-client", version: "0.0.0" });
+      const transport = new StreamableHTTPClientTransport(new URL("http://127.0.0.1:9325/mcp"));
+      await client.connect(transport);
+      return { client, transport };
+    };
+    const idle = await open();
+    const busy = await open();
+    const until = Date.now() + 900;
+    while (Date.now() < until) {
+      await busy.client.callTool({ name: "ping", arguments: {} });
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.deepEqual(ended, [idle.transport.sessionId]);
+    await busy.client.close().catch(() => {});
+    await idle.client.close().catch(() => {});
+  } finally {
+    await handle.close();
+  }
+});
