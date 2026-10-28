@@ -4,7 +4,7 @@ import { test } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
-async function listRegisteredTools() {
+async function listRegisteredTools(env = {}) {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: ["index.js"],
@@ -12,6 +12,7 @@ async function listRegisteredTools() {
     env: {
       ...process.env,
       SAFARI_MCP_QUIET: "1",
+      ...env,
     },
     stderr: "pipe",
   });
@@ -67,4 +68,16 @@ test("registered tools have valid schemas and unique names", async () => {
       `${tool.name} inputSchema missing properties`
     );
   }
+});
+
+test("SAFARI_MCP_TOOLS=core registers exactly the core tools, each of which exists", async () => {
+  const source = await readFile("index.js", "utf8");
+  const core = source.match(/const _CORE_TOOLS = `([^`]*)`/)[1].trim().split(/\s+/).map((name) => `safari_${name}`);
+  const all = (await listRegisteredTools()).tools.map((tool) => tool.name);
+  for (const name of core) assert.ok(all.includes(name), `${name} is not a tool`);
+  const { tools } = await listRegisteredTools({ SAFARI_MCP_TOOLS: "core" });
+  assert.deepEqual(tools.map((tool) => tool.name).sort(), [...core].sort());
+
+  const picked = await listRegisteredTools({ SAFARI_MCP_TOOLS: "safari_doctor, safari_new_tab" });
+  assert.deepEqual(picked.tools.map((tool) => tool.name).sort(), ["safari_doctor", "safari_new_tab"]);
 });

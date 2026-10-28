@@ -312,6 +312,8 @@ The recommended pattern for AI agents using Safari MCP:
 
 > **Tip:** Start with `safari_snapshot` to get element refs, then use refs for precise targeting. This is faster and more reliable than CSS selectors.
 
+After a click or a fill, `safari_snapshot` with `diff: true` returns only the lines that changed since that tab's previous snapshot: `+` lines are new and carry fresh refs, `-` lines are gone. The first call for a tab returns the full snapshot.
+
 ---
 
 ## Running several agents at once
@@ -383,6 +385,7 @@ What the flag deliberately does *not* do:
 | `SAFARI_MCP_ALLOW_USER_TABS` | off | Let `safari_switch_tab` adopt a tab **you** already had open, instead of refusing it (see below). |
 | `MCP_MAX_TABS` | `6` | Tabs one session may keep open. Opening one more closes that session's oldest tab, and `safari_new_tab` names it in `evictedTab` (its receipt). |
 | `SAFARI_MCP_RAISE_ON_NAVIGATE` | off | Let navigation bring Safari to the front, and stop the focus guard from putting your previous app back. |
+| `SAFARI_MCP_TOOLS` | all | `core` registers only the everyday tools (tabs, navigation, snapshot, reading, clicks, forms, evaluate, console, network, doctor), or give a comma list of tool names. For clients that load every tool definition up front. |
 | `SAFARI_MCP_SCREENSHOT_MAX_WIDTH` | unset | Downscale every `safari_screenshot` to this pixel width (Retina captures are 2× the viewport). Per-call `maxWidth` overrides it. |
 | `SAFARI_MCP_KEEPALIVE_TAB` | off | Keep one daemon-served page open in the profile window so Safari never parks the extension worker between commands. |
 | `SAFARI_MCP_OPEN_WINDOW_CMD` | unset | Command run with the profile name when the profile window is absent (e.g. after a reboot). Must open the window without focusing Safari. |

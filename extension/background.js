@@ -2194,7 +2194,13 @@ async function handleCommand(type, payload) {
             attrs += ` value="${esc(String(el.value).substring(0, 50))}"`;
           }
           if (el.type && el.tagName === "INPUT") attrs += ` type="${esc(el.type)}"`;
-          if (el.href && el.tagName === "A") attrs += ` href="${esc(el.href.substring(0, 100))}"`;
+          if (el.href && el.tagName === "A") {
+            // A link on this page's origin is shown as its path: the origin repeated on every
+            // link was a large share of a snapshot.
+            const sameOrigin = el.href.startsWith(location.origin + "/");
+            const href = sameOrigin ? el.href.slice(location.origin.length) : el.href;
+            attrs += ` href="${esc(href.substring(0, 100))}"`;
+          }
           if (el.disabled) attrs += " disabled";
           const ph = el.getAttribute("placeholder");
           if (ph) attrs += ` placeholder="${esc(ph)}"`;
@@ -2231,6 +2237,13 @@ async function handleCommand(type, payload) {
           }
 
           if (!children.trim() && !interactive) return "";
+
+          // A layout element with nothing of its own (no ref, role, id, label or title) is only
+          // its content. On table and div layouts these tags outweighed the text. Block ones
+          // leave a line break and cells and spans a space, so neighbouring texts stay apart.
+          if (!attrs && ["div", "span", "table", "tr", "td", "th"].includes(tag)) {
+            return children.trim() + (["span", "td", "th"].includes(tag) ? " " : "\n");
+          }
 
           return `<${tag}${attrs}>${children}</${tag}>`;
         }
