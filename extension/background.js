@@ -186,17 +186,37 @@ async function _waitForNavigatedTab(tabId, timeoutMs = 12000) {
   return null;
 }
 
+// safari_new_tab private:true opens in one private window of its own (no cookies or logins),
+// reused for later private tabs and never the shared default. If Safari will not make the window
+// private (the extension lacks "Allow in Private Browsing"), refuse: a normal window would hand a
+// logged-in tab to a caller that asked for a logged-out one.
+let _privateWindowId = null;
+async function _existingPrivateWindow() {
+  if (!_privateWindowId) {
+    _privateWindowId = (await browser.storage.local.get("mcpPrivateWindowId").catch(() => ({}))).mcpPrivateWindowId || null;
+  }
+  const win = _privateWindowId ? await browser.windows.get(_privateWindowId).catch(() => null) : null;
+  return win?.incognito ? win : null;
+}
+
 async function _newTabForSession(sessionId, payload) {
   const sid = sessionId || _DEFAULT_SESSION;
+  const incognito = payload.private === true;
   const hadSessionWindow = _sessionWindowIds.has(sid);
-  const preferredWindowId = _windowForSession(sessionId);
-  let profileWindow = preferredWindowId
-    ? await browser.windows.get(preferredWindowId).catch(() => null)
-    : null;
-
-  if (!profileWindow) {
-    const existingWindows = await browser.windows.getAll();
-    profileWindow = existingWindows[0] || null;
+  let profileWindow;
+  if (incognito) {
+    profileWindow = await _existingPrivateWindow();
+  } else {
+    // A normal tab never lands in a private window, even one the session adopted earlier.
+    const preferredWindowId = _windowForSession(sessionId);
+    profileWindow = preferredWindowId
+      ? await browser.windows.get(preferredWindowId).catch(() => null)
+      : null;
+    if (profileWindow?.incognito) profileWindow = null;
+    if (!profileWindow) {
+      const existingWindows = await browser.windows.getAll();
+      profileWindow = existingWindows.find((win) => !win.incognito) || null;
+    }
   }
 
   let newTab;
@@ -204,7 +224,19 @@ async function _newTabForSession(sessionId, payload) {
     // The extension worker is scoped to this Safari profile, so a WebExtension
     // window created here belongs to the verified profile. `focused: false`
     // keeps the recovery entirely in the background and avoids UI scripting.
-    profileWindow = await browser.windows.create({ url: "about:blank", focused: false });
+    profileWindow = await browser.windows.create({ url: "about:blank", focused: false, ...(incognito ? { incognito: true } : {}) });
+    if (incognito && profileWindow?.incognito !== true) {
+      // Safari returns no window, or a normal one, when the extension may not run in Private Browsing.
+      if (profileWindow) await browser.windows.remove(profileWindow.id).catch(() => {});
+      throw new Error(
+        "Safari did not open a private window. Enable Safari > Settings > Extensions > Safari MCP Bridge > " +
+        "Allow in Private Browsing, then retry."
+      );
+    }
+    if (incognito) {
+      _privateWindowId = profileWindow.id;
+      browser.storage.local.set({ mcpPrivateWindowId: _privateWindowId }).catch(() => {});
+    }
     const bootstrapTabs = profileWindow.tabs?.length
       ? profileWindow.tabs
       : await browser.tabs.query({ windowId: profileWindow.id });
@@ -224,7 +256,8 @@ async function _newTabForSession(sessionId, payload) {
   const openedWindowId = newTab.windowId || profileWindow.id;
   // A session that already owns a window must not move the shared default for every
   // other session merely because it opened another tab in its own window.
-  if (!_profileWindowId || !hadSessionWindow) {
+  // A private window never becomes the shared default.
+  if (!incognito && (!_profileWindowId || !hadSessionWindow)) {
     _profileWindowId = openedWindowId;
     browser.storage.local.set({ mcpProfileWindowId: _profileWindowId }).catch(() => {});
   }
@@ -270,6 +303,8 @@ async function _newTabForSession(sessionId, payload) {
     safeUrl: _safeTabUrl(receiptIdentity),
     ...(receipt ? { receipt } : {}),
     tabIndex: newTab.index + 1,
+    // Echoed so the server can tell an extension that honoured `private` from one that ignored it.
+    ...(incognito ? { private: true } : {}),
   };
 }
 

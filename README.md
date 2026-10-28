@@ -457,7 +457,7 @@ What the flag deliberately does *not* do:
 | Tool | Description |
 |------|-------------|
 | `safari_list_tabs` | List all tabs (index, title, URL) |
-| `safari_new_tab` | Open new tab (background, no focus steal) |
+| `safari_new_tab` | Open new tab (background, no focus steal); `private: true` opens it in a private window with no logins |
 | `safari_close_tab` | Close tab |
 | `safari_switch_tab` | Switch to tab by index |
 | `safari_wait_for_new_tab` | Wait for a new tab (e.g. OAuth popup) and auto-switch to it |
@@ -855,7 +855,7 @@ Note that Apple's *own* `safaridriver --mcp` server is the one that needs STP 24
 <details>
 <summary><b>Can it handle private/incognito tabs?</b></summary>
 
-Not as a supported mode, and it is untested. No tool opens a private window, and Safari disables extensions in Private Browsing unless you turn each one on explicitly, so the extension bridge — and everything in the "With Extension" column of [Safari Extension (Optional)](#safari-extension-optional) — is off there by default.
+Partly. `safari_new_tab({ private: true })` opens a tab in a private window of its own, with no cookies or logins, for checking a site as a logged-out visitor. It needs the extension's **Allow in Private Browsing** (Safari → Settings → Extensions); without it the call is refused, never opened as a normal logged-in tab, and AppleScript cannot open one. Other tools reach that tab by its receipt like any other, but private browsing is otherwise untested, and the "With Extension" column of [Safari Extension (Optional)](#safari-extension-optional) only applies there once the extension is allowed in Private Browsing.
 
 If you want an isolated identity, use a separate Safari **profile** instead: profile windows are a first-class concept here (see [Running several agents at once](#running-several-agents-at-once)).
 </details>
