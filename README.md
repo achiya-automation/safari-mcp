@@ -14,6 +14,7 @@
 [![npm downloads](https://img.shields.io/npm/dm/safari-mcp)](https://www.npmjs.com/package/safari-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![macOS](https://img.shields.io/badge/macOS-only-blue)](https://www.apple.com/macos/)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/achiya-automation/safari-mcp/badge)](https://scorecard.dev/viewer/?uri=github.com/achiya-automation/safari-mcp)
 
 [Install in VS Code](vscode:mcp/install?%7B%22safari-mcp%22%3A%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D%7D) ·
 [VS Code Insiders](https://insiders.vscode.dev/redirect?url=vscode-insiders:mcp/install?%7B%22safari-mcp%22%3A%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D%7D) ·
