@@ -17,6 +17,7 @@ Practical examples showing how AI agents use Safari MCP tools via the Model Cont
 | [Data Extraction](data-extraction.md) | Extract tables, links, meta tags, and structured data from any page |
 | [Network Monitoring](network-monitoring.md) | Capture API calls, inspect request/response details, and mock network responses |
 | [Multi-Tab Workflow](multi-tab-workflow.md) | Safely manage multiple tabs without touching the user's existing tabs |
+| [Storage and Sessions](storage-and-sessions.md) | Read and set localStorage, export a session's storage state, and import it into a fresh tab |
 
 ## How to read these examples
 
