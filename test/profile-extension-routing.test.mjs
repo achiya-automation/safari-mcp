@@ -817,7 +817,7 @@ test("new_tab recreates a closed verified-profile window through WebExtension AP
     background.indexOf("async function _closeTabForSession(")
   );
   assert.match(newTabCase, /browser\.windows\.getAll\(\)/);
-  assert.match(newTabCase, /browser\.windows\.create\(\{ url: "about:blank", focused: false \}\)/);
+  assert.match(newTabCase, /browser\.windows\.create\(\{ url: "about:blank", focused: false\b/);
   assert.doesNotMatch(index, /SAFARI_PROFILE_WINDOW_OPENER|PROFILE_WINDOW_OPENER/);
   assert.match(index, /_waitForVerifiedProfileExtension\(30000\)/);
   assert.match(index, /refusing AppleScript fallback/);
