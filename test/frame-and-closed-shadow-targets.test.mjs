@@ -256,6 +256,31 @@ test("with the bridge gone, a top-document click is still scheduled once", () =>
   assert.equal(h.injections.filter((call) => call.allFrames).length, 0, "a found target must not fall through to the all-frame fallback");
 }, { bridge: "dead" }));
 
+const CLICK_SEQUENCE = ["pointerdown", "mousedown", "pointerup", "mouseup", "click"];
+
+function recordClickSequence(el) {
+  const seen = [];
+  for (const type of CLICK_SEQUENCE) el.addEventListener(type, () => seen.push(type));
+  return seen;
+}
+
+test("with the bridge gone, a click still presses the pointer: a menu that opens on pointerdown opens", () => withHarness(async (h) => {
+  const seen = recordClickSequence(h.top.document.querySelector('[data-mcp-ref="2_2"]'));
+  assert.equal(await h.run("click", { ref: "2_2" }), "Scheduled mcp-content-click");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(seen, CLICK_SEQUENCE);
+}, { bridge: "dead" }));
+
+test("with the bridge gone, a rel=dialog link still gets a bare click", () => withHarness(async (h) => {
+  h.top.document.body.insertAdjacentHTML("beforeend", '<a id="dialog-link" rel="dialog" href="/x">Ask</a>');
+  const link = h.top.document.getElementById("dialog-link");
+  link.addEventListener("click", (event) => event.preventDefault());
+  const seen = recordClickSequence(link);
+  assert.equal(await h.run("click", { selector: "#dialog-link" }), "Scheduled mcp-content-click");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(seen, ["click"]);
+}, { bridge: "dead" }));
+
 test("with the bridge gone, fill reaches a field inside an iframe", () => withHarness(async (h) => {
   const result = await h.run("fill", { selector: '[data-mcp-ref="2_ns_2"]', value: "filled" });
   assert.notEqual(result, "Scheduled mcp-content-fill");

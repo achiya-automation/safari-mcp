@@ -3841,11 +3841,31 @@ async function sendContentCommand(tabId, type, payload, timeoutMs = 1500) {
             const cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2;
             let from = document.elementFromPoint(cx, cy);
             if (!from || !(from === el || el.contains(from))) from = el;
-            try { el.focus({ preventScroll: true }); } catch (_) { try { el.focus(); } catch (_) {} }
-            from.dispatchEvent(new MouseEvent("click", {
+            const common = {
               bubbles: true, cancelable: true, composed: true, view: window,
-              clientX: cx, clientY: cy, button: 0, buttons: 0, detail: 1,
-            }));
+              clientX: cx, clientY: cy, button: 0, detail: 1,
+            };
+            // Same sequence as handleClick in command-content.js: a bare click leaves
+            // anything that opens on pointerdown shut (Radix menus), while reporting success.
+            // Meta's rel=dialog gate is the exception, the prelude harms it there too.
+            const anchor = el.closest ? el.closest("a[href]") : null;
+            if (anchor && anchor.getAttribute("rel") === "dialog") {
+              from.dispatchEvent(new MouseEvent("click", { ...common, buttons: 0 }));
+              return;
+            }
+            const pointer = { ...common, pointerId: 1, pointerType: "mouse", isPrimary: true, width: 1, height: 1 };
+            const fire = (eventType, buttons) => from.dispatchEvent(eventType.startsWith("pointer")
+              ? new PointerEvent(eventType, { ...pointer, buttons, pressure: buttons ? 0.5 : 0 })
+              : new MouseEvent(eventType, { ...common, buttons }));
+            for (const eventType of ["pointerover", "mouseover", "pointerenter", "mouseenter", "pointermove", "mousemove"]) {
+              fire(eventType, 0);
+            }
+            fire("pointerdown", 1);
+            fire("mousedown", 1);
+            try { el.focus({ preventScroll: true }); } catch (_) { try { el.focus(); } catch (_) {} }
+            fire("pointerup", 0);
+            fire("mouseup", 0);
+            fire("click", 0);
           } catch (_) {}
         }, 0);
         return { ok: true, result: "Scheduled " + commandType };

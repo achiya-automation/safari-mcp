@@ -3380,6 +3380,12 @@ const jsKeyMap = {
   f1: "F1", f2: "F2", f3: "F3", f4: "F4", f5: "F5", f6: "F6",
 };
 
+// The extension dispatches `key` as given, and pages compare it to the DOM value, so the
+// short names safari_press_key documents ("down", "enter") must be translated before it.
+export function domKeyName(key) {
+  return jsKeyMap[String(key).toLowerCase()] || key;
+}
+
 // macOS virtual key codes for CGEvent keyboard (used by _helperNativeKeyboard).
 // These are the HID-level codes that postToPid uses, NOT JS keyCode values.
 const macKeyCodeMap = {
