@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`safari_click` opens menus when the tab's content bridge does not answer.** The recovery path in `sendContentCommand` sent only a focus and a `click`, and answered `Scheduled mcp-content-click` as if it had worked. Radix dropdowns and anything else that opens on `pointerdown` stayed shut (reproduced with `@radix-ui/react-dropdown-menu` 2.1.6 on Safari 27.2). The recovery path now sends the same pointer and mouse sequence as the bridge. `rel="dialog"` links keep their bare click. The Safari extension has to be rebuilt to get this.
+- **`safari_press_key` sends the key names it documents.** With the extension, `down` or `enter` reached the page as the literal strings `"down"` and `"enter"`, which pages ignore. Only `ArrowDown` and `Enter` worked. The server now translates the short names before sending them.
+
 ## [2.23.0] - 2026-10-28
 
 ### Added

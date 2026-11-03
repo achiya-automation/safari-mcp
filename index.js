@@ -2453,7 +2453,7 @@ async function _runExtensionBatchAction(action, args = {}) {
 
     case "pressKey":
       return await extensionOrFallback(
-        "press_key", { key: args.key, modifiers: args.modifiers },
+        "press_key", { key: safari.domKeyName(args.key), modifiers: args.modifiers },
         () => safari.pressKey(args)
       );
 
@@ -3284,7 +3284,7 @@ server.tool(
   },
   async (args) => {
     const result = await extensionOrFallback(
-      "press_key", { key: args.key, modifiers: args.modifiers, ..._explicitReceipt(args) },
+      "press_key", { key: safari.domKeyName(args.key), modifiers: args.modifiers, ..._explicitReceipt(args) },
       () => safari.pressKey(args)
     );
     return textResult(result);
