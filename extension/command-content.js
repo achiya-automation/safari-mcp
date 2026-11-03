@@ -789,3 +789,21 @@ function safeDispatch(el, event) {
 // added to an already-open tab; it schedules the call after executeScript has returned.
 globalThis.__mcpHandleContentClick = handleClick;
 globalThis.__mcpHandleContentFill = handleFill;
+
+// Ask once whether the background owns this tab; if it does, tell content.js (MAIN
+// world) to keep the page rendering while hidden. A blank tab is made first and owned
+// before it navigates, so the page's first load already answers yes; the retries cover
+// a worker that is still waking up. The message carries no data either way.
+(() => {
+  try { if (window.top !== window) return; } catch (_) { return; }
+  const ask = (left) => {
+    let sent;
+    try { sent = browser.runtime.sendMessage({ action: "mcpTabOwnedV1" }); } catch (_) { return; }
+    const retry = () => { if (left > 0) setTimeout(() => ask(left - 1), 1500); };
+    Promise.resolve(sent).then((r) => {
+      if (r && r.owned === true) window.postMessage({ __mcp: "keep_rendering_v1" }, "*");
+      else if (!r || r.owned !== false) retry();
+    }, retry);
+  };
+  ask(3);
+})();

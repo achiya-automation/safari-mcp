@@ -488,6 +488,21 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
     return false;
   }
+  // command-content.js asks whether its own tab is one the bridge owns, to keep that page
+  // rendering while hidden (content.js). Answers only about the sender's top frame, with
+  // a boolean: no tab id, receipt or session leaves the worker.
+  if (msg?.action === "mcpTabOwnedV1") {
+    if (Object.keys(msg).length !== 1) return false;
+    const tabId = sender?.tab?.id;
+    if (!Number.isInteger(tabId) || sender.frameId > 0) return false; // Safari may omit frameId; the asker checks it is the top frame
+    // A returned Promise, not sendResponse + `return true`: Safari dropped the async
+    // sendResponse here and the page got undefined.
+    // _sessionOwnedTabs, not the receipts: a new tab is owned before it navigates, but its
+    // receipt is minted after, so the page's first load would ask too early.
+    return _hydrateOwnedTabs().catch(() => {}).then(() => ({
+      owned: _tokenByTabId.has(tabId) || [..._sessionOwnedTabs.values()].some((ids) => ids.has(tabId)),
+    }));
+  }
   if (msg.action === "setEnabled") {
     _enabled = msg.enabled;
     if (!_enabled) {
@@ -597,6 +612,11 @@ async function connect() {
     ...BRIDGE_PORTS.map((port) => `http://127.0.0.1:${port}`),
   ].filter((url, index, all) => url && all.indexOf(url) === index);
 
+  // A daemon answers 423 while another healthy worker holds its lease. That holder may be
+  // another profile's worker on a port this worker remembered from an earlier run, so a
+  // 423 is remembered and the scan goes on; the short lease retry runs only when no
+  // candidate takes this worker.
+  let leaseHeld = false;
   for (const candidate of candidates) {
     try {
       HTTP_URL = candidate;
@@ -615,12 +635,8 @@ async function connect() {
       });
       if (_restartInvalidatedConnect(pollGeneration)) return;
       if (res.status === 423) {
-        isConnected = false;
-        updateBadge("");
-        _stopHeartbeat();
-        scheduleReconnect(3000);
-        _connecting = false;
-        return;
+        leaseHeld = true;
+        continue;
       }
       if (!res.ok) continue;
 
@@ -681,7 +697,13 @@ async function connect() {
   if (_restartInvalidatedConnect(pollGeneration)) return;
   isConnected = false;
   updateBadge("");
-  scheduleReconnect();
+  if (leaseHeld) {
+    // This worker may be the valid successor once the lease holder exits.
+    _stopHeartbeat();
+    scheduleReconnect(3000);
+  } else {
+    scheduleReconnect();
+  }
   _connecting = false;
 }
 
@@ -2100,6 +2122,10 @@ async function handleCommand(type, payload) {
           if (!el || el.nodeType !== 1) return false;
           const cs = window.getComputedStyle(el);
           if (cs.display === "none" || cs.visibility === "hidden" || cs.opacity === "0") return false;
+          // display:contents has no box of its own (a 0x0 rect), and walk() stops at an
+          // invisible node, so a whole app mounted in such a root came back empty (#187).
+          // Its children decide.
+          if (cs.display === "contents") return true;
           const r = el.getBoundingClientRect();
           return r.width > 0 && r.height > 0;
         }
@@ -2168,7 +2194,13 @@ async function handleCommand(type, payload) {
             attrs += ` value="${esc(String(el.value).substring(0, 50))}"`;
           }
           if (el.type && el.tagName === "INPUT") attrs += ` type="${esc(el.type)}"`;
-          if (el.href && el.tagName === "A") attrs += ` href="${esc(el.href.substring(0, 100))}"`;
+          if (el.href && el.tagName === "A") {
+            // A link on this page's origin is shown as its path: the origin repeated on every
+            // link was a large share of a snapshot.
+            const sameOrigin = el.href.startsWith(location.origin + "/");
+            const href = sameOrigin ? el.href.slice(location.origin.length) : el.href;
+            attrs += ` href="${esc(href.substring(0, 100))}"`;
+          }
           if (el.disabled) attrs += " disabled";
           const ph = el.getAttribute("placeholder");
           if (ph) attrs += ` placeholder="${esc(ph)}"`;
@@ -2205,6 +2237,13 @@ async function handleCommand(type, payload) {
           }
 
           if (!children.trim() && !interactive) return "";
+
+          // A layout element with nothing of its own (no ref, role, id, label or title) is only
+          // its content. On table and div layouts these tags outweighed the text. Block ones
+          // leave a line break and cells and spans a space, so neighbouring texts stay apart.
+          if (!attrs && ["div", "span", "table", "tr", "td", "th"].includes(tag)) {
+            return children.trim() + (["span", "td", "th"].includes(tag) ? " " : "\n");
+          }
 
           return `<${tag}${attrs}>${children}</${tag}>`;
         }
@@ -3802,11 +3841,31 @@ async function sendContentCommand(tabId, type, payload, timeoutMs = 1500) {
             const cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2;
             let from = document.elementFromPoint(cx, cy);
             if (!from || !(from === el || el.contains(from))) from = el;
-            try { el.focus({ preventScroll: true }); } catch (_) { try { el.focus(); } catch (_) {} }
-            from.dispatchEvent(new MouseEvent("click", {
+            const common = {
               bubbles: true, cancelable: true, composed: true, view: window,
-              clientX: cx, clientY: cy, button: 0, buttons: 0, detail: 1,
-            }));
+              clientX: cx, clientY: cy, button: 0, detail: 1,
+            };
+            // Same sequence as handleClick in command-content.js: a bare click leaves
+            // anything that opens on pointerdown shut (Radix menus), while reporting success.
+            // Meta's rel=dialog gate is the exception, the prelude harms it there too.
+            const anchor = el.closest ? el.closest("a[href]") : null;
+            if (anchor && anchor.getAttribute("rel") === "dialog") {
+              from.dispatchEvent(new MouseEvent("click", { ...common, buttons: 0 }));
+              return;
+            }
+            const pointer = { ...common, pointerId: 1, pointerType: "mouse", isPrimary: true, width: 1, height: 1 };
+            const fire = (eventType, buttons) => from.dispatchEvent(eventType.startsWith("pointer")
+              ? new PointerEvent(eventType, { ...pointer, buttons, pressure: buttons ? 0.5 : 0 })
+              : new MouseEvent(eventType, { ...common, buttons }));
+            for (const eventType of ["pointerover", "mouseover", "pointerenter", "mouseenter", "pointermove", "mousemove"]) {
+              fire(eventType, 0);
+            }
+            fire("pointerdown", 1);
+            fire("mousedown", 1);
+            try { el.focus({ preventScroll: true }); } catch (_) { try { el.focus(); } catch (_) {} }
+            fire("pointerup", 0);
+            fire("mouseup", 0);
+            fire("click", 0);
           } catch (_) {}
         }, 0);
         return { ok: true, result: "Scheduled " + commandType };

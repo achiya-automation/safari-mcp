@@ -28,6 +28,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { jpegSize } from "./image-size.js";
+import { diffSnapshots, lastSnapshots as _lastSnapshots } from "./snapshot-diff.js";
 import { createSafariSessionHintReader } from "./safari-session-hint.js";
 import { createStaleWorkerPolicy, leaseBuildVerdict, LEASE_BUILD_PREFERENCE_MS, HOME_CONTEXT_ALIVE_MS } from "./worker-upgrade.js";
 import {
@@ -252,6 +253,23 @@ async function _evictOldestTab(sessionId) {
     }
   }
   return null;
+}
+
+// An HTTP session that ended (its DELETE, or the opt-in idle reaper in transport.js) closes the
+// tabs it opened. They used to stay open until the daemon restarted, up to MAX_TABS for every
+// finished session. A tab whose close failed stays tracked, so shutdown and the memory sweep
+// still see it. Idea from PR #202 by @fahadjibransheikh.
+async function _closeSessionTabs(sessionId) {
+  const key = `${SESSION_ID}:${sessionId}`;
+  _activeReceipts.delete(key);
+  let closed = 0;
+  for (const [tabKey, info] of _sessionTabs(key)) {
+    const outcome = await _oneCloseAtATime(() => _closeTrackedTab(info));
+    if (outcome === "failed") continue;
+    _untrackTab(tabKey);
+    if (outcome === "closed") closed++;
+  }
+  if (closed) console.error(`[Safari MCP] Session ${sessionId.slice(0, 8)} ended — closed its ${closed} tab(s)`);
 }
 
 // What safari_new_tab tells the caller about the tab the cap closed. The receipt is how the
@@ -2435,7 +2453,7 @@ async function _runExtensionBatchAction(action, args = {}) {
 
     case "pressKey":
       return await extensionOrFallback(
-        "press_key", { key: args.key, modifiers: args.modifiers },
+        "press_key", { key: safari.domKeyName(args.key), modifiers: args.modifiers },
         () => safari.pressKey(args)
       );
 
@@ -2558,6 +2576,17 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
   if (_preferAppleScript && (!_extensionConnected || !_profileExtensionVerified)) {
     await _waitForVerifiedProfileExtension(30000);
   }
+  // Without a named profile a new tab gets a shorter grace. Safari suspends the worker now
+  // and then, and an AppleScript tab opened in that gap has no receipt, which the extension
+  // refuses once it is back. So when the extension served this daemon in the last two minutes,
+  // wait up to ~10 s (one proxy primary check) for it; a daemon that never had it, or lost it
+  // long ago, falls back at once. The timestamp lives on this function so the guard stays
+  // self-contained. Idea and diagnosis from PR #190 by @kad-xyz.
+  if (!_preferAppleScript && extensionType === "new_tab" && !_extensionConnected &&
+      Date.now() - (extensionOrFallback.servedAt || 0) < 120000) {
+    const deadline = Date.now() + 10500;
+    while (!_extensionConnected && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 250));
+  }
 
   // ========== FOCUS PRESERVATION ==========
   // Safari AppleScript/extension can steal focus (bring Safari window to front).
@@ -2660,6 +2689,7 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
         console.error(`[Safari MCP] ${extensionType} extension failed: ${err.message} — falling back to AppleScript`);
       }
     }
+    if (usedExtension) extensionOrFallback.servedAt = Date.now();
     if (!usedExtension) {
       if (_preferAppleScript) {
         // The extension answered here, so naming it unavailable sent callers after a bridge
@@ -2740,6 +2770,22 @@ safari.setExtensionTabMarker(async (marker) => {
   }
 });
 
+// SAFARI_MCP_TOOLS (idea from PR #204 by @fahadjibransheikh): "core" registers the everyday tools
+// below, or give a comma list of tool names, "core" allowed among them. Unset or "all" registers
+// every tool. A client that loads every definition up front pays for all of them on each turn.
+const _CORE_TOOLS = `
+  new_tab close_tab list_tabs switch_tab wait_for_new_tab navigate navigate_and_read go_back
+  reload snapshot read_page screenshot get_element extract_links click click_and_wait
+  fill fill_form type_text press_key select_option scroll hover upload_file
+  handle_dialog wait_for evaluate run_script get_console network doctor
+`.trim().split(/\s+/).map((name) => `safari_${name}`);
+function _toolsToRegister(spec) {
+  const names = String(spec || "").split(",").map((name) => name.trim()).filter(Boolean);
+  if (!names.length || names.includes("all")) return null;
+  return new Set(names.flatMap((name) => (name === "core" ? _CORE_TOOLS : [name])));
+}
+const _registeredTools = _toolsToRegister(process.env.SAFARI_MCP_TOOLS);
+
 // Read version from package.json to avoid hardcoded mismatch
 const _pkgVersion = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'package.json'), 'utf8')).version;
 // Factory so each MCP session (in HTTP mode) gets its own McpServer — McpServer is single-connection.
@@ -2752,6 +2798,10 @@ const server = new McpServer({
   version: _pkgVersion,
   description: "Safari browser automation - lightweight, keeps logins",
 });
+if (_registeredTools) {
+  const register = server.tool.bind(server);
+  server.tool = (name, ...rest) => (_registeredTools.has(name) ? register(name, ...rest) : undefined);
+}
 
 // ========== NAVIGATION ==========
 
@@ -2851,14 +2901,25 @@ server.tool(
 server.tool(
   "safari_snapshot",
   "PREFERRED way to see page state. Returns accessibility tree with ref IDs for every interactive element. Use refs with click/fill/type instead of CSS selectors. Workflow: snapshot → see refs → click({ref:'0_5'}). PREFER THIS over safari_screenshot (cheaper, structured text vs heavy image) and over safari_read_page (includes interactive refs). Use safari_screenshot only when you need to see visual layout/styling.",
-  { selector: z.string().optional().describe("CSS selector for subtree (default: full page)"), receipt: z.string().optional().describe("Tab receipt from safari_new_tab — pins this call to that tab (survives reconnects/subagents)"), },
+  {
+    selector: z.string().optional().describe("CSS selector for subtree (default: full page)"),
+    receipt: z.string().optional().describe("Tab receipt from safari_new_tab — pins this call to that tab (survives reconnects/subagents)"),
+    diff: z.boolean().optional().describe("Return only the lines that changed since this tab's previous snapshot (+ added, with fresh refs; - removed). Much smaller after a click or a fill"),
+  },
   async (args) => {
     const gen = safari.getNextSnapshotGen();
+    // Read before the call: a reply can make another tab the session's current one.
+    const tab = _receiptToken(args.receipt) || _getActiveReceipt() || "";
     const result = await extensionOrFallback(
       "snapshot", { selector: args.selector, gen, ..._explicitReceipt(args) },
       () => safari.takeSnapshot({ ...args, _gen: gen })
     );
-    return textResult(result);
+    if (typeof result !== "string") return textResult(result);
+    // Every snapshot is remembered, so the first diff:true after a plain snapshot has a base.
+    const previous = _lastSnapshots.swap(`${_receiptSessionKey()}|${tab}|${args.selector || ""}`, result);
+    if (!args.diff) return textResult(result);
+    if (previous === undefined) return textResult(`(No earlier snapshot of this tab to compare with, so this is the full snapshot.)\n${result}`);
+    return textResult(diffSnapshots(previous, result));
   }
 );
 
@@ -3227,7 +3288,7 @@ server.tool(
   },
   async (args) => {
     const result = await extensionOrFallback(
-      "press_key", { key: args.key, modifiers: args.modifiers, ..._explicitReceipt(args) },
+      "press_key", { key: safari.domKeyName(args.key), modifiers: args.modifiers, ..._explicitReceipt(args) },
       () => safari.pressKey(args)
     );
     return textResult(result);
@@ -3438,9 +3499,20 @@ server.tool(
     if (!viaAppleScript) safari.setActiveTabFromExtension(safeResult?.tabIndex, requestedUrl);
     // The eviction used to be stderr-only, so a session learned about its closed tab from
     // the next "receipt … stale" error. Say it in the response instead.
-    const out = evicted && safeResult && typeof safeResult === "object"
+    let out = evicted && safeResult && typeof safeResult === "object"
       ? { ...safeResult, ..._evictionReport(evicted) }
       : safeResult;
+    // Nothing in an AppleScript tab's result said it had no receipt; the caller learned it
+    // from the next refusal.
+    if (viaAppleScript && out && typeof out === "object" && !out.receipt) {
+      out = {
+        ...out,
+        receipt: null,
+        via: "applescript",
+        note: "The Safari extension was not connected, so AppleScript opened this tab without a receipt. " +
+          "Keep working in it without one, or open a new tab once safari_doctor shows the extension connected.",
+      };
+    }
     return { content: [{ type: "text", text: typeof out === 'string' ? out : JSON.stringify(out) }] };
   }
 );
@@ -4830,7 +4902,7 @@ if (!process.env.SAFARI_PROFILE) _startMemoryMonitor();
 
 // Transport is chosen at runtime: default stdio (unchanged), or a shared HTTP instance when
 // SAFARI_MCP_HTTP=1 (many Claude sessions → one process). buildServer is the per-session factory.
-const transportHandle = await startTransport(buildServer, process.env);
+const transportHandle = await startTransport(buildServer, process.env, { onSessionClosed: _closeSessionTabs });
 
 if (transportHandle.kind === "stdio") {
   // A client can disappear without delivering a signal. Treat its pipe closing as the stdio

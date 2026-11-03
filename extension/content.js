@@ -139,3 +139,59 @@ if (!window.__mcpTrustedPolicy && window.trustedTypes && typeof window.trustedTy
     // before page scripts. Leave undefined; evaluate fallbacks will probe other paths.
   }
 }
+
+// Keep an automation tab rendering while it is hidden: a background tab, or every tab
+// while the Mac's screen is locked. Safari then stops requestAnimationFrame entirely, and
+// apps that paint a streamed answer on the next frame (Perplexity, 26.10.2026) freeze
+// mid-answer until the tab is shown. Only a tab the extension owns switches this on
+// (command-content.js asks the background); the user's own tabs keep the native
+// behaviour, so their hidden tabs cost no CPU. Installed at document_start so the page's
+// own scripts capture the wrapped functions.
+if (!window.__mcpKeepRendering) {
+  (function () {
+    var on = false;
+    var nativeRaf = window.requestAnimationFrame && window.requestAnimationFrame.bind(window);
+    var nativeCaf = window.cancelAnimationFrame && window.cancelAnimationFrame.bind(window);
+    if (!nativeRaf || !nativeCaf) return;
+    var pending = new Map(); // id → { cb, nativeId, timer }
+    var nextId = 0;
+    function run(id) {
+      var p = pending.get(id);
+      if (!p) return;
+      pending.delete(id);
+      nativeCaf(p.nativeId);
+      if (p.timer) clearTimeout(p.timer);
+      p.cb(performance.now());
+    }
+    function arm(id) {
+      var p = pending.get(id);
+      if (p && !p.timer) p.timer = setTimeout(function () { run(id); }, 50);
+    }
+    window.requestAnimationFrame = function (cb) {
+      var id = ++nextId;
+      pending.set(id, { cb: cb, nativeId: nativeRaf(function () { run(id); }), timer: 0 });
+      if (on) arm(id);
+      return id;
+    };
+    window.cancelAnimationFrame = function (id) {
+      var p = pending.get(id);
+      if (!p) return;
+      pending.delete(id);
+      nativeCaf(p.nativeId);
+      if (p.timer) clearTimeout(p.timer);
+    };
+    function enable() {
+      if (on) return;
+      on = true;
+      pending.forEach(function (_p, id) { arm(id); });
+      try {
+        Object.defineProperty(document, "visibilityState", { configurable: true, get: function () { return "visible"; } });
+        Object.defineProperty(document, "hidden", { configurable: true, get: function () { return false; } });
+      } catch (_e) {}
+    }
+    window.addEventListener("message", function (e) {
+      if (e.source === window && e.data && e.data.__mcp === "keep_rendering_v1") enable();
+    });
+    window.__mcpKeepRendering = true;
+  })();
+}
