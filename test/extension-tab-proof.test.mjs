@@ -258,6 +258,7 @@ function loadSafari(browser) {
     execFileAsync: async (_cmd, [file]) => ({ stdout: String((await browser.run(files.get(file))) ?? "") }),
     tmpdir: () => "/tmp", join: (...parts) => parts.join("/"),
     _helperGetFrontApp: async () => null, restoreFocusIfStolen: async () => {}, _focusGuardActive: false,
+    _pinnedWindowOverride: null,
   };
   const safari = new Function(
     ...Object.keys(deps),
