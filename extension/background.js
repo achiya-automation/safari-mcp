@@ -186,6 +186,38 @@ async function _waitForNavigatedTab(tabId, timeoutMs = 12000) {
   return null;
 }
 
+// Opt-in (SAFARI_MCP_AGENT_WINDOW=1, sent as payload.agentWindow): agent tabs live in one window
+// of their own, opened unfocused behind the user's windows, so they never land among the user's
+// tabs. Safari has no tabGroups API for extensions, so a window is the closest substitute.
+// Its first tab stays as a blank parking tab: closing the agent's last real tab would otherwise
+// close the window, and reopening it later can bring Safari to the front.
+// A stored window id alone is not proof the window is still ours: the user can close it and
+// ids are not promised unique across restarts. The agent window is recognised by its parking
+// tab as well: the tab id recorded when the window was made, still in it, still blank. Its
+// position is no proof: Safari puts the user's pinned tabs first in every window.
+let _agentWindowRecord = null; // { windowId, parkingTabId }
+async function _agentWindowForTabs() {
+  if (!_agentWindowRecord) {
+    _agentWindowRecord = (await browser.storage.local.get("mcpAgentWindow").catch(() => ({}))).mcpAgentWindow || null;
+  }
+  const existing = _agentWindowRecord ? await browser.windows.get(_agentWindowRecord.windowId).catch(() => null) : null;
+  if (existing) {
+    const parking = _agentWindowRecord.parkingTabId != null
+      ? await browser.tabs.get(_agentWindowRecord.parkingTabId).catch(() => null)
+      : null;
+    if (parking?.windowId === existing.id && (!parking.url || parking.url === "about:blank")) return existing;
+  }
+  // 1440x900: one size for every session's screenshots and layouts, whatever the user's windows.
+  const created = await browser.windows.create({ url: "about:blank", focused: false, width: 1440, height: 900 });
+  // The window's own blank tab, not one of the user's pinned tabs Safari placed before it
+  // (Safari does not report them as pinned, so they are told apart by their pages).
+  const createdTabs = created.tabs?.length ? created.tabs : await browser.tabs.query({ windowId: created.id });
+  const parking = createdTabs.find((tab) => !tab.url || tab.url === "about:blank") || createdTabs[createdTabs.length - 1];
+  _agentWindowRecord = { windowId: created.id, parkingTabId: parking?.id };
+  browser.storage.local.set({ mcpAgentWindow: _agentWindowRecord }).catch(() => {});
+  return created;
+}
+
 async function _newTabForSession(sessionId, payload) {
   const sid = sessionId || _DEFAULT_SESSION;
   const hadSessionWindow = _sessionWindowIds.has(sid);
@@ -194,7 +226,14 @@ async function _newTabForSession(sessionId, payload) {
     ? await browser.windows.get(preferredWindowId).catch(() => null)
     : null;
 
-  if (!profileWindow) {
+  if (payload.agentWindow === true) {
+    // A session's own window (one it opened a tab in) is kept; with none, never the shared
+    // default, which is the user's focused window until the agent window takes its place.
+    profileWindow = hadSessionWindow
+      ? await browser.windows.get(_sessionWindowIds.get(sid)).catch(() => null)
+      : null;
+    if (!profileWindow) profileWindow = await _agentWindowForTabs();
+  } else if (!profileWindow) {
     const existingWindows = await browser.windows.getAll();
     profileWindow = existingWindows[0] || null;
   }
