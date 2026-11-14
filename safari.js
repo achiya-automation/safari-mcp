@@ -12,6 +12,7 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { VIEWPORT_SCRIPT, SAFE_AREA_SCRIPT, PWA_SCRIPT, WEBKIT_COMPAT_SCRIPT, ALL_SHEETS_FN } from "./injected-validators.js";
+import { NETWORK_CAPTURE_SCRIPT, networkDetailsScript } from "./injected-network.js";
 import { escJsSingleQuote, escAppleScriptString } from "./injected-escape.js";
 import { currentSessionId } from "./session-context.js";
 import { allowUserTabs } from "./ownership-state.js";
@@ -6249,44 +6250,15 @@ export async function waitForTime({ ms }) {
 // ========== NETWORK CAPTURE (Detailed) ==========
 
 export async function startNetworkCapture() {
-  await runJS(
-    `if(!window.__mcp_network){window.__mcp_network=[];
-    var origFetch=window.fetch;
-    window.fetch=function(){var url=arguments[0];var opts=arguments[1]||{};var start=Date.now();
-      return origFetch.apply(this,arguments).then(function(resp){
-        var entry={url:typeof url==='string'?url:url.url,method:opts.method||'GET',status:resp.status,statusText:resp.statusText,
-          type:'fetch',duration:Date.now()-start,headers:Object.fromEntries([...resp.headers.entries()].slice(0,20)),time:new Date().toISOString()};
-        window.__mcp_network.push(entry);if(window.__mcp_network.length>5000)window.__mcp_network.shift();return resp;
-      }).catch(function(err){
-        window.__mcp_network.push({url:typeof url==='string'?url:url.url,method:opts.method||'GET',error:err.message,type:'fetch',time:new Date().toISOString()});if(window.__mcp_network.length>5000)window.__mcp_network.shift();
-        throw err;
-      });
-    };
-    var origXHR=XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open=function(method,url){
-      this.__mcp_method=method;this.__mcp_url=url;this.__mcp_start=Date.now();
-      this.addEventListener('load',function(){
-        window.__mcp_network.push({url:this.__mcp_url,method:this.__mcp_method,status:this.status,statusText:this.statusText,
-          type:'xhr',duration:Date.now()-this.__mcp_start,responseSize:this.responseText.length,time:new Date().toISOString()});if(window.__mcp_network.length>5000)window.__mcp_network.shift();
-      });
-      this.addEventListener('error',function(){
-        window.__mcp_network.push({url:this.__mcp_url,method:this.__mcp_method,error:'Network error',type:'xhr',time:new Date().toISOString()});if(window.__mcp_network.length>5000)window.__mcp_network.shift();
-      });
-      return origXHR.apply(this,arguments);
-    };}`
-  );
-  return "Network capture started (fetch + XHR interception)";
+  return runJS(NETWORK_CAPTURE_SCRIPT);
 }
 
 export async function clearNetworkCapture() {
   return runJS("window.__mcp_network=[]; 'Network capture cleared'");
 }
 
-export async function getNetworkDetails({ limit = 50, filter } = {}) {
-  const filterStr = filter ? `.filter(function(r){return r.url.includes('${escJsSingleQuote(filter)}')})` : "";
-  return runJS(
-    `JSON.stringify((window.__mcp_network||[])${filterStr}.slice(-${Number(limit)}))`
-  );
+export async function getNetworkDetails(args = {}) {
+  return runJS(networkDetailsScript(args));
 }
 
 // ========== PERFORMANCE METRICS ==========
