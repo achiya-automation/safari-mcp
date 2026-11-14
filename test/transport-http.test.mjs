@@ -13,7 +13,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { request } from "node:http";
-import { startTransport, isLoopbackRequest } from "../transport.js";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { startTransport, isLoopbackRequest, resolveHttpToken, isAuthorized } from "../transport.js";
 
 function makeStubServer() {
   const server = new McpServer({ name: "safari-mcp-test", version: "0.0.0" });
@@ -210,4 +213,75 @@ test("http mode: a positive SAFARI_MCP_SESSION_IDLE_MIN ends only the idle sessi
   } finally {
     await handle.close();
   }
+});
+
+test("resolveHttpToken: unset means no auth, and a token file wins over the variable", () => {
+  assert.equal(resolveHttpToken({}), null);
+  assert.equal(resolveHttpToken({ SAFARI_MCP_HTTP_TOKEN: "" }), null);
+  assert.equal(resolveHttpToken({ SAFARI_MCP_HTTP_TOKEN: " s3cret \n" }), "s3cret");
+  const dir = mkdtempSync(join(tmpdir(), "safari-mcp-token-"));
+  try {
+    const file = join(dir, "token");
+    writeFileSync(file, "from-file\n");
+    assert.equal(resolveHttpToken({ SAFARI_MCP_HTTP_TOKEN_FILE: file, SAFARI_MCP_HTTP_TOKEN: "from-env" }), "from-file");
+    // A token source that was asked for but cannot be used must stop the daemon, not open the port.
+    writeFileSync(file, " \n");
+    assert.throws(() => resolveHttpToken({ SAFARI_MCP_HTTP_TOKEN_FILE: file }), /empty/);
+    assert.throws(() => resolveHttpToken({ SAFARI_MCP_HTTP_TOKEN_FILE: join(dir, "missing") }), /ENOENT/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("isAuthorized: only a Bearer header that carries the exact token", () => {
+  assert.ok(isAuthorized("Bearer s3cret", "s3cret"));
+  assert.ok(isAuthorized("bearer   s3cret ", "s3cret"), "scheme is case-insensitive");
+  assert.ok(!isAuthorized(undefined, "s3cret"), "no header");
+  assert.ok(!isAuthorized("s3cret", "s3cret"), "no scheme");
+  assert.ok(!isAuthorized("Basic s3cret", "s3cret"), "another scheme");
+  assert.ok(!isAuthorized("Bearer s3cre", "s3cret"), "a prefix of the token");
+  assert.ok(!isAuthorized("Bearer s3cret2", "s3cret"), "a longer token");
+});
+
+test("http mode: with a token set, a request without it gets 401 and an MCP client with it works", async () => {
+  const handle = await startTransport(makeStubServer, httpEnv(9326, { SAFARI_MCP_HTTP_TOKEN: "s3cret" }));
+  try {
+    const initialize = (headers) =>
+      fetch("http://127.0.0.1:9326/mcp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...headers },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "0" } },
+        }),
+      });
+    const missing = await initialize({});
+    assert.equal(missing.status, 401);
+    assert.equal(missing.headers.get("www-authenticate"), "Bearer");
+    assert.equal((await initialize({ Authorization: "Bearer wrong" })).status, 401);
+    assert.equal((await initialize({ Authorization: "Bearer s3cret" })).status, 200);
+
+    const client = new Client({ name: "test-client", version: "0.0.0" });
+    await client.connect(
+      new StreamableHTTPClientTransport(new URL("http://127.0.0.1:9326/mcp"), {
+        requestInit: { headers: { Authorization: "Bearer s3cret" } },
+      })
+    );
+    const res = await client.callTool({ name: "ping", arguments: {} });
+    assert.equal(res.content[0].text, "pong");
+    await client.close();
+  } finally {
+    await handle.close();
+  }
+});
+
+test("http mode: an unusable token file stops the daemon before it listens", async () => {
+  await assert.rejects(
+    startTransport(makeStubServer, httpEnv(9327, { SAFARI_MCP_HTTP_TOKEN_FILE: join(tmpdir(), "safari-mcp-no-such-token") })),
+    /ENOENT/
+  );
+  // Nothing is left listening on the port.
+  await assert.rejects(fetch("http://127.0.0.1:9327/mcp", { method: "POST" }));
 });
