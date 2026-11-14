@@ -7,7 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`safari_network_details` returns request and response bodies, request headers and WebSocket frames.** The capture started by `safari_start_network_capture` recorded only the URL, method, status and the first twenty response headers of a `fetch`, and less for XHR. It now records request headers and bodies and response headers and bodies for both, the frames of each WebSocket in both directions, and `navigator.sendBeacon` calls. The list stays short: each request carries an `id` and its body sizes, and `safari_network_details({ id })` returns that one request in full. Text bodies are capped at 20,000 characters, binary ones are reported by size, and only the 200 most recent requests keep their bodies.
+
 ### Fixed
+- **An XHR with `responseType` `json`, `blob` or `arraybuffer` is captured.** The load handler read `responseText`, which throws for those response types, so the request never reached the list.
+- **A `fetch(new URL(...))` call is captured with its URL** instead of an entry without one.
 - **`safari_click` opens menus when the tab's content bridge does not answer.** The recovery path in `sendContentCommand` sent only a focus and a `click`, and answered `Scheduled mcp-content-click` as if it had worked. Radix dropdowns and anything else that opens on `pointerdown` stayed shut (reproduced with `@radix-ui/react-dropdown-menu` 2.1.6 on Safari 27.2). The recovery path now sends the same pointer and mouse sequence as the bridge. `rel="dialog"` links keep their bare click. The Safari extension has to be rebuilt to get this.
 - **`safari_press_key` sends the key names it documents.** With the extension, `down` or `enter` reached the page as the literal strings `"down"` and `"enter"`, which pages ignore. Only `ArrowDown` and `Enter` worked. The server now translates the short names before sending them.
 
