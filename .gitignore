@@ -32,3 +32,6 @@ eslint-report.json
 
 # מחוללי גיבוי מקומיים של עבודת ה-frames — לא חלק מהחבילה
 .bak-frames/
+
+# scripts/release-app.sh output (the notarized zip and its checksum)
+build/

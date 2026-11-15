@@ -20,8 +20,12 @@ test("the Safari worker authenticates every localhost bridge request", () => {
   assert.match(worker, /browser\.runtime\.getURL\("bridge-auth-token"\)/);
   assert.match(worker, /headers\.set\("X-Safari-MCP-Token"/);
   assert.match(worker, /headers\.set\("X-Safari-MCP-Worker"/);
+  // POST /pair is the one bridge request without a token: it is how a downloaded app gets one.
+  const pairingRequests = worker.split("\n").filter((line) => line.includes("${bridgeUrl}/pair`"));
+  assert.equal(pairingRequests.length, 1);
+  assert.match(pairingRequests[0], /await fetch\(`\$\{bridgeUrl\}\/pair`, \{$/);
   const bridgeRequestLines = worker.split("\n").filter(
-    (line) => line.includes("${HTTP_URL}/") || line.includes("${bridgeUrl}/")
+    (line) => (line.includes("${HTTP_URL}/") || line.includes("${bridgeUrl}/")) && !pairingRequests.includes(line)
   );
   assert.ok(bridgeRequestLines.length >= 6);
   assert.ok(bridgeRequestLines.every((line) => line.includes("_bridgeFetch(")));

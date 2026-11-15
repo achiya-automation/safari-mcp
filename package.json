@@ -6,7 +6,7 @@
   "type": "module",
   "main": "index.js",
   "bin": {
-    "safari-mcp": "index.js"
+    "safari-mcp": "cli.js"
   },
   "scripts": {
     "start": "node index.js",
@@ -62,7 +62,9 @@
     "darwin"
   ],
   "files": [
+    "cli.js",
     "index.js",
+    "pairing.js",
     "transport.js",
     "response.js",
     "safari.js",

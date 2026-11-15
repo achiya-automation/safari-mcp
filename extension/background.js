@@ -36,26 +36,95 @@ async function _storedReloadHandoffToken() {
     : "";
 }
 
+// A downloaded app carries no token: the user pairs it once (`npx safari-mcp pair`, then the
+// popup), and the token lands here. Pages cannot read extension storage. The extension's own
+// content scripts could, but they cannot present it: their requests carry the page's
+// origin, which the bridge refuses before it reads any token. The wake capability they do
+// need stays a separate derived value (_publishContentWakeToken).
+const _PAIRED_BRIDGE_TOKEN_KEY = "mcpPairedBridgeTokenV1";
+// "" = no known credential problem; "unpaired" = no token at all; "rejected" = a bridge
+// answered 401 to this worker's token. The popup offers pairing for the last two.
+let _bridgeAuthProblem = "";
+
 async function _bridgeAuthToken() {
   if (!_bridgeAuthTokenPromise) {
-    // Bounded: an extension-resource fetch that never settles would wedge every
-    // connect() behind it — this is the one await before /connect with no timeout.
-    _bridgeAuthTokenPromise = fetch(browser.runtime.getURL("bridge-auth-token"), {
-      cache: "no-store",
-      signal: AbortSignal.timeout(5000),
-    }).then(async (response) => {
+    _bridgeAuthTokenPromise = (async () => {
+      // A pairing is newer than any build, so it wins over a built-in token.
+      const stored = await browser.storage.local.get(_PAIRED_BRIDGE_TOKEN_KEY).catch(() => ({}));
+      const paired = String(stored?.[_PAIRED_BRIDGE_TOKEN_KEY] || "");
+      if (/^[0-9a-f]{64}$/.test(paired)) return paired;
+      // A locally built app has the token as a private resource (scripts/embed-bridge-token.sh).
+      // Bounded: an extension-resource fetch that never settles would wedge every
+      // connect() behind it — this is the one await before /connect with no timeout.
+      const response = await fetch(browser.runtime.getURL("bridge-auth-token"), {
+        cache: "no-store",
+        signal: AbortSignal.timeout(5000),
+      });
       if (!response.ok) throw new Error("Safari MCP bridge authentication resource is unavailable");
       const token = (await response.text()).trim();
       if (!/^[0-9a-f]{64}$/.test(token)) {
         throw new Error("Safari MCP bridge authentication resource is invalid");
       }
       return token;
-    }).catch((error) => {
+    })().catch((error) => {
       _bridgeAuthTokenPromise = null;
       throw error;
     });
   }
   return _bridgeAuthTokenPromise;
+}
+
+function _showPairingNeeded(problem) {
+  _bridgeAuthProblem = problem;
+  browser.storage.local.set({ mcpStatus: problem }).catch(() => {});
+  try {
+    browser.action.setBadgeText({ text: "PAIR" });
+    browser.action.setBadgeBackgroundColor({ color: "#FF9800" });
+  } catch {}
+}
+
+// Trades a code from `npx safari-mcp pair` for the bridge token. Every profile daemon reads
+// the same ~/.safari-mcp-bridge-token, so whichever bridge answers first can pair.
+async function _pairWithBridge(code) {
+  const stored = await browser.storage.local.get("mcpBridgeUrl").catch(() => ({}));
+  const candidates = [
+    stored.mcpBridgeUrl,
+    ...BRIDGE_PORTS.map((port) => `http://127.0.0.1:${port}`),
+  ].filter((url, index, all) => url && all.indexOf(url) === index);
+  for (const bridgeUrl of candidates) {
+    let response;
+    try {
+      response = await fetch(`${bridgeUrl}/pair`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: String(code || "").slice(0, 64) }),
+        cache: "no-store",
+        signal: AbortSignal.timeout(3000),
+      });
+    } catch {
+      continue; // nothing listens on this port
+    }
+    const reply = await response.json().catch(() => ({}));
+    if (response.status === 404) {
+      return { ok: false, error: "This Safari MCP server is too old to pair. Update it (npx safari-mcp@latest), restart your MCP client, and try again." };
+    }
+    const token = String(reply?.token || "");
+    if (!response.ok || !/^[0-9a-f]{64}$/.test(token)) {
+      return { ok: false, error: String(reply?.error || `The Safari MCP server refused the code (HTTP ${response.status}).`) };
+    }
+    await browser.storage.local.set({ [_PAIRED_BRIDGE_TOKEN_KEY]: token });
+    _bridgeAuthTokenPromise = null;
+    _bridgeAuthProblem = "";
+    _publishContentWakeToken().catch(() => {});
+    if (!isConnected) {
+      if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
+      _reconnectDelay = 3000;
+      updateBadge("");
+      connect(); // a connect already in flight retries in 3 s with the new token
+    }
+    return { ok: true };
+  }
+  return { ok: false, error: "No Safari MCP server is running. Start your MCP client (it starts safari-mcp), then try again." };
 }
 
 async function _bridgeFetch(url, init = {}) {
@@ -522,8 +591,13 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false;
   }
   if (msg.action === "getStatus") {
-    sendResponse({ connected: isConnected, enabled: _enabled });
+    sendResponse({ connected: isConnected, enabled: _enabled, auth: _bridgeAuthProblem });
     return false; // Synchronous response
+  }
+  // Only the popup pairs. A content script's message always names its sender tab.
+  if (msg.action === "pairBridge") {
+    if (sender?.tab) return false;
+    return _pairWithBridge(msg.code); // a Promise: Safari drops an async sendResponse
   }
   return false;
 });
@@ -606,6 +680,16 @@ async function connect() {
     pollAbort = null;
   }
 
+  if (!(await _bridgeAuthToken().catch(() => ""))) {
+    // A downloaded app before its first pairing. Pairing calls connect() itself; the retry
+    // only covers a built-in token whose read failed once.
+    if (_restartInvalidatedConnect(pollGeneration)) return;
+    _showPairingNeeded("unpaired");
+    scheduleReconnect();
+    _connecting = false;
+    return;
+  }
+
   const storedBridge = await browser.storage.local.get("mcpBridgeUrl").catch(() => ({}));
   const candidates = [
     storedBridge.mcpBridgeUrl,
@@ -617,6 +701,7 @@ async function connect() {
   // 423 is remembered and the scan goes on; the short lease retry runs only when no
   // candidate takes this worker.
   let leaseHeld = false;
+  let tokenRejected = false;
   for (const candidate of candidates) {
     try {
       HTTP_URL = candidate;
@@ -638,6 +723,7 @@ async function connect() {
         leaseHeld = true;
         continue;
       }
+      if (res.status === 401) tokenRejected = true;
       if (!res.ok) continue;
 
       const data = await res.json().catch(() => ({}));
@@ -680,6 +766,7 @@ async function connect() {
       await browser.storage.local.set({ mcpBridgeUrl: HTTP_URL }).catch(() => {});
       if (_restartInvalidatedConnect(pollGeneration)) return;
       isConnected = true;
+      _bridgeAuthProblem = "";
       _reconnectDelay = 3000; // Reset backoff on success
       // A retry scheduled before this attempt succeeded (the wake alarm, a lease-held
       // backoff) would run connect() again seconds later, invalidate this healthy loop and
@@ -696,7 +783,14 @@ async function connect() {
   // No matching server available — retry with exponential backoff.
   if (_restartInvalidatedConnect(pollGeneration)) return;
   isConnected = false;
-  updateBadge("");
+  if (tokenRejected && !leaseHeld) {
+    // A stale built-in token, or a pairing older than the bridge's token file: the user has
+    // to pair (again). The retry stays on, since the bridge that knows this token may not be up yet.
+    _showPairingNeeded("rejected");
+  } else {
+    _bridgeAuthProblem = "";
+    updateBadge("");
+  }
   if (leaseHeld) {
     // This worker may be the valid successor once the lease holder exits.
     _stopHeartbeat();

@@ -7,12 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **The Safari extension pairs with `npx safari-mcp pair` instead of carrying your bridge token from the build.** A local Xcode build bakes this Mac's bridge token into the extension, so one signed app could not serve everyone. Now `npx safari-mcp pair` prints an 8-character code. It works once, expires after 10 minutes, burns after 5 wrong tries, and is stored only as a SHA-256 in `~/.safari-mcp-pairing`. The user enters it in the extension popup. The bridge's new `POST /pair` endpoint answers only an extension origin and returns the token, which the extension keeps in `browser.storage.local`. The token never appears in a URL or a log. Until the extension is paired, the toolbar badge reads **PAIR** and the popup shows the two steps. The same happens when the bridge stops accepting the token. A local build still embeds the token and connects without pairing; a paired token takes precedence. `test/pairing.test.mjs`. Manifest 2.10.34.
+- **`scripts/release-app.sh` builds the downloadable app.** It archives with no bridge token inside (`SAFARI_MCP_EMBED_BRIDGE_TOKEN=NO`), exports with a Developer ID, notarizes with `notarytool`, staples, checks Gatekeeper, and attaches `Safari-MCP.app.zip` to the GitHub release. The README now installs the extension from `releases/latest/download/Safari-MCP.app.zip`, and building from source is the contributor path. A release cut without a new build gets the newest zip from an older release (`release.yml`), so the link keeps working.
+
 ### Fixed
 - **`safari_click` opens menus when the tab's content bridge does not answer.** The recovery path in `sendContentCommand` sent only a focus and a `click`, and answered `Scheduled mcp-content-click` as if it had worked. Radix dropdowns and anything else that opens on `pointerdown` stayed shut (reproduced with `@radix-ui/react-dropdown-menu` 2.1.6 on Safari 27.2). The recovery path now sends the same pointer and mouse sequence as the bridge. `rel="dialog"` links keep their bare click. The Safari extension has to be rebuilt to get this.
 - **`safari_press_key` sends the key names it documents.** With the extension, `down` or `enter` reached the page as the literal strings `"down"` and `"enter"`, which pages ignore. Only `ArrowDown` and `Enter` worked. The server now translates the short names before sending them.
 
 ### Changed
 - **The macOS app's `MARKETING_VERSION` matches the extension manifest again (2.10.33).** It had stayed at 2.10.27 while the manifest moved on, so the app and the extension inside it reported different versions from the bundled manifest.
+- **The npm `bin` is `cli.js`.** It runs `safari-mcp pair` without starting the server, and otherwise loads `index.js` as before.
 
 ## [2.23.0] - 2026-10-28
 

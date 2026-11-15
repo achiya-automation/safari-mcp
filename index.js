@@ -42,6 +42,7 @@ import {
 } from "./worker-ledger.js";
 import { Socket } from "node:net";
 import { ignoreTypeOfServiceEinval } from "./node-compat.js";
+import { consumePairingCode } from "./pairing.js";
 
 // Before the first fetch: a secondary's /proxy-check to a primary that just went away
 // must reject, not end the process (#140).
@@ -64,9 +65,10 @@ function _getProxyToken() {
 }
 const PROXY_TOKEN = _getProxyToken();
 
-// The Safari extension bridge uses a separate per-install secret. The signed
-// extension bundle receives the same value as a private resource at build time;
-// it never travels in a URL or page state. Keeping this separate from the proxy
+// The Safari extension bridge uses a separate per-install secret. A locally built
+// extension receives the same value as a private resource at build time; a downloaded
+// one gets it once through POST /pair. It never travels in a URL or page state, and is
+// never logged. Keeping this separate from the proxy
 // token prevents a compromised extension transport from authenticating as a
 // secondary MCP process.
 const BRIDGE_TOKEN_FILE = join(homedir(), ".safari-mcp-bridge-token");
@@ -1124,6 +1126,41 @@ try {
       return;
     }
 
+    // POST /pair — `safari-mcp pair` printed a one-time code; the extension's popup trades
+    // it here for the bridge token, so a downloaded app needs none built in. Unlike the
+    // routes below, a missing Origin is refused too: only an extension page may ask, and a
+    // web page cannot send an extension origin. The token goes only into this response body.
+    if (req.method === "POST" && req.url === "/pair") {
+      if (!_isExtensionSchemeOrigin(origin)) {
+        res.writeHead(403);
+        res.end("Forbidden");
+        return;
+      }
+      let body = "";
+      let bodyTooLarge = false;
+      req.on("data", (chunk) => {
+        if (bodyTooLarge) return;
+        body += chunk;
+        if (body.length > 1024) { bodyTooLarge = true; res.writeHead(413); res.end(); req.destroy(); }
+      });
+      req.on("end", () => {
+        if (bodyTooLarge) return;
+        let code = "";
+        try { code = String(JSON.parse(body)?.code ?? ""); } catch {}
+        const verdict = consumePairingCode(code);
+        const reply = {
+          ok: [200, { token: BRIDGE_TOKEN }],
+          invalid: [401, { error: "That pairing code is not valid. Check it, or run npx safari-mcp pair for a new one." }],
+          missing: [401, { error: "No pairing code is waiting. Run npx safari-mcp pair first." }],
+          expired: [410, { error: "That pairing code has expired. Run npx safari-mcp pair for a new one." }],
+        }[verdict];
+        if (verdict === "ok") console.error("[Safari MCP] A Safari extension paired with this bridge.");
+        res.writeHead(reply[0], { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        res.end(JSON.stringify(reply[1]));
+      });
+      return;
+    }
+
     // Every Safari-extension HTTP endpoint is authenticated in addition to its
     // CORS check. Origin alone is not authority: another extension has its own
     // extension-scheme origin, and a local process can forge or omit Origin.
@@ -1144,8 +1181,9 @@ try {
         _rejectedWorkerIdsLogged.add(rejectedId);
         console.error(
           `[Safari MCP] ⚠️ Extension worker ${rejectedId.slice(0, 8)} rejected (401) on ${req.method} ${req.url.split("?")[0]}: ` +
-          `its bridge token does not match extension/bridge-auth-token as this host read it — a worker started ` +
-          `before the app was rebuilt, or two checkouts with different tokens. Relaunch Safari (or reinstall the app).`
+          `its bridge token does not match ~/.safari-mcp-bridge-token as this host read it — a worker started ` +
+          `before the app was rebuilt, two checkouts with different tokens, or a pairing older than the token file. ` +
+          `Pair again (npx safari-mcp pair) or relaunch Safari (or reinstall the app).`
         );
       }
       res.writeHead(401);

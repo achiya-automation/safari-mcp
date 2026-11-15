@@ -716,6 +716,9 @@ test("OFF→ON during connect starts one fresh generation after prior command ex
      let _reconnectTimer = null;
      const _BRIDGE_RELOAD_HANDOFF_KEY = "reload";
      let _commandExecutionTail = new Promise((resolve) => { globalThis.__releaseOldCommand = resolve; });
+     let _bridgeAuthProblem = "";
+     const _bridgeAuthToken = async () => "0".repeat(64);
+     const _showPairingNeeded = (problem) => { _bridgeAuthProblem = problem; };
      ${connectSource}
      return {
        connect,
