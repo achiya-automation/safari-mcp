@@ -1,16 +1,18 @@
 #!/bin/sh
 set -eu
 
-# A downloadable release must not carry the builder's own token: its users pair instead
-# (`npx safari-mcp pair`). scripts/release-app.sh builds with SAFARI_MCP_EMBED_BRIDGE_TOKEN=NO.
-if [ "${SAFARI_MCP_EMBED_BRIDGE_TOKEN:-YES}" = "NO" ]; then
-  echo "Safari MCP: not embedding a bridge token (SAFARI_MCP_EMBED_BRIDGE_TOKEN=NO); the extension will ask to pair."
-  exit 0
-fi
-
 token_file="${HOME}/.safari-mcp-bridge-token"
 resource_dir="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
 resource_file="${resource_dir}/bridge-auth-token"
+
+# A downloadable release must not carry the builder's own token: its users pair instead
+# (`npx safari-mcp pair`). scripts/release-app.sh builds with SAFARI_MCP_EMBED_BRIDGE_TOKEN=NO.
+if [ "${SAFARI_MCP_EMBED_BRIDGE_TOKEN:-YES}" = "NO" ]; then
+  # An earlier local build into the same folder may have left its token there.
+  /bin/rm -f "${resource_file}"
+  echo "Safari MCP: not embedding a bridge token (SAFARI_MCP_EMBED_BRIDGE_TOKEN=NO); the extension will ask to pair."
+  exit 0
+fi
 
 if ! [ -s "${token_file}" ] || ! /usr/bin/grep -Eq '^[0-9a-f]{64}$' "${token_file}"; then
   umask 077

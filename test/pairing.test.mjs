@@ -11,10 +11,10 @@
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { once } from "node:events";
-import { mkdtempSync, readFileSync, statSync, existsSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, statSync, existsSync, writeFileSync, rmSync, chmodSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { JSDOM } from "jsdom";
 import { createPairingCode, consumePairingCode, normalizePairingCode, PAIRING_TTL_MS } from "../pairing.js";
@@ -39,6 +39,19 @@ test("a code works once, however it is typed", () => {
   assert.equal(consumePairingCode(typed, { file }), "ok");
   assert.equal(existsSync(file), false);
   assert.equal(consumePairingCode(code, { file }), "missing");
+});
+
+test("a bridge that cannot remove the code file hands out no token", { skip: process.getuid?.() === 0 && "root can remove it anyway" }, () => {
+  // Bridges on several ports share the file. When two match the same code at once, the one
+  // that finds it already gone must not pair too. A read-only folder fails the removal the same way.
+  const file = tempFile();
+  const code = createPairingCode({ file });
+  chmodSync(dirname(file), 0o500);
+  try {
+    assert.equal(consumePairingCode(code, { file }), "missing");
+  } finally {
+    chmodSync(dirname(file), 0o700);
+  }
 });
 
 test("letters that look like digits read as those digits", () => {
@@ -165,6 +178,12 @@ test("a refused code is reported and stores nothing", async () => {
 test("a bridge without /pair is named as too old; no bridge at all is named too", async () => {
   const old = pairingHarness({ fetch: async () => new Response("Not found", { status: 404 }) });
   assert.match((await old._pairWithBridge("0000-0000")).error, /too old to pair/);
+  // An old daemon on one port must not hide a newer one on the next.
+  const mixed = pairingHarness({
+    fetch: async (url) => (url.includes(":9224/") ? new Response("Not found", { status: 404 }) : Response.json({ token: TOKEN })),
+  });
+  assert.deepEqual(await mixed._pairWithBridge("0000-0000"), { ok: true });
+  assert.equal(mixed.store.mcpPairedBridgeTokenV1, TOKEN);
   const none = pairingHarness({ fetch: async () => { throw new TypeError("refused"); } });
   assert.match((await none._pairWithBridge("0000-0000")).error, /No Safari MCP server is running/);
 });
@@ -276,6 +295,13 @@ test("a local build embeds this Mac's token; a release build embeds none", () =>
   });
   assert.equal(again, "");
   assert.equal(readFileSync(local.resource, "utf8").trim(), "e".repeat(64));
+
+  // A release build into a folder that a local build used removes the token left there.
+  execFileSync("/bin/sh", [embedScript], {
+    env: { PATH: process.env.PATH, HOME: local.home, TARGET_BUILD_DIR: join(local.home, "build"), UNLOCALIZED_RESOURCES_FOLDER_PATH: "Resources", SAFARI_MCP_EMBED_BRIDGE_TOKEN: "NO" },
+    encoding: "utf8",
+  });
+  assert.equal(existsSync(local.resource), false);
 });
 
 async function freePort() {

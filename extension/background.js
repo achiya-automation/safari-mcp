@@ -84,8 +84,10 @@ function _showPairingNeeded(problem) {
 }
 
 // Trades a code from `npx safari-mcp pair` for the bridge token. Every profile daemon reads
-// the same ~/.safari-mcp-bridge-token, so whichever bridge answers first can pair.
+// the same ~/.safari-mcp-bridge-token, so whichever bridge answers first can pair. A daemon
+// from before pairing answers 404 and is skipped: a newer one may listen on another port.
 async function _pairWithBridge(code) {
+  let oldServer = false;
   const stored = await browser.storage.local.get("mcpBridgeUrl").catch(() => ({}));
   const candidates = [
     stored.mcpBridgeUrl,
@@ -104,10 +106,11 @@ async function _pairWithBridge(code) {
     } catch {
       continue; // nothing listens on this port
     }
-    const reply = await response.json().catch(() => ({}));
     if (response.status === 404) {
-      return { ok: false, error: "This Safari MCP server is too old to pair. Update it (npx safari-mcp@latest), restart your MCP client, and try again." };
+      oldServer = true;
+      continue;
     }
+    const reply = await response.json().catch(() => ({}));
     const token = String(reply?.token || "");
     if (!response.ok || !/^[0-9a-f]{64}$/.test(token)) {
       return { ok: false, error: String(reply?.error || `The Safari MCP server refused the code (HTTP ${response.status}).`) };
@@ -123,6 +126,9 @@ async function _pairWithBridge(code) {
       connect(); // a connect already in flight retries in 3 s with the new token
     }
     return { ok: true };
+  }
+  if (oldServer) {
+    return { ok: false, error: "This Safari MCP server is too old to pair. Update it (npx safari-mcp@latest), restart your MCP client, and try again." };
   }
   return { ok: false, error: "No Safari MCP server is running. Start your MCP client (it starts safari-mcp), then try again." };
 }

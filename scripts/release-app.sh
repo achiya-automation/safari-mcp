@@ -72,7 +72,8 @@ APP="$WORK/export/Safari MCP.app"
 
 step "Verifying the signed app"
 # Fail closed: a release that carried the builder's token would hand it to everyone.
-[ -z "$(find "$APP" -name bridge-auth-token)" ] || die "the app contains a bridge-auth-token; refusing to publish it."
+FOUND="$(find "$APP" -name bridge-auth-token)" || die "could not search the whole app for a bridge-auth-token."
+[ -z "$FOUND" ] || die "the app contains a bridge-auth-token; refusing to publish it."
 codesign --verify --deep --strict --verbose=2 "$APP"
 SIGNATURE="$(codesign -dvv "$APP" 2>&1)"
 grep -q "^Authority=Developer ID Application: .*($TEAM_ID)" <<<"$SIGNATURE" || die "the app is not signed with this team's Developer ID."

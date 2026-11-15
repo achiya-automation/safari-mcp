@@ -45,7 +45,9 @@ export function consumePairingCode(input, { file = PAIRING_FILE, now = Date.now(
   const expected = Buffer.from(String(state.sha256 || ""), "hex");
   const given = sha256(code);
   if (/^[0-9A-Z]{8}$/.test(code) && expected.length === given.length && timingSafeEqual(expected, given)) {
-    burn();
+    // Bridges on other ports share this file. Only the one that removes it hands out the
+    // token, so two that matched the same code at the same moment cannot both pair.
+    try { unlinkSync(file); } catch { return "missing"; }
     return "ok";
   }
   // ponytail: two daemons judging guesses at once can race this count; the 40-bit code
