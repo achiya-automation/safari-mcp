@@ -9,7 +9,7 @@
     .dot { width: 10px; height: 10px; border-radius: 50%; }
     .connected { background: #4CAF50; }
     .disconnected { background: #f44336; }
-    .paused { background: #FF9800; }
+    .paused, .unpaired { background: #FF9800; }
     .checking { background: #FF9800; animation: pulse 1.2s ease-in-out infinite; }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
     .info { color: #666; font-size: 11px; margin-bottom: 12px; }
@@ -21,6 +21,20 @@
     .slider::before { content: ""; position: absolute; width: 18px; height: 18px; left: 3px; bottom: 3px; background: white; border-radius: 50%; transition: 0.2s; }
     .toggle input:checked + .slider { background: #4CAF50; }
     .toggle input:checked + .slider::before { transform: translateX(18px); }
+    #pairForm[hidden] { display: none; }
+    .steps { margin: -4px 0 4px; padding-left: 18px; }
+    .steps li { margin-bottom: 10px; }
+    .row { display: flex; align-items: center; gap: 6px; margin-top: 5px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .row code { flex: 1; font-size: 12px; background: #f2f2f2; border-radius: 4px; padding: 5px 6px; user-select: all; }
+    #pairCode { flex: 1; min-width: 0; font-size: 14px; letter-spacing: 1px; padding: 5px 6px; border: 1px solid #ccc; border-radius: 4px; }
+    #pairCode:focus { outline: 2px solid #4CAF50; outline-offset: -1px; border-color: transparent; }
+    button { font: inherit; font-size: 12px; padding: 5px 10px; border-radius: 4px; border: 1px solid #ccc; background: #fff; cursor: pointer; }
+    #pairButton { background: #4CAF50; border-color: #4CAF50; color: #fff; font-weight: 600; }
+    #pairButton:disabled { opacity: 0.6; cursor: default; }
+    .pair-message { font-size: 11px; min-height: 14px; margin-bottom: 8px; }
+    .pair-message.error { color: #c62828; }
+    .pair-message.ok { color: #2e7d32; }
   </style>
 </head>
 <body>
@@ -30,6 +44,23 @@
     <span id="statusText">Checking...</span>
   </div>
   <div class="info" id="info"></div>
+  <form id="pairForm" hidden>
+    <ol class="steps">
+      <li>In Terminal, run:
+        <div class="row">
+          <code class="mono" id="pairCommand">npx safari-mcp pair</code>
+          <button type="button" id="copyCommand">Copy</button>
+        </div>
+      </li>
+      <li><label for="pairCode">Enter the code it prints:</label>
+        <div class="row">
+          <input id="pairCode" class="mono" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="9" placeholder="XXXX-XXXX" required>
+          <button type="submit" id="pairButton">Pair</button>
+        </div>
+      </li>
+    </ol>
+    <div class="pair-message" id="pairMessage" role="status" aria-live="polite"></div>
+  </form>
   <div class="toggle-row">
     <span class="toggle-label">Active</span>
     <label class="toggle">

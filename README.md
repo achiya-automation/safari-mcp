@@ -612,6 +612,7 @@ Safari MCP runs locally on your Mac with minimal attack surface:
 | Permissions | macOS system permissions required (Screen Recording for screenshots) |
 | Data | No telemetry, no analytics, no data sent anywhere |
 | Extension | Communicates only with the local profile bridges (`localhost:9224/9228/9232/9236`), validated by Safari |
+| Pairing | The bridge token never leaves your Mac and is not in the app. `npx safari-mcp pair` prints a one-time 8-character code (10 minutes, 5 tries); the bridge hands its token only to an extension origin that presents it |
 | Code | Fully open source (MIT) — audit every line |
 
 ---
@@ -734,15 +735,30 @@ The Safari MCP Extension is **optional but recommended**. Without it, ~80% of fu
 
 ### Installing the Extension
 
-The extension requires a one-time build with Xcode (free, included with macOS).
+No Xcode needed. The app is signed with a Developer ID and notarized by Apple.
 
-> **Note for npm users:** The `xcode/` directory is not included in the npm package.
-> Clone the [GitHub repository](https://github.com/achiya-automation/safari-mcp) to build from source.
+1. **Download** [`Safari-MCP.app.zip`](https://github.com/achiya-automation/safari-mcp/releases/latest/download/Safari-MCP.app.zip) from the latest release, unzip it, and move **Safari MCP.app** to `/Applications`.
+2. **Open the app once.** That registers the extension with Safari. Click **Quit and Open Safari Settings…**.
+3. **Turn it on** in Safari → Settings → Extensions → **Safari MCP Bridge**. When Safari asks, allow it on every website: it needs page access to run commands, and it talks only to the local bridge. If you use Safari profiles, turn it on in each profile you automate (Settings → Profiles → *profile* → Extensions).
+4. **Pair it.** With your MCP client running (it starts safari-mcp), run:
 
-**Prerequisites:** Xcode (install from App Store — free)
+   ```bash
+   npx safari-mcp pair
+   ```
+
+   Click the Safari MCP button in Safari's toolbar, enter the code, and click **Pair**. The badge changes from **PAIR** to **ON**. A code works once and expires after 10 minutes. Each Safari profile pairs once, so run the command again for the next profile.
+
+To update, download the new zip when a release says the extension changed and replace the app. The pairing stays.
+
+The extension connects to the first local bridge whose declared Safari profile matches its own. The default bridge ports are `9224`, `9228`, `9232`, and `9236`; a single-profile setup normally uses `9224`.
+
+<details>
+<summary><b>Building the extension from source (contributors)</b></summary>
+
+A build from source needs Xcode (free in the App Store). The npm package does not include the `xcode/` directory, so clone the repository:
 
 ```bash
-# 1. Clone the repo (the npm package does not include the Xcode project)
+# 1. Clone the repo
 git clone https://github.com/achiya-automation/safari-mcp.git
 cd safari-mcp
 
@@ -765,6 +781,8 @@ codesign --sign - --force --identifier com.achiya-automation.safari-mcp \
 open "$APP_PATH"
 ```
 
+A local build embeds this Mac's bridge token (`~/.safari-mcp-bridge-token`) as a private resource, so it connects without pairing. Pairing still works on a local build and takes precedence over the built-in token.
+
 > **Do not ad-hoc re-sign `Safari MCP.app` with `codesign --deep --sign -`.** That replaces the Apple Development identity on the wrapper and embedded extension; current Safari can then silently disable or mark the extension as removed. If a previous build was ad-hoc signed, run the `clean build` command above again.
 
 Alternatively, open `xcode/Safari MCP/Safari MCP.xcodeproj` directly in Xcode, select your Apple ID under Signing & Capabilities, and click Run. A free personal Apple Developer account is sufficient for local use.
@@ -774,12 +792,15 @@ Then in Safari:
 2. Safari → Settings → Developer → **Allow unsigned extensions** (required each Safari restart)
 3. Safari → Settings → Extensions → enable **Safari MCP Bridge**
 
-The extension connects automatically to the first local bridge whose declared Safari profile matches its own. The default bridge ports are `9224`, `9228`, `9232`, and `9236`; a single-profile setup normally uses `9224`.
+> **Note:** "Allow unsigned extensions" resets every time Safari restarts. You'll need to re-enable it in Safari → Settings → Developer after each restart. The extension itself stays installed. The downloaded, notarized app does not need this setting.
 
-> **Note:** "Allow unsigned extensions" resets every time Safari restarts. You'll need to re-enable it in Safari → Settings → Developer after each restart. The extension itself stays installed.
+Maintainers publish the downloadable app with `scripts/release-app.sh`, which archives without a bridge token, exports with a Developer ID, notarizes, staples, and attaches `Safari-MCP.app.zip` to the GitHub release.
+
+</details>
 
 **Toolbar icon status:**
 - **ON** — connected to MCP server
+- **PAIR** — not paired yet, or the bridge no longer accepts its pairing: run `npx safari-mcp pair` and enter the code in the popup
 - **OFF** — manually disabled via popup
 - *(no badge)* — server not running, will auto-reconnect
 
@@ -836,6 +857,8 @@ That call registers the Terminal app in the Automation database and then trigger
 | `safari_native_click` reports success but page doesn't react | Add `safari-helper` to **System Settings → Privacy & Security → Accessibility** (see [Granting Accessibility](#granting-accessibility-to-safari-helper-required-for-safari_native_) above). Confirm by attaching a `click` listener with `{capture:true}` in the page console — without the grant, no `isTrusted: true` event fires |
 | Screenshots empty | Grant Screen & System Audio Recording to Terminal/VS Code — or, when safari-mcp runs as a LaunchAgent, to the `node` binary itself (a Homebrew node upgrade changes its path, so re-grant after upgrading). `safari_doctor` names the exact binary |
 | Extension missing after enabling "Allow unsigned extensions" (macOS 27) | Known macOS 27.0 issue (183044008): with the setting on, rebuild the extension app (see [Installing the Extension](#installing-the-extension)) and it appears |
+| Popup says **Not paired** or **Pairing needed** | Run `npx safari-mcp pair` while your MCP client is running and enter the code in the popup. "Pairing needed" means the bridge's token changed since the last pairing (for example, `~/.safari-mcp-bridge-token` was deleted) |
+| Popup says the server is **too old to pair** | Your MCP client runs a safari-mcp from before pairing existed. Update it (`npx safari-mcp@latest`) and restart the client |
 | Tab not found | Call `safari_list_tabs` to refresh tab indices |
 | Hebrew keyboard issues | All typing uses JS events — immune to keyboard layout |
 | HTTPS blocked | `safari_navigate` auto-tries HTTPS first, falls back to HTTP |

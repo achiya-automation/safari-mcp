@@ -68,6 +68,9 @@ test("a reconnect scheduled before a successful connect never runs after it", as
      const _RECONNECT_MAX = 60000;
      const _BRIDGE_RELOAD_HANDOFF_KEY = "reload";
      let _commandExecutionTail = Promise.resolve();
+     let _bridgeAuthProblem = "";
+     const _bridgeAuthToken = async () => "0".repeat(64);
+     const _showPairingNeeded = (problem) => { _bridgeAuthProblem = problem; };
      ${sourceBetween("let _connecting = false", "async function pollForCommands(")}
      return { connect, scheduleReconnect, state: () => ({ isConnected, generation: _pollLoopGeneration }) };`
   )(
@@ -106,13 +109,14 @@ test("a reconnect scheduled before a successful connect never runs after it", as
 // Seen live 24.10.26: the bridge a worker remembered was now another profile's daemon, whose
 // lease that profile's worker held. Every attempt stopped at its 423 and retried it, and the
 // worker never reached its own daemon on the next port.
-function connectHarness(answers) {
+function connectHarness(answers, { token = "0".repeat(64) } = {}) {
   const delays = [];
   const stored = [];
+  let requests = 0;
   const harness = Function(
     "_bridgeFetch", "browser", "_storedReloadHandoffToken", "_verifyProfileMatch",
     "_discoverProfileWindow", "updateBadge", "_startHeartbeat", "_stopHeartbeat",
-    "pollForCommands", "AbortSignal", "setTimeout", "clearTimeout",
+    "pollForCommands", "AbortSignal", "setTimeout", "clearTimeout", "_bridgeAuthToken",
     `const BRIDGE_PORTS = [9224, 9228];
      const _EXTENSION_BUILD = "test-build";
      let HTTP_URL = "http://127.0.0.1:9224";
@@ -128,10 +132,13 @@ function connectHarness(answers) {
      const _RECONNECT_MAX = 60000;
      const _BRIDGE_RELOAD_HANDOFF_KEY = "reload";
      let _commandExecutionTail = Promise.resolve();
+     let _bridgeAuthProblem = "";
+     const _showPairingNeeded = (problem) => { _bridgeAuthProblem = problem; };
      ${sourceBetween("let _connecting = false", "async function pollForCommands(")}
-     return { connect, state: () => ({ isConnected }) };`
+     return { connect, state: () => ({ isConnected, auth: _bridgeAuthProblem }) };`
   )(
     async (url) => {
+      requests += 1;
       const port = Number(String(url).match(/:(\d+)\//)[1]);
       const status = String(url).includes("/connect") ? answers[port] : 200;
       return { ok: status === 200, status, json: async () => ({ profile: "אוטומציות" }) };
@@ -155,10 +162,34 @@ function connectHarness(answers) {
     () => {},
     AbortSignal,
     (fire, delay) => { delays.push(delay); return delays.length; },
-    () => {}
+    () => {},
+    async () => {
+      if (!token) throw new Error("no bridge token");
+      return token;
+    }
   );
-  return { harness, delays, stored };
+  return { harness, delays, stored, requests: () => requests };
 }
+
+test("a worker with no token asks to be paired and sends no bridge request", async () => {
+  const { harness, delays, requests } = connectHarness({ 9224: 200, 9228: 200 }, { token: "" });
+  await harness.connect();
+  assert.equal(requests(), 0, "a request without a token only earns a 401");
+  assert.equal(harness.state().auth, "unpaired");
+  assert.equal(harness.state().isConnected, false);
+  assert.equal(delays.length, 1, "a built-in token whose read failed once gets another try");
+});
+
+test("a token every bridge refuses asks for pairing again, unless one bridge took it", async () => {
+  const refused = connectHarness({ 9224: 401, 9228: 401 });
+  await refused.harness.connect();
+  assert.equal(refused.harness.state().auth, "rejected");
+
+  // The bridge checks the token before the lease, so a 423 means that daemon accepted it.
+  const leased = connectHarness({ 9224: 401, 9228: 423 });
+  await leased.harness.connect();
+  assert.equal(leased.harness.state().auth, "", "a worker whose token works must not be sent to pair");
+});
 
 test("a 423 from a remembered bridge does not stop the scan for this profile's daemon", async () => {
   const { harness, delays, stored } = connectHarness({ 9224: 423, 9228: 200 });

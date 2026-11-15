@@ -15,6 +15,33 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # The README links to releases/latest/download/Safari-MCP.app.zip. A release cut without a
+  # new notarized build (scripts/release-app.sh) gets the newest one an older release
+  # carries, so that link keeps working. A later release-app.sh upload replaces it.
+  carry-app-forward:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Attach the newest notarized app if this release has none
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          has_app() { gh release view "$1" --repo "$REPO" --json assets -q '.assets[].name' | grep -qx 'Safari-MCP.app.zip'; }
+          if has_app "$TAG"; then echo "$TAG already carries Safari-MCP.app.zip"; exit 0; fi
+          for older in $(gh release list --repo "$REPO" --exclude-drafts --limit 100 --json tagName -q '.[].tagName'); do
+            [ "$older" = "$TAG" ] && continue
+            if has_app "$older"; then
+              gh release download "$older" --repo "$REPO" --pattern 'Safari-MCP.app.zip*' --dir app
+              gh release upload "$TAG" app/* --repo "$REPO"
+              echo "Attached Safari-MCP.app.zip from $older to $TAG"
+              exit 0
+            fi
+          done
+          echo "No release carries Safari-MCP.app.zip yet"
+
   publish-npm:
     runs-on: ubuntu-latest
     environment: npm-publish
