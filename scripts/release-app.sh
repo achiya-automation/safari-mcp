@@ -26,7 +26,19 @@ TAG="${1:-v$(node -p "require('$ROOT/package.json').version")}"
 PROJECT="$ROOT/xcode/Safari MCP/Safari MCP.xcodeproj"
 OUT="$ROOT/build"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/safari-mcp-release.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+
+# Xcode registers each app it builds with LaunchServices and pluginkit. On a Mac that already runs
+# Safari MCP, a second registered copy of the extension can make Safari switch to it (this one has
+# no bridge token) or turn the extension off, so every copy made here is unregistered once it exists.
+forget_copies() {
+  local app
+  while IFS= read -r -d '' app; do
+    pluginkit -r "$app/Contents/PlugIns/Safari MCP Extension.appex" 2>/dev/null || true
+    "$LSREGISTER" -u "$app" 2>/dev/null || true
+  done < <(find "$WORK" -name "Safari MCP.app" -type d -prune -print0 2>/dev/null)
+}
+trap 'forget_copies; rm -rf "$WORK"' EXIT
 
 die() { echo "release-app: $*" >&2; exit 1; }
 step() { printf '\n==> %s\n' "$*"; }
@@ -45,10 +57,11 @@ fi
 step "Archiving (no bridge token)"
 xcodebuild archive -quiet \
   -project "$PROJECT" -scheme "Safari MCP (macOS)" -configuration Release \
-  -archivePath "$WORK/Safari MCP.xcarchive" \
+  -archivePath "$WORK/Safari MCP.xcarchive" -derivedDataPath "$WORK/DerivedData" \
   SAFARI_MCP_EMBED_BRIDGE_TOKEN=NO \
   DEVELOPMENT_TEAM="$TEAM_ID" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="Developer ID Application" \
   PROVISIONING_PROFILE_SPECIFIER=
+forget_copies
 
 step "Exporting with Developer ID"
 cat > "$WORK/ExportOptions.plist" <<PLIST
@@ -67,6 +80,7 @@ xcodebuild -exportArchive -quiet \
   -archivePath "$WORK/Safari MCP.xcarchive" \
   -exportPath "$WORK/export" \
   -exportOptionsPlist "$WORK/ExportOptions.plist"
+forget_copies
 APP="$WORK/export/Safari MCP.app"
 [ -d "$APP" ] || die "the export produced no Safari MCP.app"
 
