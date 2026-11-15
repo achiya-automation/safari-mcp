@@ -77,6 +77,7 @@
     "node-compat.js",
     "mcp-helpers.js",
     "injected-validators.js",
+    "injected-network.js",
     "injected-escape.js",
     "safari-helper",
     "safari-helper.entitlements",

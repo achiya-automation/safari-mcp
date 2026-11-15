@@ -538,8 +538,8 @@ What the flag deliberately does *not* do:
 | Tool | Description |
 |------|-------------|
 | `safari_network` | Quick network requests via Performance API |
-| `safari_start_network_capture` | Start detailed capture (fetch + XHR) |
-| `safari_network_details` | Get captured requests with headers/timing |
+| `safari_start_network_capture` | Start detailed capture (fetch, XHR, WebSocket, sendBeacon) |
+| `safari_network_details` | Get captured requests with headers and timing; pass an `id` for one request with its bodies or WebSocket frames |
 | `safari_clear_network` | Clear captured requests |
 | `safari_mock_route` | Mock network responses (intercept fetch/XHR) |
 | `safari_clear_mocks` | Remove all network mocks |

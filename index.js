@@ -4507,7 +4507,7 @@ server.tool(
 
 server.tool(
   "safari_start_network_capture",
-  "Start capturing detailed network requests (fetch + XHR) with headers, status, timing. Call once per page. Intercepts fetch/XHR — captures requests AFTER this call only. For quick overview of already-loaded resources, use safari_network instead.",
+  "Start capturing the requests the page's own JavaScript makes: fetch and XHR with request and response headers and bodies, WebSocket frames, and sendBeacon. Call once per page; it records requests made AFTER this call and stops when the page navigates. The document, images, stylesheets, redirects and cookie headers are not visible to page JavaScript: use safari_network for an overview of those.",
   {},
   async () => {
     const result = await safari.startNetworkCapture();
@@ -4517,11 +4517,13 @@ server.tool(
 
 server.tool(
   "safari_network_details",
-  "Get captured network requests with full details (must call safari_start_network_capture first)",
+  "Get captured network requests (must call safari_start_network_capture first). The list gives each request's id, URL, method, status, timing, headers and body sizes; pass an id to get that one request in full, with its request and response bodies or its WebSocket frames.",
   {
     receipt: z.string().optional().describe("Tab receipt from safari_new_tab — pins this call to that tab (survives reconnects/subagents)"),
     limit: z.coerce.number().optional().describe("Max requests (default: 50)"),
     filter: z.string().optional().describe("Filter by URL substring"),
+    id: z.coerce.number().int().optional().describe("Return only the request with this id, in full (bodies and WebSocket frames included)"),
+    bodies: z.boolean().optional().describe("Include bodies and WebSocket frames in the list as well (default: false). Bodies are capped at 20,000 characters each."),
   },
   async (args) => {
     const result = await safari.getNetworkDetails(args);
