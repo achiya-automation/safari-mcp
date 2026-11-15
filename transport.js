@@ -5,7 +5,8 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createServer } from "node:http";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { sessionCtx } from "./session-context.js";
 import { _dropSession } from "./safari.js";
 
@@ -23,6 +24,30 @@ export function planTransport(env = {}) {
     };
   }
   return { kind: "stdio" };
+}
+
+// Optional bearer token for HTTP mode. The loopback bind and the Host/Origin check keep other
+// machines and web pages out, but any local process can still open the port, and every tool here
+// runs in the user's logged-in Safari under this daemon's Automation grant. A token closes the
+// port to local processes that cannot read it (sandboxed apps, other user accounts).
+// SAFARI_MCP_HTTP_TOKEN holds the token itself; SAFARI_MCP_HTTP_TOKEN_FILE names a file that holds
+// it, so a launchd plist or a shell profile need not contain the secret. Neither set = no auth,
+// the historical behaviour. A token source that is set but unusable throws: a daemon that was
+// asked for auth must not start open.
+export function resolveHttpToken(env = {}) {
+  const file = env.SAFARI_MCP_HTTP_TOKEN_FILE;
+  const token = (file ? readFileSync(file, "utf8") : env.SAFARI_MCP_HTTP_TOKEN || "").trim();
+  if (file && !token) throw new Error(`SAFARI_MCP_HTTP_TOKEN_FILE is empty: ${file}`);
+  return token || null;
+}
+
+// Constant-time check of an Authorization header against the expected token. Hashing both sides
+// first gives timingSafeEqual the equal-length buffers it requires without leaking the length.
+export function isAuthorized(header, token) {
+  const match = /^Bearer\s+(.+)$/i.exec(typeof header === "string" ? header.trim() : "");
+  if (!match) return false;
+  const digest = (s) => createHash("sha256").update(s).digest();
+  return timingSafeEqual(digest(match[1]), digest(token));
 }
 
 // Connects an McpServer over the chosen transport and returns a handle with close().
@@ -44,6 +69,8 @@ export async function startTransport(createMcpServer, env = process.env, hooks =
     await server.connect(new StdioServerTransport());
     return { kind: "stdio", async close() {} };
   }
+
+  const token = resolveHttpToken(env);
 
   // One StreamableHTTP transport per MCP session (keyed by Mcp-Session-Id), all sharing the single
   // McpServer — this is the SDK's supported multi-client pattern. safari's tab/ownership state stays
@@ -68,6 +95,14 @@ export async function startTransport(createMcpServer, env = process.env, hooks =
         res.statusCode = 403;
         res.end(
           JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Forbidden: non-loopback Host or Origin" }, id: null })
+        );
+        return;
+      }
+      if (token && !isAuthorized(req.headers.authorization, token)) {
+        res.statusCode = 401;
+        res.setHeader("WWW-Authenticate", "Bearer");
+        res.end(
+          JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Unauthorized: missing or wrong bearer token" }, id: null })
         );
         return;
       }

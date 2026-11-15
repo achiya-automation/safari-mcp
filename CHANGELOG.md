@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **The HTTP daemon can require a bearer token.** `SAFARI_MCP_HTTP_TOKEN`, or `SAFARI_MCP_HTTP_TOKEN_FILE` for a token kept in a file, makes every request to the shared daemon carry `Authorization: Bearer <token>`; anything else gets `401`. The loopback bind and the Host/Origin check already keep other machines and web pages out, but any local process could open the port and drive the logged-in Safari under the daemon's Automation grant. Unset, nothing changes. A token file that is missing or empty stops the daemon at startup.
+
 ### Fixed
 - **`safari_click` opens menus when the tab's content bridge does not answer.** The recovery path in `sendContentCommand` sent only a focus and a `click`, and answered `Scheduled mcp-content-click` as if it had worked. Radix dropdowns and anything else that opens on `pointerdown` stayed shut (reproduced with `@radix-ui/react-dropdown-menu` 2.1.6 on Safari 27.2). The recovery path now sends the same pointer and mouse sequence as the bridge. `rel="dialog"` links keep their bare click. The Safari extension has to be rebuilt to get this.
 - **`safari_press_key` sends the key names it documents.** With the extension, `down` or `enter` reached the page as the literal strings `"down"` and `"enter"`, which pages ignore. Only `ArrowDown` and `Enter` worked. The server now translates the short names before sending them.

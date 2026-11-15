@@ -343,6 +343,23 @@ Two properties make this safe rather than merely tidy:
   (would target the user's active tab). Call safari_new_tab to reopen.
   ```
 
+### Requiring a token
+
+The daemon listens on loopback only and rejects requests whose `Host` or `Origin` is not loopback, so other machines and web pages cannot reach it. Any process on your Mac still can, and every tool runs in your logged-in Safari. To close that, give the daemon a bearer token:
+
+```bash
+openssl rand -hex 32 > ~/.config/safari-mcp-token && chmod 600 ~/.config/safari-mcp-token
+SAFARI_MCP_HTTP=1 SAFARI_MCP_HTTP_TOKEN_FILE=~/.config/safari-mcp-token npx safari-mcp
+```
+
+Every request must then carry the token, and anything else gets `401`:
+
+```json
+{ "mcpServers": { "safari-mcp": { "type": "http", "url": "http://127.0.0.1:9225/mcp", "headers": { "Authorization": "Bearer <token>" } } } }
+```
+
+`SAFARI_MCP_HTTP_TOKEN` takes the token itself instead of a file. A token file that is missing or empty stops the daemon at startup rather than leaving the port open. The token keeps out processes that cannot read it, such as sandboxed apps and other user accounts; a process running as you can read the file.
+
 This also drops process count sharply: ~17 node processes for 17 concurrent sessions becomes 1.
 
 `SAFARI_PROFILE` stays optional — leave it unset and sessions bind to your ordinary Safari windows, cookies and logins intact. Details in [docs/http-transport-design.md](docs/http-transport-design.md).
@@ -382,6 +399,8 @@ What the flag deliberately does *not* do:
 |----------|---------|--------------|
 | `SAFARI_MCP_HTTP` | off | Run one shared HTTP daemon instead of a process per client (see above). |
 | `SAFARI_MCP_HTTP_PORT` | `9225` | Port for that daemon. |
+| `SAFARI_MCP_HTTP_TOKEN` | unset | Require `Authorization: Bearer <token>` on every request to that daemon. Unset = no authentication. |
+| `SAFARI_MCP_HTTP_TOKEN_FILE` | unset | Read that token from a file instead, so a launchd plist or shell profile need not contain it. Takes precedence over `SAFARI_MCP_HTTP_TOKEN`. |
 | `SAFARI_PROFILE` | unset | Bind sessions to a named Safari profile. Unset = your ordinary windows. |
 | `SAFARI_MCP_ALLOW_USER_TABS` | off | Let `safari_switch_tab` adopt a tab **you** already had open, instead of refusing it (see below). |
 | `MCP_MAX_TABS` | `6` | Tabs one session may keep open. Opening one more closes that session's oldest tab, and `safari_new_tab` names it in `evictedTab` (its receipt). |
