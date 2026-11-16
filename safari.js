@@ -10,6 +10,7 @@ import { join, dirname, resolve as resolvePath } from "node:path";
 import { readFile, writeFile, unlink, appendFile, mkdir } from "node:fs/promises";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { VIEWPORT_SCRIPT, SAFE_AREA_SCRIPT, PWA_SCRIPT, WEBKIT_COMPAT_SCRIPT, ALL_SHEETS_FN } from "./injected-validators.js";
 import { escJsSingleQuote, escAppleScriptString } from "./injected-escape.js";
@@ -4031,7 +4032,51 @@ export async function replaceEditorContent({ text }) {
 
 export async function screenshot({ fullPage = false } = {}) {
   await refreshTargetWindow();
+  // A locked Mac hides every window behind the lock screen: screencapture returns the
+  // lock screen and ScreenCaptureKit refuses to start. The page can still paint itself.
+  if (await isScreenLocked()) return domScreenshot({ fullPage });
   return _withTargetTabFronted(() => _screenshotFronted({ fullPage }));
+}
+
+let _html2canvasSource = null;
+
+// The tab draws its own DOM onto a canvas with html2canvas-pro (a re-implementation of
+// painting, not an SVG foreignObject, which WebKit taints so toDataURL throws). Works with
+// no screen at all; fidelity is a little below a real capture (no video frames, plugins or
+// cross-origin images without CORS). Start-then-poll so it also works on the AppleScript
+// path, where `do JavaScript` cannot await a Promise.
+export async function domScreenshot({ fullPage = false, timeoutMs = 45000 } = {}) {
+  const ready = await runJS("(function(){var h=window.html2canvas;return typeof h==='function'||!!(h&&h.default)})()");
+  if (String(ready) !== "true") {
+    if (!_html2canvasSource) {
+      const require = createRequire(import.meta.url);
+      // The package exports only its module entries; the browser build sits beside them.
+      const dist = dirname(require.resolve("html2canvas-pro"));
+      _html2canvasSource = await readFile(join(dist, "html2canvas-pro.min.js"), "utf8");
+    }
+    await runJSLarge(`${_html2canvasSource};'loaded'`);
+  }
+  await runJS(
+    `(function(){var h=window.html2canvas,f=typeof h==='function'?h:h&&h.default;` +
+    `window.__safariMcpShot={state:'running'};var full=${fullPage ? "true" : "false"};` +
+    `var w=innerWidth,ht=full?document.documentElement.scrollHeight:innerHeight;` +
+    `f(document.documentElement,{x:full?0:scrollX,y:full?0:scrollY,width:w,height:Math.min(ht,8000),` +
+    `windowWidth:w,windowHeight:innerHeight,scale:1,useCORS:true,logging:false,backgroundColor:'#ffffff'})` +
+    `.then(function(c){window.__safariMcpShot={state:'done',data:c.toDataURL('image/jpeg',0.8).split(',')[1]}},` +
+    `function(e){window.__safariMcpShot={state:'error',error:String(e&&e.message||e)}});return 'started'})()`
+  );
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 1000));
+    const raw = await runJS(
+      "(function(){var s=window.__safariMcpShot||{};var out=JSON.stringify(s);if(s.state!=='running')window.__safariMcpShot=null;return out})()",
+      { timeout: 30000 }
+    );
+    const shot = JSON.parse(String(raw || "{}"));
+    if (shot.state === "done" && shot.data) return shot.data;
+    if (shot.state === "error") throw new Error(`screen is locked and the page could not draw itself: ${shot.error}`);
+  }
+  throw new Error("screen is locked and the page did not finish drawing itself in time");
 }
 
 async function _screenshotFronted({ fullPage }) {
