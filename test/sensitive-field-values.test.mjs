@@ -191,10 +191,63 @@ test("safari_get_source masks the value attribute of sensitive fields", async ()
 
 // ---------- the server's pass over extension replies ----------
 
-test("every extension reply goes through the server's pass", () => {
-  assert.equal(typeof fields.redactFieldValues, "function", "sensitive-fields.js exports redactFieldValues");
-  const fn = between(INDEX, "function sendToExtension(", "\n}\n");
-  assert.match(fn, /return reply\.then\(\(result\) => redactFieldValues\(type, result\)\);\s*$/, "sendToExtension returns every reply through redactFieldValues");
+// index.js's sendToExtension over a fake extension that answers like an app built before this fix:
+// read_page gives a field's bare value, get_element what the field is.
+function oldExtensionSend(answer, { thermal = false } = {}) {
+  const calls = [];
+  const send = new Function(
+    "_THERMAL_FILE", "_THERMAL_FREE", "_thermalGate", "_sendToExtension", "redactFieldValues", "redactReadPage",
+    `${between(INDEX, "function sendToExtension(", "\n}\n")}\n}\nreturn sendToExtension;`
+  )(
+    thermal ? "/tmp/heat.json" : "", new Set(), async () => {},
+    async (type, payload) => { calls.push(`${type} ${payload.selector || ""}`.trim()); return answer(type, payload); },
+    fields.redactFieldValues, fields.redactReadPage
+  );
+  return { send, calls };
+}
+
+test("every extension reply goes through the server's pass, also behind the thermal gate", async () => {
+  for (const thermal of [false, true]) {
+    const { send } = oldExtensionSend(() => '<input ref="0_3" id="pw" value="typed-SECRET" type="password"/>', { thermal });
+    assert.equal(await send("snapshot", {}), '<input ref="0_3" id="pw" value="[redacted 12 chars]" type="password"/>');
+  }
+});
+
+test("read_page with a selector from an older extension is masked by the field it read", async () => {
+  const FIELDS = {
+    "#pw": { tag: "INPUT", attrs: { id: "pw", type: "password" }, value: "typed-SECRET" },
+    "#otp": { tag: "INPUT", attrs: { id: "otp", autocomplete: "one-time-code" }, value: "otp-SECRET" },
+    "#card": { tag: "SELECT", attrs: { autocomplete: "cc-exp-month" }, value: "05-SECRET" },
+    "#email": { tag: "INPUT", attrs: { id: "email", type: "email" }, value: "visible@example.com" },
+    "article": { tag: "ARTICLE", attrs: {}, text: "Readable article text" },
+  };
+  const { send, calls } = oldExtensionSend((type, { selector }) => {
+    if (!selector) return JSON.stringify({ title: "Sign up", text: "Email Password" });
+    const el = FIELDS[selector];
+    if (!el) return `Element not found: ${selector}`;
+    return type === "read_page" ? el.value ?? el.text : JSON.stringify(el);
+  });
+  assert.equal(await send("read_page", { selector: "#pw" }), "[redacted 12 chars]");
+  assert.equal(await send("read_page", { selector: "#otp" }), "[redacted 10 chars]");
+  assert.equal(await send("read_page", { selector: "#card" }), "[redacted 9 chars]");
+  assert.equal(await send("read_page", { selector: "#email" }), "visible@example.com");
+  assert.equal(await send("read_page", { selector: "article" }), "Readable article text");
+  assert.deepEqual(calls.splice(0), [
+    "read_page #pw", "get_element #pw", "read_page #otp", "get_element #otp", "read_page #card", "get_element #card",
+    "read_page #email", "get_element #email", "read_page article", "get_element article",
+  ]);
+  assert.equal(await send("read_page", { selector: "#gone" }), "Element not found: #gone");
+  assert.equal(await send("read_page", {}), '{"title":"Sign up","text":"Email Password"}', "a whole-page read is not checked against a field");
+  assert.deepEqual(calls.splice(0), ["read_page #gone", "read_page"], "only a value that was read asks what its field is");
+
+  const unsure = oldExtensionSend((type) => {
+    if (type === "read_page") return "maybe-SECRET";
+    throw new Error("Extension timeout");
+  });
+  assert.equal(await unsure.send("read_page", { selector: "#x" }), "[redacted 12 chars]", "a field nobody could check counts as sensitive");
+  const masked = oldExtensionSend(() => "[redacted 8 chars]");
+  assert.equal(await masked.send("read_page", { selector: "#pw" }), "[redacted 8 chars]");
+  assert.deepEqual(masked.calls, ["read_page #pw"], "an extension that masks by itself is not asked again");
 });
 
 test("snapshot from an older extension: a password value is masked, other values stay", () => {

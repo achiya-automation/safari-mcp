@@ -63,3 +63,15 @@ export function redactFieldValues(command, result) {
   }
   return changed ? JSON.stringify(data) : result;
 }
+
+// An older extension's read_page with a selector returns a field's value as bare text, with
+// nothing that says what the field is. `probe` asks get_element about the same selector. A
+// probe that fails, or that cannot be read, counts as a sensitive field.
+export async function redactReadPage(text, probe) {
+  if (typeof text !== "string" || text === "" || MASKED.test(text) || text.startsWith("Element not found: ")) return text;
+  let el = null;
+  try { el = JSON.parse(await probe()); } catch {}
+  const attrs = (el && el.attrs) || {};
+  const type = String(el?.tag || "").toUpperCase() === "INPUT" ? attrs.type : "";
+  return !el || isSensitiveField(type, attrs.autocomplete) ? maskValue(text) : text;
+}
