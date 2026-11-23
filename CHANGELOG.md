@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **No read tool returns what a password, one-time-code or payment-card field holds.** `safari_snapshot` printed `value="…"` for every filled input, so on a sign-up form it returned the password the user had just typed, and the password reached the agent's transcript. A field is sensitive when it is `type="password"` or its `autocomplete` names `current-password`, `new-password`, `one-time-code` or a `cc-*` token. Its value is now reported as `[redacted N chars]`, so an agent still sees that the field is filled and how long the value is. This covers `safari_snapshot` (also with `selector` and `diff`), `safari_read_page` with a selector, `safari_get_element` (its `value` and its `value` attribute), `safari_query_all`, `safari_get_source`, `safari_accessibility_snapshot`, `safari_detect_forms`, `safari_verify_state`, the result of `safari_fill`, and the label a native click reports. Other fields keep their values. The server also masks every extension reply (`sensitive-fields.js`), so an extension app built before this release is already covered in `safari_get_element`, `safari_get_source` and `safari_read_page` with a selector (there the server asks `get_element` what the field is, and masks the value when it cannot tell), and for password fields in `safari_snapshot` and `safari_query_all`. One-time-code and card fields in that app's snapshots and `safari_query_all` results are masked once the extension app is rebuilt. `test/sensitive-field-values.test.mjs`. Manifest 2.10.35.
+
 ## [2.24.1] - 2026-11-15
 
 ### Fixed

@@ -43,6 +43,7 @@ import {
 import { Socket } from "node:net";
 import { ignoreTypeOfServiceEinval } from "./node-compat.js";
 import { consumePairingCode } from "./pairing.js";
+import { redactFieldValues, redactReadPage } from "./sensitive-fields.js";
 
 // Before the first fetch: a secondary's /proxy-check to a primary that just went away
 // must reject, not end the process (#140).
@@ -1823,8 +1824,14 @@ async function _thermalGate(type) {
 }
 
 function sendToExtension(type, payload = {}, timeoutMs = 30000) {
-  if (!_THERMAL_FILE || _THERMAL_FREE.has(type)) return _sendToExtension(type, payload, timeoutMs);
-  return _thermalGate(type).then(() => _sendToExtension(type, payload, timeoutMs));
+  const reply = !_THERMAL_FILE || _THERMAL_FREE.has(type)
+    ? _sendToExtension(type, payload, timeoutMs)
+    : _thermalGate(type).then(() => _sendToExtension(type, payload, timeoutMs));
+  // A password, one-time-code or card field is reported masked even by an extension built
+  // before its page functions masked them (an installed app updates later than this server).
+  return reply.then((result) => type === "read_page" && payload.selector
+    ? redactReadPage(result, () => _sendToExtension("get_element", payload, timeoutMs))
+    : redactFieldValues(type, result));
 }
 
 function _sendToExtension(type, payload = {}, timeoutMs = 30000) {

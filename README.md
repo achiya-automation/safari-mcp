@@ -613,6 +613,7 @@ Safari MCP runs locally on your Mac with minimal attack surface:
 | Data | No telemetry, no analytics, no data sent anywhere |
 | Extension | Communicates only with the local profile bridges (`localhost:9224/9228/9232/9236`), validated by Safari |
 | Pairing | The bridge token never leaves your Mac and is not in the app. `npx safari-mcp pair` prints a one-time 8-character code (10 minutes, 5 tries); the bridge hands its token only to an extension origin that presents it |
+| Form secrets | Read tools never return what a password, one-time-code or card field holds (`type="password"`, or `autocomplete` of `current-password`, `new-password`, `one-time-code` or `cc-*`). They report `[redacted N chars]` instead |
 | Code | Fully open source (MIT) — audit every line |
 
 ---

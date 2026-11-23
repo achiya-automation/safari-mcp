@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { VIEWPORT_SCRIPT, SAFE_AREA_SCRIPT, PWA_SCRIPT, WEBKIT_COMPAT_SCRIPT, ALL_SHEETS_FN } from "./injected-validators.js";
 import { escJsSingleQuote, escAppleScriptString } from "./injected-escape.js";
+import { PAGE_FIELD_JS, redactMarkupFieldValues } from "./sensitive-fields.js";
 import { currentSessionId } from "./session-context.js";
 import { allowUserTabs } from "./ownership-state.js";
 // Extension bridge is handled by index.js (WebSocket server on port 9223)
@@ -1713,6 +1714,7 @@ async function _helperAxDomOnce(domId, action, value, timeout) {
 // a temporary one goes on, and _axUnstampJs puts the original back.
 function _axStampJs(findExpr, scroll = true) {
   return `(function(){
+    ${PAGE_FIELD_JS}
     var el = ${findExpr};
     if (!el || el.nodeType !== 1) return JSON.stringify({error: 'not found'});
     ${scroll ? "el.scrollIntoView({block:'center', behavior:'instant'});" : ""}
@@ -1723,7 +1725,7 @@ function _axStampJs(findExpr, scroll = true) {
       el.id = id; tmp = true;
     }
     return JSON.stringify({id: id, tmp: tmp, tag: el.tagName,
-      text: (el.innerText || el.textContent || el.value || '').trim().substring(0, 50)});
+      text: (el.innerText || el.textContent || __mcpValue(el, el.value) || '').trim().substring(0, 50)});
   })()`;
 }
 
@@ -2416,9 +2418,10 @@ export async function readPage({ selector, maxLength = 50000 } = {}) {
     const sel = escJsSingleQuote(selector);
     return runJS(
       `(function(){
+        ${PAGE_FIELD_JS}
         var el = document.querySelector('${sel}');
         if (!el) return 'Element not found: ${sel}';
-        if (el.value !== undefined && el.value !== '') return el.value.substring(0,${Number(maxLength)});
+        if (el.value !== undefined && el.value !== '') return __mcpValue(el, el.value).substring(0,${Number(maxLength)});
         return (el.innerText || el.textContent || '').substring(0,${Number(maxLength)});
       })()`
     );
@@ -2463,7 +2466,7 @@ export async function readPage({ selector, maxLength = 50000 } = {}) {
 }
 
 export async function getPageSource({ maxLength = 200000 } = {}) {
-  return runJS(`document.documentElement.outerHTML.substring(0,${Number(maxLength)})`);
+  return redactMarkupFieldValues(await runJS(`document.documentElement.outerHTML.substring(0,${Number(maxLength)})`));
 }
 
 // ========== CLICK ==========
@@ -2939,7 +2942,7 @@ export async function fill({ selector, value, ref }) {
   // silent catch made the whole strategy vanish without a trace.
   const lexVal = JSON.stringify(String(value)).slice(1, -1).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
   const result = await runJS(
-    `(function(){try{var el=document.querySelector('${sel}');if(!el){var q=function(r){var a=r.querySelectorAll('*');for(var i=0;i<a.length;i++){if(a[i].shadowRoot){el=a[i].shadowRoot.querySelector('${sel}');if(el)return el;el=q(a[i].shadowRoot);if(el)return el;}}return null;};el=q(document);}if(!el)return 'Element not found: ${sel}';el.focus();if(el.isContentEditable||el.getAttribute('contenteditable')==='true'){` +
+    `(function(){${PAGE_FIELD_JS}try{var el=document.querySelector('${sel}');if(!el){var q=function(r){var a=r.querySelectorAll('*');for(var i=0;i<a.length;i++){if(a[i].shadowRoot){el=a[i].shadowRoot.querySelector('${sel}');if(el)return el;el=q(a[i].shadowRoot);if(el)return el;}}return null;};el=q(document);}if(!el)return 'Element not found: ${sel}';el.focus();if(el.isContentEditable||el.getAttribute('contenteditable')==='true'){` +
     // Quill editor detection (LinkedIn share composer in 2026 — they migrated from
     // ProseMirror, Slack message editor, many enterprise apps). The Quill instance is
     // attached to `.ql-container.__quill` (v2) or accessible via React Fiber's
@@ -3054,8 +3057,8 @@ export async function fill({ selector, value, ref }) {
     `el.dispatchEvent(new Event('change',{bubbles:true,composed:true}));` +
     `if(!inDlg){el.dispatchEvent(new Event('blur',{bubbles:true,composed:true}));el.dispatchEvent(new Event('focusout',{bubbles:true,composed:true}));el.focus();}` +
     `var actual=(el.value!==undefined?el.value:'');` +
-    `if(actual!=='${val}'){return '__FILL_VALUE_MISMATCH__:'+actual.substring(0,80);}` +
-    `return 'Filled: '+actual.substring(0,50);}catch(e){return 'ERR: '+e.message;}})()`
+    `if(actual!=='${val}'){return '__FILL_VALUE_MISMATCH__:'+__mcpValue(el,actual).substring(0,80);}` +
+    `return 'Filled: '+__mcpValue(el,actual).substring(0,50);}catch(e){return 'ERR: '+e.message;}})()`
   );
 
   // ProseMirror editor with no view access: use char-by-char with beforeinput events
@@ -3204,6 +3207,7 @@ export async function verifyState({ selector, expected, ref }) {
   const expSnippet = String(expected || '').substring(0, 30).replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, "");
   return runJS(
     `(function(){
+      ${PAGE_FIELD_JS}
       var el = document.querySelector('${sel}');
       if (!el && window.mcpQuerySelectorDeep) el = window.mcpQuerySelectorDeep('${sel}');
       if (!el) return JSON.stringify({ match: false, mode: 'not-found', actual: '', expected: '${exp}' });
@@ -3263,9 +3267,9 @@ export async function verifyState({ selector, expected, ref }) {
       // Detect React store/_valueTracker mismatch — common Featured.com / Next.js RSC bug
       if (!match && el._valueTracker && typeof el._valueTracker.getValue === 'function') {
         var tracked = el._valueTracker.getValue();
-        if (tracked !== actualVal) hint = 'React _valueTracker out of sync (tracked=' + JSON.stringify(tracked.substring(0, 60)) + ')';
+        if (tracked !== actualVal) hint = 'React _valueTracker out of sync (tracked=' + JSON.stringify(__mcpValue(el, tracked).substring(0, 60)) + ')';
       }
-      return JSON.stringify({ match: match, mode: 'input', actual: actualVal.substring(0, 200), expected: expected.substring(0, 200), hint: hint });
+      return JSON.stringify({ match: match, mode: 'input', actual: __mcpValue(el, actualVal).substring(0, 200), expected: expected.substring(0, 200), hint: hint });
     })()`
   );
 }
@@ -4999,14 +5003,14 @@ export async function evaluate({ script }) {
 export async function getElementInfo({ selector }) {
   const sel = escJsSingleQuote(selector);
   return runJS(
-    `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found';var r=el.getBoundingClientRect();return JSON.stringify({tag:el.tagName,text:el.textContent.trim().substring(0,200),href:el.href||'',value:el.value||'',visible:r.width>0&&r.height>0,rect:{x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)},attrs:Object.fromEntries([...el.attributes].map(function(a){return[a.name,a.value.substring(0,100)]}))})})()`
+    `(function(){${PAGE_FIELD_JS}var el=document.querySelector('${sel}');if(!el)return 'Element not found';var r=el.getBoundingClientRect();return JSON.stringify({tag:el.tagName,text:el.textContent.trim().substring(0,200),href:el.href||'',value:__mcpValue(el,el.value||''),visible:r.width>0&&r.height>0,rect:{x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)},attrs:Object.fromEntries([...el.attributes].map(function(a){return[a.name,(a.name==='value'?__mcpValue(el,a.value):a.value).substring(0,100)]}))})})()`
   );
 }
 
 export async function querySelectorAll({ selector, limit = 20 }) {
   const sel = escJsSingleQuote(selector);
   return runJS(
-    `JSON.stringify([...document.querySelectorAll('${sel}')].slice(0,${Number(limit)}).map(function(el,i){return{index:i,tag:el.tagName,text:el.textContent.trim().substring(0,100),href:el.href||undefined,value:el.value||undefined}}))`
+    `(function(){${PAGE_FIELD_JS}return JSON.stringify([...document.querySelectorAll('${sel}')].slice(0,${Number(limit)}).map(function(el,i){return{index:i,tag:el.tagName,text:el.textContent.trim().substring(0,100),href:el.href||undefined,value:__mcpValue(el,el.value)||undefined}}))})()`
   );
 }
 
@@ -5761,6 +5765,7 @@ export async function takeSnapshot({ selector, _gen } = {}) {
 
   const result = await runJS(
     `(function(){
+      ${PAGE_FIELD_JS}
       var gen = ${gen};
       var id = 0;
       var lines = [];
@@ -5876,7 +5881,7 @@ export async function takeSnapshot({ selector, _gen } = {}) {
 
           // Value for inputs
           if (el.value !== undefined && el.value !== '' && el.tagName !== 'BUTTON') {
-            line += ' value="' + String(el.value).substring(0,50).replace(/"/g, "'") + '"';
+            line += ' value="' + String(__mcpValue(el, el.value)).substring(0,50).replace(/"/g, "'") + '"';
           }
           // Checked state
           if (el.checked) line += ' checked';
@@ -5992,6 +5997,7 @@ export async function getAccessibilityTree({ selector, maxDepth = 5 }) {
   const sel = selector ? `'${escJsSingleQuote(selector)}'` : "null";
   return runJS(
     `(function(){
+      ${PAGE_FIELD_JS}
       function buildTree(el, depth) {
         if (!el || depth > ${Number(maxDepth)}) return null;
         var role = el.getAttribute('role') || el.tagName.toLowerCase();
@@ -6021,7 +6027,7 @@ export async function getAccessibilityTree({ selector, maxDepth = 5 }) {
         if (el.tagName === 'IMG') { node.alt = el.alt || '(missing)'; node.src = el.src; }
         if (['INPUT','TEXTAREA','SELECT'].includes(el.tagName)) {
           node.type = el.type || el.tagName.toLowerCase();
-          node.value = (el.value || '').substring(0, 100);
+          node.value = (__mcpValue(el, el.value) || '').substring(0, 100);
           if (el.required) node.required = true;
           if (el.placeholder) node.placeholder = el.placeholder;
         }
@@ -6817,6 +6823,7 @@ export async function doctor() {
 export async function detectForms() {
   return runJS(
     `(function(){
+      ${PAGE_FIELD_JS}
       var forms = [...document.querySelectorAll('form')];
       if (forms.length === 0) {
         var inputs = document.querySelectorAll('input, textarea, select');
@@ -6824,7 +6831,7 @@ export async function detectForms() {
           return JSON.stringify([{
             index: 0, action: '(no form tag)', method: '', fields: [...inputs].slice(0, 30).map(function(el) {
               return { tag: el.tagName, type: el.type || '', name: el.name || '', id: el.id || '',
-                placeholder: el.placeholder || '', required: el.required, value: (el.value || '').substring(0, 50),
+                placeholder: el.placeholder || '', required: el.required, value: (__mcpValue(el, el.value) || '').substring(0, 50),
                 selector: el.id ? '#' + el.id : (el.name ? '[name="' + el.name + '"]' : el.tagName.toLowerCase() + '[type="' + el.type + '"]') };
             })
           }]);
@@ -6834,7 +6841,7 @@ export async function detectForms() {
       return JSON.stringify(forms.map(function(form, i) {
         var fields = [...form.querySelectorAll('input, textarea, select')].map(function(el) {
           return { tag: el.tagName, type: el.type || '', name: el.name || '', id: el.id || '',
-            placeholder: el.placeholder || '', required: el.required, value: (el.value || '').substring(0, 50),
+            placeholder: el.placeholder || '', required: el.required, value: (__mcpValue(el, el.value) || '').substring(0, 50),
             selector: el.id ? '#' + el.id : (el.name ? '[name="' + el.name + '"]' : el.tagName.toLowerCase()) };
         });
         return { index: i, action: form.action || '', method: form.method || 'GET', id: form.id || '',
