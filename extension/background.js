@@ -1275,7 +1275,11 @@ async function handleCommand(type, payload) {
         if (sel) {
           const el = document.querySelector(sel);
           if (!el) return null;
-          return el.value !== undefined && el.value !== "" ? el.value.substring(0, maxLen) : (el.innerText || el.textContent || "").substring(0, maxLen);
+          if (el.value === undefined || el.value === "") return (el.innerText || el.textContent || "").substring(0, maxLen);
+          // A password, one-time-code or card field: say it is filled, never what it holds
+          // (sensitive-fields.js is the definition; Safari runs this function on its own).
+          const secret = (el) => (el.tagName === "INPUT" && el.type === "password") || /(?:^|\s)(?:current-password|new-password|one-time-code|cc-\S*)(?:\s|$)/i.test(el.getAttribute("autocomplete") || "");
+          return secret(el) ? `[redacted ${String(el.value).length} chars]` : el.value.substring(0, maxLen);
         }
         const bodyText = document.body?.innerText || document.body?.textContent || "";
         return JSON.stringify({ title: document.title, url: location.href, text: bodyText.substring(0, maxLen) });
@@ -2207,6 +2211,9 @@ async function handleCommand(type, payload) {
         // Shared by both walk() and the child-frame wrapper below. Keeping this in
         // walk() made every non-empty child frame throw when its URL was escaped.
         const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        // A password, one-time-code or card field shows only that it is filled
+        // (sensitive-fields.js is the definition; Safari runs this function on its own).
+        const secret = (el) => (el.tagName === "INPUT" && el.type === "password") || /(?:^|\s)(?:current-password|new-password|one-time-code|cc-\S*)(?:\s|$)/i.test(el.getAttribute("autocomplete") || "");
         // Refs must be unique across child frames because click/fill later search all
         // frames for the exact data attribute.  Keep the historical top-frame format
         // and give each child document a stable per-document namespace.
@@ -2291,7 +2298,7 @@ async function handleCommand(type, payload) {
           const title = el.getAttribute("title");
           if (title) attrs += ` title="${esc(title.substring(0, 80))}"`;
           if (el.value && ["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName)) {
-            attrs += ` value="${esc(String(el.value).substring(0, 50))}"`;
+            attrs += ` value="${secret(el) ? `[redacted ${String(el.value).length} chars]` : esc(String(el.value).substring(0, 50))}"`;
           }
           if (el.type && el.tagName === "INPUT") attrs += ` type="${esc(el.type)}"`;
           if (el.href && el.tagName === "A") {
@@ -2745,11 +2752,16 @@ async function handleCommand(type, payload) {
         const r = el.getBoundingClientRect();
         const attrs = {};
         for (const a of el.attributes) attrs[a.name] = a.value;
+        // A password, one-time-code or card field: its value and value attribute are masked
+        // (sensitive-fields.js is the definition; Safari runs this function on its own).
+        const secret = (el) => (el.tagName === "INPUT" && el.type === "password") || /(?:^|\s)(?:current-password|new-password|one-time-code|cc-\S*)(?:\s|$)/i.test(el.getAttribute("autocomplete") || "");
+        const mask = (v) => (v && secret(el) ? `[redacted ${String(v).length} chars]` : v);
+        if (attrs.value) attrs.value = mask(attrs.value);
         return JSON.stringify({
           tag: el.tagName, text: (el.innerText || el.textContent || "").substring(0, 200),
           rect: { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) },
           visible: cs.display !== "none" && cs.visibility !== "hidden" && r.width > 0,
-          attrs, value: el.value, checked: el.checked, disabled: el.disabled,
+          attrs, value: mask(el.value), checked: el.checked, disabled: el.disabled,
         });
       }, [payload.selector], tabId);
       return result || "Element not found: " + payload.selector;
@@ -2759,6 +2771,9 @@ async function handleCommand(type, payload) {
     case "query_all": {
       const queryFn = (selector, limit) => {
         const els = (window.__mcpDeepQueryAll || document.querySelectorAll.bind(document))(selector, limit);
+        // A password, one-time-code or card field: its value is masked
+        // (sensitive-fields.js is the definition; Safari runs this function on its own).
+        const secret = (el) => (el.tagName === "INPUT" && el.type === "password") || /(?:^|\s)(?:current-password|new-password|one-time-code|cc-\S*)(?:\s|$)/i.test(el.getAttribute("autocomplete") || "");
         const results = [];
         for (let i = 0; i < Math.min(els.length, limit); i++) {
           const el = els[i];
@@ -2766,7 +2781,7 @@ async function handleCommand(type, payload) {
           results.push({
             index: i, tag: el.tagName,
             text: (el.innerText || "").substring(0, 100),
-            href: el.href || "", value: el.value || "",
+            href: el.href || "", value: el.value && secret(el) ? `[redacted ${String(el.value).length} chars]` : el.value || "",
             id: el.id || "", name: el.name || "", type: el.type || "",
             placeholder: el.getAttribute("placeholder") || "",
             ariaLabel: el.getAttribute("aria-label") || "",
